@@ -401,7 +401,7 @@ def run_scan():
 
         conn = get_db()
         alerted_rows = conn.run(
-            "SELECT market_id FROM limitless_predictions WHERE fired_at > NOW() - INTERVAL '6 hours'"
+            "SELECT market_id FROM limitless_predictions WHERE fired_at::timestamptz > NOW() - INTERVAL '6 hours'"
         )
         alerted_ids = set(str(row[0]) for row in alerted_rows)
         conn.close()
@@ -751,7 +751,7 @@ def run_otp_scan():
         # Get already-alerted
         conn = get_db()
         alerted = conn.run(
-            "SELECT match_id FROM football_picks WHERE fired_at > NOW() - INTERVAL \'6 hours\' AND pick_type=\'limitless_otp\'"
+            "SELECT match_id FROM football_picks WHERE fired_at::timestamptz > NOW() - INTERVAL '6 hours' AND pick_type='limitless_otp'"
         )
         alerted_ids = set(str(r[0]) for r in alerted)
         conn.close()
