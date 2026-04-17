@@ -284,8 +284,8 @@ def score_market(p, btc_trend, price, debug_log=None):
     odds = p["yes_odds"]
 
     # 5. Odds filter (now using 0-100 scale properly)
-    if not (75 <= odds <= 97):
-        return reject("odds {:.1f}% outside 75-97% range".format(odds))
+    if not (73 <= odds <= 99):
+        return reject("odds {:.1f}% outside 73-99% range".format(odds))
 
     # Confidence
     if not btc_aligned and btc_trend:
