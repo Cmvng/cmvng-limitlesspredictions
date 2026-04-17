@@ -452,6 +452,42 @@ def scan_loop():
 # OUTCOME CHECKER
 # ═══════════════════════════════════════════════════════════
 
+def check_football_outcomes():
+    """Mark football picks that are older than their kickoff + 2 hours as resolved."""
+    try:
+        conn = get_db()
+        rows = conn.run(
+            "SELECT id, kickoff_time, fired_at FROM football_picks "
+            "WHERE status='Pending' AND accumulator_tier IN ('safe_2x','medium_3x','value_10x')"
+        )
+        cols = [c['name'] for c in conn.columns]
+        picks = [dict(zip(cols, r)) for r in rows]
+        conn.close()
+        now = datetime.now(timezone.utc)
+        for p in picks:
+            try:
+                # Use kickoff time if valid, else fallback to fired_at + 24h
+                ko = p.get("kickoff_time", "")
+                if ko:
+                    try:
+                        ko_dt = datetime.fromisoformat(ko.replace("Z", "+00:00"))
+                        if ko_dt.tzinfo is None:
+                            ko_dt = ko_dt.replace(tzinfo=timezone.utc)
+                        # Match over 2 hours after kickoff — mark as needing manual check
+                        if now > ko_dt + timedelta(hours=2.5):
+                            conn2 = get_db()
+                            conn2.run(
+                                "UPDATE football_picks SET status='Needs Check' WHERE id=:i",
+                                i=p["id"]
+                            )
+                            conn2.close()
+                    except:
+                        pass
+            except Exception as e:
+                print("Football outcome #{}: {}".format(p["id"], e))
+    except Exception as e:
+        print("Football outcome check error: {}".format(e))
+
 def outcome_loop():
     while True:
         try:
@@ -497,6 +533,10 @@ def outcome_loop():
                     print("Outcome #{}: {}".format(p["id"], e))
         except Exception as e:
             print("Outcome loop: {}".format(e))
+        try:
+            check_football_outcomes()
+        except Exception as e:
+            print("FB outcome error: {}".format(e))
         time.sleep(300)
 
 # ═══════════════════════════════════════════════════════════
@@ -658,30 +698,52 @@ def analyze_match_with_claude(match):
         return None
 
 def build_accumulators(picks):
-    """Build 2, 3, 10 odds accumulators from picks (sorted by confidence)"""
+    """Build 2, 3, 10 odds accumulators with STRICT uniqueness.
+    Each MATCH appears in at most ONE tier — higher-confidence picks go to safe tier.
+    Within a tier, only the best pick per match is used."""
     if not picks:
         return {}
-    # Sort by confidence descending
-    sorted_picks = sorted(picks, key=lambda p: p.get("confidence", 0), reverse=True)
 
-    def build_tier(target_odds):
+    # Group picks by match — keep only the best pick per match
+    match_best = {}
+    for p in picks:
+        m = p.get("match", "")
+        if not m:
+            continue
+        if m not in match_best or p.get("confidence", 0) > match_best[m].get("confidence", 0):
+            match_best[m] = p
+
+    # Sort by confidence descending
+    sorted_picks = sorted(match_best.values(), key=lambda p: p.get("confidence", 0), reverse=True)
+
+    # Track used matches globally across all tiers
+    used_matches = set()
+
+    def build_tier(target_odds, available):
         tier_picks = []
         cumulative = 1.0
-        for p in sorted_picks:
-            if p in tier_picks:
+        for p in available:
+            match_key = p.get("match", "")
+            if not match_key or match_key in used_matches:
                 continue
-            new_total = cumulative * p.get("implied_odds", 1.0)
-            if new_total <= target_odds * 1.2:  # allow 20% over
-                tier_picks.append(p)
-                cumulative = new_total
-                if cumulative >= target_odds * 0.9:
-                    break
+            implied = float(p.get("implied_odds") or 1.0)
+            if implied < 1.0:
+                continue
+            tier_picks.append(p)
+            used_matches.add(match_key)
+            cumulative *= implied
+            if cumulative >= target_odds:
+                break
         return {"picks": tier_picks, "total_odds": round(cumulative, 2)}
 
+    safe = build_tier(2.0, sorted_picks)
+    medium = build_tier(3.0, [p for p in sorted_picks if p.get("match") not in used_matches])
+    value = build_tier(10.0, [p for p in sorted_picks if p.get("match") not in used_matches])
+
     return {
-        "safe_2x":   build_tier(2.0),
-        "medium_3x": build_tier(3.0),
-        "value_10x": build_tier(10.0),
+        "safe_2x":   safe,
+        "medium_3x": medium,
+        "value_10x": value,
     }
 
 
@@ -859,7 +921,8 @@ def run_otp_scan():
                 expiry_dt = datetime.fromtimestamp(exp_ts / 1000, tz=timezone.utc)
                 now = datetime.now(timezone.utc)
                 mins_left = (expiry_dt - now).total_seconds() / 60
-                if mins_left <= 15 or mins_left > 600:  # Only 15min-10hr markets
+                # Allow any future market — from 15 mins to 7 days ahead
+                if mins_left <= 15 or mins_left > 10080:
                     continue
                 
                 prices = market.get("prices", [0.5, 0.5])
@@ -907,19 +970,60 @@ def otp_loop():
             print("OTP loop: {}".format(e))
         time.sleep(1800)  # 30 min
 
+def save_accumulator_picks(accas):
+    """Save accumulator picks to DB — replacing any unresolved old ones"""
+    try:
+        conn = get_db()
+        now = datetime.now(timezone.utc).isoformat()
+        # Mark old pending accumulators as "Expired" (replaced by new set)
+        conn.run(
+            "UPDATE football_picks SET status='Expired' "
+            "WHERE status='Pending' AND pick_type != 'limitless_otp' "
+            "AND accumulator_tier IN ('safe_2x','medium_3x','value_10x')"
+        )
+        # Save new accumulators
+        for tier_name, tier in accas.items():
+            for p in tier.get("picks", []):
+                match_str = p.get("match", "")
+                home, away = "", ""
+                if " vs " in match_str:
+                    parts = match_str.split(" vs ", 1)
+                    home, away = parts[0].strip(), parts[1].strip()
+                conn.run(
+                    """INSERT INTO football_picks
+                    (match_id, home_team, away_team, competition, kickoff_time,
+                     pick_type, pick_value, confidence, reasoning, implied_odds,
+                     accumulator_tier, status, fired_at)
+                    VALUES (:m, :h, :a, :c, :k, :pt, :pv, :conf, :r, :o, :tier, 'Pending', :now)""",
+                    m=match_str[:100], h=home[:50], a=away[:50],
+                    c=p.get("competition", "")[:50],
+                    k=p.get("kickoff", ""),
+                    pt=p.get("pick_type", ""),
+                    pv=str(p.get("pick_value", ""))[:50],
+                    conf=float(p.get("confidence", 0)),
+                    r=str(p.get("reasoning", ""))[:200],
+                    o=float(p.get("implied_odds", 1.0)),
+                    tier=tier_name,
+                    now=now
+                )
+        conn.close()
+        print("Accumulators saved to DB")
+    except Exception as e:
+        print("Save accumulator error: {}".format(e))
+
 def football_loop():
-    """Run football analysis every 6 hours"""
+    """Run football analysis every 6 hours — scans multiple days ahead"""
     time.sleep(60)
     while True:
         try:
-            if not FOOTBALL_DATA_KEY or not ANTHROPIC_KEY:
-                print("Football: missing FOOTBALL_DATA_KEY or ANTHROPIC_API_KEY — skipping")
+            if not ANTHROPIC_KEY:
+                print("Football: missing ANTHROPIC_API_KEY — skipping")
                 time.sleep(21600)
                 continue
             fixtures = get_todays_fixtures()
-            print("Football: {} fixtures today".format(len(fixtures)))
+            print("Football: {} fixtures found".format(len(fixtures)))
             all_picks = []
-            for match in fixtures[:10]:  # limit to 10 matches per run
+            for match in fixtures[:12]:  # limit to 12 matches per run
                 picks = analyze_match_with_claude(match)
                 if picks:
                     for p in picks:
@@ -928,24 +1032,29 @@ def football_loop():
                             match.get("awayTeam", {}).get("name", "")
                         )
                         p["kickoff"] = match.get("utcDate", "")
+                        p["competition"] = match.get("competition", {}).get("name", "")
                         all_picks.append(p)
                 time.sleep(2)
             if all_picks:
                 accas = build_accumulators(all_picks)
+                save_accumulator_picks(accas)
                 msg = "⚽ <b>DAILY FOOTBALL ACCUMULATORS</b>\n\n"
                 for tier_name, tier in accas.items():
+                    if not tier.get("picks"):
+                        continue
                     label = {"safe_2x": "🟢 Safe (~2x)",
                              "medium_3x": "🟡 Medium (~3x)",
                              "value_10x": "🔥 Value (~10x)"}[tier_name]
                     msg += "<b>{}</b> — {}x total\n".format(label, tier["total_odds"])
                     for p in tier["picks"]:
-                        msg += "• {}: {} {} ({}%)\n".format(
+                        msg += "• {}: {} — <b>{}</b> ({}%)\n".format(
                             p.get("match", "?"),
                             p.get("pick_type", "").replace("_", " "),
                             p.get("pick_value", ""),
-                            p.get("confidence", 0)
+                            int(p.get("confidence", 0))
                         )
                     msg += "\n"
+                msg += "💡 <i>Each match appears only once across all tiers</i>"
                 send_telegram(msg)
         except Exception as e:
             print("Football loop: {}".format(e))
@@ -1287,25 +1396,59 @@ body{font-family:var(--sans);background:var(--bg);color:var(--ink);-webkit-font-
 .hero-title{font-family:var(--display);font-weight:400;font-size:clamp(34px,4.8vw,52px);line-height:1.03;letter-spacing:-.035em;margin-bottom:14px}
 .hero-title em{font-style:italic;color:var(--accent)}
 .hero-sub{font-size:15px;color:var(--ink-3);max-width:560px;line-height:1.55}
-.accas{padding:40px;display:grid;grid-template-columns:repeat(auto-fit,minmax(360px,1fr));gap:24px}
+.section-head{padding:32px 40px 20px;display:flex;align-items:baseline;justify-content:space-between;flex-wrap:wrap;gap:14px}
+.section-title{font-family:var(--display);font-weight:500;font-size:22px;letter-spacing:-.02em}
+.section-count{font-size:11px;font-family:var(--mono);color:var(--ink-4);background:var(--bg-subtle);padding:3px 8px;border-radius:100px;margin-left:10px}
+.btn{font-family:var(--sans);font-size:13px;font-weight:500;padding:9px 16px;border-radius:8px;border:1px solid var(--border);background:var(--surface);color:var(--ink);cursor:pointer;display:inline-flex;align-items:center;gap:7px}
+.btn-primary{background:var(--accent);color:var(--bg);border-color:var(--accent)}
+.btn-primary:hover{background:var(--accent-muted)}
+.accas{padding:0 40px 32px;display:grid;grid-template-columns:repeat(auto-fit,minmax(380px,1fr));gap:24px}
 .acca{background:var(--surface);border:1px solid var(--border);border-radius:16px;padding:28px;position:relative;overflow:hidden}
 .acca-safe{border-top:3px solid var(--positive)}
 .acca-medium{border-top:3px solid var(--warning)}
 .acca-value{border-top:3px solid var(--accent)}
-.acca-head{display:flex;align-items:flex-start;justify-content:space-between;margin-bottom:20px}
+.acca-head{display:flex;align-items:flex-start;justify-content:space-between;margin-bottom:18px}
 .acca-title{font-family:var(--display);font-weight:500;font-size:22px;letter-spacing:-.02em}
-.acca-desc{font-size:12px;color:var(--ink-4);margin-top:2px}
-.acca-odds{font-family:var(--mono);font-weight:600;font-size:24px;color:var(--accent);letter-spacing:-.02em}
-.acca-odds small{font-size:10px;font-weight:400;color:var(--ink-4);display:block;text-transform:uppercase;letter-spacing:.1em}
+.acca-desc{font-size:12px;color:var(--ink-4);margin-top:4px;font-family:var(--mono)}
+.acca-odds{font-family:var(--mono);font-weight:600;font-size:24px;color:var(--accent);letter-spacing:-.02em;text-align:right}
+.acca-odds small{font-size:9px;font-weight:400;color:var(--ink-4);display:block;text-transform:uppercase;letter-spacing:.1em;margin-top:2px}
 .pick{padding:14px 0;border-top:1px solid var(--border);display:flex;justify-content:space-between;align-items:flex-start;gap:16px}
 .pick:last-child{border-bottom:none}
-.pick-match{font-size:13px;color:var(--ink);font-weight:500;margin-bottom:4px}
+.pick-body{flex:1;min-width:0}
+.pick-match{font-size:13px;color:var(--ink);font-weight:500;margin-bottom:4px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .pick-bet{font-size:11px;color:var(--ink-3);font-family:var(--mono);text-transform:uppercase;letter-spacing:.06em}
-.pick-conf{font-family:var(--mono);font-size:12px;color:var(--positive);font-weight:600;white-space:nowrap}
+.pick-val{font-weight:600;color:var(--accent)}
+.pick-right{display:flex;flex-direction:column;align-items:flex-end;gap:4px;flex-shrink:0}
+.pick-conf{font-family:var(--mono);font-size:11px;color:var(--positive);font-weight:600}
+.status-tag{display:inline-flex;align-items:center;gap:4px;padding:2px 7px;border-radius:100px;font-size:10px;font-weight:500;font-family:var(--sans)}
+.status-pending{background:var(--info-bg);color:var(--info)}
+.status-won{background:var(--positive-bg);color:var(--positive)}
+.status-lost{background:var(--negative-bg);color:var(--negative)}
+.status-check{background:var(--warning-bg);color:var(--warning)}
+.status-expired{background:var(--bg-subtle);color:var(--ink-4)}
+.otp-wrap{margin:0 40px 32px;background:var(--surface);border:1px solid var(--border);border-radius:14px;overflow:hidden}
+.table-scroll{overflow-x:auto}
+table{width:100%;border-collapse:collapse;font-size:13px;min-width:800px}
+thead{background:var(--bg-subtle);border-bottom:1px solid var(--border)}
+thead th{text-align:left;padding:14px 16px;font-size:10px;font-family:var(--mono);font-weight:500;color:var(--ink-3);text-transform:uppercase;letter-spacing:.1em;white-space:nowrap}
+thead th:first-child{padding-left:24px}
+thead th:last-child{padding-right:24px}
+tbody td{padding:14px 16px;border-bottom:1px solid var(--border);color:var(--ink-2)}
+tbody td:first-child{padding-left:24px}
+tbody td:last-child{padding-right:24px}
+tbody tr:last-child td{border-bottom:none}
+tbody tr:hover{background:var(--bg)}
 .empty{padding:80px 40px;text-align:center;color:var(--ink-3)}
-.empty h3{font-family:var(--display);font-size:22px;margin-bottom:10px;color:var(--ink);font-weight:500}
+.empty-mark{width:56px;height:56px;border-radius:14px;background:var(--bg-subtle);display:inline-flex;align-items:center;justify-content:center;font-size:22px;margin-bottom:16px;border:1px solid var(--border)}
+.empty h3{font-family:var(--display);font-size:20px;margin-bottom:10px;color:var(--ink);font-weight:500}
 .empty p{font-size:14px;max-width:440px;margin:0 auto;line-height:1.6}
 .footer{padding:24px 40px 40px;border-top:1px solid var(--border);text-align:center;font-size:11px;font-family:var(--mono);color:var(--ink-4)}
+.stats-row{padding:20px 40px;display:grid;grid-template-columns:repeat(4,1fr);gap:0;border-bottom:1px solid var(--border)}
+.stats-row .stat{padding:0 24px;border-left:1px solid var(--border)}
+.stats-row .stat:first-child{padding-left:0;border-left:none}
+.stat-label{font-size:10px;font-family:var(--mono);color:var(--ink-4);text-transform:uppercase;letter-spacing:.14em;margin-bottom:8px;font-weight:500}
+.stat-value{font-family:var(--display);font-weight:400;font-size:32px;line-height:1;letter-spacing:-.03em}
+.stat-value.is-positive{color:var(--positive)}.stat-value.is-negative{color:var(--negative)}
 </style></head><body>
 <div class="app">
 <header class="hdr">
@@ -1320,49 +1463,135 @@ body{font-family:var(--sans);background:var(--bg);color:var(--ink);-webkit-font-
 </header>
 <section class="hero">
   <div class="hero-label">Accumulator Engine</div>
-  <h2 class="hero-title">Stacked picks,<br><em>calculated risk.</em></h2>
-  <p class="hero-sub">Daily football analysis using real match data and AI-powered reasoning. Three tiers — safe, medium, value — built from the highest-confidence picks across today's fixtures.</p>
+  <h2 class="hero-title">Stacked picks,<br><em>unique selections.</em></h2>
+  <p class="hero-sub">Daily football analysis using real match data and AI-powered reasoning. Each match appears in only one tier — highest confidence picks go to Safe, mid-confidence builds Medium, value-hunts fill the 10x tier.</p>
 </section>
+
+<div class="stats-row">
+  <div class="stat"><div class="stat-label">Safe Tier</div><div class="stat-value">{{ stats.safe }}</div></div>
+  <div class="stat"><div class="stat-label">Medium Tier</div><div class="stat-value">{{ stats.medium }}</div></div>
+  <div class="stat"><div class="stat-label">Value Tier</div><div class="stat-value">{{ stats.value }}</div></div>
+  <div class="stat"><div class="stat-label">OTP Picks</div><div class="stat-value">{{ otp_picks|length }}</div></div>
+</div>
+
+<div class="section-head">
+  <div><span class="section-title">Current Accumulators</span><span class="section-count">{{ acca_total }} active picks</span></div>
+  <button class="btn btn-primary" onclick="fetch('/otp/scan').then(()=>alert('OTP scan triggered'))">◎ Scan OTP</button>
+</div>
 
 {% if not has_keys %}
 <div class="empty">
+  <div class="empty-mark">🔑</div>
   <h3>Setup required</h3>
-  <p>Football module needs <code style="font-family:var(--mono);background:var(--bg-subtle);padding:2px 6px;border-radius:4px">ANTHROPIC_API_KEY</code> (required, from anthropic.com) and optionally <code style="font-family:var(--mono);background:var(--bg-subtle);padding:2px 6px;border-radius:4px">FOOTBALL_DATA_KEY</code> (free from football-data.org) in Railway environment variables.</p>
+  <p>Football module needs <code style="font-family:var(--mono);background:var(--bg-subtle);padding:2px 6px;border-radius:4px">ANTHROPIC_API_KEY</code> in Railway environment variables.</p>
+</div>
+{% elif not (safe_picks or medium_picks or value_picks) %}
+<div class="empty">
+  <div class="empty-mark">⚽</div>
+  <h3>Building accumulators</h3>
+  <p>The football analyzer runs every 6 hours. It scans today's fixtures, analyzes each match with Claude, and builds three unique accumulator tiers. Wait ~5 minutes for the first run.</p>
 </div>
 {% else %}
+<div class="accas">
 
-<!-- Off The Pitch Picks Section -->
-<div class="action-bar" style="padding:32px 40px 16px;display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap">
-  <div class="section-head" style="display:flex;align-items:baseline;gap:14px">
-    <h3 style="font-family:var(--display);font-weight:500;font-size:22px;letter-spacing:-.02em">Off The Pitch Picks</h3>
-    <span style="font-size:11px;font-family:var(--mono);color:var(--ink-4);background:var(--bg-subtle);padding:3px 8px;border-radius:100px">{{ otp_picks|length }} picks</span>
+  <div class="acca acca-safe">
+    <div class="acca-head">
+      <div>
+        <div class="acca-title">🟢 Safe</div>
+        <div class="acca-desc">High confidence · ~2x payout</div>
+      </div>
+      <div class="acca-odds">{{ "%.2f"|format(stats.safe_odds) }}x<small>total</small></div>
+    </div>
+    {% for p in safe_picks %}
+    <div class="pick">
+      <div class="pick-body">
+        <div class="pick-match">{{ p.match_id }}</div>
+        <div class="pick-bet">{{ p.pick_type.replace("_", " ") }} — <span class="pick-val">{{ p.pick_value }}</span></div>
+      </div>
+      <div class="pick-right">
+        <span class="pick-conf">{{ p.confidence|int }}%</span>
+        <span class="status-tag status-{{ p.status|lower|replace(' ', '-') if p.status else 'pending' }}">
+          {{ p.status or 'Pending' }}
+        </span>
+      </div>
+    </div>
+    {% endfor %}
+    {% if not safe_picks %}<div style="padding:14px 0;color:var(--ink-4);font-size:13px;font-style:italic">No picks available</div>{% endif %}
   </div>
-  <button class="btn btn-primary" onclick="fetch('/otp/scan').then(()=>alert('OTP scan running'))" style="font-family:var(--sans);font-size:13px;font-weight:500;padding:9px 16px;border-radius:8px;border:1px solid var(--accent);background:var(--accent);color:var(--bg);cursor:pointer">◎ Scan OTP</button>
+
+  <div class="acca acca-medium">
+    <div class="acca-head">
+      <div>
+        <div class="acca-title">🟡 Medium</div>
+        <div class="acca-desc">Balanced risk · ~3x payout</div>
+      </div>
+      <div class="acca-odds">{{ "%.2f"|format(stats.medium_odds) }}x<small>total</small></div>
+    </div>
+    {% for p in medium_picks %}
+    <div class="pick">
+      <div class="pick-body">
+        <div class="pick-match">{{ p.match_id }}</div>
+        <div class="pick-bet">{{ p.pick_type.replace("_", " ") }} — <span class="pick-val">{{ p.pick_value }}</span></div>
+      </div>
+      <div class="pick-right">
+        <span class="pick-conf">{{ p.confidence|int }}%</span>
+        <span class="status-tag status-{{ p.status|lower|replace(' ', '-') if p.status else 'pending' }}">
+          {{ p.status or 'Pending' }}
+        </span>
+      </div>
+    </div>
+    {% endfor %}
+    {% if not medium_picks %}<div style="padding:14px 0;color:var(--ink-4);font-size:13px;font-style:italic">No picks available</div>{% endif %}
+  </div>
+
+  <div class="acca acca-value">
+    <div class="acca-head">
+      <div>
+        <div class="acca-title">🔥 Value</div>
+        <div class="acca-desc">Big payout · ~10x target</div>
+      </div>
+      <div class="acca-odds">{{ "%.2f"|format(stats.value_odds) }}x<small>total</small></div>
+    </div>
+    {% for p in value_picks %}
+    <div class="pick">
+      <div class="pick-body">
+        <div class="pick-match">{{ p.match_id }}</div>
+        <div class="pick-bet">{{ p.pick_type.replace("_", " ") }} — <span class="pick-val">{{ p.pick_value }}</span></div>
+      </div>
+      <div class="pick-right">
+        <span class="pick-conf">{{ p.confidence|int }}%</span>
+        <span class="status-tag status-{{ p.status|lower|replace(' ', '-') if p.status else 'pending' }}">
+          {{ p.status or 'Pending' }}
+        </span>
+      </div>
+    </div>
+    {% endfor %}
+    {% if not value_picks %}<div style="padding:14px 0;color:var(--ink-4);font-size:13px;font-style:italic">No picks available</div>{% endif %}
+  </div>
+
+</div>
+{% endif %}
+
+<div class="section-head">
+  <div><span class="section-title">Off The Pitch Picks</span><span class="section-count">Limitless · {{ otp_picks|length }}</span></div>
 </div>
 
 {% if otp_picks %}
-<div class="table-wrap" style="margin:0 40px 32px;background:var(--surface);border:1px solid var(--border);border-radius:14px;overflow:hidden">
-  <div style="overflow-x:auto">
-    <table style="width:100%;border-collapse:collapse;font-size:13px;min-width:800px">
-      <thead style="background:var(--bg-subtle)">
-        <tr>
-          <th style="text-align:left;padding:14px 16px;font-size:10px;font-family:var(--mono);font-weight:500;color:var(--ink-3);text-transform:uppercase;letter-spacing:.1em;padding-left:24px">Market</th>
-          <th style="text-align:left;padding:14px 16px;font-size:10px;font-family:var(--mono);font-weight:500;color:var(--ink-3);text-transform:uppercase;letter-spacing:.1em">Pick</th>
-          <th style="text-align:left;padding:14px 16px;font-size:10px;font-family:var(--mono);font-weight:500;color:var(--ink-3);text-transform:uppercase;letter-spacing:.1em">Odds</th>
-          <th style="text-align:left;padding:14px 16px;font-size:10px;font-family:var(--mono);font-weight:500;color:var(--ink-3);text-transform:uppercase;letter-spacing:.1em">Confidence</th>
-          <th style="text-align:left;padding:14px 16px;font-size:10px;font-family:var(--mono);font-weight:500;color:var(--ink-3);text-transform:uppercase;letter-spacing:.1em">Reasoning</th>
-          <th style="text-align:left;padding:14px 16px;font-size:10px;font-family:var(--mono);font-weight:500;color:var(--ink-3);text-transform:uppercase;letter-spacing:.1em">Status</th>
-        </tr>
-      </thead>
+<div class="otp-wrap">
+  <div class="table-scroll">
+    <table>
+      <thead><tr>
+        <th>Market</th><th>Pick</th><th>Odds</th><th>Confidence</th><th>Reasoning</th><th>Status</th>
+      </tr></thead>
       <tbody>
-        {% for pick in otp_picks %}
-        <tr style="border-top:1px solid var(--border)">
-          <td style="padding:16px;padding-left:24px;font-weight:500;color:var(--ink);max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="{{ pick.match_id }}">Match #{{ pick.match_id[:8] }}</td>
-          <td style="padding:16px"><span class="tag {{ 'tag-high' if pick.pick_value == 'YES' else 'tag-lost' }}" style="display:inline-flex;align-items:center;gap:5px;padding:3px 9px;border-radius:100px;font-size:11px;font-weight:500">{{ pick.pick_value }}</span></td>
-          <td style="padding:16px;font-family:var(--mono);font-weight:600;color:var(--ink)">{{ "%.1f"|format(pick.implied_odds) }}%</td>
-          <td style="padding:16px"><span style="font-family:var(--mono);color:var(--positive);font-weight:600">{{ pick.confidence|int }}%</span></td>
-          <td style="padding:16px;color:var(--ink-3);font-size:12px;max-width:300px">{{ pick.reasoning }}</td>
-          <td style="padding:16px"><span class="tag tag-pending">{{ pick.status }}</span></td>
+        {% for p in otp_picks %}
+        <tr>
+          <td style="font-weight:500;color:var(--ink);max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ p.match_id }}</td>
+          <td><span class="status-tag status-{{ 'won' if p.pick_value == 'YES' else 'lost' }}">{{ p.pick_value }}</span></td>
+          <td style="font-family:var(--mono);font-weight:600">{{ "%.1f"|format(p.implied_odds) }}%</td>
+          <td><span style="font-family:var(--mono);color:var(--positive);font-weight:600">{{ p.confidence|int }}%</span></td>
+          <td style="color:var(--ink-3);font-size:12px;max-width:280px">{{ p.reasoning }}</td>
+          <td><span class="status-tag status-{{ p.status|lower|replace(' ', '-') }}">{{ p.status }}</span></td>
         </tr>
         {% endfor %}
       </tbody>
@@ -1371,28 +1600,16 @@ body{font-family:var(--sans);background:var(--bg);color:var(--ink);-webkit-font-
 </div>
 {% else %}
 <div class="empty">
+  <div class="empty-mark">⚽</div>
   <h3>No OTP picks yet</h3>
   <p>The Off The Pitch scanner runs every 30 minutes during Lagos trading hours. It uses AI to identify mispriced football prop markets on Limitless. Click <b>Scan OTP</b> to trigger a manual scan.</p>
 </div>
 {% endif %}
 
-<!-- Accumulator Section (placeholder for Week 2 full build) -->
-<div class="action-bar" style="padding:32px 40px 16px">
-  <div class="section-head">
-    <h3 style="font-family:var(--display);font-weight:500;font-size:22px;letter-spacing:-.02em">Daily Accumulators</h3>
-    <span style="font-size:11px;font-family:var(--mono);color:var(--ink-4);background:var(--bg-subtle);padding:3px 8px;border-radius:100px">Updated every 6 hours</span>
-  </div>
+<footer class="footer">Accumulators update every 6 hours · OTP scans every 30 minutes · Auto-refresh 60s</footer>
 </div>
 
-<div class="empty" style="padding:60px 40px">
-  <h3>Accumulators building</h3>
-  <p>The daily accumulator engine scans today's fixtures, applies AI reasoning to each match, then stacks the highest-confidence picks into 2x, 3x and 10x tiers. Daily Telegram brief sent every 6 hours.</p>
-</div>
-
-{% endif %}
-
-<footer class="footer">Powered by football-data.org · Claude Haiku · Auto-refresh every 6 hours</footer>
-</div>
+<script>setTimeout(()=>location.reload(),60000);</script>
 </body></html>"""
 
 @app.route("/")
@@ -1425,22 +1642,65 @@ def dashboard():
 
 @app.route("/football")
 def football_page():
-    has_keys = bool(ANTHROPIC_KEY)  # OTP only needs Anthropic key; football APIs are tried in order
+    has_keys = bool(ANTHROPIC_KEY)
     try:
         conn = get_db()
-        rows = conn.run("SELECT * FROM football_picks WHERE pick_type='limitless_otp' ORDER BY id DESC LIMIT 50")
+        # OTP picks (last 30 pending or recently resolved)
+        rows = conn.run(
+            "SELECT * FROM football_picks WHERE pick_type='limitless_otp' "
+            "ORDER BY id DESC LIMIT 30"
+        )
         cols = [c['name'] for c in conn.columns]
         otp_picks = [dict(zip(cols, r)) for r in rows]
-        
-        rows2 = conn.run("SELECT * FROM football_picks WHERE pick_type != 'limitless_otp' ORDER BY id DESC LIMIT 50")
+
+        # Current accumulator picks (Pending only)
+        rows2 = conn.run(
+            "SELECT * FROM football_picks "
+            "WHERE pick_type != 'limitless_otp' AND status = 'Pending' "
+            "ORDER BY confidence DESC"
+        )
         cols2 = [c['name'] for c in conn.columns]
-        picks = [dict(zip(cols2, r)) for r in rows2]
+        all_acca = [dict(zip(cols2, r)) for r in rows2]
         conn.close()
     except Exception as e:
         print("Football page error: {}".format(e))
         otp_picks = []
-        picks = []
-    return render_template_string(FOOTBALL_HTML, has_keys=has_keys, picks=picks, otp_picks=otp_picks)
+        all_acca = []
+
+    # Split by tier
+    safe_picks   = [p for p in all_acca if p.get("accumulator_tier") == "safe_2x"]
+    medium_picks = [p for p in all_acca if p.get("accumulator_tier") == "medium_3x"]
+    value_picks  = [p for p in all_acca if p.get("accumulator_tier") == "value_10x"]
+
+    # Calculate total odds per tier
+    def calc_odds(picks):
+        total = 1.0
+        for p in picks:
+            o = float(p.get("implied_odds") or 1.0)
+            if o > 1.0:
+                total *= o
+        return total
+
+    stats = {
+        "safe":        len(safe_picks),
+        "medium":      len(medium_picks),
+        "value":       len(value_picks),
+        "safe_odds":   calc_odds(safe_picks),
+        "medium_odds": calc_odds(medium_picks),
+        "value_odds":  calc_odds(value_picks),
+    }
+    acca_total = len(safe_picks) + len(medium_picks) + len(value_picks)
+
+    return render_template_string(
+        FOOTBALL_HTML,
+        has_keys=has_keys,
+        otp_picks=otp_picks,
+        safe_picks=safe_picks,
+        medium_picks=medium_picks,
+        value_picks=value_picks,
+        stats=stats,
+        acca_total=acca_total,
+    )
 
 # ═══════════════════════════════════════════════════════════
 # STARTUP
