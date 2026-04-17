@@ -452,39 +452,150 @@ def scan_loop():
 # OUTCOME CHECKER
 # ═══════════════════════════════════════════════════════════
 
+def _fetch_match_result(match_name):
+    """Try to fetch final score from available football APIs"""
+    import requests as req
+    try:
+        # Try API-Football first
+        key = os.environ.get("API_FOOTBALL_KEY", "")
+        if key:
+            # Search for the match in finished fixtures (last 3 days)
+            for days_back in range(4):
+                date = (datetime.now(LAGOS_TZ) - timedelta(days=days_back)).strftime("%Y-%m-%d")
+                r = req.get(
+                    "https://v3.football.api-sports.io/fixtures?date={}&status=FT".format(date),
+                    headers={"x-apisports-key": key},
+                    timeout=15
+                )
+                if r.status_code == 200:
+                    for fx in r.json().get("response", []):
+                        home = fx.get("teams", {}).get("home", {}).get("name", "")
+                        away = fx.get("teams", {}).get("away", {}).get("name", "")
+                        if home and away and (home in match_name or away in match_name):
+                            if home in match_name and away in match_name:
+                                return {
+                                    "home": home, "away": away,
+                                    "home_goals": fx.get("goals", {}).get("home"),
+                                    "away_goals": fx.get("goals", {}).get("away"),
+                                    "status": "finished",
+                                }
+        return None
+    except Exception as e:
+        print("Match result fetch error: {}".format(e))
+        return None
+
+def _evaluate_pick_result(pick, result):
+    """Given a pick and match result, return True (won), False (lost), or None (can't tell)"""
+    if not result or result.get("home_goals") is None:
+        return None
+    hg = int(result["home_goals"])
+    ag = int(result["away_goals"])
+    total = hg + ag
+    pick_type = (pick.get("pick_type") or "").lower()
+    pick_value = (pick.get("pick_value") or "").lower().strip()
+
+    try:
+        if "over_0.5" in pick_type:
+            return total > 0 if pick_value in ("yes", "over") else total == 0
+        elif "over_1.5" in pick_type:
+            return total > 1 if pick_value in ("yes", "over") else total <= 1
+        elif "over_2.5" in pick_type:
+            return total > 2 if pick_value in ("yes", "over") else total <= 2
+        elif "over_3.5" in pick_type:
+            return total > 3 if pick_value in ("yes", "over") else total <= 3
+        elif "both_teams_score" in pick_type or "btts" in pick_type:
+            btts = hg > 0 and ag > 0
+            return btts if pick_value in ("yes",) else not btts
+        elif "match_winner" in pick_type or "winner" in pick_type:
+            if pick_value in ("home",):
+                return hg > ag
+            elif pick_value in ("away",):
+                return ag > hg
+            elif pick_value in ("draw",):
+                return hg == ag
+        elif "draw_no_bet" in pick_type:
+            if pick_value in ("home",):
+                if hg == ag: return None  # draw = refund, treat as not lost
+                return hg > ag
+            elif pick_value in ("away",):
+                if hg == ag: return None
+                return ag > hg
+        elif "double_chance" in pick_type:
+            if pick_value in ("home",) or "home_or_draw" in pick_value:
+                return hg >= ag
+            elif pick_value in ("away",) or "away_or_draw" in pick_value:
+                return ag >= hg
+    except Exception as e:
+        print("Evaluate error: {}".format(e))
+    return None
+
 def check_football_outcomes():
-    """Mark football picks that are older than their kickoff + 2 hours as resolved."""
+    """Auto-resolve football picks by fetching match results."""
     try:
         conn = get_db()
         rows = conn.run(
-            "SELECT id, kickoff_time, fired_at FROM football_picks "
-            "WHERE status='Pending' AND accumulator_tier IN ('safe_2x','medium_3x','value_10x')"
+            "SELECT id, match_id, pick_type, pick_value, kickoff_time, fired_at "
+            "FROM football_picks "
+            "WHERE status='Pending' AND accumulator_tier IN ('safe_2x','medium_3x','value_10x','value_100x')"
         )
         cols = [c['name'] for c in conn.columns]
         picks = [dict(zip(cols, r)) for r in rows]
         conn.close()
         now = datetime.now(timezone.utc)
+        resolved_count = 0
         for p in picks:
             try:
-                # Use kickoff time if valid, else fallback to fired_at + 24h
                 ko = p.get("kickoff_time", "")
+                # Only check matches that are at least 2 hours past kickoff
                 if ko:
                     try:
                         ko_dt = datetime.fromisoformat(ko.replace("Z", "+00:00"))
                         if ko_dt.tzinfo is None:
                             ko_dt = ko_dt.replace(tzinfo=timezone.utc)
-                        # Match over 2 hours after kickoff — mark as needing manual check
-                        if now > ko_dt + timedelta(hours=2.5):
-                            conn2 = get_db()
-                            conn2.run(
-                                "UPDATE football_picks SET status='Needs Check' WHERE id=:i",
-                                i=p["id"]
-                            )
-                            conn2.close()
+                        if now < ko_dt + timedelta(hours=2):
+                            continue  # Too early
                     except:
                         pass
+
+                result = _fetch_match_result(p.get("match_id", ""))
+                if not result:
+                    # Mark as needs check only if > 24h past kickoff
+                    if ko:
+                        try:
+                            ko_dt = datetime.fromisoformat(ko.replace("Z", "+00:00"))
+                            if ko_dt.tzinfo is None:
+                                ko_dt = ko_dt.replace(tzinfo=timezone.utc)
+                            if now > ko_dt + timedelta(hours=24):
+                                conn2 = get_db()
+                                conn2.run(
+                                    "UPDATE football_picks SET status='Needs Check' WHERE id=:i",
+                                    i=p["id"]
+                                )
+                                conn2.close()
+                        except:
+                            pass
+                    continue
+
+                won = _evaluate_pick_result(p, result)
+                if won is None:
+                    continue
+
+                status = "✅ Won" if won else "❌ Lost"
+                outcome = "WIN" if won else "LOSS"
+                conn2 = get_db()
+                conn2.run(
+                    "UPDATE football_picks SET status=:s, outcome=:o, resolved_at=:r WHERE id=:i",
+                    s=status, o=outcome, r=now.isoformat(), i=p["id"]
+                )
+                conn2.close()
+                resolved_count += 1
+                print("Football #{} -> {} (score: {}-{})".format(
+                    p["id"], outcome, result.get("home_goals"), result.get("away_goals")))
+                time.sleep(0.5)  # pace API calls
             except Exception as e:
                 print("Football outcome #{}: {}".format(p["id"], e))
+        if resolved_count > 0:
+            print("Auto-resolved {} football picks".format(resolved_count))
     except Exception as e:
         print("Football outcome check error: {}".format(e))
 
@@ -581,9 +692,9 @@ def _fetch_api_football():
         return []
     import requests as req
     try:
-        today = datetime.now(LAGOS_TZ).strftime("%Y-%m-%d")
+        tomorrow = (datetime.now(LAGOS_TZ) + timedelta(days=1)).strftime("%Y-%m-%d")
         r = req.get(
-            "https://v3.football.api-sports.io/fixtures?date={}".format(today),
+            "https://v3.football.api-sports.io/fixtures?date={}".format(tomorrow),
             headers={"x-apisports-key": key},
             timeout=15
         )
@@ -591,7 +702,7 @@ def _fetch_api_football():
             print("API-Football error: {}".format(r.status_code))
             return []
         matches = r.json().get("response", [])
-        print("API-Football: {} fixtures".format(len(matches)))
+        print("API-Football: {} fixtures (tomorrow)".format(len(matches)))
         return [_normalize_fixture(m, "api-football") for m in matches]
     except Exception as e:
         print("API-Football error: {}".format(e))
@@ -603,9 +714,9 @@ def _fetch_football_data():
         return []
     import requests as req
     try:
-        today = datetime.now(LAGOS_TZ).strftime("%Y-%m-%d")
+        tomorrow = (datetime.now(LAGOS_TZ) + timedelta(days=1)).strftime("%Y-%m-%d")
         r = req.get(
-            "https://api.football-data.org/v4/matches?dateFrom={}&dateTo={}".format(today, today),
+            "https://api.football-data.org/v4/matches?dateFrom={}&dateTo={}".format(tomorrow, tomorrow),
             headers={"X-Auth-Token": FOOTBALL_DATA_KEY},
             timeout=15
         )
@@ -613,7 +724,7 @@ def _fetch_football_data():
             print("football-data.org error: {}".format(r.status_code))
             return []
         matches = r.json().get("matches", [])
-        print("football-data.org: {} fixtures".format(len(matches)))
+        print("football-data.org: {} fixtures (tomorrow)".format(len(matches)))
         return [_normalize_fixture(m, "football-data") for m in matches]
     except Exception as e:
         print("football-data.org error: {}".format(e))
@@ -623,17 +734,17 @@ def _fetch_thesportsdb():
     """Fetch from TheSportsDB (free, no key needed)"""
     import requests as req
     try:
-        today = datetime.now(LAGOS_TZ).strftime("%Y-%m-%d")
+        tomorrow = (datetime.now(LAGOS_TZ) + timedelta(days=1)).strftime("%Y-%m-%d")
         # TheSportsDB free endpoint - uses "1" as public key
         r = req.get(
-            "https://www.thesportsdb.com/api/v1/json/3/eventsday.php?d={}&s=Soccer".format(today),
+            "https://www.thesportsdb.com/api/v1/json/3/eventsday.php?d={}&s=Soccer".format(tomorrow),
             timeout=15
         )
         if r.status_code != 200:
             print("TheSportsDB error: {}".format(r.status_code))
             return []
         events = r.json().get("events") or []
-        print("TheSportsDB: {} fixtures".format(len(events)))
+        print("TheSportsDB: {} fixtures (tomorrow)".format(len(events)))
         return [_normalize_fixture(e, "thesportsdb") for e in events]
     except Exception as e:
         print("TheSportsDB error: {}".format(e))
@@ -666,16 +777,21 @@ def analyze_match_with_claude(match):
             "Football match: {} vs {}\n"
             "League: {}\n"
             "Kickoff: {}\n\n"
-            "Return a JSON array of 4-6 distinct prediction picks for this match.\n"
-            "IMPORTANT RULES:\n"
-            "- Mix SAFE picks (confidence 80-95, implied_odds 1.05-1.30) and VALUE picks (confidence 65-79, implied_odds 1.5-3.0)\n"
-            "- pick_value must be ONE OF: Yes, No, Home, Away, Draw, Over, Under (no extra text)\n"
-            "- pick_type must be: match_winner, both_teams_score, over_0.5_goals, over_1.5_goals, over_2.5_goals, draw_no_bet, double_chance\n"
-            "- Include at least 2 value picks (confidence 65-79) so we have options for a 10x accumulator\n"
-            "- confidence: realistic 65-95, no lower\n"
-            "- implied_odds: decimal odds that make sense (higher odds = higher risk)\n\n"
-            'Format: [{{"pick_type":"over_0.5_goals","pick_value":"Yes","confidence":90,"implied_odds":1.08,"reasoning":"both teams scored in last 5 games"}},...]\n\n'
-            "Output ONLY the JSON array, no preamble, no markdown."
+            "Return a JSON array of 5-8 DIVERSE prediction picks covering different risk levels.\n\n"
+            "REQUIRED DISTRIBUTION:\n"
+            "- 2 SAFE picks: confidence 85-95, implied_odds 1.03-1.25\n"
+            "- 2 MEDIUM picks: confidence 75-84, implied_odds 1.25-1.60\n"
+            "- 2 VALUE picks: confidence 65-74, implied_odds 1.60-2.50\n"
+            "- 1-2 MEGA LONGSHOT picks: confidence 55-70, implied_odds 2.50-8.00 (for 100x accumulator)\n\n"
+            "STRICT RULES:\n"
+            "- pick_value MUST be ONE OF (exact match): Yes, No, Home, Away, Draw, Over, Under\n"
+            "- pick_type MUST be one of: match_winner, both_teams_score, over_0.5_goals, over_1.5_goals, over_2.5_goals, over_3.5_goals, draw_no_bet, double_chance\n"
+            "- NEVER leave pick_value blank\n"
+            "- implied_odds must be realistic decimal odds (1.01-10.00)\n"
+            "- reasoning: max 100 chars, useful context\n\n"
+            'Example: [{{"pick_type":"over_0.5_goals","pick_value":"Yes","confidence":92,"implied_odds":1.06,"reasoning":"both teams avg 2.1 goals scored"}},'
+            '{{"pick_type":"match_winner","pick_value":"Home","confidence":68,"implied_odds":2.10,"reasoning":"home team 7W-1L last 8 home games"}}]\n\n'
+            "Output ONLY the JSON array. No markdown, no preamble, no commentary."
         ).format(home, away, comp, kickoff)
 
         r = req.post(
@@ -687,7 +803,7 @@ def analyze_match_with_claude(match):
             },
             json={
                 "model": "claude-haiku-4-5-20251001",
-                "max_tokens": 1024,
+                "max_tokens": 2048,
                 "messages": [{"role": "user", "content": prompt}]
             },
             timeout=30
@@ -706,37 +822,34 @@ def analyze_match_with_claude(match):
         return None
 
 def build_accumulators(picks):
-    """Build 2x / 3x / 10x accumulators with strict uniqueness per MATCH.
-    Strategy:
-      - Safe: high-confidence low-odds picks (80%+), target ~2x
-      - Medium: mix of safe + some value, target ~3x
-      - Value: value picks (higher odds), target ~10x
-    Each match appears in at most ONE tier."""
+    """Build 2x / 3x / 10x / 100x accumulators. Each MATCH appears in at most ONE tier."""
     if not picks:
         return {}
 
-    # For uniqueness use match-level tracking, but allow SAME match to have multiple picks if we want
-    # Actually keep: one match = one tier, best pick per match
-
+    # Group by match, keep best pick per match for safe/medium
     match_groups = {}
     for p in picks:
-        m = p.get("match", "")
+        m = (p.get("match") or "").strip()
         if not m:
+            continue
+        # Filter out picks with blank/invalid values
+        pv = (p.get("pick_value") or "").strip()
+        if not pv or pv == "—":
             continue
         match_groups.setdefault(m, []).append(p)
 
-    # For each match, keep picks sorted by confidence (best first)
     for m in match_groups:
         match_groups[m].sort(key=lambda p: p.get("confidence", 0), reverse=True)
 
+    # Track used matches GLOBALLY — each match can only appear in ONE tier
     used_matches = set()
 
     def build_tier(target_odds, strategy):
-        """strategy: 'safe' (high conf, low odds), 'medium' (balanced), 'value' (higher odds)"""
+        """strategy: safe | medium | value | mega"""
         tier_picks = []
         cumulative = 1.0
-        # Collect candidates
         candidates = []
+
         for match, match_picks in match_groups.items():
             if match in used_matches:
                 continue
@@ -745,26 +858,33 @@ def build_accumulators(picks):
             conf = float(best.get("confidence") or 0)
 
             if strategy == "safe":
-                if conf >= 80 and implied >= 1.05:
+                # Very high confidence, low odds
+                if conf >= 85 and implied >= 1.03:
                     candidates.append((best, match, implied, conf))
             elif strategy == "medium":
-                if conf >= 75 and implied >= 1.10:
+                # Balanced
+                if 75 <= conf < 90 and 1.15 <= implied <= 1.60:
                     candidates.append((best, match, implied, conf))
             elif strategy == "value":
-                # Prefer higher-odds picks for value tier
-                # Use any pick with decent odds, not just the highest-confidence one
+                # Higher odds picks from any pick per match (not just best)
                 for p in match_picks:
                     pi = float(p.get("implied_odds") or 1.0)
                     pc = float(p.get("confidence") or 0)
-                    if pi >= 1.5 and pc >= 65:
+                    if 1.50 <= pi <= 2.50 and pc >= 65:
+                        candidates.append((p, match, pi, pc))
+                        break
+            elif strategy == "mega":
+                # Mega long shots — very high odds, acceptable confidence
+                for p in match_picks:
+                    pi = float(p.get("implied_odds") or 1.0)
+                    pc = float(p.get("confidence") or 0)
+                    if pi >= 2.50 and pc >= 55:
                         candidates.append((p, match, pi, pc))
                         break
 
-        if strategy == "safe":
+        if strategy in ("safe", "medium"):
             candidates.sort(key=lambda x: -x[3])  # highest confidence first
-        elif strategy == "medium":
-            candidates.sort(key=lambda x: -x[3])
-        elif strategy == "value":
+        else:
             candidates.sort(key=lambda x: -x[2])  # highest odds first
 
         for pick, match, implied, conf in candidates:
@@ -781,8 +901,14 @@ def build_accumulators(picks):
     safe = build_tier(2.0, "safe")
     medium = build_tier(3.0, "medium")
     value = build_tier(10.0, "value")
+    mega = build_tier(100.0, "mega")
 
-    return {"safe_2x": safe, "medium_3x": medium, "value_10x": value}
+    return {
+        "safe_2x":   safe,
+        "medium_3x": medium,
+        "value_10x": value,
+        "mega_100x": mega,
+    }
 
 
 # ═══════════════════════════════════════════════════════════
@@ -1030,16 +1156,16 @@ def otp_loop():
         time.sleep(1800)  # 30 min
 
 def save_accumulator_picks(accas):
-    """Save accumulator picks to DB — keeps history, only expires truly old ones"""
+    """Save accumulator picks to DB — wipes ALL old pending when new batch arrives.
+    This prevents duplicate matches accumulating from multiple runs."""
     try:
         conn = get_db()
         now = datetime.now(timezone.utc).isoformat()
-        # Only expire picks older than 24 hours (they've had time to play out)
+        # Wipe ALL old pending accumulator picks — a new batch is fully replacing them
         conn.run(
-            "UPDATE football_picks SET status='Expired' "
+            "UPDATE football_picks SET status='Replaced' "
             "WHERE status='Pending' AND pick_type != 'limitless_otp' "
-            "AND accumulator_tier IN ('safe_2x','medium_3x','value_10x') "
-            "AND fired_at::timestamptz < NOW() - INTERVAL '24 hours'"
+            "AND accumulator_tier IN ('safe_2x','medium_3x','value_10x','mega_100x')"
         )
         # Save new accumulators
         for tier_name, tier in accas.items():
@@ -1129,7 +1255,8 @@ def football_loop():
                         continue
                     label = {"safe_2x": "🟢 <b>Safe Bet</b>",
                              "medium_3x": "🟡 <b>Medium Risk</b>",
-                             "value_10x": "🔥 <b>Value (High Reward)</b>"}[tier_name]
+                             "value_10x": "🔥 <b>Value (10x Target)</b>",
+                             "mega_100x": "🚀 <b>Mega Long Shot (100x Target)</b>"}[tier_name]
                     msg += "{} — {:.2f}x total\n".format(label, tier["total_odds"])
                     msg += "─────────────────\n"
                     for p in tier["picks"]:
@@ -1504,6 +1631,7 @@ body{font-family:var(--sans);background:var(--bg);color:var(--ink);-webkit-font-
 .acca-safe{border-top:3px solid var(--positive)}
 .acca-medium{border-top:3px solid var(--warning)}
 .acca-value{border-top:3px solid var(--accent)}
+.acca-mega{border-top:3px solid #a855f7}
 .acca-head{display:flex;align-items:flex-start;justify-content:space-between;margin-bottom:18px}
 .acca-title{font-family:var(--display);font-weight:500;font-size:22px;letter-spacing:-.02em}
 .acca-desc{font-size:12px;color:var(--ink-4);margin-top:4px;font-family:var(--mono)}
