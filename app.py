@@ -16,6 +16,9 @@ DATABASE_URL     = os.environ.get("DATABASE_URL", "")
 LAGOS_TZ      = timezone(timedelta(hours=1))
 LIMITLESS_API = "https://api.limitless.exchange"
 
+# Global BTC trend cache — updated by scanner, read by dashboard
+_btc_trend_cache = {"trend": None}
+
 # Favourite pairs — always qualify regardless of time window
 FAVOURITE_HOURLY = ["ADA", "BNB", "HYPE"]
 
@@ -116,22 +119,24 @@ def get_btc_trend():
     """
     Determine BTC trend using yfinance.
     Uses 1H candles — if current price is above the 10-period SMA = BUY, else SELL.
+    Updates global cache so dashboard never calls yfinance directly.
     """
     import yfinance as yf
     try:
         btc  = yf.Ticker("BTC-USD")
         hist = btc.history(period="2d", interval="1h")
         if hist.empty or len(hist) < 10:
-            return None
+            return _btc_trend_cache.get("trend")
         closes  = hist["Close"].tolist()
         current = closes[-1]
         sma10   = sum(closes[-10:]) / 10
         trend   = "BUY" if current > sma10 else "SELL"
+        _btc_trend_cache["trend"] = trend
         print("BTC trend: {} (price={:.0f}, sma10={:.0f})".format(trend, current, sma10))
         return trend
     except Exception as e:
         print("BTC trend error: {}".format(e))
-        return None
+        return _btc_trend_cache.get("trend")
 
 # ═══════════════════════════════════════════════════════════
 # HELPERS
@@ -616,11 +621,15 @@ setTimeout(()=>location.reload(),60000);
 @app.route("/")
 def dashboard():
     from flask import render_template_string
-    conn     = get_db()
-    lp_rows  = conn.run("SELECT * FROM limitless_predictions ORDER BY id DESC")
-    lp_cols  = [c['name'] for c in conn.columns]
-    preds    = [dict(zip(lp_cols, r)) for r in lp_rows]
-    conn.close()
+    try:
+        conn     = get_db()
+        lp_rows  = conn.run("SELECT * FROM limitless_predictions ORDER BY id DESC")
+        lp_cols  = [c['name'] for c in conn.columns]
+        preds    = [dict(zip(lp_cols, r)) for r in lp_rows]
+        conn.close()
+    except Exception as e:
+        print("Dashboard DB error: {}".format(e))
+        preds = []
 
     total   = len(preds)
     wins    = sum(1 for p in preds if p.get("outcome") == "WIN")
@@ -635,10 +644,11 @@ def dashboard():
     stats = {"total": total, "wins": wins, "losses": losses,
              "pending": pending, "wr": wr, "today": today}
 
+    # Use cached BTC trend — never call yfinance on page load
     return render_template_string(
         DASHBOARD_HTML,
         preds=preds, stats=stats,
-        btc_trend=get_btc_trend(),
+        btc_trend=_btc_trend_cache.get("trend"),
         in_window=is_lagos_window()
     )
 
