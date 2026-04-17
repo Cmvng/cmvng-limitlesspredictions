@@ -1,3 +1,4 @@
 flask
 requests
 pg8000
+yfinance
