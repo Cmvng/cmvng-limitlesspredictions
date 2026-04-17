@@ -661,14 +661,22 @@ def analyze_match_with_claude(match):
         home = match.get("homeTeam", {}).get("name", "")
         away = match.get("awayTeam", {}).get("name", "")
         comp = match.get("competition", {}).get("name", "")
+        kickoff = match.get("utcDate", "")
         prompt = (
-            "Football match: {} vs {} ({})\n\n"
-            "Return JSON array of up to 3 safe prediction picks. "
-            "Each pick: {{\"pick_type\": str, \"pick_value\": str, \"confidence\": 0-100, "
-            "\"implied_odds\": float, \"reasoning\": str}}. "
-            "Pick types: 'match_winner', 'both_teams_score', 'over_0.5_goals', 'over_1.5_goals', 'over_2.5_goals'. "
-            "Only include picks with confidence >= 70. Output ONLY the JSON array, no other text."
-        ).format(home, away, comp)
+            "Football match: {} vs {}\n"
+            "League: {}\n"
+            "Kickoff: {}\n\n"
+            "Return a JSON array of 4-6 distinct prediction picks for this match.\n"
+            "IMPORTANT RULES:\n"
+            "- Mix SAFE picks (confidence 80-95, implied_odds 1.05-1.30) and VALUE picks (confidence 65-79, implied_odds 1.5-3.0)\n"
+            "- pick_value must be ONE OF: Yes, No, Home, Away, Draw, Over, Under (no extra text)\n"
+            "- pick_type must be: match_winner, both_teams_score, over_0.5_goals, over_1.5_goals, over_2.5_goals, draw_no_bet, double_chance\n"
+            "- Include at least 2 value picks (confidence 65-79) so we have options for a 10x accumulator\n"
+            "- confidence: realistic 65-95, no lower\n"
+            "- implied_odds: decimal odds that make sense (higher odds = higher risk)\n\n"
+            'Format: [{{"pick_type":"over_0.5_goals","pick_value":"Yes","confidence":90,"implied_odds":1.08,"reasoning":"both teams scored in last 5 games"}},...]\n\n'
+            "Output ONLY the JSON array, no preamble, no markdown."
+        ).format(home, away, comp, kickoff)
 
         r = req.post(
             "https://api.anthropic.com/v1/messages",
@@ -698,53 +706,83 @@ def analyze_match_with_claude(match):
         return None
 
 def build_accumulators(picks):
-    """Build 2, 3, 10 odds accumulators with STRICT uniqueness.
-    Each MATCH appears in at most ONE tier — higher-confidence picks go to safe tier.
-    Within a tier, only the best pick per match is used."""
+    """Build 2x / 3x / 10x accumulators with strict uniqueness per MATCH.
+    Strategy:
+      - Safe: high-confidence low-odds picks (80%+), target ~2x
+      - Medium: mix of safe + some value, target ~3x
+      - Value: value picks (higher odds), target ~10x
+    Each match appears in at most ONE tier."""
     if not picks:
         return {}
 
-    # Group picks by match — keep only the best pick per match
-    match_best = {}
+    # For uniqueness use match-level tracking, but allow SAME match to have multiple picks if we want
+    # Actually keep: one match = one tier, best pick per match
+
+    match_groups = {}
     for p in picks:
         m = p.get("match", "")
         if not m:
             continue
-        if m not in match_best or p.get("confidence", 0) > match_best[m].get("confidence", 0):
-            match_best[m] = p
+        match_groups.setdefault(m, []).append(p)
 
-    # Sort by confidence descending
-    sorted_picks = sorted(match_best.values(), key=lambda p: p.get("confidence", 0), reverse=True)
+    # For each match, keep picks sorted by confidence (best first)
+    for m in match_groups:
+        match_groups[m].sort(key=lambda p: p.get("confidence", 0), reverse=True)
 
-    # Track used matches globally across all tiers
     used_matches = set()
 
-    def build_tier(target_odds, available):
+    def build_tier(target_odds, strategy):
+        """strategy: 'safe' (high conf, low odds), 'medium' (balanced), 'value' (higher odds)"""
         tier_picks = []
         cumulative = 1.0
-        for p in available:
-            match_key = p.get("match", "")
-            if not match_key or match_key in used_matches:
+        # Collect candidates
+        candidates = []
+        for match, match_picks in match_groups.items():
+            if match in used_matches:
                 continue
-            implied = float(p.get("implied_odds") or 1.0)
-            if implied < 1.0:
+            best = match_picks[0]
+            implied = float(best.get("implied_odds") or 1.0)
+            conf = float(best.get("confidence") or 0)
+
+            if strategy == "safe":
+                if conf >= 80 and implied >= 1.05:
+                    candidates.append((best, match, implied, conf))
+            elif strategy == "medium":
+                if conf >= 75 and implied >= 1.10:
+                    candidates.append((best, match, implied, conf))
+            elif strategy == "value":
+                # Prefer higher-odds picks for value tier
+                # Use any pick with decent odds, not just the highest-confidence one
+                for p in match_picks:
+                    pi = float(p.get("implied_odds") or 1.0)
+                    pc = float(p.get("confidence") or 0)
+                    if pi >= 1.5 and pc >= 65:
+                        candidates.append((p, match, pi, pc))
+                        break
+
+        if strategy == "safe":
+            candidates.sort(key=lambda x: -x[3])  # highest confidence first
+        elif strategy == "medium":
+            candidates.sort(key=lambda x: -x[3])
+        elif strategy == "value":
+            candidates.sort(key=lambda x: -x[2])  # highest odds first
+
+        for pick, match, implied, conf in candidates:
+            if match in used_matches:
                 continue
-            tier_picks.append(p)
-            used_matches.add(match_key)
-            cumulative *= implied
             if cumulative >= target_odds:
                 break
+            tier_picks.append(pick)
+            used_matches.add(match)
+            cumulative *= implied
+
         return {"picks": tier_picks, "total_odds": round(cumulative, 2)}
 
-    safe = build_tier(2.0, sorted_picks)
-    medium = build_tier(3.0, [p for p in sorted_picks if p.get("match") not in used_matches])
-    value = build_tier(10.0, [p for p in sorted_picks if p.get("match") not in used_matches])
+    safe = build_tier(2.0, "safe")
+    medium = build_tier(3.0, "medium")
+    value = build_tier(10.0, "value")
 
-    return {
-        "safe_2x":   safe,
-        "medium_3x": medium,
-        "value_10x": value,
-    }
+    return {"safe_2x": safe, "medium_3x": medium, "value_10x": value}
 
 
 # ═══════════════════════════════════════════════════════════
@@ -887,17 +925,38 @@ def save_and_alert_otp(market, parsed, analysis):
         print("OTP alert error: {}".format(e))
 
 def run_otp_scan():
-    """Scan Limitless for Off The Pitch markets and analyze them"""
+    """Scan Limitless for Off The Pitch / sports markets and analyze them"""
     import requests as req
     if not ANTHROPIC_KEY:
+        print("OTP scan skipped — no ANTHROPIC_API_KEY")
         return 0
     try:
-        r = req.get("{}/markets/active".format(LIMITLESS_API), timeout=15)
-        if r.status_code != 200:
+        # Try sports automation type first (most reliable for OTP markets)
+        otp_markets = []
+        try:
+            r = req.get(
+                "{}/markets/active?automationType=sports&limit=50".format(LIMITLESS_API),
+                timeout=15
+            )
+            if r.status_code == 200:
+                otp_markets = r.json().get("data", [])
+                print("OTP via automationType=sports: {} markets".format(len(otp_markets)))
+        except:
+            pass
+
+        # Fallback: fetch all markets and filter for football-like content
+        if not otp_markets:
+            r = req.get("{}/markets/active".format(LIMITLESS_API), timeout=15)
+            if r.status_code != 200:
+                return 0
+            all_markets = r.json().get("data", [])
+            otp_markets = [m for m in all_markets if is_otp_market(m)]
+            print("OTP via title detection: {} markets (from {} total)".format(
+                len(otp_markets), len(all_markets)))
+
+        if not otp_markets:
+            print("OTP scan: no sports/OTP markets available right now")
             return 0
-        markets = r.json().get("data", [])
-        otp_markets = [m for m in markets if is_otp_market(m)]
-        print("OTP scan: {} off-the-pitch markets found".format(len(otp_markets)))
         
         # Get already-alerted
         conn = get_db()
@@ -971,15 +1030,16 @@ def otp_loop():
         time.sleep(1800)  # 30 min
 
 def save_accumulator_picks(accas):
-    """Save accumulator picks to DB — replacing any unresolved old ones"""
+    """Save accumulator picks to DB — keeps history, only expires truly old ones"""
     try:
         conn = get_db()
         now = datetime.now(timezone.utc).isoformat()
-        # Mark old pending accumulators as "Expired" (replaced by new set)
+        # Only expire picks older than 24 hours (they've had time to play out)
         conn.run(
             "UPDATE football_picks SET status='Expired' "
             "WHERE status='Pending' AND pick_type != 'limitless_otp' "
-            "AND accumulator_tier IN ('safe_2x','medium_3x','value_10x')"
+            "AND accumulator_tier IN ('safe_2x','medium_3x','value_10x') "
+            "AND fired_at::timestamptz < NOW() - INTERVAL '24 hours'"
         )
         # Save new accumulators
         for tier_name, tier in accas.items():
@@ -1038,23 +1098,60 @@ def football_loop():
             if all_picks:
                 accas = build_accumulators(all_picks)
                 save_accumulator_picks(accas)
-                msg = "⚽ <b>DAILY FOOTBALL ACCUMULATORS</b>\n\n"
+
+                # Format kickoff as readable time
+                def fmt_kickoff(kickoff_str):
+                    if not kickoff_str:
+                        return ""
+                    try:
+                        dt = datetime.fromisoformat(kickoff_str.replace("Z", "+00:00"))
+                        if dt.tzinfo is None:
+                            dt = dt.replace(tzinfo=timezone.utc)
+                        dt_lagos = dt.astimezone(LAGOS_TZ)
+                        return dt_lagos.strftime("%a %d %b, %H:%M")
+                    except:
+                        return kickoff_str[:10]
+
+                # Clean pick value — strip weird formatting
+                def clean_value(val):
+                    if not val:
+                        return "—"
+                    s = str(val).strip()
+                    if len(s) > 40:
+                        s = s[:40]
+                    return s or "—"
+
+                msg = "⚽ <b>DAILY FOOTBALL ACCUMULATORS</b>\n"
+                msg += "<i>{}</i>\n\n".format(datetime.now(LAGOS_TZ).strftime("%A, %d %B"))
+
                 for tier_name, tier in accas.items():
                     if not tier.get("picks"):
                         continue
-                    label = {"safe_2x": "🟢 Safe (~2x)",
-                             "medium_3x": "🟡 Medium (~3x)",
-                             "value_10x": "🔥 Value (~10x)"}[tier_name]
-                    msg += "<b>{}</b> — {}x total\n".format(label, tier["total_odds"])
+                    label = {"safe_2x": "🟢 <b>Safe Bet</b>",
+                             "medium_3x": "🟡 <b>Medium Risk</b>",
+                             "value_10x": "🔥 <b>Value (High Reward)</b>"}[tier_name]
+                    msg += "{} — {:.2f}x total\n".format(label, tier["total_odds"])
+                    msg += "─────────────────\n"
                     for p in tier["picks"]:
-                        msg += "• {}: {} — <b>{}</b> ({}%)\n".format(
-                            p.get("match", "?"),
-                            p.get("pick_type", "").replace("_", " "),
-                            p.get("pick_value", ""),
-                            int(p.get("confidence", 0))
-                        )
+                        match = p.get("match", "Unknown")
+                        comp = p.get("competition", "")
+                        ko = fmt_kickoff(p.get("kickoff", ""))
+                        pick_type = p.get("pick_type", "").replace("_", " ").title()
+                        pick_val = clean_value(p.get("pick_value", ""))
+                        conf = int(p.get("confidence", 0))
+
+                        msg += "⚡ <b>{}</b>\n".format(match)
+                        if comp or ko:
+                            line = []
+                            if comp:
+                                line.append(comp)
+                            if ko:
+                                line.append(ko)
+                            msg += "   🏆 <i>{}</i>\n".format(" · ".join(line))
+                        msg += "   → {}: <b>{}</b> ({}%)\n\n".format(pick_type, pick_val, conf)
                     msg += "\n"
-                msg += "💡 <i>Each match appears only once across all tiers</i>"
+                msg += "💡 <i>Each match appears only once across all tiers</i>\n"
+                msg += "📊 <i>View all picks on your dashboard</i>"
                 send_telegram(msg)
         except Exception as e:
             print("Football loop: {}".format(e))
@@ -1653,10 +1750,11 @@ def football_page():
         cols = [c['name'] for c in conn.columns]
         otp_picks = [dict(zip(cols, r)) for r in rows]
 
-        # Current accumulator picks (Pending only)
+        # Current accumulator picks — show Pending + any resolved in last 48hrs
         rows2 = conn.run(
             "SELECT * FROM football_picks "
-            "WHERE pick_type != 'limitless_otp' AND status = 'Pending' "
+            "WHERE pick_type != 'limitless_otp' "
+            "AND (status = 'Pending' OR fired_at::timestamptz > NOW() - INTERVAL '48 hours') "
             "ORDER BY confidence DESC"
         )
         cols2 = [c['name'] for c in conn.columns]
