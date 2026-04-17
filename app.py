@@ -595,6 +595,229 @@ def build_accumulators(picks):
         "value_10x": build_tier(10.0),
     }
 
+
+# ═══════════════════════════════════════════════════════════
+# OFF THE PITCH SCANNER — football prop markets on Limitless
+# ═══════════════════════════════════════════════════════════
+
+def is_otp_market(market):
+    """Detect if this is a football/sports prop market (not crypto price)"""
+    title = market.get("title", "") or ""
+    cats  = market.get("categories", []) or []
+    tags  = market.get("tags", []) or []
+    
+    # Clear sports indicators
+    sport_signals = ["Football", "Soccer", "Sports", "Basketball", "Tennis",
+                     "NBA", "NFL", "EPL", "UCL", "Premier League", "Off the Pitch"]
+    if any(s in cats or s in tags for s in sport_signals):
+        return True
+    
+    # Title-based detection — football prop patterns
+    football_keywords = [
+        "goals", "assists", "shots", "fouls", "corners", "yellow card",
+        "red card", "substitution", "possession", "saves", "penalty",
+        "vs ", " vs.", "to win", "to score", "clean sheet", "Manchester",
+        "Arsenal", "Chelsea", "Liverpool", "Real Madrid", "Barcelona",
+        "first half", "second half", "extra time", "shots on target"
+    ]
+    title_lower = title.lower()
+    if any(kw.lower() in title_lower for kw in football_keywords):
+        # Exclude crypto that happens to mention "goals"
+        if "$" in title and ("above $" in title_lower or "below $" in title_lower):
+            # Price market with dollar sign — skip
+            return False
+        return True
+    
+    return False
+
+def analyze_otp_market_with_claude(market, parsed_odds):
+    """Use Claude Haiku to judge if an Off The Pitch market is a sure winner"""
+    if not ANTHROPIC_KEY:
+        return None
+    import requests as req
+    try:
+        title = market.get("title", "")
+        yes_odds = parsed_odds["yes_odds"]
+        no_odds  = 100 - yes_odds
+        hours    = parsed_odds["hours_left"]
+        
+        prompt = (
+            "You are analyzing a prediction market on Limitless Exchange. "
+            "Your job is to identify mispriced markets where the current odds don't reflect reality.\n\n"
+            "MARKET: {}\n"
+            "Current odds: YES {:.1f}% / NO {:.1f}%\n"
+            "Time to expiry: {:.1f} hours\n\n"
+            "Based on publicly known information (team form, player stats, recent news), "
+            "should a bettor take YES, NO, or SKIP this market?\n\n"
+            "Only recommend YES or NO if you have HIGH confidence (75%+) and the market odds "
+            "offer value. Most markets should be SKIP.\n\n"
+            "Respond ONLY in this JSON format (no other text):\n"
+            '{{"action": "YES"|"NO"|"SKIP", "confidence": 0-100, "reasoning": "brief explanation (max 120 chars)"}}'
+        ).format(title, yes_odds, no_odds, hours)
+        
+        r = req.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": ANTHROPIC_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json"
+            },
+            json={
+                "model": "claude-haiku-4-5-20251001",
+                "max_tokens": 300,
+                "messages": [{"role": "user", "content": prompt}]
+            },
+            timeout=30
+        )
+        if r.status_code != 200:
+            print("OTP Claude error: {}".format(r.status_code))
+            return None
+        data = r.json()
+        text = data["content"][0]["text"].strip()
+        text = re.sub(r"^```(?:json)?\s*", "", text)
+        text = re.sub(r"\s*```$", "", text)
+        return json.loads(text)
+    except Exception as e:
+        print("OTP analyze error: {}".format(e))
+        return None
+
+def save_and_alert_otp(market, parsed, analysis):
+    """Save OTP pick to DB and send Telegram alert"""
+    try:
+        action = analysis["action"]
+        if action == "SKIP":
+            return
+        conf = analysis.get("confidence", 0)
+        reasoning = analysis.get("reasoning", "")
+        
+        now = datetime.now(timezone.utc).isoformat()
+        conn = get_db()
+        rows = conn.run(
+            """INSERT INTO football_picks
+            (match_id, home_team, away_team, competition, kickoff_time,
+             pick_type, pick_value, confidence, reasoning, implied_odds,
+             accumulator_tier, status, fired_at)
+            VALUES (:mid, :h, :a, :c, :k, 'limitless_otp', :pv, :conf, :r, :o, 'single', 'Pending', :now)
+            RETURNING id""",
+            mid=parsed["market_id"], h="", a="", c="Limitless OTP",
+            k=parsed["expiry_dt"].isoformat(), pv=action,
+            conf=conf, r=reasoning[:200],
+            o=parsed["yes_odds"] if action == "YES" else (100 - parsed["yes_odds"]),
+            now=now
+        )
+        pid = rows[0][0]
+        conn.close()
+        
+        odds_val = parsed["yes_odds"] if action == "YES" else (100 - parsed["yes_odds"])
+        hrs_str = "{:.1f} hrs".format(parsed["hours_left"]) if parsed["hours_left"] >= 1 else "{:.0f} mins".format(parsed["mins_left"])
+        conf_emoji = "🔥" if conf >= 85 else "🟡"
+        
+        msg = (
+            "⚽ <b>OFF THE PITCH PICK #{}</b>\n"
+            "──────────────────────────\n"
+            "📌 {}\n"
+            "──────────────────────────\n"
+            "<b>Bet:</b> {} ✅\n"
+            "<b>Market Odds:</b> {:.1f}%\n"
+            "<b>Time Left:</b> {}\n"
+            "──────────────────────────\n"
+            "{} <b>AI Confidence:</b> {}%\n"
+            "💭 <b>Reasoning:</b> {}\n"
+            "🔗 limitless.exchange/markets/{}"
+        ).format(
+            pid, parsed["title"],
+            action, odds_val, hrs_str,
+            conf_emoji, conf, reasoning,
+            parsed["slug"]
+        )
+        send_telegram(msg)
+        print("OTP alert #{}: {} ({})".format(pid, parsed["title"][:50], action))
+    except Exception as e:
+        print("OTP alert error: {}".format(e))
+
+def run_otp_scan():
+    """Scan Limitless for Off The Pitch markets and analyze them"""
+    import requests as req
+    if not ANTHROPIC_KEY:
+        return 0
+    try:
+        r = req.get("{}/markets/active".format(LIMITLESS_API), timeout=15)
+        if r.status_code != 200:
+            return 0
+        markets = r.json().get("data", [])
+        otp_markets = [m for m in markets if is_otp_market(m)]
+        print("OTP scan: {} off-the-pitch markets found".format(len(otp_markets)))
+        
+        # Get already-alerted
+        conn = get_db()
+        alerted = conn.run(
+            "SELECT match_id FROM football_picks WHERE fired_at > NOW() - INTERVAL \'6 hours\' AND pick_type=\'limitless_otp\'"
+        )
+        alerted_ids = set(str(r[0]) for r in alerted)
+        conn.close()
+        
+        count = 0
+        for market in otp_markets[:15]:  # Cap at 15 to control costs
+            try:
+                mid = str(market.get("id", ""))
+                if mid in alerted_ids:
+                    continue
+                
+                # Parse basic timing/odds
+                exp_ts = market.get("expirationTimestamp", 0)
+                if not exp_ts:
+                    continue
+                expiry_dt = datetime.fromtimestamp(exp_ts / 1000, tz=timezone.utc)
+                now = datetime.now(timezone.utc)
+                mins_left = (expiry_dt - now).total_seconds() / 60
+                if mins_left <= 15 or mins_left > 600:  # Only 15min-10hr markets
+                    continue
+                
+                prices = market.get("prices", [0.5, 0.5])
+                yes_raw = float(prices[0])
+                yes_odds = yes_raw if yes_raw > 1 else yes_raw * 100
+                
+                # Only analyze markets with interesting odds (not extremes)
+                if yes_odds < 20 or yes_odds > 90:
+                    continue
+                
+                parsed = {
+                    "market_id": mid,
+                    "title": market.get("title", ""),
+                    "yes_odds": yes_odds,
+                    "hours_left": mins_left / 60,
+                    "mins_left": mins_left,
+                    "expiry_dt": expiry_dt,
+                    "slug": market.get("slug", ""),
+                }
+                
+                analysis = analyze_otp_market_with_claude(market, parsed)
+                if analysis and analysis.get("action") in ("YES", "NO"):
+                    # Only fire if AI confidence >= 75
+                    if analysis.get("confidence", 0) >= 75:
+                        save_and_alert_otp(market, parsed, analysis)
+                        count += 1
+                        time.sleep(2)
+            except Exception as e:
+                print("OTP market error: {}".format(e))
+        
+        print("OTP scan done: {} picks sent".format(count))
+        return count
+    except Exception as e:
+        print("OTP scan error: {}".format(e))
+        return 0
+
+def otp_loop():
+    """Run OTP scan every 30 minutes"""
+    time.sleep(90)
+    while True:
+        try:
+            if is_lagos_window():
+                run_otp_scan()
+        except Exception as e:
+            print("OTP loop: {}".format(e))
+        time.sleep(1800)  # 30 min
+
 def football_loop():
     """Run football analysis every 6 hours"""
     time.sleep(60)
@@ -660,6 +883,11 @@ def update_prediction(pred_id, status):
 def manual_scan():
     threading.Thread(target=run_scan, daemon=True).start()
     return {"status": "scan triggered"}, 200
+
+@app.route("/otp/scan", methods=["GET"])
+def manual_otp_scan():
+    threading.Thread(target=run_otp_scan, daemon=True).start()
+    return {"status": "OTP scan triggered"}, 200
 
 @app.route("/debug", methods=["GET"])
 def debug():
@@ -1010,17 +1238,68 @@ body{font-family:var(--sans);background:var(--bg);color:var(--ink);-webkit-font-
 {% if not has_keys %}
 <div class="empty">
   <h3>Setup required</h3>
-  <p>Football module needs two free API keys to run. Add <code style="font-family:var(--mono);background:var(--bg-subtle);padding:2px 6px;border-radius:4px">FOOTBALL_DATA_KEY</code> (from football-data.org) and <code style="font-family:var(--mono);background:var(--bg-subtle);padding:2px 6px;border-radius:4px">ANTHROPIC_API_KEY</code> (from anthropic.com) to your Railway environment variables. Once added, redeploy and accumulators will appear here.</p>
-</div>
-{% elif not picks %}
-<div class="empty">
-  <h3>No picks generated yet</h3>
-  <p>The football analyzer runs every 6 hours. It scans today's fixtures, analyzes each match with Claude, and builds three accumulator tiers. Check back soon or restart the service to trigger it.</p>
+  <p>Football module needs <code style="font-family:var(--mono);background:var(--bg-subtle);padding:2px 6px;border-radius:4px">ANTHROPIC_API_KEY</code> (required, from anthropic.com) and optionally <code style="font-family:var(--mono);background:var(--bg-subtle);padding:2px 6px;border-radius:4px">FOOTBALL_DATA_KEY</code> (free from football-data.org) in Railway environment variables.</p>
 </div>
 {% else %}
-<div class="accas">
-  <!-- Content gets rendered when picks available -->
+
+<!-- Off The Pitch Picks Section -->
+<div class="action-bar" style="padding:32px 40px 16px;display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap">
+  <div class="section-head" style="display:flex;align-items:baseline;gap:14px">
+    <h3 style="font-family:var(--display);font-weight:500;font-size:22px;letter-spacing:-.02em">Off The Pitch Picks</h3>
+    <span style="font-size:11px;font-family:var(--mono);color:var(--ink-4);background:var(--bg-subtle);padding:3px 8px;border-radius:100px">{{ otp_picks|length }} picks</span>
+  </div>
+  <button class="btn btn-primary" onclick="fetch('/otp/scan').then(()=>alert('OTP scan running'))" style="font-family:var(--sans);font-size:13px;font-weight:500;padding:9px 16px;border-radius:8px;border:1px solid var(--accent);background:var(--accent);color:var(--bg);cursor:pointer">◎ Scan OTP</button>
 </div>
+
+{% if otp_picks %}
+<div class="table-wrap" style="margin:0 40px 32px;background:var(--surface);border:1px solid var(--border);border-radius:14px;overflow:hidden">
+  <div style="overflow-x:auto">
+    <table style="width:100%;border-collapse:collapse;font-size:13px;min-width:800px">
+      <thead style="background:var(--bg-subtle)">
+        <tr>
+          <th style="text-align:left;padding:14px 16px;font-size:10px;font-family:var(--mono);font-weight:500;color:var(--ink-3);text-transform:uppercase;letter-spacing:.1em;padding-left:24px">Market</th>
+          <th style="text-align:left;padding:14px 16px;font-size:10px;font-family:var(--mono);font-weight:500;color:var(--ink-3);text-transform:uppercase;letter-spacing:.1em">Pick</th>
+          <th style="text-align:left;padding:14px 16px;font-size:10px;font-family:var(--mono);font-weight:500;color:var(--ink-3);text-transform:uppercase;letter-spacing:.1em">Odds</th>
+          <th style="text-align:left;padding:14px 16px;font-size:10px;font-family:var(--mono);font-weight:500;color:var(--ink-3);text-transform:uppercase;letter-spacing:.1em">Confidence</th>
+          <th style="text-align:left;padding:14px 16px;font-size:10px;font-family:var(--mono);font-weight:500;color:var(--ink-3);text-transform:uppercase;letter-spacing:.1em">Reasoning</th>
+          <th style="text-align:left;padding:14px 16px;font-size:10px;font-family:var(--mono);font-weight:500;color:var(--ink-3);text-transform:uppercase;letter-spacing:.1em">Status</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for pick in otp_picks %}
+        <tr style="border-top:1px solid var(--border)">
+          <td style="padding:16px;padding-left:24px;font-weight:500;color:var(--ink);max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="{{ pick.match_id }}">Match #{{ pick.match_id[:8] }}</td>
+          <td style="padding:16px"><span class="tag {{ 'tag-high' if pick.pick_value == 'YES' else 'tag-lost' }}" style="display:inline-flex;align-items:center;gap:5px;padding:3px 9px;border-radius:100px;font-size:11px;font-weight:500">{{ pick.pick_value }}</span></td>
+          <td style="padding:16px;font-family:var(--mono);font-weight:600;color:var(--ink)">{{ "%.1f"|format(pick.implied_odds) }}%</td>
+          <td style="padding:16px"><span style="font-family:var(--mono);color:var(--positive);font-weight:600">{{ pick.confidence|int }}%</span></td>
+          <td style="padding:16px;color:var(--ink-3);font-size:12px;max-width:300px">{{ pick.reasoning }}</td>
+          <td style="padding:16px"><span class="tag tag-pending">{{ pick.status }}</span></td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% else %}
+<div class="empty">
+  <h3>No OTP picks yet</h3>
+  <p>The Off The Pitch scanner runs every 30 minutes during Lagos trading hours. It uses AI to identify mispriced football prop markets on Limitless. Click <b>Scan OTP</b> to trigger a manual scan.</p>
+</div>
+{% endif %}
+
+<!-- Accumulator Section (placeholder for Week 2 full build) -->
+<div class="action-bar" style="padding:32px 40px 16px">
+  <div class="section-head">
+    <h3 style="font-family:var(--display);font-weight:500;font-size:22px;letter-spacing:-.02em">Daily Accumulators</h3>
+    <span style="font-size:11px;font-family:var(--mono);color:var(--ink-4);background:var(--bg-subtle);padding:3px 8px;border-radius:100px">Updated every 6 hours</span>
+  </div>
+</div>
+
+<div class="empty" style="padding:60px 40px">
+  <h3>Accumulators building</h3>
+  <p>The daily accumulator engine scans today's fixtures, applies AI reasoning to each match, then stacks the highest-confidence picks into 2x, 3x and 10x tiers. Daily Telegram brief sent every 6 hours.</p>
+</div>
+
 {% endif %}
 
 <footer class="footer">Powered by football-data.org · Claude Haiku · Auto-refresh every 6 hours</footer>
@@ -1057,16 +1336,22 @@ def dashboard():
 
 @app.route("/football")
 def football_page():
-    has_keys = bool(ANTHROPIC_KEY and FOOTBALL_DATA_KEY)
+    has_keys = bool(ANTHROPIC_KEY)  # OTP only needs Anthropic key
     try:
         conn = get_db()
-        rows = conn.run("SELECT * FROM football_picks ORDER BY id DESC LIMIT 50")
+        rows = conn.run("SELECT * FROM football_picks WHERE pick_type='limitless_otp' ORDER BY id DESC LIMIT 50")
         cols = [c['name'] for c in conn.columns]
-        picks = [dict(zip(cols, r)) for r in rows]
+        otp_picks = [dict(zip(cols, r)) for r in rows]
+        
+        rows2 = conn.run("SELECT * FROM football_picks WHERE pick_type != 'limitless_otp' ORDER BY id DESC LIMIT 50")
+        cols2 = [c['name'] for c in conn.columns]
+        picks = [dict(zip(cols2, r)) for r in rows2]
         conn.close()
-    except:
+    except Exception as e:
+        print("Football page error: {}".format(e))
+        otp_picks = []
         picks = []
-    return render_template_string(FOOTBALL_HTML, has_keys=has_keys, picks=picks)
+    return render_template_string(FOOTBALL_HTML, has_keys=has_keys, picks=picks, otp_picks=otp_picks)
 
 # ═══════════════════════════════════════════════════════════
 # STARTUP
@@ -1080,6 +1365,7 @@ except Exception as e:
 threading.Thread(target=scan_loop, daemon=True).start()
 threading.Thread(target=outcome_loop, daemon=True).start()
 threading.Thread(target=football_loop, daemon=True).start()
+threading.Thread(target=otp_loop, daemon=True).start()
 print("Limitless Bot v3 — 3 threads running")
 
 if __name__ == "__main__":
