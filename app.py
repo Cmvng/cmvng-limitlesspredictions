@@ -496,127 +496,545 @@ def test():
 # ═══════════════════════════════════════════════════════════
 
 DASHBOARD_HTML = """<!DOCTYPE html>
-<html><head>
-<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Limitless Predictions</title>
+<html lang="en"><head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Limitless Prediction Platform</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=DM+Mono:wght@300;400;500&display=swap" rel="stylesheet">
 <style>
+:root {
+  --g0:#001a0a; --g1:#002d12; --g2:#003d18; --g3:#00521f;
+  --g4:#006b28; --g5:#00852f; --g6:#00a838; --g7:#00d147;
+  --g8:#39e86a; --g9:#7fffa0;
+  --gold:#c8f566; --amber:#f0b429;
+  --red:#ff4d6d; --blue:#38bdf8;
+  --text:#e8f5ee; --muted:#4d7a5a; --border:#0a2e15;
+  --card:#00150a; --card2:#001f0d;
+  --font:'Syne',sans-serif; --mono:'DM Mono',monospace;
+}
 *{box-sizing:border-box;margin:0;padding:0}
-body{font-family:-apple-system,Arial,sans-serif;background:#0d1117;color:#e6edf3}
-.hdr{padding:16px 24px;background:#161b22;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid #30363d;flex-wrap:wrap;gap:10px}
-.hdr h1{font-size:16px;font-weight:700;color:#fff}
+html{scroll-behavior:smooth}
+body{
+  font-family:var(--font);
+  background:var(--g0);
+  color:var(--text);
+  min-height:100vh;
+  overflow-x:hidden;
+}
+
+/* ── Background grid ── */
+body::before{
+  content:'';
+  position:fixed;inset:0;
+  background-image:
+    linear-gradient(rgba(0,168,56,.04) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(0,168,56,.04) 1px, transparent 1px);
+  background-size:40px 40px;
+  pointer-events:none;
+  z-index:0;
+}
+
+/* ── Glow orb ── */
+body::after{
+  content:'';
+  position:fixed;
+  top:-200px; left:50%;
+  transform:translateX(-50%);
+  width:800px; height:500px;
+  background:radial-gradient(ellipse, rgba(0,168,56,.12) 0%, transparent 70%);
+  pointer-events:none;
+  z-index:0;
+}
+
+.wrap{position:relative;z-index:1}
+
+/* ── Header ── */
+.hdr{
+  padding:18px 32px;
+  background:rgba(0,21,10,.85);
+  backdrop-filter:blur(20px);
+  border-bottom:1px solid var(--border);
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  flex-wrap:wrap;
+  gap:12px;
+  position:sticky;top:0;z-index:100;
+}
+.logo{
+  display:flex;align-items:center;gap:12px;
+}
+.logo-icon{
+  width:36px;height:36px;
+  background:linear-gradient(135deg,var(--g6),var(--g8));
+  border-radius:10px;
+  display:flex;align-items:center;justify-content:center;
+  font-size:18px;
+  box-shadow:0 0 20px rgba(0,168,56,.4);
+}
+.logo h1{
+  font-size:15px;font-weight:800;
+  letter-spacing:-.02em;
+  color:#fff;
+}
+.logo span{
+  font-size:11px;font-weight:400;
+  color:var(--muted);
+  display:block;
+  font-family:var(--mono);
+  letter-spacing:.05em;
+}
 .hdr-r{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
-.live{font-size:12px;color:#3fb950;display:flex;align-items:center;gap:5px}
-.dot{width:7px;height:7px;background:#3fb950;border-radius:50%;animation:pulse 2s infinite}
-@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
-.badge{font-size:11px;padding:3px 10px;border-radius:20px;font-weight:700}
-.bg{background:#238636;color:#fff}
-.bo{background:#1a4731;color:#3fb950;border:1px solid #238636}
-.bc{background:#4a1520;color:#f85149;border:1px solid #da3633}
-.wrap{padding:20px 24px}
-.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:10px;margin-bottom:20px}
-.stat{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:14px}
-.slbl{font-size:10px;color:#8b949e;text-transform:uppercase;letter-spacing:.05em;margin-bottom:4px;font-weight:700}
-.sval{font-size:22px;font-weight:700}
-.g{color:#3fb950}.r{color:#f85149}.a{color:#e3b341}.b{color:#58a6ff}
-.stit{font-size:11px;font-weight:700;color:#8b949e;text-transform:uppercase;letter-spacing:.06em;margin-bottom:12px}
-.sbtn{background:#238636;color:#fff;border:none;padding:8px 16px;border-radius:8px;font-size:13px;font-weight:700;cursor:pointer;margin-bottom:16px;margin-right:10px}
-.sbtn:hover{background:#2ea043}
-.tw{overflow-x:auto}
-table{width:100%;border-collapse:collapse;font-size:12px;min-width:700px}
-th{text-align:left;padding:9px 10px;font-size:10px;color:#8b949e;text-transform:uppercase;border-bottom:1px solid #30363d;background:#161b22;font-weight:700}
-td{padding:9px 10px;border-bottom:1px solid #21262d}
-tr:hover td{background:#1c2128}
-.bdg{display:inline-block;padding:2px 8px;border-radius:20px;font-size:11px;font-weight:700}
-.pnd{background:#1f4068;color:#58a6ff}
-.won{background:#1a4731;color:#3fb950}
-.lost{background:#4a1520;color:#f85149}
-.chigh{background:#1a4731;color:#3fb950}
-.cmed{background:#3d2f0a;color:#e3b341}
-.btn{padding:3px 8px;border-radius:5px;border:1px solid;cursor:pointer;font-size:10px;font-weight:700;margin-right:2px;background:transparent}
-.btp{color:#3fb950;border-color:#238636}
-.bsl{color:#f85149;border-color:#da3633}
-.empty{text-align:center;padding:40px;color:#8b949e;font-size:14px}
-.ref{font-size:11px;color:#30363d;text-align:right;padding:10px 24px}
-</style></head><body>
-<div class="hdr">
-  <h1>🎯 Limitless Prediction Platform</h1>
-  <div class="hdr-r">
-    <span class="badge {{ 'bo' if in_window else 'bc' }}">
-      {{ '🟢 Trading Window OPEN' if in_window else '🔴 Outside Trading Hours' }}
-    </span>
-    <span class="badge" style="background:#1f3a5f;color:#58a6ff">
-      BTC: {{ '🟢 BUY' if btc_trend == 'BUY' else '🔴 SELL' if btc_trend == 'SELL' else '⚪ N/A' }}
-    </span>
-    <div class="live"><div class="dot"></div> Live</div>
-  </div>
-</div>
+
+/* ── Pills ── */
+.pill{
+  font-size:11px;font-weight:600;
+  padding:5px 12px;border-radius:20px;
+  font-family:var(--mono);
+  letter-spacing:.03em;
+  display:inline-flex;align-items:center;gap:5px;
+}
+.pill-green{background:rgba(0,168,56,.15);color:var(--g8);border:1px solid rgba(0,168,56,.3)}
+.pill-red{background:rgba(255,77,109,.1);color:var(--red);border:1px solid rgba(255,77,109,.25)}
+.pill-btc{background:rgba(0,168,56,.1);color:var(--gold);border:1px solid rgba(200,245,102,.2)}
+.pill-blue{background:rgba(56,189,248,.1);color:var(--blue);border:1px solid rgba(56,189,248,.2)}
+
+.pulse{
+  width:7px;height:7px;border-radius:50%;
+  background:var(--g7);
+  box-shadow:0 0 8px var(--g7);
+  animation:pulse 2s infinite;
+}
+@keyframes pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.5;transform:scale(.85)}}
+
+/* ── Main content ── */
+.main{padding:28px 32px;max-width:1400px;margin:0 auto}
+
+/* ── Stats grid ── */
+.stats{
+  display:grid;
+  grid-template-columns:repeat(auto-fit,minmax(140px,1fr));
+  gap:12px;
+  margin-bottom:28px;
+}
+.stat{
+  background:var(--card);
+  border:1px solid var(--border);
+  border-radius:14px;
+  padding:18px 16px;
+  position:relative;
+  overflow:hidden;
+  transition:border-color .2s, transform .2s;
+}
+.stat:hover{border-color:var(--g4);transform:translateY(-2px)}
+.stat::before{
+  content:'';
+  position:absolute;top:0;left:0;right:0;height:2px;
+  background:linear-gradient(90deg,var(--g5),transparent);
+}
+.slbl{
+  font-size:10px;font-weight:600;
+  color:var(--muted);
+  text-transform:uppercase;
+  letter-spacing:.08em;
+  margin-bottom:8px;
+  font-family:var(--mono);
+}
+.sval{
+  font-size:28px;font-weight:800;
+  letter-spacing:-.03em;
+  color:var(--text);
+  line-height:1;
+}
+.sval.g{color:var(--g8)}
+.sval.r{color:var(--red)}
+.sval.a{color:var(--amber)}
+.sval.b{color:var(--blue)}
+.sval.gold{color:var(--gold)}
+.stat-sub{
+  font-size:10px;color:var(--muted);
+  margin-top:4px;font-family:var(--mono);
+}
+
+/* ── Section title ── */
+.section-hdr{
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  margin-bottom:16px;
+  flex-wrap:wrap;gap:10px;
+}
+.stit{
+  font-size:11px;font-weight:700;
+  color:var(--muted);
+  text-transform:uppercase;
+  letter-spacing:.1em;
+  display:flex;align-items:center;gap:8px;
+}
+.stit::before{
+  content:'';
+  width:3px;height:14px;
+  background:linear-gradient(var(--g7),var(--g5));
+  border-radius:2px;
+}
+
+/* ── Buttons ── */
+.btn-primary{
+  background:linear-gradient(135deg,var(--g5),var(--g6));
+  color:#fff;
+  border:none;
+  padding:9px 18px;
+  border-radius:10px;
+  font-size:12px;font-weight:700;
+  cursor:pointer;
+  font-family:var(--font);
+  letter-spacing:.02em;
+  transition:all .2s;
+  box-shadow:0 4px 12px rgba(0,168,56,.25);
+  display:inline-flex;align-items:center;gap:6px;
+}
+.btn-primary:hover{
+  transform:translateY(-1px);
+  box-shadow:0 6px 20px rgba(0,168,56,.4);
+}
+.btn-secondary{
+  background:transparent;
+  color:var(--muted);
+  border:1px solid var(--border);
+  padding:9px 18px;
+  border-radius:10px;
+  font-size:12px;font-weight:600;
+  cursor:pointer;
+  font-family:var(--font);
+  transition:all .2s;
+  display:inline-flex;align-items:center;gap:6px;
+}
+.btn-secondary:hover{border-color:var(--g4);color:var(--text)}
+
+/* ── Table ── */
+.tw{overflow-x:auto;border-radius:14px;border:1px solid var(--border)}
+table{
+  width:100%;
+  border-collapse:collapse;
+  font-size:12px;
+  min-width:750px;
+}
+thead{background:var(--card2)}
+th{
+  text-align:left;
+  padding:12px 14px;
+  font-size:10px;
+  color:var(--muted);
+  text-transform:uppercase;
+  letter-spacing:.08em;
+  font-weight:700;
+  font-family:var(--mono);
+  border-bottom:1px solid var(--border);
+  white-space:nowrap;
+}
+td{
+  padding:11px 14px;
+  border-bottom:1px solid rgba(10,46,21,.8);
+  vertical-align:middle;
+}
+tbody tr:last-child td{border-bottom:none}
+tbody tr{
+  background:var(--card);
+  transition:background .15s;
+}
+tbody tr:hover{background:var(--card2)}
+
+/* ── Badges ── */
+.bdg{
+  display:inline-flex;align-items:center;gap:4px;
+  padding:3px 10px;border-radius:20px;
+  font-size:10px;font-weight:700;
+  font-family:var(--mono);
+  letter-spacing:.03em;
+  white-space:nowrap;
+}
+.pnd{background:rgba(56,189,248,.1);color:var(--blue);border:1px solid rgba(56,189,248,.2)}
+.won{background:rgba(0,168,56,.12);color:var(--g8);border:1px solid rgba(0,168,56,.25)}
+.lost{background:rgba(255,77,109,.1);color:var(--red);border:1px solid rgba(255,77,109,.2)}
+.chigh{background:rgba(0,209,71,.1);color:var(--g8);border:1px solid rgba(0,168,56,.3)}
+.cmed{background:rgba(240,180,41,.08);color:var(--amber);border:1px solid rgba(240,180,41,.2)}
+
+/* ── Asset name ── */
+.asset-name{
+  font-weight:700;
+  color:var(--g8);
+  font-family:var(--mono);
+  font-size:13px;
+}
+.mkt-title{
+  font-size:11px;
+  color:var(--text);
+  opacity:.8;
+  max-width:200px;
+  overflow:hidden;
+  text-overflow:ellipsis;
+  white-space:nowrap;
+}
+.odds-val{
+  font-family:var(--mono);
+  font-weight:700;
+  font-size:13px;
+  color:var(--gold);
+}
+.price-val{
+  font-family:var(--mono);
+  font-size:11px;
+  color:var(--text);
+}
+.time-val{
+  font-family:var(--mono);
+  font-size:10px;
+  color:var(--muted);
+}
+
+/* ── Action buttons ── */
+.act-won{
+  background:rgba(0,168,56,.1);
+  color:var(--g8);
+  border:1px solid rgba(0,168,56,.3);
+  padding:4px 10px;border-radius:7px;
+  font-size:10px;font-weight:700;
+  cursor:pointer;
+  font-family:var(--mono);
+  transition:all .15s;
+  margin-right:4px;
+}
+.act-won:hover{background:rgba(0,168,56,.2)}
+.act-lost{
+  background:rgba(255,77,109,.08);
+  color:var(--red);
+  border:1px solid rgba(255,77,109,.25);
+  padding:4px 10px;border-radius:7px;
+  font-size:10px;font-weight:700;
+  cursor:pointer;
+  font-family:var(--mono);
+  transition:all .15s;
+}
+.act-lost:hover{background:rgba(255,77,109,.15)}
+
+/* ── Empty state ── */
+.empty{
+  text-align:center;
+  padding:60px 24px;
+  color:var(--muted);
+}
+.empty-icon{font-size:40px;margin-bottom:12px;opacity:.5}
+.empty h3{font-size:15px;font-weight:700;color:var(--text);margin-bottom:6px;opacity:.6}
+.empty p{font-size:12px;font-family:var(--mono);opacity:.5}
+
+/* ── Footer ── */
+.footer{
+  text-align:right;
+  padding:16px 32px;
+  font-size:10px;
+  color:var(--muted);
+  font-family:var(--mono);
+  letter-spacing:.04em;
+  border-top:1px solid var(--border);
+  margin-top:40px;
+}
+
+/* ── Scan toast ── */
+.toast{
+  position:fixed;bottom:24px;right:24px;
+  background:var(--g4);
+  color:#fff;
+  padding:12px 20px;border-radius:12px;
+  font-size:13px;font-weight:600;
+  box-shadow:0 8px 24px rgba(0,0,0,.4);
+  transform:translateY(100px);opacity:0;
+  transition:all .3s cubic-bezier(.34,1.56,.64,1);
+  z-index:999;
+}
+.toast.show{transform:translateY(0);opacity:1}
+
+/* ── Animations ── */
+@keyframes fadeUp{
+  from{opacity:0;transform:translateY(16px)}
+  to{opacity:1;transform:translateY(0)}
+}
+.stat{animation:fadeUp .4s ease both}
+.stat:nth-child(1){animation-delay:.05s}
+.stat:nth-child(2){animation-delay:.1s}
+.stat:nth-child(3){animation-delay:.15s}
+.stat:nth-child(4){animation-delay:.2s}
+.stat:nth-child(5){animation-delay:.25s}
+.stat:nth-child(6){animation-delay:.3s}
+
+@media(max-width:600px){
+  .hdr{padding:14px 16px}
+  .main{padding:16px}
+  .sval{font-size:22px}
+}
+</style>
+</head>
+<body>
 <div class="wrap">
+
+<!-- HEADER -->
+<header class="hdr">
+  <div class="logo">
+    <div class="logo-icon">🎯</div>
+    <div>
+      <h1>Limitless Prediction Platform</h1>
+      <span>CMVNG · Powered by Yahoo Finance</span>
+    </div>
+  </div>
+  <div class="hdr-r">
+    <span class="pill {{ 'pill-green' if in_window else 'pill-red' }}">
+      <span class="pulse" style="{{ '' if in_window else 'background:var(--red);box-shadow:0 0 8px var(--red)' }}"></span>
+      {{ 'Trading Window OPEN' if in_window else 'Outside Trading Hours' }}
+    </span>
+    <span class="pill pill-btc">
+      ₿ BTC: {{ '▲ BUY' if btc_trend == 'BUY' else '▼ SELL' if btc_trend == 'SELL' else '— N/A' }}
+    </span>
+    <span class="pill pill-blue">
+      <span class="pulse" style="background:var(--blue);box-shadow:0 0 8px var(--blue)"></span>
+      Live
+    </span>
+  </div>
+</header>
+
+<!-- MAIN -->
+<main class="main">
+
+  <!-- Stats -->
   <div class="stats">
-    <div class="stat"><div class="slbl">Total Sent</div><div class="sval b">{{ stats.total }}</div></div>
-    <div class="stat"><div class="slbl">Win Rate</div><div class="sval {{ 'g' if stats.wr >= 65 else 'a' if stats.wr >= 50 else 'r' }}">{{ stats.wr }}%</div></div>
-    <div class="stat"><div class="slbl">Wins</div><div class="sval g">{{ stats.wins }}</div></div>
-    <div class="stat"><div class="slbl">Losses</div><div class="sval r">{{ stats.losses }}</div></div>
-    <div class="stat"><div class="slbl">Pending</div><div class="sval a">{{ stats.pending }}</div></div>
-    <div class="stat"><div class="slbl">Today</div><div class="sval b">{{ stats.today }}</div></div>
+    <div class="stat">
+      <div class="slbl">Total Sent</div>
+      <div class="sval b">{{ stats.total }}</div>
+      <div class="stat-sub">all time</div>
+    </div>
+    <div class="stat">
+      <div class="slbl">Win Rate</div>
+      <div class="sval {{ 'g' if stats.wr >= 65 else 'a' if stats.wr >= 50 else 'r' }}">{{ stats.wr }}%</div>
+      <div class="stat-sub">{{ stats.wins }}W / {{ stats.losses }}L</div>
+    </div>
+    <div class="stat">
+      <div class="slbl">Wins</div>
+      <div class="sval g">{{ stats.wins }}</div>
+      <div class="stat-sub">resolved ✅</div>
+    </div>
+    <div class="stat">
+      <div class="slbl">Losses</div>
+      <div class="sval r">{{ stats.losses }}</div>
+      <div class="stat-sub">resolved ❌</div>
+    </div>
+    <div class="stat">
+      <div class="slbl">Pending</div>
+      <div class="sval a">{{ stats.pending }}</div>
+      <div class="stat-sub">in play</div>
+    </div>
+    <div class="stat">
+      <div class="slbl">Today</div>
+      <div class="sval gold">{{ stats.today }}</div>
+      <div class="stat-sub">Lagos time</div>
+    </div>
   </div>
 
-  <button class="sbtn" onclick="triggerScan()">🔍 Scan Now</button>
-  <button class="sbtn" style="background:#1f3a5f" onclick="location.reload()">🔄 Refresh</button>
+  <!-- Predictions Table -->
+  <div class="section-hdr">
+    <div class="stit">Predictions Log</div>
+    <div style="display:flex;gap:8px">
+      <button class="btn-primary" onclick="triggerScan()">🔍 Scan Now</button>
+      <button class="btn-secondary" onclick="location.reload()">↻ Refresh</button>
+    </div>
+  </div>
 
-  <div class="stit">Predictions Log</div>
-  <div class="tw"><table>
-    <thead><tr>
-      <th>#</th><th>Market</th><th>Asset</th><th>Type</th>
-      <th>Odds</th><th>Price@Alert</th><th>Baseline</th>
-      <th>Hrs Left</th><th>Conf</th><th>Status</th><th>Time</th><th>Action</th>
-    </tr></thead>
-    <tbody>
-      {% if not preds %}
-      <tr><td colspan="12"><div class="empty">
-        🎯 No predictions yet<br>
-        <span style="font-size:12px;color:#8b949e">Scanner runs every 5 mins during Lagos trading hours</span>
-      </div></td></tr>
-      {% endif %}
-      {% for p in preds %}
-      <tr>
-        <td style="color:#8b949e">{{ p.id }}</td>
-        <td style="font-size:11px;max-width:210px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="{{ p.title }}">{{ p.title }}</td>
-        <td style="font-weight:700;color:#58a6ff">{{ p.asset }}</td>
-        <td style="color:#8b949e;font-size:11px">{{ p.market_type }}</td>
-        <td class="a" style="font-weight:700">{{ "%.1f"|format(p.bet_odds) }}%</td>
-        <td style="font-size:11px">
-          {{ "$%.4f"|format(p.current_price) if p.current_price and p.current_price < 100 else "$%.2f"|format(p.current_price) if p.current_price else "-" }}
-        </td>
-        <td style="font-size:11px">
-          {{ "$%.4f"|format(p.baseline) if p.baseline < 100 else "$%.2f"|format(p.baseline) }}
-        </td>
-        <td style="color:#8b949e">{{ "%.1fh"|format(p.hours_left) if p.hours_left else "-" }}</td>
-        <td><span class="bdg {{ 'chigh' if p.confidence == 'HIGH' else 'cmed' }}">{{ p.confidence }}</span></td>
-        <td><span class="bdg {{ 'pnd' if p.status == 'Pending' else 'won' if '✅' in (p.status or '') else 'lost' }}">{{ p.status }}</span></td>
-        <td style="color:#8b949e;font-size:11px">{{ p.fired_at[:16].replace("T"," ") if p.fired_at else "" }}</td>
-        <td>
-          {% if p.status == "Pending" %}
-          <button class="btn btp" onclick="updL({{ p.id }},'✅ Won')">Won</button>
-          <button class="btn bsl" onclick="updL({{ p.id }},'❌ Lost')">Lost</button>
-          {% endif %}
-        </td>
-      </tr>
-      {% endfor %}
-    </tbody>
-  </table></div>
+  <div class="tw">
+    <table>
+      <thead><tr>
+        <th>#</th>
+        <th>Market</th>
+        <th>Asset</th>
+        <th>Type</th>
+        <th>Odds</th>
+        <th>Price @ Alert</th>
+        <th>Baseline</th>
+        <th>Hrs Left</th>
+        <th>Confidence</th>
+        <th>Status</th>
+        <th>Time</th>
+        <th>Action</th>
+      </tr></thead>
+      <tbody>
+        {% if not preds %}
+        <tr><td colspan="12">
+          <div class="empty">
+            <div class="empty-icon">🎯</div>
+            <h3>No predictions yet</h3>
+            <p>Scanner runs every 5 mins during Lagos trading hours<br>Click "Scan Now" to trigger manually</p>
+          </div>
+        </td></tr>
+        {% endif %}
+        {% for p in preds %}
+        <tr>
+          <td class="time-val">{{ p.id }}</td>
+          <td><div class="mkt-title" title="{{ p.title }}">{{ p.title }}</div></td>
+          <td><span class="asset-name">{{ p.asset }}</span></td>
+          <td><span class="time-val">{{ p.market_type }}</span></td>
+          <td><span class="odds-val">{{ "%.1f"|format(p.bet_odds) }}%</span></td>
+          <td><span class="price-val">{{ "$%.4f"|format(p.current_price) if p.current_price and p.current_price < 100 else "$%.2f"|format(p.current_price) if p.current_price else "—" }}</span></td>
+          <td><span class="price-val">{{ "$%.4f"|format(p.baseline) if p.baseline < 100 else "$%.2f"|format(p.baseline) }}</span></td>
+          <td><span class="time-val">{{ "%.1fh"|format(p.hours_left) if p.hours_left else "—" }}</span></td>
+          <td><span class="bdg {{ 'chigh' if p.confidence == 'HIGH' else 'cmed' }}">{{ '🔥 HIGH' if p.confidence == 'HIGH' else '🟡 MED' }}</span></td>
+          <td><span class="bdg {{ 'pnd' if p.status == 'Pending' else 'won' if '✅' in (p.status or '') else 'lost' }}">{{ p.status }}</span></td>
+          <td><span class="time-val">{{ p.fired_at[:16].replace("T"," ") if p.fired_at else "—" }}</span></td>
+          <td>
+            {% if p.status == "Pending" %}
+            <button class="act-won" onclick="updL({{ p.id }},'✅ Won')">✅ Won</button>
+            <button class="act-lost" onclick="updL({{ p.id }},'❌ Lost')">❌ Lost</button>
+            {% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+</main>
+
+<footer class="footer">
+  Scanner: every 5 mins &nbsp;·&nbsp; Outcomes: auto-checked &nbsp;·&nbsp;
+  Yahoo Finance + Limitless API &nbsp;·&nbsp;
+  Auto-refresh: 60s
+</footer>
+
 </div>
-<div class="ref">Scanner: every 5 mins · Outcomes: auto-checked · Powered by Yahoo Finance + Limitless API</div>
+
+<!-- Toast -->
+<div class="toast" id="toast"></div>
+
 <script>
 function updL(id,s){
   fetch('/limitless/update/'+id+'/'+encodeURIComponent(s),{method:'POST'})
     .then(()=>location.reload())
 }
 function triggerScan(){
-  fetch('/scan').then(()=>alert('Scan running — check Telegram in ~30 seconds'))
+  fetch('/scan').then(()=>{
+    showToast('🔍 Scan running — check Telegram in ~30 seconds');
+  })
 }
-setTimeout(()=>location.reload(),60000);
+function showToast(msg){
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.classList.add('show');
+  setTimeout(()=>t.classList.remove('show'), 3500);
+}
+// Auto-refresh every 60s
+setTimeout(()=>location.reload(), 60000);
+// Show last refresh time
+console.log('Dashboard loaded:', new Date().toLocaleTimeString());
 </script>
 </body></html>"""
+
+
 
 @app.route("/")
 def dashboard():
