@@ -503,8 +503,62 @@ def outcome_loop():
 # FOOTBALL MODULE (Week 2)
 # ═══════════════════════════════════════════════════════════
 
-def get_todays_fixtures():
-    """Fetch today's football matches from football-data.org (free)"""
+def _normalize_fixture(match, source):
+    """Normalize fixture format across different APIs"""
+    if source == "api-football":
+        return {
+            "id": match.get("fixture", {}).get("id"),
+            "homeTeam": {"name": match.get("teams", {}).get("home", {}).get("name", "")},
+            "awayTeam": {"name": match.get("teams", {}).get("away", {}).get("name", "")},
+            "competition": {"name": match.get("league", {}).get("name", "")},
+            "utcDate": match.get("fixture", {}).get("date", ""),
+            "source": "api-football",
+        }
+    elif source == "football-data":
+        return {
+            "id": match.get("id"),
+            "homeTeam": match.get("homeTeam", {}),
+            "awayTeam": match.get("awayTeam", {}),
+            "competition": match.get("competition", {}),
+            "utcDate": match.get("utcDate", ""),
+            "source": "football-data",
+        }
+    elif source == "thesportsdb":
+        return {
+            "id": match.get("idEvent"),
+            "homeTeam": {"name": match.get("strHomeTeam", "")},
+            "awayTeam": {"name": match.get("strAwayTeam", "")},
+            "competition": {"name": match.get("strLeague", "")},
+            "utcDate": "{}T{}".format(match.get("dateEvent", ""), match.get("strTime", "00:00:00")),
+            "source": "thesportsdb",
+        }
+    return None
+
+def _fetch_api_football():
+    """Fetch from API-Football via RapidAPI (100/day free tier)"""
+    key = os.environ.get("API_FOOTBALL_KEY", "")
+    if not key:
+        return []
+    import requests as req
+    try:
+        today = datetime.now(LAGOS_TZ).strftime("%Y-%m-%d")
+        r = req.get(
+            "https://v3.football.api-sports.io/fixtures?date={}".format(today),
+            headers={"x-apisports-key": key},
+            timeout=15
+        )
+        if r.status_code != 200:
+            print("API-Football error: {}".format(r.status_code))
+            return []
+        matches = r.json().get("response", [])
+        print("API-Football: {} fixtures".format(len(matches)))
+        return [_normalize_fixture(m, "api-football") for m in matches]
+    except Exception as e:
+        print("API-Football error: {}".format(e))
+        return []
+
+def _fetch_football_data():
+    """Fetch from football-data.org (10/min free tier)"""
     if not FOOTBALL_DATA_KEY:
         return []
     import requests as req
@@ -516,12 +570,47 @@ def get_todays_fixtures():
             timeout=15
         )
         if r.status_code != 200:
-            print("Football API error: {}".format(r.status_code))
+            print("football-data.org error: {}".format(r.status_code))
             return []
-        return r.json().get("matches", [])
+        matches = r.json().get("matches", [])
+        print("football-data.org: {} fixtures".format(len(matches)))
+        return [_normalize_fixture(m, "football-data") for m in matches]
     except Exception as e:
-        print("Football API error: {}".format(e))
+        print("football-data.org error: {}".format(e))
         return []
+
+def _fetch_thesportsdb():
+    """Fetch from TheSportsDB (free, no key needed)"""
+    import requests as req
+    try:
+        today = datetime.now(LAGOS_TZ).strftime("%Y-%m-%d")
+        # TheSportsDB free endpoint - uses "1" as public key
+        r = req.get(
+            "https://www.thesportsdb.com/api/v1/json/3/eventsday.php?d={}&s=Soccer".format(today),
+            timeout=15
+        )
+        if r.status_code != 200:
+            print("TheSportsDB error: {}".format(r.status_code))
+            return []
+        events = r.json().get("events") or []
+        print("TheSportsDB: {} fixtures".format(len(events)))
+        return [_normalize_fixture(e, "thesportsdb") for e in events]
+    except Exception as e:
+        print("TheSportsDB error: {}".format(e))
+        return []
+
+def get_todays_fixtures():
+    """Try all 3 football APIs in order: API-Football → football-data.org → TheSportsDB"""
+    # Try API-Football first (richest data)
+    fixtures = _fetch_api_football()
+    if fixtures:
+        return fixtures
+    # Fallback to football-data.org
+    fixtures = _fetch_football_data()
+    if fixtures:
+        return fixtures
+    # Final fallback — TheSportsDB (no key needed)
+    return _fetch_thesportsdb()
 
 def analyze_match_with_claude(match):
     """Use Claude Haiku to analyze a match and output picks — CHEAP model"""
@@ -1336,7 +1425,7 @@ def dashboard():
 
 @app.route("/football")
 def football_page():
-    has_keys = bool(ANTHROPIC_KEY)  # OTP only needs Anthropic key
+    has_keys = bool(ANTHROPIC_KEY)  # OTP only needs Anthropic key; football APIs are tried in order
     try:
         conn = get_db()
         rows = conn.run("SELECT * FROM football_picks WHERE pick_type='limitless_otp' ORDER BY id DESC LIMIT 50")
