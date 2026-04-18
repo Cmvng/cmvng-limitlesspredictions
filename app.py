@@ -1935,6 +1935,20 @@ def manual_scan():
     threading.Thread(target=run_scan, daemon=True).start()
     return {"status": "scan triggered"}, 200
 
+@app.route("/football/clear", methods=["GET"])
+def clear_football_picks():
+    """Wipe old accumulator picks with broken formatting. Run once, then /football/scan."""
+    try:
+        conn = get_db()
+        conn.run(
+            "DELETE FROM football_picks WHERE pick_type != 'limitless_otp' "
+            "AND accumulator_tier IN ('safe_2x','medium_3x','value_10x','mega_100x')"
+        )
+        conn.close()
+        return {"status": "cleared all accumulator picks — now hit /football/scan to regenerate"}, 200
+    except Exception as e:
+        return {"error": str(e)}, 500
+
 @app.route("/football/scan", methods=["GET"])
 def manual_football_scan():
     """Manually trigger the football accumulator builder (instead of waiting 6 hours)."""
@@ -1946,7 +1960,7 @@ def manual_football_scan():
             fixtures = get_todays_fixtures()
             print("Manual football scan: {} fixtures".format(len(fixtures)))
             all_picks = []
-            for match in fixtures[:12]:
+            for match in fixtures[:20]:
                 picks = analyze_match_with_claude(match)
                 if picks:
                     for p in picks:
@@ -1965,7 +1979,7 @@ def manual_football_scan():
         except Exception as e:
             print("Manual football scan error: {}".format(e))
     threading.Thread(target=run_once, daemon=True).start()
-    return {"status": "football scan triggered — wait 60-90 seconds, then refresh /football"}, 200
+    return {"status": "football scan triggered — wait 60-90 seconds, then refresh /app/football"}, 200
 
 
 @app.route("/debug/otp")
