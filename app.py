@@ -1244,12 +1244,17 @@ def run_otp_scan():
                 }
                 
                 analysis = analyze_otp_market_with_claude(market, parsed)
-                if analysis and analysis.get("action") in ("YES", "NO"):
-                    # Only fire if AI confidence >= 75
-                    if analysis.get("confidence", 0) >= 65:
+                if analysis:
+                    action = analysis.get("action", "?")
+                    conf = analysis.get("confidence", 0)
+                    # Track all decisions for debugging
+                    if action in ("YES", "NO") and conf >= 60:
                         save_and_alert_otp(market, parsed, analysis)
                         count += 1
                         time.sleep(2)
+                    else:
+                        print("  OTP SKIP: [{}] {} (conf={}) - {}".format(
+                            action, parsed["title"][:40], conf, analysis.get("reasoning", "")[:40]))
             except Exception as e:
                 print("OTP market error: {}".format(e))
         
