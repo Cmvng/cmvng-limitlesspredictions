@@ -1730,14 +1730,18 @@ def save_accumulator_picks(accas):
             if not slips:
                 continue
             for slip_idx, slip in enumerate(slips):
+                slip_num = slip_idx + 1
                 for p in slip.get("picks", []):
                     match_str = p.get("match", "")
                     home, away = "", ""
                     if " vs " in match_str:
                         parts = match_str.split(" vs ", 1)
                         home, away = parts[0].strip(), parts[1].strip()
-                    # Store slip number in pick_type suffix so dashboard can group them
-                    slip_label = "{}_slip{}".format(tier_name, slip_idx + 1)
+                    # Build a readable pick description
+                    raw_type = p.get("pick_type", "")
+                    raw_value = str(p.get("pick_value", ""))
+                    # Create human-readable pick string
+                    readable = _format_pick_readable(raw_type, raw_value)
                     conn.run(
                         """INSERT INTO football_picks
                         (match_id, home_team, away_team, competition, kickoff_time,
@@ -1747,10 +1751,10 @@ def save_accumulator_picks(accas):
                         m=match_str[:100], h=home[:50], a=away[:50],
                         c=p.get("competition", "")[:50],
                         k=p.get("kickoff", ""),
-                        pt=slip_label,
-                        pv=str(p.get("pick_value", ""))[:50],
+                        pt=raw_type,
+                        pv=readable,
                         conf=float(p.get("confidence", 0)),
-                        r=str(p.get("reasoning", ""))[:200],
+                        r="Slip {} | {}".format(slip_num, str(p.get("reasoning", ""))[:180]),
                         o=float(p.get("implied_odds", 1.0)),
                         tier=tier_name,
                         now=now
@@ -1760,6 +1764,52 @@ def save_accumulator_picks(accas):
         print("Accumulators saved to DB: {} picks across {} tiers".format(total_saved, len(accas)))
     except Exception as e:
         print("Save accumulator error: {}".format(e))
+
+def _format_pick_readable(pick_type, pick_value):
+    """Convert pick_type + pick_value into human-readable text.
+    e.g. 'over_2.5_goals' + 'Over' -> 'Over 2.5 Goals'
+         'both_teams_score' + 'Yes' -> 'Both Teams Score: Yes'
+         'match_winner' + 'Home' -> 'Home Win'"""
+    t = (pick_type or "").lower()
+    v = (pick_value or "").strip()
+
+    mappings = {
+        "over_0.5_goals": "Over 0.5 Goals",
+        "over_1.5_goals": "Over 1.5 Goals",
+        "over_2.5_goals": "Over 2.5 Goals",
+        "over_3.5_goals": "Over 3.5 Goals",
+        "over_4.5_goals": "Over 4.5 Goals",
+        "both_teams_score": "Both Teams Score: {}".format(v),
+        "btts": "Both Teams Score: {}".format(v),
+        "btts_and_over_2.5": "BTTS & Over 2.5 Goals",
+        "match_winner": "{} Win".format(v) if v in ("Home", "Away") else "Draw" if v == "Draw" else "Winner: {}".format(v),
+        "draw_no_bet": "Draw No Bet: {}".format(v),
+        "double_chance": "Double Chance: {}".format(v),
+        "home_or_draw": "Home or Draw",
+        "away_or_draw": "Away or Draw",
+        "over_8.5_corners": "Over 8.5 Corners",
+        "over_9.5_corners": "Over 9.5 Corners",
+        "over_2.5_cards": "Over 2.5 Cards",
+        "over_3.5_cards": "Over 3.5 Cards",
+        "over_4.5_cards": "Over 4.5 Cards",
+        "first_half_over_0.5": "1st Half Over 0.5 Goals",
+        "first_half_over_1.5": "1st Half Over 1.5 Goals",
+        "clean_sheet_home": "Home Clean Sheet: {}".format(v),
+        "clean_sheet_away": "Away Clean Sheet: {}".format(v),
+        "win_to_nil_home": "Home Win to Nil",
+        "win_to_nil_away": "Away Win to Nil",
+        "handicap_home_minus1": "Home -1 Handicap",
+        "handicap_away_minus1": "Away -1 Handicap",
+    }
+
+    if t in mappings:
+        return mappings[t]
+
+    # Fallback: format the type nicely and append value
+    formatted = t.replace("_", " ").title()
+    if v and v.lower() not in formatted.lower():
+        formatted = "{}: {}".format(formatted, v)
+    return formatted
 
 def football_loop():
     """Run football analysis every 6 hours — scans multiple days ahead"""
@@ -2210,6 +2260,7 @@ tbody tr:hover{background:var(--bg)}
   </div>
   <div class="hdr-right">
     <nav class="nav-tabs">
+      <a href="/" class="nav-tab">Home</a>
       <a href="/app" class="nav-tab active">Crypto</a>
       <a href="/app/football" class="nav-tab">Football</a>
     </nav>
@@ -2407,6 +2458,7 @@ tbody tr:hover{background:var(--bg)}
     <div class="brand-text"><h1>Limitless</h1><small>CMVNG · Football Picks</small></div></div>
   <div style="display:flex;gap:12px">
     <nav class="nav-tabs">
+      <a href="/" class="nav-tab">Home</a>
       <a href="/app" class="nav-tab">Crypto</a>
       <a href="/app/football" class="nav-tab active">Football</a>
     </nav>
@@ -2464,11 +2516,11 @@ tbody tr:hover{background:var(--bg)}
       <div class="match-teams">{{ pick.match_id or (pick.home_team + " vs " + pick.away_team) }}</div>
       {{ match_meta(pick) }}
       <div class="pick-line">
-        <span class="pick-type">{{ pick.pick_type.replace("_", " ") }}</span>
         <span class="pick-value">{{ pick.pick_value or "—" }}</span>
         <div class="conf-bar"><div class="conf-bar-fill" style="width:{{ pick.confidence|int }}%"></div></div>
         <span class="pick-conf">{{ pick.confidence|int }}%</span>
       </div>
+      {% if pick.reasoning %}<div style="font-size:11px;color:var(--ink-4);margin-top:2px;font-style:italic">{{ pick.reasoning.split("| ", 1)[-1] if "| " in (pick.reasoning or "") else pick.reasoning }}</div>{% endif %}
     </div>
     {% endfor %}
   </div>
@@ -2932,11 +2984,38 @@ def dashboard():
     )
 
 def _group_picks_into_slips(picks, target_odds, hard_max_picks=10):
-    """Group picks into multiple accumulator slips, each REACHING at minimum the target odds.
-    Will keep adding picks until target is hit or hard_max_picks reached.
-    Incomplete slips (below target) are discarded unless no full slip exists."""
+    """Group picks into slips. If picks have 'Slip N' in reasoning (from save),
+    group by that. Otherwise group sequentially by odds."""
     if not picks:
         return []
+
+    # Check if picks have slip numbers embedded in reasoning
+    slip_groups = {}
+    has_slip_nums = False
+    for pick in picks:
+        reasoning = pick.get("reasoning", "") or ""
+        if reasoning.startswith("Slip "):
+            has_slip_nums = True
+            try:
+                slip_num = int(reasoning.split("|")[0].replace("Slip", "").strip())
+                slip_groups.setdefault(slip_num, []).append(pick)
+            except:
+                slip_groups.setdefault(999, []).append(pick)
+        else:
+            slip_groups.setdefault(999, []).append(pick)
+
+    if has_slip_nums and 999 not in slip_groups:
+        # Use the pre-assigned slip numbers
+        slips = []
+        for slip_num in sorted(slip_groups.keys()):
+            group = slip_groups[slip_num]
+            total_odds = 1.0
+            for p in group:
+                total_odds *= float(p.get("implied_odds") or 1.0)
+            slips.append({"picks": group, "total_odds": round(total_odds, 2), "slip_number": slip_num})
+        return slips
+
+    # Fallback: group sequentially
     sorted_picks = sorted(picks, key=lambda p: float(p.get("confidence") or 0), reverse=True)
     slips = []
     current_slip = []
@@ -2949,7 +3028,6 @@ def _group_picks_into_slips(picks, target_odds, hard_max_picks=10):
             continue
         current_slip.append(pick)
         current_odds *= odds
-        # Close slip ONLY when target is reached (not before)
         if current_odds >= target_odds:
             slips.append({"picks": current_slip, "total_odds": round(current_odds, 2),
                           "slip_number": slip_number})
@@ -2957,11 +3035,9 @@ def _group_picks_into_slips(picks, target_odds, hard_max_picks=10):
             current_odds = 1.0
             slip_number += 1
         elif len(current_slip) >= hard_max_picks:
-            # Too many picks, odds still below target — skip this slip, start fresh
             current_slip = []
             current_odds = 1.0
 
-    # If NO full slips were built AND we have a partial one that's reasonable, include it
     if not slips and current_slip and current_odds >= target_odds * 0.7:
         slips.append({"picks": current_slip, "total_odds": round(current_odds, 2),
                       "slip_number": slip_number})
