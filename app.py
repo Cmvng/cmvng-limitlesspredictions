@@ -596,58 +596,60 @@ def _get_limitless_balance():
         return _trading_state.get("last_balance") or _trading_state.get("starting_balance", 20.0)
 
 def _fetch_market_details(slug):
-    """Fetch full market details including venue and positionIds."""
+    """Fetch full market details including venue and positionIds.
+    Tries multiple approaches to find the trading data."""
     import requests as req
     try:
+        # Approach 1: GET /markets/{slug} — standard endpoint
         path = "/markets/{}".format(slug)
         headers = _hmac_headers("GET", path)
-        r = req.get(
-            "{}{}".format(LIMITLESS_API, path),
-            headers=headers,
-            timeout=10
-        )
+        r = req.get("{}{}".format(LIMITLESS_API, path), headers=headers, timeout=10)
+
         if r.status_code == 200:
             data = r.json()
-            # Log the keys we got so we can debug field names
-            print("Market {} keys: {}".format(slug[:40], list(data.keys())[:15]))
+            keys = list(data.keys())
+            print("Market [{}] keys: {}".format(slug[:40], keys))
 
-            # Handle different possible field names for venue
-            venue = data.get("venue") or data.get("clob") or data.get("exchange") or {}
-            if not venue and data.get("exchangeAddress"):
-                venue = {"exchange": data["exchangeAddress"]}
+            # Check if we got venue directly
+            if data.get("venue") and data.get("positionIds"):
+                print("Market: found venue + positionIds directly")
+                return data
 
-            # Handle different possible field names for position IDs
-            pos_ids = data.get("positionIds") or data.get("tokenIds") or data.get("tokens") or []
-            if not pos_ids:
-                # Some responses have tokens as a dict {yes: "id", no: "id"}
-                tokens = data.get("tokens", {})
-                if isinstance(tokens, dict):
-                    yes_id = tokens.get("yes") or tokens.get("YES") or tokens.get("0")
-                    no_id = tokens.get("no") or tokens.get("NO") or tokens.get("1")
-                    if yes_id and no_id:
-                        pos_ids = [yes_id, no_id]
-                elif isinstance(tokens, list) and len(tokens) >= 2:
-                    pos_ids = tokens
+            # Some markets return nested CLOB data
+            if data.get("clobTokenIds"):
+                data["positionIds"] = data["clobTokenIds"]
+                print("Market: found clobTokenIds: {}".format(data["clobTokenIds"][:2]))
 
-            # Store back into data for the caller
-            data["venue"] = venue
-            data["positionIds"] = pos_ids
+            # Log ALL fields for debugging
+            for k in keys:
+                v = data[k]
+                if isinstance(v, (str, int, float, bool)) and v:
+                    print("  {}: {}".format(k, str(v)[:100]))
+                elif isinstance(v, dict):
+                    print("  {}: dict({})".format(k, list(v.keys())[:5]))
+                elif isinstance(v, list) and len(v) > 0:
+                    print("  {}: list[{}] first={}".format(k, len(v), str(v[0])[:60]))
 
-            if not venue.get("exchange") and not pos_ids:
-                print("Market details WARNING: no venue or positionIds found. Full response keys: {}".format(
-                    list(data.keys())))
-                # Print a sample of the data to help debug
-                for k in list(data.keys())[:10]:
-                    v = data[k]
-                    if isinstance(v, (str, int, float, bool)):
-                        print("  {}: {}".format(k, str(v)[:80]))
-                    elif isinstance(v, dict):
-                        print("  {}: dict with keys {}".format(k, list(v.keys())[:5]))
-                    elif isinstance(v, list):
-                        print("  {}: list len {}".format(k, len(v)))
+            # If no venue, try fetching without HMAC (public endpoint)
+            if not data.get("venue"):
+                r2 = req.get("{}{}".format(LIMITLESS_API, path), timeout=10)
+                if r2.status_code == 200:
+                    data2 = r2.json()
+                    if data2.get("venue"):
+                        print("Market: found venue via public endpoint")
+                        return data2
+                    # Check if public returns different keys
+                    new_keys = [k for k in data2.keys() if k not in keys]
+                    if new_keys:
+                        print("Market: public endpoint has extra keys: {}".format(new_keys))
+                        data.update(data2)
 
             return data
-        print("Market details failed for {}: {} {}".format(slug[:40], r.status_code, r.text[:100]))
+        else:
+            print("Market fetch failed: {} {}".format(r.status_code, r.text[:200]))
+
+        # Approach 2: Try with market ID instead of slug
+        # The slug might not be the right identifier
         return None
     except Exception as e:
         print("Market details error: {}".format(e))
@@ -779,11 +781,24 @@ def execute_trade(parsed_market, score, prediction_id):
             return False
 
         venue = market_data.get("venue", {})
-        exchange_addr = venue.get("exchange", "")
-        position_ids = market_data.get("positionIds", [])
+        exchange_addr = venue.get("exchange", "") if isinstance(venue, dict) else ""
+        position_ids = market_data.get("positionIds") or market_data.get("clobTokenIds") or []
 
-        if not exchange_addr or len(position_ids) < 2:
-            print("Auto-trade skipped: missing venue/positionIds for {}".format(slug))
+        # Try tokens dict as fallback
+        if not position_ids:
+            tokens = market_data.get("tokens", {})
+            if isinstance(tokens, dict):
+                yes_id = tokens.get("yes") or tokens.get("Yes") or tokens.get("YES")
+                no_id = tokens.get("no") or tokens.get("No") or tokens.get("NO")
+                if yes_id and no_id:
+                    position_ids = [str(yes_id), str(no_id)]
+
+        if not exchange_addr:
+            print("Auto-trade skipped: no venue.exchange for {} — market may not support CLOB trading".format(slug[:40]))
+            return False
+
+        if len(position_ids) < 2:
+            print("Auto-trade skipped: no positionIds for {} — found: {}".format(slug[:40], position_ids))
             return False
 
         # positionIds[0] = YES token, positionIds[1] = NO token
