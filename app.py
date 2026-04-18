@@ -15,9 +15,10 @@ DATABASE_URL     = os.environ.get("DATABASE_URL", "")
 ANTHROPIC_KEY    = os.environ.get("ANTHROPIC_API_KEY", "")
 FOOTBALL_DATA_KEY = os.environ.get("FOOTBALL_DATA_KEY", "")
 
-# Auto-trading credentials
-LIMITLESS_API_KEY    = os.environ.get("LIMITLESS_API_KEY", "")      # lmts_...
-LIMITLESS_PRIV_KEY   = os.environ.get("LIMITLESS_PRIVATE_KEY", "")  # 0x...
+# Auto-trading credentials (HMAC auth + EIP-712 signing)
+LIMITLESS_TOKEN_ID     = os.environ.get("LIMITLESS_TOKEN_ID", "")      # from Derive Token
+LIMITLESS_TOKEN_SECRET = os.environ.get("LIMITLESS_TOKEN_SECRET", "")  # from Derive Token (one-time)
+LIMITLESS_PRIV_KEY     = os.environ.get("LIMITLESS_PRIVATE_KEY", "")   # MetaMask private key 0x...
 
 LAGOS_TZ      = timezone(timedelta(hours=1))
 LIMITLESS_API = "https://api.limitless.exchange"
@@ -285,7 +286,7 @@ def score_market(p, btc_trend, price, debug_log=None):
 
     # 1. Time window — skip if auto-trading is off AND outside Lagos window
     #    When auto-trading is on, scan 24/7
-    auto_trading_on = bool(LIMITLESS_API_KEY and LIMITLESS_PRIV_KEY and _trading_state.get("enabled"))
+    auto_trading_on = bool(_has_trading_keys() and _trading_state.get("enabled"))
     if not auto_trading_on and not is_lagos_window() and not is_fav:
         return reject("outside Lagos window (auto-trade off)")
 
@@ -483,7 +484,7 @@ def save_and_alert(p, score, price, btc_trend):
         print("ALERT #{}: {} {} at {:.1f}%".format(pid, bet_side, p["title"][:50], score["bet_odds"]))
 
         # Auto-trade if enabled
-        if LIMITLESS_API_KEY and LIMITLESS_PRIV_KEY:
+        if _has_trading_keys():
             try:
                 execute_trade(p, score, pid)
             except Exception as te:
@@ -491,6 +492,33 @@ def save_and_alert(p, score, price, btc_trend):
 
     except Exception as e:
         print("Alert error: {}".format(e))
+
+# ═══════════════════════════════════════════════════════════
+# HMAC AUTHENTICATION FOR LIMITLESS API
+# ═══════════════════════════════════════════════════════════
+
+def _hmac_headers(method, path, body=""):
+    """Build HMAC-signed headers for Limitless API requests."""
+    import hmac as hmac_mod, hashlib, base64
+    timestamp = datetime.now(timezone.utc).isoformat()
+    message = "{}\n{}\n{}\n{}".format(timestamp, method, path, body)
+    signature = base64.b64encode(
+        hmac_mod.new(
+            base64.b64decode(LIMITLESS_TOKEN_SECRET),
+            message.encode("utf-8"),
+            hashlib.sha256,
+        ).digest()
+    ).decode("utf-8")
+    return {
+        "lmts-api-key": LIMITLESS_TOKEN_ID,
+        "lmts-timestamp": timestamp,
+        "lmts-signature": signature,
+        "Content-Type": "application/json",
+    }
+
+def _has_trading_keys():
+    """Check if all 3 trading credentials are set."""
+    return bool(LIMITLESS_TOKEN_ID and LIMITLESS_TOKEN_SECRET and LIMITLESS_PRIV_KEY)
 
 # ═══════════════════════════════════════════════════════════
 # AUTO-TRADING ENGINE
@@ -510,19 +538,20 @@ def _get_limitless_balance():
     """Fetch USDC balance from Limitless portfolio."""
     import requests as req
     try:
+        path = "/portfolio/allowance"
+        headers = _hmac_headers("GET", path)
         r = req.get(
-            "{}/portfolio/allowance".format(LIMITLESS_API),
-            headers={"X-API-Key": LIMITLESS_API_KEY},
+            "{}{}".format(LIMITLESS_API, path),
+            headers=headers,
             timeout=10
         )
         if r.status_code == 200:
             data = r.json()
-            # Balance is in USDC (6 decimals) — convert to dollars
             balance = float(data.get("balance", 0)) / 1e6 if data.get("balance", 0) > 100 else float(data.get("balance", 0))
             _trading_state["last_balance"] = balance
             return balance
         else:
-            print("Balance check failed: {} {}".format(r.status_code, r.text[:100]))
+            print("Balance check failed: {} {}".format(r.status_code, r.text[:200]))
             return _trading_state.get("last_balance")
     except Exception as e:
         print("Balance error: {}".format(e))
@@ -532,9 +561,11 @@ def _fetch_market_details(slug):
     """Fetch full market details including venue and positionIds."""
     import requests as req
     try:
+        path = "/markets/{}".format(slug)
+        headers = _hmac_headers("GET", path)
         r = req.get(
-            "{}/markets/{}".format(LIMITLESS_API, slug),
-            headers={"X-API-Key": LIMITLESS_API_KEY},
+            "{}{}".format(LIMITLESS_API, path),
+            headers=headers,
             timeout=10
         )
         if r.status_code == 200:
@@ -608,8 +639,8 @@ def execute_trade(parsed_market, score, prediction_id):
     import requests as req
 
     # Pre-checks
-    if not LIMITLESS_API_KEY or not LIMITLESS_PRIV_KEY:
-        print("Auto-trade skipped: missing API key or private key")
+    if not _has_trading_keys():
+        print("Auto-trade skipped: missing trading credentials")
         return False
 
     if not _trading_state["enabled"]:
@@ -746,13 +777,14 @@ def execute_trade(parsed_market, score, prediction_id):
             "orderType": "FOK",
         }
 
+        order_body = json.dumps(order_payload)
+        path = "/orders"
+        headers = _hmac_headers("POST", path, order_body)
+
         r = req.post(
-            "{}/orders".format(LIMITLESS_API),
-            headers={
-                "X-API-Key": LIMITLESS_API_KEY,
-                "Content-Type": "application/json",
-            },
-            json=order_payload,
+            "{}{}".format(LIMITLESS_API, path),
+            headers=headers,
+            data=order_body,
             timeout=15,
         )
 
@@ -2324,7 +2356,7 @@ def trading_status():
         "high_pct": _trading_state["high_pct"],
         "medium_pct": _trading_state["medium_pct"],
         "daily_loss_limit_pct": _trading_state["daily_loss_limit_pct"],
-        "has_keys": bool(LIMITLESS_API_KEY and LIMITLESS_PRIV_KEY),
+        "has_keys": _has_trading_keys(),
         "schedule": "AUTO: 6am-1pm & 6pm-6am Lagos | SIGNALS ONLY: 1pm-6pm Lagos",
     }, 200
 
