@@ -2450,466 +2450,444 @@ LANDING_HTML = """<!DOCTYPE html>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Cmvng — Prediction Intelligence</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Inter+Tight:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400;1,9..40,500&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">
 <style>
 :root {
-  --ink: #ffffff;
-  --ink-2: rgba(255,255,255,.75);
-  --ink-3: rgba(255,255,255,.5);
-  --ink-4: rgba(255,255,255,.28);
-  --ink-5: rgba(255,255,255,.12);
-  --bg: #050505;
-  --bg-2: #0a0a0a;
-  --surface: rgba(255,255,255,.03);
-  --surface-hover: rgba(255,255,255,.06);
-  --border: rgba(255,255,255,.08);
-  --accent: #d4ff00;
-  --accent-dim: rgba(212,255,0,.15);
-  --positive: #4ade80;
-  --display: 'Instrument Serif', 'Times New Roman', serif;
-  --sans: 'Inter Tight', -apple-system, sans-serif;
-  --mono: 'JetBrains Mono', monospace;
+  --ink: #0f1a12;
+  --ink-2: #2d3e32;
+  --ink-3: #5a7060;
+  --ink-4: #8fa698;
+  --bg: #f6faf4;
+  --bg-2: #eef5eb;
+  --bg-3: #e4ede0;
+  --surface: #ffffff;
+  --border: rgba(15,26,18,.08);
+  --border-strong: rgba(15,26,18,.14);
+  --green: #16a34a;
+  --green-dark: #0d7a36;
+  --green-light: #dcfce7;
+  --green-glow: rgba(22,163,74,.12);
+  --emerald: #065f46;
+  --lime: #84cc16;
+  --display: 'DM Sans', sans-serif;
+  --mono: 'Space Mono', monospace;
 }
 *{box-sizing:border-box;margin:0;padding:0}
-::selection{background:var(--accent);color:#000}
 html{scroll-behavior:smooth}
-body{font-family:var(--sans);background:var(--bg);color:var(--ink);-webkit-font-smoothing:antialiased;overflow-x:hidden;min-height:100vh}
+body{font-family:var(--display);background:var(--bg);color:var(--ink);-webkit-font-smoothing:antialiased;overflow-x:hidden}
+::selection{background:var(--green-light);color:var(--emerald)}
 
-/* Grain overlay */
-body::after{content:'';position:fixed;inset:0;background-image:url("data:image/svg+xml,%3Csvg viewBox='0 0 200 200' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='noiseFilter'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23noiseFilter)' opacity='0.8'/%3E%3C/svg%3E");opacity:.04;pointer-events:none;z-index:1000;mix-blend-mode:overlay}
-
-/* Reactive gradient follow-cursor */
-.bg-glow{position:fixed;inset:0;pointer-events:none;z-index:0;overflow:hidden}
-.bg-glow::before{content:'';position:absolute;width:800px;height:800px;border-radius:50%;background:radial-gradient(circle,rgba(212,255,0,.08) 0%,transparent 70%);left:var(--mx,50%);top:var(--my,50%);transform:translate(-50%,-50%);transition:left .3s,top .3s;filter:blur(40px)}
-.bg-glow::after{content:'';position:absolute;top:-200px;right:-200px;width:600px;height:600px;border-radius:50%;background:radial-gradient(circle,rgba(255,255,255,.03) 0%,transparent 70%);filter:blur(60px)}
-
-.nav{position:fixed;top:0;left:0;right:0;z-index:100;padding:22px 48px;display:flex;justify-content:space-between;align-items:center;backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px);background:rgba(5,5,5,.5);border-bottom:1px solid var(--border)}
-.logo{display:flex;align-items:center;gap:12px;text-decoration:none;color:var(--ink)}
-.logo-mark{width:32px;height:32px;border-radius:50%;background:var(--accent);position:relative;overflow:hidden}
-.logo-mark::before{content:'';position:absolute;inset:8px;border-radius:50%;background:var(--bg)}
-.logo-mark::after{content:'';position:absolute;inset:14px;border-radius:50%;background:var(--accent)}
-.logo-text{font-family:var(--display);font-size:22px;letter-spacing:-.02em;font-weight:400}
-.logo-text em{font-style:italic}
-.nav-links{display:flex;gap:36px;align-items:center}
-.nav-link{color:var(--ink-2);text-decoration:none;font-size:13px;font-weight:400;transition:color .2s;letter-spacing:.01em}
+/* NAV */
+.nav{position:fixed;top:0;left:0;right:0;z-index:100;padding:16px 40px;display:flex;justify-content:space-between;align-items:center;background:rgba(246,250,244,.85);backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px);border-bottom:1px solid var(--border)}
+.logo{display:flex;align-items:center;gap:10px;text-decoration:none;color:var(--ink)}
+.logo-icon{width:36px;height:36px;border-radius:10px;background:var(--green);display:flex;align-items:center;justify-content:center;position:relative;overflow:hidden}
+.logo-icon svg{width:20px;height:20px;fill:none;stroke:#fff;stroke-width:2.5;stroke-linecap:round;stroke-linejoin:round}
+.logo-text{font-weight:700;font-size:20px;letter-spacing:-.03em}
+.logo-text span{color:var(--green)}
+.nav-links{display:flex;gap:32px;align-items:center}
+.nav-link{color:var(--ink-3);text-decoration:none;font-size:14px;font-weight:500;transition:color .2s}
 .nav-link:hover{color:var(--ink)}
-.btn{font-family:var(--sans);font-size:13px;font-weight:500;padding:10px 20px;border-radius:100px;border:1px solid var(--border);background:transparent;color:var(--ink);text-decoration:none;display:inline-flex;align-items:center;gap:8px;cursor:pointer;transition:all .2s;letter-spacing:.01em}
-.btn:hover{background:rgba(255,255,255,.05);border-color:rgba(255,255,255,.2)}
-.btn-primary{background:var(--accent);color:#000;border-color:var(--accent);font-weight:600}
-.btn-primary:hover{background:#e4ff33;border-color:#e4ff33;box-shadow:0 0 30px rgba(212,255,0,.3)}
-.btn svg{width:14px;height:14px}
-
-main{position:relative;z-index:2}
+.btn{font-family:var(--display);font-size:14px;font-weight:600;padding:10px 22px;border-radius:10px;border:none;cursor:pointer;transition:all .2s;text-decoration:none;display:inline-flex;align-items:center;gap:8px}
+.btn-outline{background:transparent;border:1.5px solid var(--border-strong);color:var(--ink)}
+.btn-outline:hover{border-color:var(--green);color:var(--green)}
+.btn-green{background:var(--green);color:#fff;box-shadow:0 2px 12px var(--green-glow)}
+.btn-green:hover{background:var(--green-dark);box-shadow:0 4px 20px rgba(22,163,74,.25);transform:translateY(-1px)}
 
 /* HERO */
-.hero{min-height:100vh;display:flex;flex-direction:column;justify-content:center;padding:120px 48px 80px;position:relative}
-.hero-label{font-size:11px;font-family:var(--mono);color:var(--ink-3);text-transform:uppercase;letter-spacing:.2em;margin-bottom:32px;display:flex;align-items:center;gap:14px;opacity:0;animation:fadeUp 1s .2s forwards}
-.hero-label::before{content:'';width:40px;height:1px;background:var(--ink-3)}
-.hero-label .dot{width:6px;height:6px;background:var(--accent);border-radius:50%;animation:pulse 2s infinite}
-.hero-title{font-family:var(--display);font-size:clamp(64px,11vw,180px);line-height:.92;letter-spacing:-.04em;font-weight:400;max-width:1100px;margin-bottom:32px;opacity:0;animation:fadeUp 1.2s .4s forwards}
-.hero-title em{font-style:italic;color:var(--accent)}
-.hero-sub{font-size:18px;line-height:1.55;color:var(--ink-2);max-width:580px;margin-bottom:48px;font-weight:300;opacity:0;animation:fadeUp 1s .7s forwards}
-.hero-cta{display:flex;gap:12px;flex-wrap:wrap;align-items:center;opacity:0;animation:fadeUp 1s .9s forwards}
-.hero-meta{margin-top:80px;display:flex;gap:48px;flex-wrap:wrap;font-family:var(--mono);font-size:11px;color:var(--ink-4);text-transform:uppercase;letter-spacing:.15em;opacity:0;animation:fadeUp 1s 1.1s forwards}
-.hero-meta-item{display:flex;flex-direction:column;gap:6px}
-.hero-meta-item strong{color:var(--ink);font-size:13px;font-family:var(--mono);font-weight:500;letter-spacing:.02em}
+.hero{padding:140px 40px 80px;display:grid;grid-template-columns:1fr 1fr;gap:64px;align-items:center;max-width:1320px;margin:0 auto;min-height:100vh}
+.hero-content{max-width:580px}
+.hero-badge{display:inline-flex;align-items:center;gap:8px;padding:6px 14px 6px 8px;background:var(--green-light);border-radius:100px;font-size:12px;font-weight:600;color:var(--emerald);margin-bottom:28px}
+.hero-badge .pulse{width:8px;height:8px;border-radius:50%;background:var(--green);animation:pulse 2s infinite}
+@keyframes pulse{0%,100%{opacity:1;box-shadow:0 0 0 0 rgba(22,163,74,.4)}70%{opacity:.8;box-shadow:0 0 0 8px rgba(22,163,74,0)}}
+.hero-title{font-size:clamp(40px,5.5vw,64px);font-weight:700;line-height:1.08;letter-spacing:-.04em;margin-bottom:24px}
+.hero-title .accent{color:var(--green)}
+.hero-sub{font-size:18px;line-height:1.6;color:var(--ink-3);font-weight:400;margin-bottom:36px;max-width:480px}
+.hero-cta{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:48px}
+.hero-stats{display:flex;gap:40px;padding-top:32px;border-top:1px solid var(--border)}
+.hero-stat{display:flex;flex-direction:column;gap:4px}
+.hero-stat-val{font-size:28px;font-weight:700;letter-spacing:-.03em;color:var(--green)}
+.hero-stat-label{font-size:12px;color:var(--ink-4);font-weight:500;text-transform:uppercase;letter-spacing:.06em}
 
-@keyframes fadeUp{from{opacity:0;transform:translateY(24px)}to{opacity:1;transform:translateY(0)}}
-@keyframes pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.4;transform:scale(.8)}}
+/* Hero visual — chart + football card */
+.hero-visual{position:relative;height:520px}
+.chart-card{position:absolute;top:0;right:0;width:100%;max-width:480px;background:var(--surface);border-radius:20px;border:1px solid var(--border);padding:28px;box-shadow:0 20px 60px rgba(0,0,0,.06);z-index:2}
+.chart-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:20px}
+.chart-title{font-weight:600;font-size:15px;display:flex;align-items:center;gap:8px}
+.chart-title .dot{width:8px;height:8px;border-radius:50%;background:var(--green)}
+.chart-change{font-size:13px;font-weight:600;color:var(--green);background:var(--green-light);padding:4px 10px;border-radius:6px}
+.chart-svg{width:100%;height:140px}
+.chart-labels{display:flex;justify-content:space-between;margin-top:8px;font-size:11px;color:var(--ink-4);font-family:var(--mono)}
 
-/* Product card 3D tilt */
-.hero-card{position:absolute;right:48px;top:50%;transform:translateY(-50%);width:380px;height:520px;perspective:1200px;display:none}
-@media(min-width:1280px){.hero-card{display:block}}
-.card-3d{position:relative;width:100%;height:100%;transform-style:preserve-3d;transition:transform .15s ease-out;border-radius:24px;background:linear-gradient(135deg,#1a1a1a 0%,#0a0a0a 100%);border:1px solid var(--border);overflow:hidden;box-shadow:0 50px 100px -20px rgba(0,0,0,.8)}
-.card-3d::before{content:'';position:absolute;inset:0;background:radial-gradient(circle at var(--mx,50%) var(--my,50%),rgba(212,255,0,.15) 0%,transparent 50%);pointer-events:none}
-.card-header{padding:32px;display:flex;justify-content:space-between;align-items:flex-start}
-.card-chip{width:48px;height:36px;border-radius:6px;background:linear-gradient(135deg,#d4af37,#8a6914);opacity:.7}
-.card-logo{font-family:var(--display);font-size:20px;font-style:italic;color:var(--accent)}
-.card-number{padding:0 32px;margin-top:auto;font-family:var(--mono);font-size:20px;letter-spacing:.08em;color:var(--ink);opacity:.9}
-.card-bottom{padding:20px 32px 32px;display:flex;justify-content:space-between;align-items:center;margin-top:80px}
-.card-name{font-size:13px;letter-spacing:.1em;color:var(--ink-2);text-transform:uppercase}
-.card-brand{font-family:var(--display);font-size:18px;font-style:italic}
+/* Football card floating */
+.match-card{position:absolute;bottom:20px;left:0;width:280px;background:var(--surface);border-radius:16px;border:1px solid var(--border);padding:20px;box-shadow:0 16px 48px rgba(0,0,0,.08);z-index:3;animation:floatCard 4s ease-in-out infinite}
+@keyframes floatCard{0%,100%{transform:translateY(0)}50%{transform:translateY(-8px)}}
+.match-header{display:flex;align-items:center;gap:8px;margin-bottom:16px}
+.match-league{font-size:11px;font-weight:600;color:var(--green);background:var(--green-light);padding:3px 8px;border-radius:4px}
+.match-time{font-size:11px;color:var(--ink-4);font-family:var(--mono)}
+.match-teams{display:flex;flex-direction:column;gap:10px;margin-bottom:16px}
+.match-team{display:flex;align-items:center;justify-content:space-between;font-size:14px;font-weight:500}
+.match-team .flag{width:22px;height:22px;border-radius:50%;background:var(--bg-3);display:flex;align-items:center;justify-content:center;font-size:12px;margin-right:8px}
+.match-pick{padding:10px 14px;background:var(--green-light);border-radius:10px;display:flex;justify-content:space-between;align-items:center}
+.match-pick-label{font-size:12px;color:var(--emerald);font-weight:600}
+.match-pick-val{font-size:13px;font-weight:700;color:var(--green)}
 
-/* SECTIONS */
-section{padding:120px 48px;position:relative}
-.section-label{font-size:11px;font-family:var(--mono);color:var(--ink-3);text-transform:uppercase;letter-spacing:.2em;margin-bottom:32px;display:flex;align-items:center;gap:14px}
-.section-label::before{content:'';width:40px;height:1px;background:var(--ink-3)}
-.section-title{font-family:var(--display);font-size:clamp(42px,6vw,88px);line-height:1;letter-spacing:-.03em;font-weight:400;max-width:900px;margin-bottom:24px}
-.section-title em{font-style:italic;color:var(--accent)}
-.section-sub{font-size:17px;line-height:1.55;color:var(--ink-2);max-width:580px;font-weight:300;margin-bottom:64px}
+/* OTP card floating */
+.otp-card{position:absolute;top:60px;left:40px;width:220px;background:var(--surface);border-radius:14px;border:1px solid var(--border);padding:16px;box-shadow:0 12px 36px rgba(0,0,0,.06);z-index:1;animation:floatOtp 5s ease-in-out infinite .5s}
+@keyframes floatOtp{0%,100%{transform:translateY(0) rotate(-2deg)}50%{transform:translateY(-6px) rotate(-2deg)}}
+.otp-title{font-size:11px;font-weight:600;color:var(--ink-4);text-transform:uppercase;letter-spacing:.08em;margin-bottom:10px}
+.otp-item{display:flex;align-items:center;gap:6px;padding:6px 0;font-size:12px;color:var(--ink-2);border-top:1px solid var(--border)}
+.otp-item:first-of-type{border-top:none}
+.otp-badge{padding:2px 6px;border-radius:4px;font-size:10px;font-weight:700}
+.otp-yes{background:var(--green-light);color:var(--green)}
+.otp-no{background:#fef2f2;color:#dc2626}
 
-/* Reveal on scroll */
-.reveal{opacity:0;transform:translateY(40px);transition:opacity .8s ease-out,transform .8s ease-out}
-.reveal.in{opacity:1;transform:translateY(0)}
+@media(max-width:960px){
+  .hero{grid-template-columns:1fr;gap:40px;min-height:auto;padding-top:120px}
+  .hero-visual{height:400px;max-width:480px}
+}
+@media(max-width:640px){
+  .hero{padding:100px 20px 40px}
+  .hero-visual{display:none}
+  .hero-stats{gap:24px}
+}
 
 /* FEATURES */
-.features{background:var(--bg-2);border-top:1px solid var(--border);border-bottom:1px solid var(--border)}
-.features-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:1px;background:var(--border);border:1px solid var(--border);border-radius:4px;overflow:hidden}
-.feature{padding:48px;background:var(--bg-2);position:relative;transition:background .3s;cursor:default;min-height:280px;display:flex;flex-direction:column}
-.feature:hover{background:var(--bg)}
-.feature-num{font-family:var(--mono);font-size:11px;color:var(--ink-4);letter-spacing:.2em;margin-bottom:24px}
-.feature-title{font-family:var(--display);font-size:32px;line-height:1.05;margin-bottom:16px;letter-spacing:-.02em;font-weight:400}
-.feature-title em{font-style:italic;color:var(--accent)}
-.feature-desc{font-size:14px;line-height:1.6;color:var(--ink-2);font-weight:300;max-width:420px}
-.feature-icon{margin-top:auto;padding-top:32px;font-family:var(--mono);font-size:11px;color:var(--ink-3);letter-spacing:.15em;text-transform:uppercase;display:flex;align-items:center;gap:8px}
-.feature-icon::before{content:'';width:16px;height:1px;background:var(--accent)}
-@media(max-width:800px){.features-grid{grid-template-columns:1fr}}
+.features{padding:120px 40px;max-width:1320px;margin:0 auto}
+.section-eyebrow{font-size:12px;font-weight:600;color:var(--green);text-transform:uppercase;letter-spacing:.1em;margin-bottom:16px}
+.section-heading{font-size:clamp(32px,4vw,48px);font-weight:700;line-height:1.1;letter-spacing:-.03em;margin-bottom:16px;max-width:700px}
+.section-heading .accent{color:var(--green)}
+.section-desc{font-size:16px;color:var(--ink-3);max-width:520px;line-height:1.6;margin-bottom:64px}
+.feat-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:20px}
+.feat{background:var(--surface);border:1px solid var(--border);border-radius:16px;padding:32px 28px;transition:all .25s;position:relative;overflow:hidden}
+.feat:hover{border-color:var(--green);transform:translateY(-2px);box-shadow:0 12px 32px var(--green-glow)}
+.feat-icon{width:48px;height:48px;border-radius:12px;background:var(--green-light);display:flex;align-items:center;justify-content:center;margin-bottom:20px;font-size:22px}
+.feat-name{font-size:17px;font-weight:700;margin-bottom:10px;letter-spacing:-.02em}
+.feat-text{font-size:13px;color:var(--ink-3);line-height:1.55}
+.feat-tag{margin-top:16px;font-size:11px;font-family:var(--mono);color:var(--green);font-weight:700}
+@media(max-width:900px){.feat-grid{grid-template-columns:repeat(2,1fr)}}
+@media(max-width:560px){.feat-grid{grid-template-columns:1fr}.features{padding:80px 20px}}
 
-/* HOW IT WORKS - horizontal scroll */
-.how{padding:120px 0 120px}
-.how-intro{padding:0 48px 80px}
-.how-rail{display:flex;gap:24px;padding:0 48px;overflow-x:auto;scroll-snap-type:x mandatory;scrollbar-width:none;padding-bottom:24px}
-.how-rail::-webkit-scrollbar{display:none}
-.how-step{flex:0 0 520px;scroll-snap-align:start;background:linear-gradient(180deg,rgba(255,255,255,.02) 0%,rgba(255,255,255,0) 100%);border:1px solid var(--border);border-radius:20px;padding:48px;position:relative;overflow:hidden}
-.how-step::before{content:attr(data-num);position:absolute;top:-40px;right:-20px;font-family:var(--display);font-size:320px;line-height:1;color:rgba(255,255,255,.02);font-style:italic;pointer-events:none}
-.how-step-label{font-family:var(--mono);font-size:11px;color:var(--accent);letter-spacing:.2em;margin-bottom:24px}
-.how-step-title{font-family:var(--display);font-size:48px;line-height:1.05;letter-spacing:-.03em;margin-bottom:20px;font-weight:400}
-.how-step-title em{font-style:italic}
-.how-step-desc{font-size:15px;line-height:1.6;color:var(--ink-2);font-weight:300}
+/* HOW IT WORKS */
+.how{padding:120px 40px;background:var(--bg-2)}
+.how-inner{max-width:1320px;margin:0 auto}
+.steps{display:grid;grid-template-columns:repeat(3,1fr);gap:32px;margin-top:64px}
+.step{background:var(--surface);border:1px solid var(--border);border-radius:16px;padding:36px 28px;position:relative}
+.step-num{position:absolute;top:20px;right:24px;font-size:80px;font-weight:700;color:var(--bg-3);line-height:1;letter-spacing:-.06em}
+.step-icon{width:44px;height:44px;border-radius:50%;background:var(--green);display:flex;align-items:center;justify-content:center;margin-bottom:20px;color:#fff;font-size:18px;font-weight:700}
+.step-title{font-size:20px;font-weight:700;margin-bottom:12px;letter-spacing:-.02em}
+.step-desc{font-size:14px;color:var(--ink-3);line-height:1.6}
+@media(max-width:800px){.steps{grid-template-columns:1fr}}
+@media(max-width:560px){.how{padding:80px 20px}}
 
 /* STATS */
-.stats-section{padding:160px 48px;border-top:1px solid var(--border)}
-.stats-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:0}
-.stat-block{padding:0 32px;border-left:1px solid var(--border)}
-.stat-block:first-child{border-left:none;padding-left:0}
-.stat-label{font-family:var(--mono);font-size:10px;color:var(--ink-3);text-transform:uppercase;letter-spacing:.2em;margin-bottom:16px}
-.stat-value{font-family:var(--display);font-size:clamp(48px,5vw,80px);line-height:1;letter-spacing:-.03em;font-weight:400;color:var(--ink)}
-.stat-value em{font-style:italic;color:var(--accent);font-size:.55em;vertical-align:top;margin-left:.1em}
-.stat-desc{margin-top:12px;font-size:12px;color:var(--ink-3);font-weight:300}
-@media(max-width:800px){.stats-grid{grid-template-columns:repeat(2,1fr);gap:48px 0}.stat-block{border-left:none;padding:0}.stat-block:nth-child(n+3){border-top:1px solid var(--border);padding-top:48px}}
+.stats{padding:120px 40px;max-width:1320px;margin:0 auto}
+.stats-row{display:grid;grid-template-columns:repeat(4,1fr);gap:0;background:var(--surface);border:1px solid var(--border);border-radius:20px;overflow:hidden;margin-top:48px}
+.stat{padding:40px 32px;border-right:1px solid var(--border);text-align:center}
+.stat:last-child{border-right:none}
+.stat-num{font-size:clamp(36px,4vw,52px);font-weight:700;color:var(--green);letter-spacing:-.04em;line-height:1}
+.stat-unit{font-size:14px;color:var(--ink-3);font-weight:500;margin-top:8px}
+@media(max-width:800px){.stats-row{grid-template-columns:repeat(2,1fr)}.stat:nth-child(2){border-right:none}.stat:nth-child(n+3){border-top:1px solid var(--border)}}
+@media(max-width:560px){.stats{padding:80px 20px}}
 
 /* PLANS */
-.plans{padding:160px 48px;background:var(--bg-2);border-top:1px solid var(--border);border-bottom:1px solid var(--border)}
-.plans-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:24px;margin-top:64px}
-.plan{border:1px solid var(--border);border-radius:20px;padding:40px;background:rgba(255,255,255,.01);position:relative;transition:all .3s}
-.plan:hover{border-color:rgba(255,255,255,.16);background:rgba(255,255,255,.02);transform:translateY(-2px)}
-.plan-featured{border:1px solid var(--accent);background:linear-gradient(180deg,rgba(212,255,0,.05) 0%,transparent 50%)}
-.plan-featured::before{content:'Recommended';position:absolute;top:-12px;left:40px;padding:4px 12px;background:var(--accent);color:#000;font-size:10px;font-family:var(--mono);font-weight:500;border-radius:100px;letter-spacing:.1em;text-transform:uppercase}
-.plan-name{font-family:var(--display);font-size:28px;font-weight:400;letter-spacing:-.01em;margin-bottom:8px}
-.plan-name em{font-style:italic}
-.plan-price{font-family:var(--display);font-size:56px;line-height:1;letter-spacing:-.04em;font-weight:400;margin:32px 0 8px}
-.plan-price em{font-style:italic;color:var(--accent)}
-.plan-price small{font-size:16px;color:var(--ink-3);font-family:var(--sans);margin-left:4px}
-.plan-desc{font-size:13px;color:var(--ink-2);margin-bottom:32px;line-height:1.6;font-weight:300}
-.plan-list{list-style:none;margin-bottom:40px}
-.plan-list li{font-size:13px;padding:10px 0;color:var(--ink-2);display:flex;align-items:flex-start;gap:12px;border-top:1px solid var(--border);font-weight:300}
-.plan-list li:first-child{border-top:none}
-.plan-list li::before{content:'→';color:var(--accent);flex-shrink:0;margin-top:1px}
-.plan-cta{width:100%;text-align:center;justify-content:center}
-@media(max-width:900px){.plans-grid{grid-template-columns:1fr}}
+.plans{padding:120px 40px;background:var(--bg-2)}
+.plans-inner{max-width:1320px;margin:0 auto}
+.plan-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:24px;margin-top:48px}
+.plan{background:var(--surface);border:1px solid var(--border);border-radius:20px;padding:36px 28px;transition:all .25s;display:flex;flex-direction:column}
+.plan:hover{transform:translateY(-2px);box-shadow:0 16px 40px rgba(0,0,0,.06)}
+.plan-featured{border:2px solid var(--green);position:relative}
+.plan-featured::before{content:'Best value';position:absolute;top:-13px;left:28px;padding:4px 14px;background:var(--green);color:#fff;font-size:11px;font-weight:700;border-radius:100px;letter-spacing:.04em}
+.plan-name{font-size:22px;font-weight:700;margin-bottom:4px;letter-spacing:-.02em}
+.plan-price{font-size:44px;font-weight:700;color:var(--green);letter-spacing:-.04em;margin:20px 0 8px}
+.plan-price small{font-size:15px;color:var(--ink-4);font-weight:500}
+.plan-desc{font-size:13px;color:var(--ink-3);line-height:1.55;margin-bottom:24px}
+.plan-features{list-style:none;margin-bottom:32px;flex:1}
+.plan-features li{padding:8px 0;font-size:13px;color:var(--ink-2);display:flex;align-items:center;gap:10px}
+.plan-features li::before{content:'✓';width:20px;height:20px;border-radius:50%;background:var(--green-light);color:var(--green);display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:700;flex-shrink:0}
+.plan .btn{width:100%;justify-content:center}
+@media(max-width:800px){.plan-grid{grid-template-columns:1fr}}
+@media(max-width:560px){.plans{padding:80px 20px}}
 
 /* FOOTER */
-footer{padding:80px 48px 48px;border-top:1px solid var(--border)}
-.footer-main{display:grid;grid-template-columns:2fr 1fr 1fr 1fr;gap:48px;margin-bottom:64px}
-.footer-col h4{font-family:var(--mono);font-size:10px;color:var(--ink-3);letter-spacing:.2em;text-transform:uppercase;margin-bottom:20px;font-weight:500}
-.footer-col ul{list-style:none}
-.footer-col li{padding:6px 0}
-.footer-col a{color:var(--ink-2);text-decoration:none;font-size:13px;transition:color .2s;font-weight:300}
-.footer-col a:hover{color:var(--ink)}
-.footer-brand{max-width:380px}
-.footer-brand p{font-size:14px;color:var(--ink-2);line-height:1.6;margin-top:20px;font-weight:300}
-.footer-bar{display:flex;justify-content:space-between;align-items:center;padding-top:32px;border-top:1px solid var(--border);font-size:11px;color:var(--ink-4);font-family:var(--mono);letter-spacing:.1em;flex-wrap:wrap;gap:16px}
-@media(max-width:800px){.footer-main{grid-template-columns:1fr 1fr;gap:40px}.footer-brand{grid-column:1/-1}}
+footer{padding:64px 40px 32px;border-top:1px solid var(--border);max-width:1320px;margin:0 auto}
+.footer-top{display:grid;grid-template-columns:2fr 1fr 1fr 1fr;gap:48px;margin-bottom:48px}
+.footer-brand p{font-size:14px;color:var(--ink-3);margin-top:16px;line-height:1.6;max-width:320px}
+.footer-col h5{font-size:12px;font-weight:700;color:var(--ink-4);text-transform:uppercase;letter-spacing:.08em;margin-bottom:16px}
+.footer-col a{display:block;padding:5px 0;color:var(--ink-3);text-decoration:none;font-size:14px;transition:color .2s}
+.footer-col a:hover{color:var(--green)}
+.footer-bar{display:flex;justify-content:space-between;padding-top:24px;border-top:1px solid var(--border);font-size:12px;color:var(--ink-4);flex-wrap:wrap;gap:12px}
+@media(max-width:800px){.footer-top{grid-template-columns:1fr 1fr;gap:32px}.footer-brand{grid-column:1/-1}}
+@media(max-width:560px){footer{padding:48px 20px 24px}}
 
-/* Mobile */
-@media(max-width:720px){
-  .nav{padding:18px 20px}
-  .nav-links{gap:16px}
-  .nav-link:not(.btn){display:none}
-  .hero,section{padding-left:20px;padding-right:20px}
-  .hero{padding:100px 20px 60px}
-  .hero-meta{gap:24px;margin-top:48px}
-  .how-rail{padding:0 20px}
-  .how-intro{padding:0 20px 48px}
-  .how-step{flex:0 0 85vw}
-  footer{padding:64px 20px 32px}
-  .feature{padding:32px;min-height:240px}
-}
+/* Animations */
+.reveal{opacity:0;transform:translateY(32px);transition:opacity .7s ease-out,transform .7s ease-out}
+.reveal.in{opacity:1;transform:translateY(0)}
 </style></head><body>
-<div class="bg-glow" id="bgGlow"></div>
 
 <nav class="nav">
   <a href="/" class="logo">
-    <div class="logo-mark"></div>
-    <span class="logo-text">Cmvng<em>.</em></span>
+    <div class="logo-icon">
+      <svg viewBox="0 0 24 24"><polyline points="22 7 13.5 15.5 8.5 10.5 2 17"/><polyline points="16 7 22 7 22 13"/></svg>
+    </div>
+    <span class="logo-text">Cmvng<span>.</span></span>
   </a>
   <div class="nav-links">
     <a href="#features" class="nav-link">Features</a>
     <a href="#how" class="nav-link">How it works</a>
     <a href="#stats" class="nav-link">Stats</a>
-    <a href="#plans" class="nav-link">Plans</a>
-    <a href="/app" class="btn btn-primary">Open Dashboard <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M7 17L17 7M17 7H7M17 7V17"/></svg></a>
+    <a href="/app" class="btn btn-green">Open Dashboard →</a>
   </div>
 </nav>
 
-<main>
-
 <!-- HERO -->
 <section class="hero">
-  <div class="hero-label"><span class="dot"></span>Live · Tracking {{ markets_total }} active markets</div>
-  <h1 class="hero-title">The sharpest<br>edge in <em>predictions</em><br>begins here.</h1>
-  <p class="hero-sub">An AI-powered intelligence layer for prediction markets. We scan thousands of live markets on Limitless Exchange, apply football heuristics with decades of statistical data, and surface only the trades with real edge — delivered to Telegram the moment they qualify.</p>
-  <div class="hero-cta">
-    <a href="/app" class="btn btn-primary">Enter Dashboard <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M7 17L17 7M17 7H7M17 7V17"/></svg></a>
-    <a href="#how" class="btn">Learn how it works</a>
-  </div>
-
-  <div class="hero-meta">
-    <div class="hero-meta-item">
-      <span>Scanner</span>
-      <strong>{{ btc_trend or "LIVE" }}</strong>
+  <div class="hero-content">
+    <div class="hero-badge"><span class="pulse"></span> Live · Tracking {{ markets_total }} markets</div>
+    <h1 class="hero-title">Smarter bets start with<br><span class="accent">better signals.</span></h1>
+    <p class="hero-sub">AI-powered prediction intelligence for Limitless Exchange. We scan crypto prices and football markets, surface the edge, and deliver picks straight to Telegram.</p>
+    <div class="hero-cta">
+      <a href="/app" class="btn btn-green">Enter Dashboard →</a>
+      <a href="#how" class="btn btn-outline">How it works</a>
     </div>
-    <div class="hero-meta-item">
-      <span>Crypto Signals</span>
-      <strong>{{ crypto_total }}</strong>
-    </div>
-    <div class="hero-meta-item">
-      <span>Win Rate</span>
-      <strong>{{ win_rate }}%</strong>
-    </div>
-    <div class="hero-meta-item">
-      <span>Status</span>
-      <strong>{{ "OPEN" if in_window else "CLOSED" }}</strong>
+    <div class="hero-stats">
+      <div class="hero-stat">
+        <span class="hero-stat-val" data-count="{{ crypto_total }}">0</span>
+        <span class="hero-stat-label">Predictions</span>
+      </div>
+      <div class="hero-stat">
+        <span class="hero-stat-val" data-count="{{ win_rate }}">0<small>%</small></span>
+        <span class="hero-stat-label">Win Rate</span>
+      </div>
+      <div class="hero-stat">
+        <span class="hero-stat-val">{{ "OPEN" if in_window else "CLOSED" }}</span>
+        <span class="hero-stat-label">Window</span>
+      </div>
     </div>
   </div>
 
-  <div class="hero-card" id="heroCard">
-    <div class="card-3d" id="card3d">
-      <div class="card-header">
-        <div class="card-chip"></div>
-        <div class="card-logo"><em>Cmvng</em></div>
+  <div class="hero-visual">
+    <!-- Crypto chart card -->
+    <div class="chart-card">
+      <div class="chart-head">
+        <div class="chart-title"><span class="dot" style="background:var(--green)"></span> BTC/USD · {{ btc_trend or "LIVE" }}</div>
+        <span class="chart-change">+2.4%</span>
       </div>
-      <div class="card-number">•••• •••• •••• 2026</div>
-      <div class="card-bottom">
-        <div>
-          <div class="card-name">Predictions</div>
-        </div>
-        <div class="card-brand"><em>Intelligence</em></div>
+      <svg class="chart-svg" viewBox="0 0 440 140" fill="none">
+        <defs>
+          <linearGradient id="chartGrad" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stop-color="#16a34a" stop-opacity=".18"/>
+            <stop offset="100%" stop-color="#16a34a" stop-opacity="0"/>
+          </linearGradient>
+        </defs>
+        <path d="M0 120 C40 110,60 95,80 100 C100 105,120 85,160 70 C200 55,220 75,260 50 C300 25,320 40,360 20 C380 10,420 30,440 15" stroke="#16a34a" stroke-width="2.5" fill="none"/>
+        <path d="M0 120 C40 110,60 95,80 100 C100 105,120 85,160 70 C200 55,220 75,260 50 C300 25,320 40,360 20 C380 10,420 30,440 15 L440 140 L0 140 Z" fill="url(#chartGrad)"/>
+        <circle cx="440" cy="15" r="4" fill="#16a34a"/>
+        <circle cx="440" cy="15" r="8" fill="#16a34a" opacity=".3">
+          <animate attributeName="r" values="8;14;8" dur="2s" repeatCount="indefinite"/>
+          <animate attributeName="opacity" values=".3;0;.3" dur="2s" repeatCount="indefinite"/>
+        </circle>
+      </svg>
+      <div class="chart-labels"><span>12h ago</span><span>8h</span><span>4h</span><span>Now</span></div>
+    </div>
+
+    <!-- Football match card -->
+    <div class="match-card">
+      <div class="match-header">
+        <span class="match-league">EPL</span>
+        <span class="match-time">SAT 12:30</span>
       </div>
+      <div class="match-teams">
+        <div class="match-team"><span><span class="flag">🏴</span> Brentford</span><span style="color:var(--ink-4)">46.8%</span></div>
+        <div class="match-team"><span><span class="flag">⚪</span> Fulham</span><span style="color:var(--ink-4)">28.5%</span></div>
+      </div>
+      <div class="match-pick">
+        <span class="match-pick-label">AI Pick: BTTS Yes</span>
+        <span class="match-pick-val">58%</span>
+      </div>
+    </div>
+
+    <!-- OTP card -->
+    <div class="otp-card">
+      <div class="otp-title">Off The Pitch</div>
+      <div class="otp-item"><span class="otp-badge otp-yes">YES</span> 4+ cards: 62%</div>
+      <div class="otp-item"><span class="otp-badge otp-yes">YES</span> Over 2.5: 55%</div>
+      <div class="otp-item"><span class="otp-badge otp-no">NO</span> 11+ corners: 60%</div>
     </div>
   </div>
 </section>
 
 <!-- FEATURES -->
 <section class="features reveal" id="features">
-  <div class="section-label">Capabilities</div>
-  <h2 class="section-title">Every decision,<br><em>informed.</em></h2>
-  <p class="section-sub">Four distinct engines work in parallel — each tuned for a different class of opportunity. Together they form a complete intelligence system for prediction markets.</p>
+  <div class="section-eyebrow">What we do</div>
+  <h2 class="section-heading">Four engines, one <span class="accent">edge.</span></h2>
+  <p class="section-desc">Each module targets a different opportunity class. Together they cover crypto prices, match outcomes, and football props on Limitless Exchange.</p>
 
-  <div class="features-grid">
-    <div class="feature">
-      <div class="feature-num">01</div>
-      <div class="feature-title">Crypto <em>scanner</em></div>
-      <div class="feature-desc">Real-time monitoring of price-based markets with BTC trend alignment, Lagos-timezone filtering, and confidence-weighted position sizing. Fires only when the setup meets every strategy rule.</div>
-      <div class="feature-icon">Every 5 minutes</div>
+  <div class="feat-grid">
+    <div class="feat">
+      <div class="feat-icon">📈</div>
+      <div class="feat-name">Crypto Scanner</div>
+      <div class="feat-text">Monitors BTC, ETH, SOL, ADA and more. Fires when price direction, trend, and odds window all align.</div>
+      <div class="feat-tag">Every 5 min</div>
     </div>
-    <div class="feature">
-      <div class="feature-num">02</div>
-      <div class="feature-title">Football <em>accumulators</em></div>
-      <div class="feature-desc">Four-tier stacking system — 2x, 3x, 10x, 100x targets. Each match appears in only one tier. Smart distribution ensures every target is reachable with unique picks.</div>
-      <div class="feature-icon">AI + Heuristics</div>
+    <div class="feat">
+      <div class="feat-icon">⚽</div>
+      <div class="feat-name">Accumulators</div>
+      <div class="feat-text">4-tier system building 2x, 3x, 10x, and 100x slips from 200+ live football matches daily.</div>
+      <div class="feat-tag">4 tiers</div>
     </div>
-    <div class="feature">
-      <div class="feature-num">03</div>
-      <div class="feature-title">Off-the-pitch <em>props</em></div>
-      <div class="feature-desc">Prop markets analyzed through a hybrid engine — statistical heuristics from decades of football data, with AI backup for complex matchups. Zero dependency on rate-limited APIs.</div>
-      <div class="feature-icon">Hybrid engine</div>
+    <div class="feat">
+      <div class="feat-icon">🎯</div>
+      <div class="feat-name">OTP Props</div>
+      <div class="feat-text">Hybrid engine: statistical heuristics from real match data + AI backup. Cards, corners, goals, BTTS.</div>
+      <div class="feat-tag">Free + instant</div>
     </div>
-    <div class="feature">
-      <div class="feature-num">04</div>
-      <div class="feature-title">Outcome <em>tracking</em></div>
-      <div class="feature-desc">Auto-resolving win/loss verification using live match data. Every signal is marked, measured, and tracked — so edge can be proven, not assumed.</div>
-      <div class="feature-icon">Auto-resolve</div>
+    <div class="feat">
+      <div class="feat-icon">✅</div>
+      <div class="feat-name">Outcome Tracking</div>
+      <div class="feat-text">Every pick auto-resolves against real match results. Win rates are earned, not claimed.</div>
+      <div class="feat-tag">Auto-resolve</div>
     </div>
   </div>
 </section>
 
 <!-- HOW IT WORKS -->
 <section class="how reveal" id="how">
-  <div class="how-intro">
-    <div class="section-label">The method</div>
-    <h2 class="section-title">Three steps.<br><em>Thousands of markets.</em></h2>
-    <p class="section-sub">The workflow is intentionally simple. Complexity lives under the hood — the experience stays effortless.</p>
-  </div>
+  <div class="how-inner">
+    <div class="section-eyebrow">The process</div>
+    <h2 class="section-heading">Scan. Analyze. <span class="accent">Decide.</span></h2>
+    <p class="section-desc">Complexity under the hood, simplicity in your hands.</p>
 
-  <div class="how-rail">
-    <div class="how-step" data-num="1">
-      <div class="how-step-label">Step one</div>
-      <div class="how-step-title">We <em>scan.</em></div>
-      <div class="how-step-desc">Every 5 minutes, the scanner pulls every active market from Limitless Exchange. Prices, odds, expiry times, trend alignment — all cross-referenced against your strategy rules in real time.</div>
-    </div>
-    <div class="how-step" data-num="2">
-      <div class="how-step-label">Step two</div>
-      <div class="how-step-title">AI <em>analyzes.</em></div>
-      <div class="how-step-desc">For football markets, a hybrid engine applies real bookmaker-grade heuristics. For complex matchups, Claude Haiku 4.5 steps in with team form data. Every pick has reasoning you can read.</div>
-    </div>
-    <div class="how-step" data-num="3">
-      <div class="how-step-label">Step three</div>
-      <div class="how-step-title">You <em>decide.</em></div>
-      <div class="how-step-desc">Signals land in Telegram within seconds of qualifying. Click through to Limitless, place the bet, or skip. The dashboard tracks outcomes automatically — so you learn what&apos;s working.</div>
+    <div class="steps">
+      <div class="step">
+        <div class="step-num">1</div>
+        <div class="step-icon">⟳</div>
+        <div class="step-title">We scan</div>
+        <div class="step-desc">Every 5 minutes, the bot pulls all active markets from Limitless. Crypto prices, football fixtures, prop markets — all checked in real time against your strategy rules.</div>
+      </div>
+      <div class="step">
+        <div class="step-num">2</div>
+        <div class="step-icon">◎</div>
+        <div class="step-title">AI analyzes</div>
+        <div class="step-desc">Football heuristics from decades of data. Claude AI for edge cases. Each pick includes confidence, reasoning, and the exact market link. No black boxes.</div>
+      </div>
+      <div class="step">
+        <div class="step-num">3</div>
+        <div class="step-icon">→</div>
+        <div class="step-title">You decide</div>
+        <div class="step-desc">Signals hit Telegram instantly. Click through to Limitless, place the bet, or skip it. The dashboard tracks everything — so you know what is working.</div>
+      </div>
     </div>
   </div>
 </section>
 
 <!-- STATS -->
-<section class="stats-section reveal" id="stats">
-  <div class="section-label">By the numbers</div>
-  <h2 class="section-title">Built on <em>data.</em><br>Not assumption.</h2>
+<section class="stats reveal" id="stats">
+  <div class="section-eyebrow">Live numbers</div>
+  <h2 class="section-heading">Proof is in the <span class="accent">data.</span></h2>
 
-  <div class="stats-grid" style="margin-top:80px">
-    <div class="stat-block">
-      <div class="stat-label">Total predictions</div>
-      <div class="stat-value" data-count="{{ crypto_total }}">0</div>
-      <div class="stat-desc">Across all engines</div>
+  <div class="stats-row">
+    <div class="stat">
+      <div class="stat-num" data-count="{{ crypto_total }}">0</div>
+      <div class="stat-unit">Total predictions</div>
     </div>
-    <div class="stat-block">
-      <div class="stat-label">Markets monitored</div>
-      <div class="stat-value" data-count="{{ markets_total }}">0</div>
-      <div class="stat-desc">Refreshed every 5 min</div>
+    <div class="stat">
+      <div class="stat-num" data-count="{{ markets_total }}">0</div>
+      <div class="stat-unit">Markets monitored</div>
     </div>
-    <div class="stat-block">
-      <div class="stat-label">Win rate</div>
-      <div class="stat-value" data-count="{{ win_rate }}"><em>%</em></div>
-      <div class="stat-desc">Of resolved signals</div>
+    <div class="stat">
+      <div class="stat-num" data-count="{{ win_rate }}">0<small>%</small></div>
+      <div class="stat-unit">Win rate</div>
     </div>
-    <div class="stat-block">
-      <div class="stat-label">Response latency</div>
-      <div class="stat-value" data-count="5"><em>min</em></div>
-      <div class="stat-desc">Scanner interval</div>
+    <div class="stat">
+      <div class="stat-num">5<small>min</small></div>
+      <div class="stat-unit">Scan interval</div>
     </div>
   </div>
 </section>
 
 <!-- PLANS -->
 <section class="plans reveal" id="plans">
-  <div class="section-label">Access tiers</div>
-  <h2 class="section-title">Free for now.<br><em>Premium soon.</em></h2>
-  <p class="section-sub">The system runs entirely for personal use today. Future tiers will open access for serious traders who want signals without running infrastructure.</p>
+  <div class="plans-inner">
+    <div class="section-eyebrow">Access</div>
+    <h2 class="section-heading">Start free. <span class="accent">Upgrade later.</span></h2>
 
-  <div class="plans-grid">
-    <div class="plan">
-      <div class="plan-name">Observer</div>
-      <div class="plan-price">Free</div>
-      <div class="plan-desc">Read-only access to published pick history and win rates.</div>
-      <ul class="plan-list">
-        <li>View resolved signals</li>
-        <li>Public leaderboard</li>
-        <li>No Telegram alerts</li>
-      </ul>
-      <a href="/app" class="btn plan-cta">View dashboard</a>
-    </div>
-
-    <div class="plan plan-featured">
-      <div class="plan-name">Operator <em>—</em></div>
-      <div class="plan-price"><em>$29</em> <small>/mo</small></div>
-      <div class="plan-desc">Real-time alerts for every qualifying signal across all engines.</div>
-      <ul class="plan-list">
-        <li>All crypto signals via Telegram</li>
-        <li>4-tier football accumulators</li>
-        <li>Off-the-pitch picks</li>
-        <li>Outcome tracking</li>
-        <li>Strategy transparency</li>
-      </ul>
-      <a href="/app" class="btn btn-primary plan-cta">Coming soon</a>
-    </div>
-
-    <div class="plan">
-      <div class="plan-name">Desk</div>
-      <div class="plan-price">Custom</div>
-      <div class="plan-desc">For desks running multiple strategies or custom rule sets.</div>
-      <ul class="plan-list">
-        <li>Custom strategy engine</li>
-        <li>API access</li>
-        <li>Dedicated support</li>
-        <li>SLA guarantees</li>
-      </ul>
-      <a href="#" class="btn plan-cta">Get in touch</a>
+    <div class="plan-grid">
+      <div class="plan">
+        <div class="plan-name">Observer</div>
+        <div class="plan-price">Free</div>
+        <div class="plan-desc">Browse the dashboard, see resolved picks and win rates.</div>
+        <ul class="plan-features">
+          <li>View dashboard</li>
+          <li>Resolved pick history</li>
+          <li>Public stats</li>
+        </ul>
+        <a href="/app" class="btn btn-outline">View dashboard</a>
+      </div>
+      <div class="plan plan-featured">
+        <div class="plan-name">Operator</div>
+        <div class="plan-price">$29 <small>/mo</small></div>
+        <div class="plan-desc">Full access: every signal, every market, every engine.</div>
+        <ul class="plan-features">
+          <li>Telegram alerts</li>
+          <li>4-tier accumulators</li>
+          <li>OTP props</li>
+          <li>Crypto signals</li>
+          <li>Outcome tracking</li>
+        </ul>
+        <a href="/app" class="btn btn-green">Coming soon</a>
+      </div>
+      <div class="plan">
+        <div class="plan-name">Desk</div>
+        <div class="plan-price">Custom</div>
+        <div class="plan-desc">For teams running custom strategies at scale.</div>
+        <ul class="plan-features">
+          <li>Custom rules engine</li>
+          <li>API access</li>
+          <li>Dedicated support</li>
+        </ul>
+        <a href="#" class="btn btn-outline">Contact</a>
+      </div>
     </div>
   </div>
 </section>
 
 <!-- FOOTER -->
 <footer>
-  <div class="footer-main">
-    <div class="footer-col footer-brand">
+  <div class="footer-top">
+    <div class="footer-brand">
       <a href="/" class="logo">
-        <div class="logo-mark"></div>
-        <span class="logo-text">Cmvng<em>.</em></span>
+        <div class="logo-icon">
+          <svg viewBox="0 0 24 24"><polyline points="22 7 13.5 15.5 8.5 10.5 2 17"/><polyline points="16 7 22 7 22 13"/></svg>
+        </div>
+        <span class="logo-text">Cmvng<span>.</span></span>
       </a>
-      <p>Prediction intelligence, built for operators who treat markets as craft. Not a signal seller — a system.</p>
+      <p>Prediction intelligence for operators. Not a signal group — a system.</p>
     </div>
     <div class="footer-col">
-      <h4>Product</h4>
-      <ul>
-        <li><a href="/app">Dashboard</a></li>
-        <li><a href="/app/football">Football</a></li>
-        <li><a href="#features">Features</a></li>
-        <li><a href="#plans">Plans</a></li>
-      </ul>
+      <h5>Product</h5>
+      <a href="/app">Dashboard</a>
+      <a href="/app/football">Football</a>
+      <a href="#features">Features</a>
     </div>
     <div class="footer-col">
-      <h4>Resources</h4>
-      <ul>
-        <li><a href="#how">How it works</a></li>
-        <li><a href="#stats">Statistics</a></li>
-        <li><a href="/debug" target="_blank">System status</a></li>
-      </ul>
+      <h5>Resources</h5>
+      <a href="#how">How it works</a>
+      <a href="#stats">Statistics</a>
     </div>
     <div class="footer-col">
-      <h4>Connect</h4>
-      <ul>
-        <li><a href="#">Telegram</a></li>
-        <li><a href="https://limitless.exchange" target="_blank">Limitless Exchange</a></li>
-      </ul>
+      <h5>Connect</h5>
+      <a href="#">Telegram</a>
+      <a href="https://limitless.exchange" target="_blank">Limitless</a>
     </div>
   </div>
   <div class="footer-bar">
     <span>© 2026 Cmvng Predictions</span>
-    <span>Built for operators · Not financial advice</span>
+    <span>Not financial advice</span>
   </div>
 </footer>
 
-</main>
-
 <script>
-// Cursor-reactive gradient
-const glow = document.getElementById('bgGlow');
-document.addEventListener('mousemove', (e) => {
-  glow.style.setProperty('--mx', e.clientX + 'px');
-  glow.style.setProperty('--my', e.clientY + 'px');
-});
-
-// 3D tilt card
-const card = document.getElementById('card3d');
-const cardContainer = document.getElementById('heroCard');
-if (card && cardContainer) {
-  cardContainer.addEventListener('mousemove', (e) => {
-    const rect = cardContainer.getBoundingClientRect();
-    const x = (e.clientX - rect.left) / rect.width;
-    const y = (e.clientY - rect.top) / rect.height;
-    const rotY = (x - 0.5) * 24;
-    const rotX = (0.5 - y) * 24;
-    card.style.transform = `rotateX(${rotX}deg) rotateY(${rotY}deg)`;
-    card.style.setProperty('--mx', (x*100)+'%');
-    card.style.setProperty('--my', (y*100)+'%');
-  });
-  cardContainer.addEventListener('mouseleave', () => {
-    card.style.transform = 'rotateX(0) rotateY(0)';
-  });
-}
-
-// Reveal on scroll
-const revealObs = new IntersectionObserver((entries) => {
-  entries.forEach(e => {
-    if (e.isIntersecting) {
-      e.target.classList.add('in');
-    }
-  });
-}, { threshold: 0.12 });
-document.querySelectorAll('.reveal').forEach(el => revealObs.observe(el));
-
-// Count-up numbers
+// Count-up animation
 const countObs = new IntersectionObserver((entries) => {
   entries.forEach(entry => {
     if (!entry.isIntersecting) return;
@@ -2917,15 +2895,14 @@ const countObs = new IntersectionObserver((entries) => {
     if (el.dataset.counted) return;
     el.dataset.counted = '1';
     const target = parseFloat(el.dataset.count) || 0;
-    const suffix = el.querySelector('em')?.outerHTML || '';
-    const duration = 1400;
+    const suffix = el.querySelector('small')?.outerHTML || '';
+    const duration = 1200;
     const start = performance.now();
     const tick = (now) => {
       const p = Math.min(1, (now - start) / duration);
       const eased = 1 - Math.pow(1 - p, 3);
       const val = target * eased;
-      const display = target < 10 ? val.toFixed(1) : Math.round(val).toLocaleString();
-      el.innerHTML = display + suffix;
+      el.innerHTML = (target < 10 ? val.toFixed(1) : Math.round(val).toLocaleString()) + suffix;
       if (p < 1) requestAnimationFrame(tick);
     };
     requestAnimationFrame(tick);
@@ -2933,6 +2910,12 @@ const countObs = new IntersectionObserver((entries) => {
   });
 }, { threshold: 0.4 });
 document.querySelectorAll('[data-count]').forEach(el => countObs.observe(el));
+
+// Reveal on scroll
+const revealObs = new IntersectionObserver((entries) => {
+  entries.forEach(e => { if (e.isIntersecting) e.target.classList.add('in'); });
+}, { threshold: 0.1 });
+document.querySelectorAll('.reveal').forEach(el => revealObs.observe(el));
 </script>
 
 </body></html>"""
