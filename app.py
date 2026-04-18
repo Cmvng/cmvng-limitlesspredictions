@@ -672,6 +672,22 @@ def check_football_outcomes():
                 resolved_count += 1
                 print("Football #{} -> {} (score: {}-{})".format(
                     p["id"], outcome, result.get("home_goals"), result.get("away_goals")))
+                # Notify on Telegram
+                try:
+                    emoji = "✅" if won else "❌"
+                    send_telegram(
+                        "{} <b>FOOTBALL {} — #{}</b>\n"
+                        "📌 {}\n"
+                        "⚽ Final: {}-{}\n"
+                        "🎯 Pick: {} = {}".format(
+                            emoji, outcome, p["id"],
+                            p.get("match_id", ""),
+                            result.get("home_goals", "?"), result.get("away_goals", "?"),
+                            p.get("pick_type", ""), p.get("pick_value", "")
+                        )
+                    )
+                except:
+                    pass
                 time.sleep(0.5)  # pace API calls
             except Exception as e:
                 print("Football outcome #{}: {}".format(p["id"], e))
@@ -900,7 +916,7 @@ def get_todays_fixtures():
     return _fetch_thesportsdb()
 
 def analyze_match_with_claude(match):
-    """Use Claude Haiku to analyze a match and output picks — CHEAP model"""
+    """Use Claude Haiku to analyze a match like a seasoned punter — worst case scenario thinking"""
     if not ANTHROPIC_KEY:
         return None
     import requests as req
@@ -913,25 +929,57 @@ def analyze_match_with_claude(match):
             "Football match: {} vs {}\n"
             "League: {}\n"
             "Kickoff: {}\n\n"
-            "Act like a football betting analyst. Return a JSON array of 8-12 REALISTIC prediction picks with REALISTIC BOOKMAKER ODDS.\n\n"
-            "REQUIRED MIX (give me variety):\n"
-            "- 3 SAFE picks (confidence 80-95): odds 1.18-1.40\n"
-            "  Examples: Over 0.5 goals (1.10), Over 1.5 goals (1.35), match to have a corner (1.15)\n"
-            "- 3 MEDIUM picks (confidence 70-82): odds 1.50-2.00\n"
-            "  Examples: BTTS Yes (1.75), Over 2.5 goals (1.85), double chance home/draw (1.40)\n"
-            "- 3 VALUE picks (confidence 60-72): odds 2.00-3.50\n"
-            "  Examples: match winner home (2.20), over 3.5 goals (2.50), first to score away (2.80)\n"
-            "- 2 MEGA LONGSHOT picks (confidence 40-60): odds 4.00-10.00\n"
-            "  Examples: correct score (6.00), both teams to score AND over 3.5 goals (3.50), team to win by 2+ (4.50)\n\n"
+            "You are a SEASONED PUNTER with 20 years experience. You think in WORST-CASE SCENARIOS.\n\n"
+            "YOUR PHILOSOPHY:\n"
+            "- Never trust media hype. If bookies tip Chelsea to win 3-0, check their actual form first.\n"
+            "- Check recent form (last 5 games), head-to-head records, home/away performance.\n"
+            "- A team that hasnt scored in 4 games wont suddenly score 3 goals.\n"
+            "- Big game pressure often means FEWER goals, not more.\n"
+            "- New managers usually start with defensive tactics.\n"
+            "- Injured key players massively affect team output.\n"
+            "- The SAFEST bet is always the one where it takes an UNEXPECTED event to lose.\n\n"
+            "FOR THE 2x SAFE TIER — think: what is ALMOST CERTAIN to happen?\n"
+            "- Over 0.5 goals (a goalless draw takes an unexpected event)\n"
+            "- Over 1.5 goals (most matches have 2+ goals)\n"
+            "- Over 7.5 corners (most competitive matches hit 8+)\n"
+            "- Both teams to get a card (its the Premier League / Serie A / etc)\n"
+            "- Over 0.5 first half goals (if both teams are attacking)\n"
+            "These should have implied odds 1.10-1.45 — safe, boring, almost certain.\n\n"
+            "FOR THE 3x TIER — same philosophy but more picks stacked:\n"
+            "- Similar safety level to 2x picks, just more of them\n"
+            "- Over 2.5 goals only if BOTH teams have been scoring recently\n"
+            "- BTTS only if both teams have scored in 4+ of last 5\n"
+            "- Implied odds 1.15-1.50\n\n"
+            "FOR THE 10x TIER — calculated risk based on data:\n"
+            "- BTTS when both teams average 1.2+ goals\n"
+            "- Over 2.5 goals in attacking matchups\n"
+            "- Match winner when one team dominates head-to-head\n"
+            "- Double chance for the team with better recent form\n"
+            "- Implied odds 1.60-3.00\n\n"
+            "FOR THE 100x TIER — long shots with genuine reasoning:\n"
+            "- Both teams to score AND over 2.5 (needs attacking match)\n"
+            "- Correct score 1-1 or 2-1 (most common scorelines)\n"
+            "- Over 3.5 goals (only in genuinely open matches)\n"
+            "- First half over 1.5 goals (in fast-starting teams)\n"
+            "- Home/away win to nil (strong defence vs weak attack)\n"
+            "- Implied odds 3.00-12.00\n\n"
+            "Return a JSON array of 10-14 picks:\n"
+            "- 4 SAFE picks: confidence 82-95, implied_odds 1.10-1.45\n"
+            "- 3 MEDIUM picks: confidence 75-85, implied_odds 1.15-1.50\n"
+            "- 4 VALUE picks: confidence 60-78, implied_odds 1.60-3.00\n"
+            "- 3 MEGA picks: confidence 40-62, implied_odds 3.00-12.00\n\n"
             "STRICT RULES:\n"
             "- pick_value MUST be ONE OF: Yes, No, Home, Away, Draw, Over, Under\n"
-            "- pick_type options: match_winner, both_teams_score, over_0.5_goals, over_1.5_goals, over_2.5_goals, over_3.5_goals, draw_no_bet, double_chance, over_0.5_corners_ht, over_2.5_cards, over_9.5_corners, first_half_over_0.5, first_half_over_1.5, clean_sheet_home, clean_sheet_away, win_to_nil_home, win_to_nil_away, home_or_draw, away_or_draw, btts_and_over_2.5\n"
-            "- implied_odds MUST be realistic bookmaker-style decimal odds (1.10-10.00)\n"
-            "- NEVER leave pick_value blank\n"
-            "- reasoning: max 80 chars, betting-analyst style\n\n"
-            "Spread your picks across DIFFERENT bet types (not all over 0.5 goals). Use your knowledge of team form, recent results, and realistic probabilities.\n\n"
-            'Example pick: {{"pick_type":"both_teams_score","pick_value":"Yes","confidence":75,"implied_odds":1.72,"reasoning":"both avg 1.4 goals scored, 1.2 conceded last 5"}}\n\n'
-            "Output ONLY the JSON array. No markdown, no preamble, no commentary."
+            "- pick_type options: match_winner, both_teams_score, over_0.5_goals, over_1.5_goals, "
+            "over_2.5_goals, over_3.5_goals, draw_no_bet, double_chance, over_8.5_corners, "
+            "over_9.5_corners, over_2.5_cards, over_3.5_cards, over_4.5_cards, "
+            "first_half_over_0.5, first_half_over_1.5, clean_sheet_home, clean_sheet_away, "
+            "win_to_nil_home, win_to_nil_away, home_or_draw, away_or_draw, "
+            "btts_and_over_2.5, handicap_home_minus1, handicap_away_minus1\n"
+            "- reasoning: cite actual data (form, h2h, home/away stats). Max 100 chars.\n"
+            "- NEVER pick a team to win 3+ goals if they havent scored in recent matches\n"
+            "- NEVER pick BTTS if either team has kept 3+ clean sheets in last 5\n\n"
+            "Output ONLY the JSON array. No markdown."
         ).format(home, away, comp, kickoff)
 
         r = req.post(
@@ -943,7 +991,7 @@ def analyze_match_with_claude(match):
             },
             json={
                 "model": "claude-haiku-4-5-20251001",
-                "max_tokens": 3000,
+                "max_tokens": 4000,
                 "messages": [{"role": "user", "content": prompt}]
             },
             timeout=30
@@ -953,7 +1001,6 @@ def analyze_match_with_claude(match):
             return None
         data = r.json()
         text = data["content"][0]["text"].strip()
-        # Strip code fences
         text = re.sub(r'^```(?:json)?\s*', '', text)
         text = re.sub(r'\s*```$', '', text)
         return json.loads(text)
@@ -962,8 +1009,9 @@ def analyze_match_with_claude(match):
         return None
 
 def build_accumulators(picks):
-    """Build 2x / 3x / 10x / 100x accumulators. Each MATCH appears in at most ONE tier.
-    Smart distribution so all 4 tiers get populated."""
+    """Build multiple slips per tier (2x / 3x / 10x / 100x).
+    Each MATCH appears in at most ONE tier.
+    Pre-assigns matches to tiers fairly, then builds slips within each."""
     if not picks:
         return {}
 
@@ -980,88 +1028,98 @@ def build_accumulators(picks):
     for m in match_groups:
         match_groups[m].sort(key=lambda p: p.get("confidence", 0), reverse=True)
 
+    # PRE-ASSIGN: for each match, find its BEST pick for each tier
+    # Then assign the match to the tier where it's most useful
+    match_tier_scores = {}  # match -> {tier: (best_pick, odds, conf)}
+    for match, match_picks in match_groups.items():
+        match_tier_scores[match] = {}
+        for p in match_picks:
+            pi = float(p.get("implied_odds") or 1.0)
+            pc = float(p.get("confidence") or 0)
+            # Check which tiers this pick qualifies for
+            if pc >= 80 and 1.10 <= pi <= 1.45 and "safe" not in match_tier_scores[match]:
+                match_tier_scores[match]["safe"] = (p, pi, pc)
+            if pc >= 75 and 1.15 <= pi <= 1.50 and "medium" not in match_tier_scores[match]:
+                match_tier_scores[match]["medium"] = (p, pi, pc)
+            if 60 <= pc < 80 and 1.60 <= pi <= 3.00 and "value" not in match_tier_scores[match]:
+                match_tier_scores[match]["value"] = (p, pi, pc)
+            if pc >= 40 and pi >= 3.00 and "mega" not in match_tier_scores[match]:
+                match_tier_scores[match]["mega"] = (p, pi, pc)
+
+    # Assign matches to tiers: prioritize underrepresented tiers
+    tier_matches = {"safe": [], "medium": [], "value": [], "mega": []}
     used_matches = set()
+    total = len(match_groups)
 
-    def build_tier(target_odds, strategy, max_picks=None):
-        """Build a tier with optional max_picks cap to leave picks for other tiers."""
-        tier_picks = []
-        cumulative = 1.0
-        candidates = []
+    # Target distribution: split matches roughly equally, with safe getting slightly more
+    target_per_tier = max(3, total // 4)
 
-        for match, match_picks in match_groups.items():
-            if match in used_matches:
-                continue
-            best = match_picks[0]
-            implied = float(best.get("implied_odds") or 1.0)
-            conf = float(best.get("confidence") or 0)
-
-            if strategy == "safe":
-                # Safe = high confidence (80+) AND odds 1.15-1.50 (each pick contributes ~1.3 avg)
-                for p in match_picks:
-                    pi = float(p.get("implied_odds") or 1.0)
-                    pc = float(p.get("confidence") or 0)
-                    if pc >= 80 and 1.15 <= pi <= 1.50:
-                        candidates.append((p, match, pi, pc))
-                        break
-            elif strategy == "medium":
-                # Medium = decent confidence (70+) AND odds 1.40-2.00
-                for p in match_picks:
-                    pi = float(p.get("implied_odds") or 1.0)
-                    pc = float(p.get("confidence") or 0)
-                    if 70 <= pc < 90 and 1.40 <= pi <= 2.10:
-                        candidates.append((p, match, pi, pc))
-                        break
-            elif strategy == "value":
-                # Value = moderate confidence (60+) AND odds 2.00-4.00
-                for p in match_picks:
-                    pi = float(p.get("implied_odds") or 1.0)
-                    pc = float(p.get("confidence") or 0)
-                    if 60 <= pc < 80 and 2.00 <= pi <= 4.00:
-                        candidates.append((p, match, pi, pc))
-                        break
-            elif strategy == "mega":
-                # Mega = high-odds long shots (odds 3.5+)
-                for p in match_picks:
-                    pi = float(p.get("implied_odds") or 1.0)
-                    pc = float(p.get("confidence") or 0)
-                    if pi >= 3.50 and pc >= 40:
-                        candidates.append((p, match, pi, pc))
-                        break
-
-        if strategy in ("safe", "medium"):
-            candidates.sort(key=lambda x: -x[3])
-        else:
-            candidates.sort(key=lambda x: -x[2])
-
-        for pick, match, implied, conf in candidates:
-            if match in used_matches:
-                continue
-            if max_picks and len(tier_picks) >= max_picks:
-                break
-            if cumulative >= target_odds:
-                break
-            tier_picks.append(pick)
+    # First pass: assign matches that ONLY qualify for one tier
+    for match in match_tier_scores:
+        qualifying_tiers = [t for t in match_tier_scores[match]]
+        if len(qualifying_tiers) == 1:
+            tier = qualifying_tiers[0]
+            tier_matches[tier].append((match, *match_tier_scores[match][tier]))
             used_matches.add(match)
-            cumulative *= implied
 
-        return {"picks": tier_picks, "total_odds": round(cumulative, 2)}
+    # Second pass: assign remaining matches to smallest tier
+    remaining = [m for m in match_tier_scores if m not in used_matches]
+    import random
+    random.shuffle(remaining)  # randomize so it's not always alphabetical
+    for match in remaining:
+        # Find which qualifying tier is most underrepresented
+        best_tier = None
+        best_gap = -999
+        for tier in match_tier_scores[match]:
+            gap = target_per_tier - len(tier_matches[tier])
+            if gap > best_gap:
+                best_gap = gap
+                best_tier = tier
+        if best_tier:
+            tier_matches[best_tier].append((match, *match_tier_scores[match][best_tier]))
+            used_matches.add(match)
 
-    total_matches = len(match_groups)
-    # Limit each tier to leave picks for others — divide available matches fairly
-    safe_cap   = max(3, min(6, total_matches // 3))
-    medium_cap = max(3, min(5, total_matches // 4))
-    value_cap  = max(3, min(5, total_matches // 4))
+    # Now build slips for each tier
+    def build_slips(candidates, target_odds, hard_max_picks=10):
+        slips = []
+        remaining = list(candidates)
+        if not remaining:
+            return slips
+        # Sort: safe/medium by confidence desc, value/mega by odds desc
+        while remaining:
+            slip_picks = []
+            cumulative = 1.0
+            i = 0
+            while i < len(remaining):
+                if len(slip_picks) >= hard_max_picks:
+                    break
+                if cumulative >= target_odds and len(slip_picks) >= 2:
+                    break
+                match, pick, implied, conf = remaining[i]
+                slip_picks.append(remaining.pop(i))
+                cumulative *= implied
+            if not slip_picks:
+                break
+            if cumulative >= target_odds or (cumulative >= target_odds * 0.6 and len(slip_picks) >= 3):
+                slips.append({
+                    "picks": [s[1] for s in slip_picks],
+                    "total_odds": round(cumulative, 2)
+                })
+            else:
+                break
+        return slips
 
-    safe   = build_tier(2.0,   "safe",   max_picks=safe_cap)
-    medium = build_tier(3.0,   "medium", max_picks=medium_cap)
-    value  = build_tier(10.0,  "value",  max_picks=value_cap)
-    mega   = build_tier(100.0, "mega")  # no cap, uses what's left
+    # Sort candidates within each tier
+    tier_matches["safe"].sort(key=lambda x: -x[3])      # by confidence
+    tier_matches["medium"].sort(key=lambda x: -x[3])     # by confidence
+    tier_matches["value"].sort(key=lambda x: -x[2])      # by odds
+    tier_matches["mega"].sort(key=lambda x: -x[2])       # by odds
 
     return {
-        "safe_2x":   safe,
-        "medium_3x": medium,
-        "value_10x": value,
-        "mega_100x": mega,
+        "safe_2x":   build_slips(tier_matches["safe"],   target_odds=2.0,   hard_max_picks=8),
+        "medium_3x": build_slips(tier_matches["medium"], target_odds=3.0,   hard_max_picks=8),
+        "value_10x": build_slips(tier_matches["value"],  target_odds=10.0,  hard_max_picks=10),
+        "mega_100x": build_slips(tier_matches["mega"],   target_odds=100.0, hard_max_picks=12),
     }
 
 
@@ -1658,43 +1716,48 @@ def otp_loop():
 
 def save_accumulator_picks(accas):
     """Save accumulator picks to DB — wipes ALL old pending when new batch arrives.
-    This prevents duplicate matches accumulating from multiple runs."""
+    Now handles multiple slips per tier."""
     try:
         conn = get_db()
         now = datetime.now(timezone.utc).isoformat()
-        # Wipe ALL old pending accumulator picks — a new batch is fully replacing them
         conn.run(
             "UPDATE football_picks SET status='Replaced' "
             "WHERE status='Pending' AND pick_type != 'limitless_otp' "
             "AND accumulator_tier IN ('safe_2x','medium_3x','value_10x','mega_100x')"
         )
-        # Save new accumulators
-        for tier_name, tier in accas.items():
-            for p in tier.get("picks", []):
-                match_str = p.get("match", "")
-                home, away = "", ""
-                if " vs " in match_str:
-                    parts = match_str.split(" vs ", 1)
-                    home, away = parts[0].strip(), parts[1].strip()
-                conn.run(
-                    """INSERT INTO football_picks
-                    (match_id, home_team, away_team, competition, kickoff_time,
-                     pick_type, pick_value, confidence, reasoning, implied_odds,
-                     accumulator_tier, status, fired_at)
-                    VALUES (:m, :h, :a, :c, :k, :pt, :pv, :conf, :r, :o, :tier, 'Pending', :now)""",
-                    m=match_str[:100], h=home[:50], a=away[:50],
-                    c=p.get("competition", "")[:50],
-                    k=p.get("kickoff", ""),
-                    pt=p.get("pick_type", ""),
-                    pv=str(p.get("pick_value", ""))[:50],
-                    conf=float(p.get("confidence", 0)),
-                    r=str(p.get("reasoning", ""))[:200],
-                    o=float(p.get("implied_odds", 1.0)),
-                    tier=tier_name,
-                    now=now
-                )
+        total_saved = 0
+        for tier_name, slips in accas.items():
+            if not slips:
+                continue
+            for slip_idx, slip in enumerate(slips):
+                for p in slip.get("picks", []):
+                    match_str = p.get("match", "")
+                    home, away = "", ""
+                    if " vs " in match_str:
+                        parts = match_str.split(" vs ", 1)
+                        home, away = parts[0].strip(), parts[1].strip()
+                    # Store slip number in pick_type suffix so dashboard can group them
+                    slip_label = "{}_slip{}".format(tier_name, slip_idx + 1)
+                    conn.run(
+                        """INSERT INTO football_picks
+                        (match_id, home_team, away_team, competition, kickoff_time,
+                         pick_type, pick_value, confidence, reasoning, implied_odds,
+                         accumulator_tier, status, fired_at)
+                        VALUES (:m, :h, :a, :c, :k, :pt, :pv, :conf, :r, :o, :tier, 'Pending', :now)""",
+                        m=match_str[:100], h=home[:50], a=away[:50],
+                        c=p.get("competition", "")[:50],
+                        k=p.get("kickoff", ""),
+                        pt=slip_label,
+                        pv=str(p.get("pick_value", ""))[:50],
+                        conf=float(p.get("confidence", 0)),
+                        r=str(p.get("reasoning", ""))[:200],
+                        o=float(p.get("implied_odds", 1.0)),
+                        tier=tier_name,
+                        now=now
+                    )
+                    total_saved += 1
         conn.close()
-        print("Accumulators saved to DB")
+        print("Accumulators saved to DB: {} picks across {} tiers".format(total_saved, len(accas)))
     except Exception as e:
         print("Save accumulator error: {}".format(e))
 
@@ -1710,7 +1773,7 @@ def football_loop():
             fixtures = get_todays_fixtures()
             print("Football: {} fixtures found".format(len(fixtures)))
             all_picks = []
-            for match in fixtures[:12]:  # limit to 12 matches per run
+            for match in fixtures[:20]:  # analyze up to 20 matches per run
                 picks = analyze_match_with_claude(match)
                 if picks:
                     for p in picks:
@@ -1751,35 +1814,50 @@ def football_loop():
                 msg = "⚽ <b>DAILY FOOTBALL ACCUMULATORS</b>\n"
                 msg += "<i>{}</i>\n\n".format(datetime.now(LAGOS_TZ).strftime("%A, %d %B"))
 
-                for tier_name, tier in accas.items():
-                    if not tier.get("picks"):
-                        continue
-                    label = {"safe_2x": "🟢 <b>Safe Bet</b>",
-                             "medium_3x": "🟡 <b>Medium Risk</b>",
-                             "value_10x": "🔥 <b>Value (10x Target)</b>",
-                             "mega_100x": "🚀 <b>Mega Long Shot (100x Target)</b>"}[tier_name]
-                    msg += "{} — {:.2f}x total\n".format(label, tier["total_odds"])
-                    msg += "─────────────────\n"
-                    for p in tier["picks"]:
-                        match = p.get("match", "Unknown")
-                        comp = p.get("competition", "")
-                        ko = fmt_kickoff(p.get("kickoff", ""))
-                        pick_type = p.get("pick_type", "").replace("_", " ").title()
-                        pick_val = clean_value(p.get("pick_value", ""))
-                        conf = int(p.get("confidence", 0))
+                tier_labels = {
+                    "safe_2x": "🟢 2x Safe",
+                    "medium_3x": "🟡 3x Medium",
+                    "value_10x": "🔥 10x Value",
+                    "mega_100x": "🚀 100x Mega"
+                }
 
-                        msg += "⚡ <b>{}</b>\n".format(match)
-                        if comp or ko:
-                            line = []
-                            if comp:
-                                line.append(comp)
-                            if ko:
-                                line.append(ko)
-                            msg += "   🏆 <i>{}</i>\n".format(" · ".join(line))
-                        msg += "   → {}: <b>{}</b> ({}%)\n\n".format(pick_type, pick_val, conf)
-                    msg += "\n"
-                msg += "💡 <i>Each match appears only once across all tiers</i>\n"
-                msg += "📊 <i>View all picks on your dashboard</i>"
+                for tier_name, slips in accas.items():
+                    if not slips:
+                        continue
+                    label = tier_labels.get(tier_name, tier_name)
+                    for slip_idx, slip in enumerate(slips):
+                        if not slip.get("picks"):
+                            continue
+                        msg += "<b>{} Slip #{}</b> — {:.2f}x\n".format(label, slip_idx + 1, slip["total_odds"])
+                        msg += "─────────────────\n"
+                        for p in slip["picks"]:
+                            match = p.get("match", "Unknown")
+                            comp = p.get("competition", "")
+                            ko = fmt_kickoff(p.get("kickoff", ""))
+                            pick_type = p.get("pick_type", "").replace("_", " ").title()
+                            pick_val = clean_value(p.get("pick_value", ""))
+                            conf = int(p.get("confidence", 0))
+                            odds = float(p.get("implied_odds", 1.0))
+                            reasoning = p.get("reasoning", "")
+
+                            msg += "⚡ <b>{}</b>\n".format(match)
+                            if comp or ko:
+                                line = []
+                                if comp:
+                                    line.append(comp)
+                                if ko:
+                                    line.append(ko)
+                                msg += "   🏆 <i>{}</i>\n".format(" · ".join(line))
+                            msg += "   → {}: <b>{}</b> @ {:.2f} ({}%)\n".format(pick_type, pick_val, odds, conf)
+                            if reasoning:
+                                msg += "   💭 <i>{}</i>\n".format(reasoning[:80])
+                            msg += "\n"
+                        msg += "\n"
+
+                # Summary
+                total_slips = sum(len(s) for s in accas.values())
+                total_picks = sum(len(p.get("picks", [])) for s in accas.values() for p in s)
+                msg += "📊 <i>{} slips · {} picks · Each match in one tier only</i>".format(total_slips, total_picks)
                 send_telegram(msg)
         except Exception as e:
             print("Football loop: {}".format(e))
@@ -2498,23 +2576,44 @@ tbody tr:hover{background:var(--bg)}
 {% endif %}
 
 <!-- History Section -->
-{% if history_picks %}
 <div class="section-head">
-  <div><span class="section-title">Recent Results</span></div>
+  <div><span class="section-title">Performance Tracker</span></div>
+  <button class="btn" onclick="fetch('/football/scan').then(()=>alert('Football scan triggered'))">⚡ Manual Scan</button>
 </div>
+
+<!-- Performance Stats Cards -->
+<div class="slips-grid" style="margin-bottom:24px">
+  {% for tier_key, tier_label in [('safe_2x','🟢 2x Safe'),('medium_3x','🟡 3x Medium'),('value_10x','🔥 10x Value'),('mega_100x','🚀 100x Mega')] %}
+  <div class="slip" style="border-top:none">
+    <div class="slip-head">
+      <div class="slip-label">{{ tier_label }}</div>
+      <div class="slip-odds">{{ perf[tier_key].rate }}%</div>
+    </div>
+    <div style="padding:16px 20px;display:flex;gap:24px">
+      <div><span style="font-family:var(--mono);font-size:24px;color:var(--positive);font-weight:600">{{ perf[tier_key].w }}</span><br><small style="color:var(--ink-4)">Won</small></div>
+      <div><span style="font-family:var(--mono);font-size:24px;color:var(--negative);font-weight:600">{{ perf[tier_key].l }}</span><br><small style="color:var(--ink-4)">Lost</small></div>
+      <div><span style="font-family:var(--mono);font-size:24px;color:var(--ink-3);font-weight:600">{{ perf[tier_key].total }}</span><br><small style="color:var(--ink-4)">Total</small></div>
+    </div>
+  </div>
+  {% endfor %}
+</div>
+
+{% if history_picks %}
 <div class="hist-wrap">
   <div class="table-scroll">
     <table>
       <thead><tr>
-        <th>Match</th><th>League</th><th>Pick</th><th>Confidence</th><th>Outcome</th><th>Resolved</th>
+        <th>Match</th><th>League</th><th>Tier</th><th>Pick</th><th>Conf</th><th>Reasoning</th><th>Outcome</th><th>Resolved</th>
       </tr></thead>
       <tbody>
         {% for p in history_picks %}
         <tr>
-          <td style="font-weight:500;color:var(--ink);max-width:260px">{{ p.match_id }}</td>
+          <td style="font-weight:500;color:var(--ink);max-width:220px">{{ p.match_id }}</td>
           <td style="font-family:var(--mono);font-size:11px;color:var(--ink-3)">{{ p.competition or "—" }}</td>
-          <td><span class="pick-value">{{ p.pick_value or "—" }}</span> <small style="color:var(--ink-4)">{{ p.pick_type.replace("_", " ") }}</small></td>
+          <td><span class="tier-badge">{{ p.accumulator_tier or "otp" }}</span></td>
+          <td><span class="pick-value">{{ p.pick_value or "—" }}</span> <small style="color:var(--ink-4)">{{ (p.pick_type or "").replace("_", " ")[:25] }}</small></td>
           <td><span class="pick-conf">{{ p.confidence|int }}%</span></td>
+          <td style="color:var(--ink-3);font-size:12px;max-width:200px">{{ p.reasoning or "—" }}</td>
           <td><span class="status-chip {{ 'status-won' if '✅' in (p.status or '') else 'status-lost' }}">{{ p.status }}</span></td>
           <td style="font-family:var(--mono);font-size:11px;color:var(--ink-4)">{{ p.resolved_at[:16].replace("T"," ") if p.resolved_at else "—" }}</td>
         </tr>
@@ -2522,6 +2621,10 @@ tbody tr:hover{background:var(--bg)}
       </tbody>
     </table>
   </div>
+</div>
+{% else %}
+<div class="empty" style="padding:32px">
+  <p>No resolved picks yet. Results appear here after matches finish (checked every 5 minutes, 2 hours after kickoff).</p>
 </div>
 {% endif %}
 
@@ -2940,6 +3043,32 @@ def football_page():
     }
     acca_total = len(all_acca)
 
+    # Performance tracking — win/loss by tier
+    perf = {"safe_2x": {"w": 0, "l": 0}, "medium_3x": {"w": 0, "l": 0},
+            "value_10x": {"w": 0, "l": 0}, "mega_100x": {"w": 0, "l": 0}, "otp": {"w": 0, "l": 0}}
+    try:
+        conn3 = get_db()
+        perf_rows = conn3.run(
+            "SELECT accumulator_tier, outcome, COUNT(*) FROM football_picks "
+            "WHERE outcome IN ('WIN','LOSS') GROUP BY accumulator_tier, outcome"
+        )
+        conn3.close()
+        for tier, outcome, cnt in perf_rows:
+            key = tier if tier in perf else ("otp" if "otp" in (tier or "") else None)
+            if key:
+                if outcome == "WIN":
+                    perf[key]["w"] += cnt
+                else:
+                    perf[key]["l"] += cnt
+    except Exception as e:
+        print("Perf stats error: {}".format(e))
+
+    # Calculate win rates
+    for k in perf:
+        total = perf[k]["w"] + perf[k]["l"]
+        perf[k]["rate"] = round(perf[k]["w"] / total * 100, 1) if total > 0 else 0
+        perf[k]["total"] = total
+
     return render_template_string(
         FOOTBALL_HTML,
         has_keys=has_keys,
@@ -2951,6 +3080,7 @@ def football_page():
         mega_slips=mega_slips,
         stats=stats,
         acca_total=acca_total,
+        perf=perf,
     )
 
 # ═══════════════════════════════════════════════════════════
