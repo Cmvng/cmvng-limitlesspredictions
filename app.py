@@ -91,9 +91,15 @@ def init_db():
             accumulator_tier TEXT,
             status          TEXT DEFAULT 'Pending',
             outcome         TEXT,
-            fired_at        TEXT
+            fired_at        TEXT,
+            resolved_at     TEXT
         )
     """)
+    # Add resolved_at if table already exists without it
+    try:
+        conn.run("ALTER TABLE football_picks ADD COLUMN IF NOT EXISTS resolved_at TEXT")
+    except:
+        pass
     conn.close()
     print("DB initialized OK")
 
@@ -1102,13 +1108,12 @@ def run_otp_scan():
         except Exception as e:
             print("OTP strategy 1 failed: {}".format(e))
 
-        # Strategy 2: fetch ALL markets and aggressively filter
+        # Strategy 2: fetch pages with larger limit
         if not otp_markets:
             try:
-                # Fetch multiple pages
-                for page in range(1, 4):  # up to 3 pages
+                for page in range(1, 6):  # up to 5 pages x 100 = 500 markets
                     r = req.get(
-                        "{}/markets/active?page={}&limit=50".format(LIMITLESS_API, page),
+                        "{}/markets/active?page={}&limit=100".format(LIMITLESS_API, page),
                         timeout=15
                     )
                     if r.status_code != 200:
@@ -1118,12 +1123,32 @@ def run_otp_scan():
                         break
                     page_otp = [m for m in markets if is_otp_market(m)]
                     otp_markets.extend(page_otp)
-                    if len(markets) < 50:
-                        break  # last page
-                print("OTP strategy 2 (title filter across pages): {} markets found".format(
+                    print("  Page {}: {}/{} are OTP".format(page, len(page_otp), len(markets)))
+                    if len(markets) < 100:
+                        break
+                print("OTP strategy 2 (paginated filter): {} markets found".format(
                     len(otp_markets)))
             except Exception as e:
                 print("OTP strategy 2 failed: {}".format(e))
+
+        # Strategy 3: try search endpoint for football terms
+        if not otp_markets:
+            try:
+                search_terms = ["goals", "score", "corners", "cards", "winner"]
+                for term in search_terms:
+                    r = req.get(
+                        "{}/markets/search?q={}".format(LIMITLESS_API, term),
+                        timeout=10
+                    )
+                    if r.status_code == 200:
+                        results = r.json().get("data", [])
+                        for m in results:
+                            if is_otp_market(m) and m not in otp_markets:
+                                otp_markets.append(m)
+                    time.sleep(0.5)
+                print("OTP strategy 3 (search): {} markets found".format(len(otp_markets)))
+            except Exception as e:
+                print("OTP strategy 3 failed: {}".format(e))
 
         if not otp_markets:
             print("OTP scan: NO sports markets found — this likely means none are live now")
