@@ -693,23 +693,20 @@ def _sign_order(order_data, verifying_contract):
     """Sign order with EIP-712."""
     try:
         from eth_account import Account
-        from eth_account.messages import encode_typed_data
         from web3 import Web3
     except ImportError:
-        print("Auto-trade ERROR: eth-account or web3 not installed. Add to requirements.txt: eth-account web3")
+        print("Auto-trade ERROR: eth-account or web3 not installed")
         return None
     try:
-        from eth_account import Account
-        from eth_account.messages import encode_typed_data
-        from web3 import Web3
-
         CHAIN_ID = 8453  # Base
+        vc = Web3.to_checksum_address(verifying_contract)
+        print("Signing with verifyingContract: {}".format(vc))
 
         domain = {
             "name": "Limitless CTF Exchange",
             "version": "1",
             "chainId": CHAIN_ID,
-            "verifyingContract": Web3.to_checksum_address(verifying_contract),
+            "verifyingContract": vc,
         }
         types = {
             "Order": [
@@ -728,10 +725,40 @@ def _sign_order(order_data, verifying_contract):
             ],
         }
 
-        signable = encode_typed_data(domain, types, order_data)
         account = Account.from_key(LIMITLESS_PRIV_KEY)
-        signed = account.sign_message(signable)
-        return signed.signature.hex()
+
+        # Try the newer encode_typed_data API first
+        try:
+            from eth_account.messages import encode_typed_data
+            signable = encode_typed_data(domain, types, order_data)
+            signed = account.sign_message(signable)
+            print("Signed OK (encode_typed_data)")
+            return signed.signature.hex()
+        except TypeError:
+            # Some versions of eth-account use different parameter order
+            try:
+                from eth_account.messages import encode_structured_data
+                full_message = {
+                    "types": {
+                        "EIP712Domain": [
+                            {"name": "name", "type": "string"},
+                            {"name": "version", "type": "string"},
+                            {"name": "chainId", "type": "uint256"},
+                            {"name": "verifyingContract", "type": "address"},
+                        ],
+                        **types,
+                    },
+                    "primaryType": "Order",
+                    "domain": domain,
+                    "message": order_data,
+                }
+                signable = encode_structured_data(full_message)
+                signed = account.sign_message(signable)
+                print("Signed OK (encode_structured_data)")
+                return signed.signature.hex()
+            except Exception as e2:
+                print("Signing fallback error: {}".format(e2))
+                return None
     except Exception as e:
         print("Signing error: {}".format(e))
         return None
@@ -816,6 +843,7 @@ def execute_trade(parsed_market, score, prediction_id):
 
         venue = market_data.get("venue", {})
         exchange_addr = venue.get("exchange", "") if isinstance(venue, dict) else ""
+        print("Venue exchange: {}".format(exchange_addr))
         position_ids = market_data.get("positionIds") or market_data.get("clobTokenIds") or []
 
         # Try tokens dict as fallback
