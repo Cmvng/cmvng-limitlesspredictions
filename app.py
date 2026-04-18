@@ -983,6 +983,65 @@ def build_accumulators(picks):
     }
 
 
+
+# ═══════════════════════════════════════════════════════════
+# MARKET CLASSIFIER — team-level vs player-prop
+# ═══════════════════════════════════════════════════════════
+
+def classify_market_type(title):
+    """Return 'team' if market is predictable from team stats,
+    'player' if it needs real-time player data, 'complex' if too unpredictable."""
+    t = (title or "").lower()
+
+    # Player-specific props (NEED real-time player data — hard for Claude)
+    player_patterns = [
+        "to record more", "to make more", "to score more than",
+        "to outscore", "to play more minutes",
+        "donnarumma", "raya", "haaland", "martinelli", "doku",
+        "to record", "to score", "minutes than",
+        "successful dribbles", "more saves", "more touches",
+        "more tackles", "big chances", "key passes",
+        "to start", "on bench", "to commit more",
+    ]
+    # Individual named player = player prop
+    player_names = [
+        "haaland", "salah", "son", "saka", "rodri", "bruno fernandes",
+        "casemiro", "caicedo", "gordon", "solanke", "watkins",
+        "van dijk", "bellingham", "vinicius", "mbappe", "rashford",
+        "martinelli", "saliba", "doku", "de bruyne", "isak",
+        "welbeck", "tanaka", "hwang", "gyokeres",
+    ]
+    if any(p in t for p in player_patterns):
+        return "player"
+    if any(name in t for name in player_names):
+        return "player"
+
+    # Complex/unpredictable markets
+    complex_patterns = [
+        "goal in added time", "goal in first 5 minutes",
+        "goal in first", "two goals to be scored within",
+        "substitution before", "substitute",
+        "red card in", "any player",
+        "specific minute", "exact minute",
+    ]
+    if any(p in t for p in complex_patterns):
+        return "complex"
+
+    # Team-level markets (predictable from team stats)
+    team_patterns = [
+        "total goals", "total corners", "total cards",
+        "both teams score", "both teams to score", "btts",
+        "clean sheet", "to win", "to draw",
+        "more goals than", "more corners than",
+        "higher possession", "possession",
+        "over", "under", "winner",
+    ]
+    if any(p in t for p in team_patterns):
+        return "team"
+
+    return "team"  # default — try to analyze
+
+
 # ═══════════════════════════════════════════════════════════
 # OFF THE PITCH SCANNER — football prop markets on Limitless
 # ═══════════════════════════════════════════════════════════
@@ -1037,8 +1096,98 @@ def is_otp_market(market):
 
     return False
 
+
+def _fetch_team_context_for_match(home_team, away_team):
+    """Fetch recent team stats to give Claude real data to analyze with.
+    Uses API-Football if key present. Returns formatted string or empty."""
+    key = os.environ.get("API_FOOTBALL_KEY", "")
+    if not key:
+        return ""
+    import requests as req
+    context_lines = []
+    try:
+        # Search for home and away team IDs
+        for team_name in [home_team, away_team]:
+            if not team_name:
+                continue
+            r = req.get(
+                "https://v3.football.api-sports.io/teams?search={}".format(team_name.replace(" ", "%20")),
+                headers={"x-apisports-key": key},
+                timeout=10
+            )
+            if r.status_code != 200:
+                continue
+            results = r.json().get("response", [])
+            if not results:
+                continue
+            team_id = results[0].get("team", {}).get("id")
+            if not team_id:
+                continue
+            # Get last 5 fixtures
+            r2 = req.get(
+                "https://v3.football.api-sports.io/fixtures?team={}&last=5".format(team_id),
+                headers={"x-apisports-key": key},
+                timeout=10
+            )
+            if r2.status_code != 200:
+                continue
+            fixtures = r2.json().get("response", [])
+            form = []
+            goals_scored = []
+            goals_conceded = []
+            for fx in fixtures:
+                teams = fx.get("teams", {})
+                goals = fx.get("goals", {})
+                is_home = teams.get("home", {}).get("id") == team_id
+                my_goals = goals.get("home") if is_home else goals.get("away")
+                op_goals = goals.get("away") if is_home else goals.get("home")
+                if my_goals is None or op_goals is None:
+                    continue
+                goals_scored.append(int(my_goals))
+                goals_conceded.append(int(op_goals))
+                if my_goals > op_goals:
+                    form.append("W")
+                elif my_goals == op_goals:
+                    form.append("D")
+                else:
+                    form.append("L")
+            if form:
+                avg_scored = sum(goals_scored) / len(goals_scored)
+                avg_conceded = sum(goals_conceded) / len(goals_conceded)
+                context_lines.append(
+                    "{}: last 5 = {} | scored {:.1f}/game | conceded {:.1f}/game".format(
+                        team_name, "".join(form), avg_scored, avg_conceded
+                    )
+                )
+        return "\n".join(context_lines)
+    except Exception as e:
+        print("Team context fetch error: {}".format(e))
+        return ""
+
+def _extract_teams_from_title(title):
+    """Try to pull home/away teams from market title."""
+    import re
+    # Pattern: "X vs Y" or "Home vs Away"
+    m = re.search(r'(?:against|vs\.?)\s+([A-Z][a-zA-Z\s]+?)(?:\s+on\b|\s*\?|\s*$|,)', title)
+    if m:
+        # Try to extract both - look backwards for home team
+        parts = title.split(" vs ")
+        if len(parts) == 2:
+            home = parts[0].strip()
+            # Home often has prefix like "Arsenal to commit more fouls than Man City"
+            # Extract first capitalized noun
+            hm = re.search(r'([A-Z][a-zA-Z]+(?:\s[A-Z][a-zA-Z]+)?)', home)
+            away_str = parts[1].split(" on ")[0].split("?")[0].split(",")[0].strip()
+            if hm:
+                return hm.group(1), away_str
+    # Pattern "Team A vs Team B: ..."
+    m2 = re.search(r'^([A-Z][a-zA-Z\s]+?)\s+vs\s+([A-Z][a-zA-Z\s]+?):', title)
+    if m2:
+        return m2.group(1).strip(), m2.group(2).strip()
+    return None, None
+
 def analyze_otp_market_with_claude(market, parsed_odds):
-    """Use Claude Haiku to judge if an Off The Pitch market is a sure winner"""
+    """Use Claude Haiku to analyze a football prop market WITH team context data."""
     if not ANTHROPIC_KEY:
         return None
     import requests as req
@@ -1047,6 +1196,12 @@ def analyze_otp_market_with_claude(market, parsed_odds):
         yes_odds = parsed_odds["yes_odds"]
         no_odds  = 100 - yes_odds
         hours    = parsed_odds["hours_left"]
+
+        # Fetch real team stats to feed Claude
+        home, away = _extract_teams_from_title(title)
+        team_context = ""
+        if home and away:
+            team_context = _fetch_team_context_for_match(home, away)
         
         prompt = (
             "You are analyzing a prediction market on Limitless Exchange. "
@@ -1229,8 +1384,14 @@ def run_otp_scan():
                 yes_raw = float(prices[0])
                 yes_odds = yes_raw if yes_raw > 1 else yes_raw * 100
                 
-                # Only analyze markets with interesting odds (not extremes)
+                # Skip extreme-odds markets (not worth analyzing)
                 if yes_odds < 15 or yes_odds > 92:
+                    continue
+
+                # CLASSIFY: skip player props and complex markets (Claude can't analyze them well)
+                market_class = classify_market_type(market.get("title", ""))
+                if market_class != "team":
+                    print("  OTP skip ({}): {}".format(market_class, market.get("title", "")[:60]))
                     continue
                 
                 parsed = {
