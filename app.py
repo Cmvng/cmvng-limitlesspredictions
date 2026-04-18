@@ -1421,6 +1421,38 @@ def manual_scan():
     threading.Thread(target=run_scan, daemon=True).start()
     return {"status": "scan triggered"}, 200
 
+@app.route("/football/scan", methods=["GET"])
+def manual_football_scan():
+    """Manually trigger the football accumulator builder (instead of waiting 6 hours)."""
+    def run_once():
+        try:
+            if not ANTHROPIC_KEY:
+                print("Football scan skipped — no ANTHROPIC_API_KEY")
+                return
+            fixtures = get_todays_fixtures()
+            print("Manual football scan: {} fixtures".format(len(fixtures)))
+            all_picks = []
+            for match in fixtures[:12]:
+                picks = analyze_match_with_claude(match)
+                if picks:
+                    for p in picks:
+                        p["match"] = "{} vs {}".format(
+                            match.get("homeTeam", {}).get("name", ""),
+                            match.get("awayTeam", {}).get("name", "")
+                        )
+                        p["kickoff"] = match.get("utcDate", "")
+                        p["competition"] = match.get("competition", {}).get("name", "")
+                        all_picks.append(p)
+                time.sleep(2)
+            if all_picks:
+                accas = build_accumulators(all_picks)
+                save_accumulator_picks(accas)
+                print("Manual football scan: done — {} picks saved".format(len(all_picks)))
+        except Exception as e:
+            print("Manual football scan error: {}".format(e))
+    threading.Thread(target=run_once, daemon=True).start()
+    return {"status": "football scan triggered — wait 60-90 seconds, then refresh /football"}, 200
+
 
 @app.route("/debug/otp")
 def debug_otp():
