@@ -42,6 +42,7 @@ _trading_state = {
     "medium_pct": 0.08,          # 8% of balance on MEDIUM confidence
     "daily_loss_limit_pct": 0.25,# Stop after 25% daily loss
     "min_stake": 1.0,            # Limitless minimum $1
+    "starting_balance": 20.0,    # Manual fallback balance
 }
 
 FAVOURITE_HOURLY = ["ADA", "BNB", "HYPE"]
@@ -535,27 +536,64 @@ def _reset_daily_counters():
         print("Trading: daily counters reset for {}".format(today))
 
 def _get_limitless_balance():
-    """Fetch USDC balance from Limitless portfolio."""
+    """Fetch USDC balance from Limitless.
+    Tries multiple endpoints since the API structure varies."""
     import requests as req
     try:
-        path = "/portfolio/allowance"
+        # First get our wallet address from the private key
+        try:
+            from eth_account import Account
+            account = Account.from_key(LIMITLESS_PRIV_KEY)
+            wallet_addr = account.address
+        except Exception:
+            print("Balance: can't derive wallet address from private key")
+            return _trading_state.get("last_balance")
+
+        # Try 1: Get profile which may include balance info
+        path = "/profiles/{}".format(wallet_addr)
         headers = _hmac_headers("GET", path)
-        r = req.get(
-            "{}{}".format(LIMITLESS_API, path),
-            headers=headers,
-            timeout=10
-        )
+        r = req.get("{}{}".format(LIMITLESS_API, path), headers=headers, timeout=10)
         if r.status_code == 200:
             data = r.json()
-            balance = float(data.get("balance", 0)) / 1e6 if data.get("balance", 0) > 100 else float(data.get("balance", 0))
-            _trading_state["last_balance"] = balance
-            return balance
-        else:
-            print("Balance check failed: {} {}".format(r.status_code, r.text[:200]))
-            return _trading_state.get("last_balance")
+            # Store profile ID for later use
+            _trading_state["profile_id"] = data.get("id")
+            _trading_state["wallet_addr"] = wallet_addr
+
+        # Try 2: Trading allowance endpoint
+        for try_path in ["/trading/allowance", "/portfolio/trading-allowance", "/allowance"]:
+            try:
+                h = _hmac_headers("GET", try_path)
+                r2 = req.get("{}{}".format(LIMITLESS_API, try_path), headers=h, timeout=10)
+                if r2.status_code == 200:
+                    data2 = r2.json()
+                    bal = data2.get("balance") or data2.get("allowance") or data2.get("available")
+                    if bal is not None:
+                        balance = float(bal) / 1e6 if float(bal) > 1000 else float(bal)
+                        _trading_state["last_balance"] = balance
+                        print("Balance: ${:.2f} (from {})".format(balance, try_path))
+                        return balance
+            except:
+                continue
+
+        # Try 3: Locked balance endpoint (shows how much is in open orders)
+        path3 = "/trading/locked-balance"
+        h3 = _hmac_headers("GET", path3)
+        r3 = req.get("{}{}".format(LIMITLESS_API, path3), headers=h3, timeout=10)
+        if r3.status_code == 200:
+            print("Locked balance response: {}".format(r3.text[:200]))
+
+        # If we can't get balance from API, use a manual fallback
+        # The user sets their starting balance, and we track P&L from there
+        if _trading_state.get("last_balance") is None:
+            # Default starting balance — user should update via /trading/set?balance=20
+            _trading_state["last_balance"] = _trading_state.get("starting_balance", 20.0)
+            print("Balance: using manual balance ${:.2f} (API endpoints not found)".format(
+                _trading_state["last_balance"]))
+
+        return _trading_state.get("last_balance")
     except Exception as e:
         print("Balance error: {}".format(e))
-        return _trading_state.get("last_balance")
+        return _trading_state.get("last_balance") or _trading_state.get("starting_balance", 20.0)
 
 def _fetch_market_details(slug):
     """Fetch full market details including venue and positionIds."""
@@ -2362,17 +2400,22 @@ def trading_status():
 
 @app.route("/trading/set", methods=["GET"])
 def trading_set():
-    """Adjust trading parameters. Usage: /trading/set?high=0.15&medium=0.08&loss_limit=0.25"""
+    """Adjust trading parameters. Usage: /trading/set?high=0.15&medium=0.08&loss_limit=0.25&balance=20"""
     if request.args.get("high"):
         _trading_state["high_pct"] = float(request.args["high"])
     if request.args.get("medium"):
         _trading_state["medium_pct"] = float(request.args["medium"])
     if request.args.get("loss_limit"):
         _trading_state["daily_loss_limit_pct"] = float(request.args["loss_limit"])
+    if request.args.get("balance"):
+        bal = float(request.args["balance"])
+        _trading_state["last_balance"] = bal
+        _trading_state["starting_balance"] = bal
     return {
         "high_pct": _trading_state["high_pct"],
         "medium_pct": _trading_state["medium_pct"],
         "daily_loss_limit_pct": _trading_state["daily_loss_limit_pct"],
+        "balance": _trading_state.get("last_balance"),
     }, 200
 
 @app.route("/football/clear", methods=["GET"])
