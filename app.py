@@ -855,18 +855,17 @@ def execute_trade(parsed_market, score, prediction_id):
         print("Token resolved: {} = {} for {}".format(bet_side, str(token_id)[:30], slug[:30]))
 
         # 2. Build order
-        # For a BUY order: makerAmount = USDC we pay, takerAmount = shares we receive
-        # Price = odds as decimal (e.g. 85% = 0.85)
+        # FOK (Fill or Kill): makerAmount = USDC to spend (6 decimals), takerAmount = 1
+        maker_amount = int(stake * 1e6)  # USDC in 6 decimals (e.g. $3 = 3000000)
+        taker_amount = 1                  # FOK requires takerAmount = 1
+
+        # Price for display purposes
         odds_decimal = score["bet_odds"] / 100.0
         if bet_side == "NO":
-            price = 1.0 - odds_decimal  # NO price = 1 - YES price
+            price = 1.0 - odds_decimal
         else:
             price = odds_decimal
-
-        # Shares = stake / price (how many shares we get for our USDC)
-        num_shares = stake / price
-        maker_amount = int(stake * 1e6)        # USDC in 6 decimals
-        taker_amount = int(num_shares * 1e6)   # Shares in 6 decimals
+        num_shares = stake / price  # approximate shares we'll receive
 
         from web3 import Web3
         from eth_account import Account
