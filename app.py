@@ -1137,7 +1137,7 @@ def run_otp_scan():
                 search_terms = ["goals", "score", "corners", "cards", "winner"]
                 for term in search_terms:
                     r = req.get(
-                        "{}/markets/search?q={}".format(LIMITLESS_API, term),
+                        "{}/markets/search?query={}&limit=20".format(LIMITLESS_API, term),
                         timeout=10
                     )
                     if r.status_code == 200:
@@ -1375,6 +1375,98 @@ def update_prediction(pred_id, status):
 def manual_scan():
     threading.Thread(target=run_scan, daemon=True).start()
     return {"status": "scan triggered"}, 200
+
+
+@app.route("/debug/otp")
+def debug_otp():
+    """Diagnostic endpoint — shows what the OTP scanner is seeing."""
+    import requests as req
+    report = {"strategies": {}, "sample_markets": []}
+
+    # Strategy 1: automationType=sports
+    try:
+        r = req.get("{}/markets/active?automationType=sports&limit=100".format(LIMITLESS_API), timeout=15)
+        if r.status_code == 200:
+            markets = r.json().get("data", [])
+            report["strategies"]["automation_sports"] = {
+                "status": r.status_code,
+                "count": len(markets),
+                "sample_titles": [m.get("title", "")[:80] for m in markets[:5]],
+            }
+        else:
+            report["strategies"]["automation_sports"] = {"status": r.status_code, "error": r.text[:200]}
+    except Exception as e:
+        report["strategies"]["automation_sports"] = {"error": str(e)}
+
+    # Strategy 2: fetch category counts
+    try:
+        r = req.get("{}/markets/categories/count".format(LIMITLESS_API), timeout=10)
+        if r.status_code == 200:
+            report["strategies"]["category_counts"] = r.json()
+    except Exception as e:
+        report["strategies"]["category_counts"] = {"error": str(e)}
+
+    # Strategy 3: pull pages and categorize
+    try:
+        category_breakdown = {}
+        automation_breakdown = {}
+        total_pulled = 0
+        all_sample_titles = []
+        for page in range(1, 6):
+            r = req.get("{}/markets/active?page={}&limit=100".format(LIMITLESS_API, page), timeout=15)
+            if r.status_code != 200:
+                break
+            markets = r.json().get("data", [])
+            if not markets:
+                break
+            total_pulled += len(markets)
+            for m in markets:
+                for c in (m.get("categories") or []):
+                    category_breakdown[c] = category_breakdown.get(c, 0) + 1
+                auto = m.get("automationType") or "none"
+                automation_breakdown[auto] = automation_breakdown.get(auto, 0) + 1
+                if len(all_sample_titles) < 20 and "above $" not in m.get("title", "").lower():
+                    all_sample_titles.append(m.get("title", "")[:80])
+            if len(markets) < 100:
+                break
+        report["strategies"]["paginated_analysis"] = {
+            "total_pulled": total_pulled,
+            "categories_found": category_breakdown,
+            "automation_types": automation_breakdown,
+            "non_crypto_sample_titles": all_sample_titles,
+        }
+    except Exception as e:
+        report["strategies"]["paginated_analysis"] = {"error": str(e)}
+
+    # Strategy 4: search endpoint
+    try:
+        r = req.get("{}/markets/search?query=goals&limit=10".format(LIMITLESS_API), timeout=10)
+        if r.status_code == 200:
+            results = r.json().get("data", [])
+            report["strategies"]["search_goals"] = {
+                "count": len(results),
+                "sample_titles": [m.get("title", "")[:80] for m in results[:5]],
+            }
+    except Exception as e:
+        report["strategies"]["search_goals"] = {"error": str(e)}
+
+    # Strategy 5: try category 49 and 50 directly (football categories likely)
+    for cat_id in [49, 50, 43]:
+        try:
+            r = req.get("{}/markets/active/{}?limit=5".format(LIMITLESS_API, cat_id), timeout=10)
+            if r.status_code == 200:
+                markets = r.json().get("data", [])
+                report["strategies"]["category_{}".format(cat_id)] = {
+                    "status": r.status_code,
+                    "count": len(markets),
+                    "sample_titles": [m.get("title", "")[:80] for m in markets[:5]],
+                }
+            else:
+                report["strategies"]["category_{}".format(cat_id)] = {"status": r.status_code}
+        except Exception as e:
+            report["strategies"]["category_{}".format(cat_id)] = {"error": str(e)}
+
+    return jsonify(report)
 
 @app.route("/otp/scan", methods=["GET"])
 def manual_otp_scan():
