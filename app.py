@@ -72,7 +72,8 @@ def init_db():
             outcome       TEXT,
             fired_at      TEXT,
             resolved_at   TEXT,
-            slug          TEXT
+            slug          TEXT,
+            bet_side      TEXT DEFAULT 'YES'
         )
     """)
     conn.run("""
@@ -98,6 +99,11 @@ def init_db():
     # Add resolved_at if table already exists without it
     try:
         conn.run("ALTER TABLE football_picks ADD COLUMN IF NOT EXISTS resolved_at TEXT")
+    except:
+        pass
+    # Add bet_side column to existing limitless_predictions table
+    try:
+        conn.run("ALTER TABLE limitless_predictions ADD COLUMN IF NOT EXISTS bet_side TEXT DEFAULT 'YES'")
     except:
         pass
     conn.close()
@@ -263,11 +269,9 @@ def score_market(p, btc_trend, price, debug_log=None):
 
     # 2. Expiry filter
     if p["is_short"]:
-        # Short-term (minutes/hourly): need 5-30 mins left, OR favourite bypasses
         if not is_fav and not (5 <= p["mins_left"] <= 30):
             return reject("short-term not in 5-30 min window (got {:.0f} mins)".format(p["mins_left"]))
     else:
-        # Daily: 0.5-10 hours
         if p["hours_left"] < 0.5:
             return reject("daily too close to expiry ({:.1f}h)".format(p["hours_left"]))
         if p["hours_left"] > 10 and not is_fav:
@@ -277,49 +281,110 @@ def score_market(p, btc_trend, price, debug_log=None):
     if price is None:
         return reject("no Yahoo price for {}".format(p["asset"]))
 
-    # 4. Price on winning side
-    if p["direction"] == "above":
-        if price <= p["baseline"]:
-            return reject("price ${:.4f} not above baseline ${:.4f}".format(price, p["baseline"]))
-        btc_aligned = (btc_trend == "BUY") if btc_trend else True
+    # 4. Calculate margin
+    margin = abs(price - p["baseline"])
+    margin_pct = (margin / p["baseline"] * 100) if p["baseline"] > 0 else 0
+
+    # 5. Determine margin thresholds based on timeframe
+    #    Shorter timeframes need less margin because price has less time to move
+    if p["is_short"] and p["mins_left"] <= 30:
+        margin_thresh_aligned = 0.1    # 0.1% when trend helps
+        margin_thresh_against = 0.3    # 0.3% when trend fights
+    elif p["hours_left"] <= 2:
+        margin_thresh_aligned = 0.3
+        margin_thresh_against = 1.0
     else:
-        if price >= p["baseline"]:
-            return reject("price ${:.4f} not below baseline ${:.4f}".format(price, p["baseline"]))
-        btc_aligned = (btc_trend == "SELL") if btc_trend else True
+        margin_thresh_aligned = 0.5
+        margin_thresh_against = 2.0
 
-    odds = p["yes_odds"]
+    # 6. Determine bet side: YES or NO
+    yes_odds = p["yes_odds"]
+    no_odds = 100 - yes_odds
 
-    # 5. Odds filter (now using 0-100 scale properly)
-    if not (73 <= odds <= 99):
-        return reject("odds {:.1f}% outside 73-99% range".format(odds))
+    if p["direction"] == "above":
+        price_is_above = price > p["baseline"]
+        price_is_below = price < p["baseline"]
+    else:
+        # "below" market: price_is_above means price IS below baseline (winning side for YES)
+        price_is_above = price < p["baseline"]
+        price_is_below = price > p["baseline"]
 
-    # Confidence
+    bet_side = None
+    effective_odds = None
+
+    if price_is_above:
+        # Price is on YES side — check YES odds
+        if 73 <= yes_odds <= 99:
+            bet_side = "YES"
+            effective_odds = yes_odds
+            # BTC alignment for YES
+            if p["direction"] == "above":
+                btc_aligned = (btc_trend == "BUY") if btc_trend else True
+            else:
+                btc_aligned = (btc_trend == "SELL") if btc_trend else True
+        else:
+            # YES odds out of range — maybe NO qualifies?
+            pass
+
+    if bet_side is None and price_is_below:
+        # Price is on NO side — check NO odds
+        if 73 <= no_odds <= 99:
+            bet_side = "NO"
+            effective_odds = no_odds
+            # BTC alignment for NO (opposite direction)
+            if p["direction"] == "above":
+                btc_aligned = (btc_trend == "SELL") if btc_trend else True
+            else:
+                btc_aligned = (btc_trend == "BUY") if btc_trend else True
+        else:
+            return reject("NO odds {:.1f}% outside 73-99% range".format(no_odds))
+
+    if bet_side is None:
+        if price_is_above:
+            return reject("YES odds {:.1f}% outside 73-99% range".format(yes_odds))
+        else:
+            return reject("price on wrong side and NO odds {:.1f}% outside range".format(no_odds))
+
+    # 7. Margin safety check
+    if not btc_aligned and btc_trend:
+        if margin_pct < margin_thresh_against:
+            return reject("{} margin {:.2f}% < {:.1f}% threshold (trend against)".format(
+                bet_side, margin_pct, margin_thresh_against))
+    else:
+        if margin_pct < margin_thresh_aligned:
+            return reject("{} margin {:.2f}% < {:.1f}% threshold (even aligned)".format(
+                bet_side, margin_pct, margin_thresh_aligned))
+
+    # 8. Confidence
     if not btc_aligned and btc_trend:
         confidence = "MEDIUM"
-    elif odds >= 90 or (odds >= 80 and btc_aligned):
+    elif effective_odds >= 90 or (effective_odds >= 80 and btc_aligned):
         confidence = "HIGH"
     else:
         confidence = "MEDIUM"
 
-    # Size
-    if odds >= 94:
+    # 9. Size recommendation
+    if effective_odds >= 94:
         size_rec = "$20-50 (high odds — go with size)"
-    elif odds >= 85:
+    elif effective_odds >= 85:
         size_rec = "$10-20 (normal size)"
     else:
         size_rec = "$5-10 (cautious)"
 
+    # 10. Reversal warning for short-term tight margins
     reversal = ""
-    if p["is_short"] and p["mins_left"] <= 60 and 78 <= odds <= 88:
+    if p["is_short"] and p["mins_left"] <= 60 and 78 <= effective_odds <= 88:
         reversal = "⚠️ Reversal risk — watch carefully"
 
     return {
-        "bet_odds":   odds,
-        "confidence": confidence,
-        "size_rec":   size_rec,
-        "margin":     abs(price - p["baseline"]),
-        "reversal":   reversal,
-        "btc_aligned":btc_aligned,
+        "bet_side":    bet_side,
+        "bet_odds":    effective_odds,
+        "confidence":  confidence,
+        "size_rec":    size_rec,
+        "margin":      margin,
+        "margin_pct":  margin_pct,
+        "reversal":    reversal,
+        "btc_aligned": btc_aligned,
     }
 
 # ═══════════════════════════════════════════════════════════
@@ -329,19 +394,20 @@ def score_market(p, btc_trend, price, debug_log=None):
 def save_and_alert(p, score, price, btc_trend):
     try:
         now  = datetime.now(timezone.utc).isoformat()
+        bet_side = score.get("bet_side", "YES")
         conn = get_db()
         rows = conn.run(
             """INSERT INTO limitless_predictions
             (market_id,title,asset,direction,baseline,bet_odds,confidence,
-             size_rec,current_price,hours_left,market_type,status,fired_at,slug)
-            VALUES (:mid,:ttl,:ast,:dir,:base,:odds,:conf,:sz,:pr,:hrs,:mt,'Pending',:now,:slg)
+             size_rec,current_price,hours_left,market_type,status,fired_at,slug,bet_side)
+            VALUES (:mid,:ttl,:ast,:dir,:base,:odds,:conf,:sz,:pr,:hrs,:mt,'Pending',:now,:slg,:bs)
             RETURNING id""",
             mid=p["market_id"], ttl=p["title"], ast=p["asset"],
             dir=p["direction"], base=p["baseline"],
             odds=score["bet_odds"], conf=score["confidence"], sz=score["size_rec"],
             pr=price, hrs=round(p["hours_left"], 2),
             mt="Short" if p["is_short"] else "Daily",
-            now=now, slg=p["slug"]
+            now=now, slg=p["slug"], bs=bet_side
         )
         pid = rows[0][0]
         conn.close()
@@ -351,16 +417,24 @@ def save_and_alert(p, score, price, btc_trend):
         hrs_str    = "{:.1f} hrs".format(p["hours_left"]) if p["hours_left"] >= 1 else "{:.0f} mins".format(p["mins_left"])
         exp_str    = p["expiry_dt"].strftime("%d %b %H:%M UTC")
 
+        # Bet side display
+        if bet_side == "YES":
+            side_str = "YES ✅"
+            margin_dir = p["direction"]
+        else:
+            side_str = "NO 🔻"
+            margin_dir = "below" if p["direction"] == "above" else "above"
+
         msg = (
             "🎯 <b>PREDICTION #{}</b>\n"
             "──────────────────────────\n"
             "📌 {}\n"
             "──────────────────────────\n"
-            "<b>Bet:</b> YES ✅\n"
+            "<b>Bet:</b> {}\n"
             "<b>Odds:</b> {:.1f}% chance\n"
             "<b>Current Price:</b> {}\n"
             "<b>Baseline:</b> {}\n"
-            "<b>Margin {} baseline:</b> {}\n"
+            "<b>Margin {} baseline:</b> {} ({:.2f}%)\n"
             "<b>Time Left:</b> {}\n"
             "<b>Expires:</b> {}\n"
             "<b>Type:</b> {}\n"
@@ -372,9 +446,10 @@ def save_and_alert(p, score, price, btc_trend):
             "🔗 limitless.exchange/markets/{}"
         ).format(
             pid, p["title"],
+            side_str,
             score["bet_odds"],
             fmt_price(price), fmt_price(p["baseline"]),
-            p["direction"], fmt_price(score["margin"]),
+            margin_dir, fmt_price(score["margin"]), score.get("margin_pct", 0),
             hrs_str, exp_str,
             "Short ⏱" if p["is_short"] else "Daily 📅",
             conf_emoji, score["confidence"],
@@ -383,7 +458,7 @@ def save_and_alert(p, score, price, btc_trend):
             p["slug"]
         )
         send_telegram(msg)
-        print("ALERT #{}: {} at {:.1f}%".format(pid, p["title"][:50], score["bet_odds"]))
+        print("ALERT #{}: {} {} at {:.1f}%".format(pid, bet_side, p["title"][:50], score["bet_odds"]))
     except Exception as e:
         print("Alert error: {}".format(e))
 
@@ -626,7 +701,14 @@ def outcome_loop():
                     price = get_price(p["asset"])
                     if price is None:
                         continue
-                    won = (price > p["baseline"]) if p["direction"] == "above" else (price < p["baseline"])
+                    # Determine if the market question resolved true or false
+                    market_resolved_true = (price > p["baseline"]) if p["direction"] == "above" else (price < p["baseline"])
+                    # Check if our bet side won
+                    bet_side = p.get("bet_side") or "YES"
+                    if bet_side == "YES":
+                        won = market_resolved_true
+                    else:
+                        won = not market_resolved_true
                     outcome = "WIN" if won else "LOSS"
                     status = "✅ Won" if won else "❌ Lost"
                     conn2 = get_db()
@@ -2014,6 +2096,9 @@ tbody tr:hover{background:var(--bg)}
 .tag-lost{background:var(--negative-bg);color:var(--negative)}
 .tag-high{background:var(--accent-soft);color:var(--accent)}
 .tag-med{background:var(--warning-bg);color:var(--warning)}
+.tag-yes{background:#dcfce7;color:#16a34a;font-weight:700}
+.tag-no{background:#fef2f2;color:#dc2626;font-weight:700}
+.cell-margin{font-family:var(--mono);font-size:12px;color:var(--ink-3)}
 .act{font-family:var(--sans);font-size:11px;font-weight:500;padding:5px 10px;border-radius:6px;border:1px solid transparent;cursor:pointer;margin-right:4px;transition:all .15s}
 .act-won{background:var(--positive-bg);color:var(--positive)}
 .act-won:hover{background:var(--positive);color:var(--bg)}
@@ -2093,13 +2178,13 @@ tbody tr:hover{background:var(--bg)}
   <div class="table-scroll">
     <table>
       <thead><tr>
-        <th>#</th><th>Market</th><th>Asset</th><th>Type</th><th>Odds</th>
-        <th>Price @ Alert</th><th>Baseline</th><th>Time Left</th>
+        <th>#</th><th>Market</th><th>Asset</th><th>Side</th><th>Type</th><th>Odds</th>
+        <th>Price @ Alert</th><th>Baseline</th><th>Margin</th><th>Time Left</th>
         <th>Confidence</th><th>Status</th><th>Logged</th><th>Action</th>
       </tr></thead>
       <tbody>
         {% if not preds %}
-        <tr><td colspan="12">
+        <tr><td colspan="14">
           <div class="empty-state">
             <div class="empty-mark">◎</div>
             <h3>Awaiting first signal</h3>
@@ -2112,10 +2197,12 @@ tbody tr:hover{background:var(--bg)}
           <td class="cell-id">{{ p.id }}</td>
           <td><div class="cell-market" title="{{ p.title }}">{{ p.title }}</div></td>
           <td><span class="cell-asset">{{ p.asset }}</span></td>
+          <td><span class="tag {{ 'tag-yes' if (p.bet_side or 'YES') == 'YES' else 'tag-no' }}">{{ p.bet_side or 'YES' }}</span></td>
           <td><span class="cell-type">{{ p.market_type }}</span></td>
           <td><span class="cell-odds">{{ "%.1f"|format(p.bet_odds) }}%</span></td>
           <td><span class="cell-price">{{ "$%.4f"|format(p.current_price) if p.current_price and p.current_price < 100 else "$%.2f"|format(p.current_price) if p.current_price else "—" }}</span></td>
           <td><span class="cell-price">{{ "$%.4f"|format(p.baseline) if p.baseline < 100 else "$%.2f"|format(p.baseline) }}</span></td>
+          <td><span class="cell-margin">{% if p.current_price and p.baseline %}{{ "%.2f"|format(((p.current_price - p.baseline)|abs / p.baseline * 100)) }}%{% else %}—{% endif %}</span></td>
           <td><span class="cell-time">{{ "%.1fh"|format(p.hours_left) if p.hours_left else "—" }}</span></td>
           <td><span class="tag {{ 'tag-high' if p.confidence == 'HIGH' else 'tag-med' }}">{{ 'High' if p.confidence == 'HIGH' else 'Medium' }}</span></td>
           <td><span class="tag {{ 'tag-pending' if p.status == 'Pending' else 'tag-won' if '✅' in (p.status or '') else 'tag-lost' }}">{{ 'Pending' if p.status == 'Pending' else 'Won' if '✅' in (p.status or '') else 'Lost' }}</span></td>
@@ -2448,474 +2535,237 @@ LANDING_HTML = """<!DOCTYPE html>
 <html lang="en"><head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Cmvng — Prediction Intelligence</title>
+<title>Cmvng Predictions</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400;1,9..40,500&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">
 <style>
 :root {
-  --ink: #0f1a12;
-  --ink-2: #2d3e32;
-  --ink-3: #5a7060;
-  --ink-4: #8fa698;
-  --bg: #f6faf4;
-  --bg-2: #eef5eb;
-  --bg-3: #e4ede0;
+  --bg: #fafff5;
   --surface: #ffffff;
-  --border: rgba(15,26,18,.08);
-  --border-strong: rgba(15,26,18,.14);
-  --green: #16a34a;
-  --green-dark: #0d7a36;
-  --green-light: #dcfce7;
-  --green-glow: rgba(22,163,74,.12);
-  --emerald: #065f46;
-  --lime: #84cc16;
-  --display: 'DM Sans', sans-serif;
+  --text: #0f1419;
+  --text-2: #536471;
+  --text-3: #8b98a5;
+  --green: #22c55e;
+  --green-dark: #16a34a;
+  --green-light: #bbf7d0;
+  --green-bg: #f0fdf4;
+  --accent: #10b981;
+  --border: #e5e7eb;
+  --sans: 'DM Sans', -apple-system, sans-serif;
   --mono: 'Space Mono', monospace;
 }
 *{box-sizing:border-box;margin:0;padding:0}
-html{scroll-behavior:smooth}
-body{font-family:var(--display);background:var(--bg);color:var(--ink);-webkit-font-smoothing:antialiased;overflow-x:hidden}
-::selection{background:var(--green-light);color:var(--emerald)}
+body{font-family:var(--sans);background:var(--bg);color:var(--text);line-height:1.6;-webkit-font-smoothing:antialiased}
+.container{max-width:1200px;margin:0 auto;padding:0 24px}
 
 /* NAV */
-.nav{position:fixed;top:0;left:0;right:0;z-index:100;padding:16px 40px;display:flex;justify-content:space-between;align-items:center;background:rgba(246,250,244,.85);backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px);border-bottom:1px solid var(--border)}
-.logo{display:flex;align-items:center;gap:10px;text-decoration:none;color:var(--ink)}
-.logo-icon{width:36px;height:36px;border-radius:10px;background:var(--green);display:flex;align-items:center;justify-content:center;position:relative;overflow:hidden}
-.logo-icon svg{width:20px;height:20px;fill:none;stroke:#fff;stroke-width:2.5;stroke-linecap:round;stroke-linejoin:round}
-.logo-text{font-weight:700;font-size:20px;letter-spacing:-.03em}
-.logo-text span{color:var(--green)}
-.nav-links{display:flex;gap:32px;align-items:center}
-.nav-link{color:var(--ink-3);text-decoration:none;font-size:14px;font-weight:500;transition:color .2s}
-.nav-link:hover{color:var(--ink)}
-.btn{font-family:var(--display);font-size:14px;font-weight:600;padding:10px 22px;border-radius:10px;border:none;cursor:pointer;transition:all .2s;text-decoration:none;display:inline-flex;align-items:center;gap:8px}
-.btn-outline{background:transparent;border:1.5px solid var(--border-strong);color:var(--ink)}
-.btn-outline:hover{border-color:var(--green);color:var(--green)}
-.btn-green{background:var(--green);color:#fff;box-shadow:0 2px 12px var(--green-glow)}
-.btn-green:hover{background:var(--green-dark);box-shadow:0 4px 20px rgba(22,163,74,.25);transform:translateY(-1px)}
+nav{background:var(--surface);border-bottom:1px solid var(--border);position:sticky;top:0;z-index:100;backdrop-filter:blur(12px);background:rgba(255,255,255,.85)}
+.nav-inner{max-width:1200px;margin:0 auto;padding:20px 24px;display:flex;justify-content:space-between;align-items:center}
+.logo{font-size:24px;font-weight:700;color:var(--green-dark);text-decoration:none;display:flex;align-items:center;gap:8px}
+.logo-dot{width:8px;height:8px;background:var(--green);border-radius:50%;animation:pulse 2s infinite}
+@keyframes pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.5;transform:scale(.85)}}
+.nav-link{padding:10px 24px;background:var(--green);color:white;border-radius:8px;text-decoration:none;font-weight:600;font-size:14px;transition:all .2s;display:inline-flex;align-items:center;gap:6px}
+.nav-link:hover{background:var(--green-dark);transform:translateY(-1px)}
+.nav-link svg{width:16px;height:16px}
 
 /* HERO */
-.hero{padding:140px 40px 80px;display:grid;grid-template-columns:1fr 1fr;gap:64px;align-items:center;max-width:1320px;margin:0 auto;min-height:100vh}
-.hero-content{max-width:580px}
-.hero-badge{display:inline-flex;align-items:center;gap:8px;padding:6px 14px 6px 8px;background:var(--green-light);border-radius:100px;font-size:12px;font-weight:600;color:var(--emerald);margin-bottom:28px}
-.hero-badge .pulse{width:8px;height:8px;border-radius:50%;background:var(--green);animation:pulse 2s infinite}
-@keyframes pulse{0%,100%{opacity:1;box-shadow:0 0 0 0 rgba(22,163,74,.4)}70%{opacity:.8;box-shadow:0 0 0 8px rgba(22,163,74,0)}}
-.hero-title{font-size:clamp(40px,5.5vw,64px);font-weight:700;line-height:1.08;letter-spacing:-.04em;margin-bottom:24px}
-.hero-title .accent{color:var(--green)}
-.hero-sub{font-size:18px;line-height:1.6;color:var(--ink-3);font-weight:400;margin-bottom:36px;max-width:480px}
-.hero-cta{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:48px}
-.hero-stats{display:flex;gap:40px;padding-top:32px;border-top:1px solid var(--border)}
-.hero-stat{display:flex;flex-direction:column;gap:4px}
-.hero-stat-val{font-size:28px;font-weight:700;letter-spacing:-.03em;color:var(--green)}
-.hero-stat-label{font-size:12px;color:var(--ink-4);font-weight:500;text-transform:uppercase;letter-spacing:.06em}
-
-/* Hero visual — chart + football card */
-.hero-visual{position:relative;height:520px}
-.chart-card{position:absolute;top:0;right:0;width:100%;max-width:480px;background:var(--surface);border-radius:20px;border:1px solid var(--border);padding:28px;box-shadow:0 20px 60px rgba(0,0,0,.06);z-index:2}
-.chart-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:20px}
-.chart-title{font-weight:600;font-size:15px;display:flex;align-items:center;gap:8px}
-.chart-title .dot{width:8px;height:8px;border-radius:50%;background:var(--green)}
-.chart-change{font-size:13px;font-weight:600;color:var(--green);background:var(--green-light);padding:4px 10px;border-radius:6px}
-.chart-svg{width:100%;height:140px}
-.chart-labels{display:flex;justify-content:space-between;margin-top:8px;font-size:11px;color:var(--ink-4);font-family:var(--mono)}
-
-/* Football card floating */
-.match-card{position:absolute;bottom:20px;left:0;width:280px;background:var(--surface);border-radius:16px;border:1px solid var(--border);padding:20px;box-shadow:0 16px 48px rgba(0,0,0,.08);z-index:3;animation:floatCard 4s ease-in-out infinite}
-@keyframes floatCard{0%,100%{transform:translateY(0)}50%{transform:translateY(-8px)}}
-.match-header{display:flex;align-items:center;gap:8px;margin-bottom:16px}
-.match-league{font-size:11px;font-weight:600;color:var(--green);background:var(--green-light);padding:3px 8px;border-radius:4px}
-.match-time{font-size:11px;color:var(--ink-4);font-family:var(--mono)}
-.match-teams{display:flex;flex-direction:column;gap:10px;margin-bottom:16px}
-.match-team{display:flex;align-items:center;justify-content:space-between;font-size:14px;font-weight:500}
-.match-team .flag{width:22px;height:22px;border-radius:50%;background:var(--bg-3);display:flex;align-items:center;justify-content:center;font-size:12px;margin-right:8px}
-.match-pick{padding:10px 14px;background:var(--green-light);border-radius:10px;display:flex;justify-content:space-between;align-items:center}
-.match-pick-label{font-size:12px;color:var(--emerald);font-weight:600}
-.match-pick-val{font-size:13px;font-weight:700;color:var(--green)}
-
-/* OTP card floating */
-.otp-card{position:absolute;top:60px;left:40px;width:220px;background:var(--surface);border-radius:14px;border:1px solid var(--border);padding:16px;box-shadow:0 12px 36px rgba(0,0,0,.06);z-index:1;animation:floatOtp 5s ease-in-out infinite .5s}
-@keyframes floatOtp{0%,100%{transform:translateY(0) rotate(-2deg)}50%{transform:translateY(-6px) rotate(-2deg)}}
-.otp-title{font-size:11px;font-weight:600;color:var(--ink-4);text-transform:uppercase;letter-spacing:.08em;margin-bottom:10px}
-.otp-item{display:flex;align-items:center;gap:6px;padding:6px 0;font-size:12px;color:var(--ink-2);border-top:1px solid var(--border)}
-.otp-item:first-of-type{border-top:none}
-.otp-badge{padding:2px 6px;border-radius:4px;font-size:10px;font-weight:700}
-.otp-yes{background:var(--green-light);color:var(--green)}
-.otp-no{background:#fef2f2;color:#dc2626}
-
-@media(max-width:960px){
-  .hero{grid-template-columns:1fr;gap:40px;min-height:auto;padding-top:120px}
-  .hero-visual{height:400px;max-width:480px}
-}
-@media(max-width:640px){
-  .hero{padding:100px 20px 40px}
-  .hero-visual{display:none}
-  .hero-stats{gap:24px}
-}
+.hero{padding:80px 0 60px;text-align:center}
+.hero h1{font-size:clamp(40px,8vw,72px);font-weight:700;color:var(--text);margin-bottom:20px;line-height:1.1}
+.hero h1 .highlight{color:var(--green);position:relative}
+.hero p{font-size:20px;color:var(--text-2);max-width:680px;margin:0 auto 40px;font-weight:400}
+.hero-cta{display:inline-flex;gap:12px;align-items:center}
+.btn{padding:14px 32px;background:var(--green);color:white;border-radius:10px;text-decoration:none;font-weight:600;font-size:16px;transition:all .2s;display:inline-flex;align-items:center;gap:8px;border:2px solid var(--green)}
+.btn:hover{background:var(--green-dark);border-color:var(--green-dark);transform:translateY(-2px);box-shadow:0 8px 24px rgba(34,197,94,.25)}
+.btn svg{width:18px;height:18px}
+.stats-bar{display:flex;justify-content:center;gap:48px;margin-top:60px;flex-wrap:wrap}
+.stat{text-align:center}
+.stat-value{font-size:36px;font-weight:700;color:var(--green-dark);font-family:var(--mono)}
+.stat-label{font-size:13px;color:var(--text-3);text-transform:uppercase;letter-spacing:.05em;margin-top:4px}
 
 /* FEATURES */
-.features{padding:120px 40px;max-width:1320px;margin:0 auto}
-.section-eyebrow{font-size:12px;font-weight:600;color:var(--green);text-transform:uppercase;letter-spacing:.1em;margin-bottom:16px}
-.section-heading{font-size:clamp(32px,4vw,48px);font-weight:700;line-height:1.1;letter-spacing:-.03em;margin-bottom:16px;max-width:700px}
-.section-heading .accent{color:var(--green)}
-.section-desc{font-size:16px;color:var(--ink-3);max-width:520px;line-height:1.6;margin-bottom:64px}
-.feat-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:20px}
-.feat{background:var(--surface);border:1px solid var(--border);border-radius:16px;padding:32px 28px;transition:all .25s;position:relative;overflow:hidden}
-.feat:hover{border-color:var(--green);transform:translateY(-2px);box-shadow:0 12px 32px var(--green-glow)}
-.feat-icon{width:48px;height:48px;border-radius:12px;background:var(--green-light);display:flex;align-items:center;justify-content:center;margin-bottom:20px;font-size:22px}
-.feat-name{font-size:17px;font-weight:700;margin-bottom:10px;letter-spacing:-.02em}
-.feat-text{font-size:13px;color:var(--ink-3);line-height:1.55}
-.feat-tag{margin-top:16px;font-size:11px;font-family:var(--mono);color:var(--green);font-weight:700}
-@media(max-width:900px){.feat-grid{grid-template-columns:repeat(2,1fr)}}
-@media(max-width:560px){.feat-grid{grid-template-columns:1fr}.features{padding:80px 20px}}
+.features{padding:80px 0;background:var(--surface)}
+.section-title{text-align:center;font-size:40px;font-weight:700;color:var(--text);margin-bottom:48px}
+.features-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:32px;margin-top:48px}
+.feature-card{background:var(--green-bg);border:2px solid var(--green-light);border-radius:16px;padding:40px;position:relative;overflow:hidden}
+.feature-card::before{content:'';position:absolute;top:0;right:0;width:120px;height:120px;background:radial-gradient(circle,rgba(34,197,94,.12),transparent);border-radius:50%}
+.feature-icon{width:56px;height:56px;background:var(--green);border-radius:12px;display:flex;align-items:center;justify-content:center;margin-bottom:24px;color:white;font-size:28px}
+.feature-title{font-size:24px;font-weight:700;color:var(--text);margin-bottom:12px}
+.feature-desc{font-size:15px;color:var(--text-2);line-height:1.6}
 
-/* HOW IT WORKS */
-.how{padding:120px 40px;background:var(--bg-2)}
-.how-inner{max-width:1320px;margin:0 auto}
-.steps{display:grid;grid-template-columns:repeat(3,1fr);gap:32px;margin-top:64px}
-.step{background:var(--surface);border:1px solid var(--border);border-radius:16px;padding:36px 28px;position:relative}
-.step-num{position:absolute;top:20px;right:24px;font-size:80px;font-weight:700;color:var(--bg-3);line-height:1;letter-spacing:-.06em}
-.step-icon{width:44px;height:44px;border-radius:50%;background:var(--green);display:flex;align-items:center;justify-content:center;margin-bottom:20px;color:#fff;font-size:18px;font-weight:700}
-.step-title{font-size:20px;font-weight:700;margin-bottom:12px;letter-spacing:-.02em}
-.step-desc{font-size:14px;color:var(--ink-3);line-height:1.6}
-@media(max-width:800px){.steps{grid-template-columns:1fr}}
-@media(max-width:560px){.how{padding:80px 20px}}
+/* PREVIEW - Charts section */
+.preview{padding:80px 0;background:var(--bg)}
+.preview-title{text-align:center;font-size:40px;font-weight:700;color:var(--text);margin-bottom:60px}
+.preview-grid{display:grid;grid-template-columns:1fr 1fr;gap:32px}
+.preview-card{background:var(--surface);border:2px solid var(--border);border-radius:16px;padding:32px;position:relative}
+.preview-card h3{font-size:18px;font-weight:700;color:var(--text);margin-bottom:24px;display:flex;align-items:center;gap:12px}
+.preview-card h3::before{content:'';width:8px;height:8px;background:var(--green);border-radius:50%}
 
-/* STATS */
-.stats{padding:120px 40px;max-width:1320px;margin:0 auto}
-.stats-row{display:grid;grid-template-columns:repeat(4,1fr);gap:0;background:var(--surface);border:1px solid var(--border);border-radius:20px;overflow:hidden;margin-top:48px}
-.stat{padding:40px 32px;border-right:1px solid var(--border);text-align:center}
-.stat:last-child{border-right:none}
-.stat-num{font-size:clamp(36px,4vw,52px);font-weight:700;color:var(--green);letter-spacing:-.04em;line-height:1}
-.stat-unit{font-size:14px;color:var(--ink-3);font-weight:500;margin-top:8px}
-@media(max-width:800px){.stats-row{grid-template-columns:repeat(2,1fr)}.stat:nth-child(2){border-right:none}.stat:nth-child(n+3){border-top:1px solid var(--border)}}
-@media(max-width:560px){.stats{padding:80px 20px}}
+/* Mini bar chart for crypto signals */
+.chart-bars{display:flex;align-items:flex-end;gap:8px;height:180px;margin-top:12px}
+.bar{flex:1;background:var(--green-light);border-radius:4px 4px 0 0;position:relative;transition:all .3s;cursor:pointer}
+.bar:hover{background:var(--green)}
+.bar.positive{background:var(--green)}
+.bar.negative{background:#fca5a5}
+.bar-label{position:absolute;bottom:-24px;left:50%;transform:translateX(-50%);font-size:10px;color:var(--text-3);font-family:var(--mono);white-space:nowrap}
 
-/* PLANS */
-.plans{padding:120px 40px;background:var(--bg-2)}
-.plans-inner{max-width:1320px;margin:0 auto}
-.plan-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:24px;margin-top:48px}
-.plan{background:var(--surface);border:1px solid var(--border);border-radius:20px;padding:36px 28px;transition:all .25s;display:flex;flex-direction:column}
-.plan:hover{transform:translateY(-2px);box-shadow:0 16px 40px rgba(0,0,0,.06)}
-.plan-featured{border:2px solid var(--green);position:relative}
-.plan-featured::before{content:'Best value';position:absolute;top:-13px;left:28px;padding:4px 14px;background:var(--green);color:#fff;font-size:11px;font-weight:700;border-radius:100px;letter-spacing:.04em}
-.plan-name{font-size:22px;font-weight:700;margin-bottom:4px;letter-spacing:-.02em}
-.plan-price{font-size:44px;font-weight:700;color:var(--green);letter-spacing:-.04em;margin:20px 0 8px}
-.plan-price small{font-size:15px;color:var(--ink-4);font-weight:500}
-.plan-desc{font-size:13px;color:var(--ink-3);line-height:1.55;margin-bottom:24px}
-.plan-features{list-style:none;margin-bottom:32px;flex:1}
-.plan-features li{padding:8px 0;font-size:13px;color:var(--ink-2);display:flex;align-items:center;gap:10px}
-.plan-features li::before{content:'✓';width:20px;height:20px;border-radius:50%;background:var(--green-light);color:var(--green);display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:700;flex-shrink:0}
-.plan .btn{width:100%;justify-content:center}
-@media(max-width:800px){.plan-grid{grid-template-columns:1fr}}
-@media(max-width:560px){.plans{padding:80px 20px}}
+/* Football field graphic */
+.football-field{width:100%;height:240px;background:linear-gradient(180deg,#22c55e 0%,#16a34a 100%);border-radius:12px;position:relative;overflow:hidden;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:12px;color:white}
+.football-field::before{content:'';position:absolute;top:50%;left:0;right:0;height:2px;background:rgba(255,255,255,.3)}
+.football-field::after{content:'';position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);width:80px;height:80px;border:2px solid rgba(255,255,255,.3);border-radius:50%}
+.field-stat{font-size:48px;font-weight:700;font-family:var(--mono);z-index:1}
+.field-label{font-size:14px;opacity:.9;z-index:1}
+
+/* CTA */
+.cta{padding:80px 0;text-align:center;background:linear-gradient(180deg,var(--green-bg) 0%,var(--surface) 100%)}
+.cta h2{font-size:48px;font-weight:700;color:var(--text);margin-bottom:20px}
+.cta p{font-size:18px;color:var(--text-2);margin-bottom:32px}
 
 /* FOOTER */
-footer{padding:64px 40px 32px;border-top:1px solid var(--border);max-width:1320px;margin:0 auto}
-.footer-top{display:grid;grid-template-columns:2fr 1fr 1fr 1fr;gap:48px;margin-bottom:48px}
-.footer-brand p{font-size:14px;color:var(--ink-3);margin-top:16px;line-height:1.6;max-width:320px}
-.footer-col h5{font-size:12px;font-weight:700;color:var(--ink-4);text-transform:uppercase;letter-spacing:.08em;margin-bottom:16px}
-.footer-col a{display:block;padding:5px 0;color:var(--ink-3);text-decoration:none;font-size:14px;transition:color .2s}
-.footer-col a:hover{color:var(--green)}
-.footer-bar{display:flex;justify-content:space-between;padding-top:24px;border-top:1px solid var(--border);font-size:12px;color:var(--ink-4);flex-wrap:wrap;gap:12px}
-@media(max-width:800px){.footer-top{grid-template-columns:1fr 1fr;gap:32px}.footer-brand{grid-column:1/-1}}
-@media(max-width:560px){footer{padding:48px 20px 24px}}
+footer{padding:40px 0;background:var(--surface);border-top:1px solid var(--border);text-align:center}
+footer p{font-size:14px;color:var(--text-3)}
+footer a{color:var(--green-dark);text-decoration:none;font-weight:600}
+footer a:hover{text-decoration:underline}
 
-/* Animations */
-.reveal{opacity:0;transform:translateY(32px);transition:opacity .7s ease-out,transform .7s ease-out}
-.reveal.in{opacity:1;transform:translateY(0)}
-</style></head><body>
+@media(max-width:768px){
+  .hero h1{font-size:36px}
+  .hero p{font-size:18px}
+  .stats-bar{gap:32px}
+  .features-grid,.preview-grid{grid-template-columns:1fr}
+  .nav-inner{padding:16px 20px}
+}
+</style>
+</head><body>
 
-<nav class="nav">
-  <a href="/" class="logo">
-    <div class="logo-icon">
-      <svg viewBox="0 0 24 24"><polyline points="22 7 13.5 15.5 8.5 10.5 2 17"/><polyline points="16 7 22 7 22 13"/></svg>
-    </div>
-    <span class="logo-text">Cmvng<span>.</span></span>
-  </a>
-  <div class="nav-links">
-    <a href="#features" class="nav-link">Features</a>
-    <a href="#how" class="nav-link">How it works</a>
-    <a href="#stats" class="nav-link">Stats</a>
-    <a href="/app" class="btn btn-green">Open Dashboard →</a>
+<nav>
+  <div class="nav-inner">
+    <a href="/" class="logo"><span class="logo-dot"></span>Cmvng</a>
+    <a href="/app" class="nav-link">Open Dashboard <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12h14M12 5l7 7-7 7"/></svg></a>
   </div>
 </nav>
 
-<!-- HERO -->
+<main>
+
 <section class="hero">
-  <div class="hero-content">
-    <div class="hero-badge"><span class="pulse"></span> Live · Tracking {{ markets_total }} markets</div>
-    <h1 class="hero-title">Smarter bets start with<br><span class="accent">better signals.</span></h1>
-    <p class="hero-sub">AI-powered prediction intelligence for Limitless Exchange. We scan crypto prices and football markets, surface the edge, and deliver picks straight to Telegram.</p>
+  <div class="container">
+    <h1>Smarter predictions for <span class="highlight">crypto</span> and <span class="highlight">football</span> markets</h1>
+    <p>AI-powered scanner tracking {{ markets_total }} live markets on Limitless Exchange. Get instant Telegram alerts when real opportunities appear.</p>
     <div class="hero-cta">
-      <a href="/app" class="btn btn-green">Enter Dashboard →</a>
-      <a href="#how" class="btn btn-outline">How it works</a>
-    </div>
-    <div class="hero-stats">
-      <div class="hero-stat">
-        <span class="hero-stat-val" data-count="{{ crypto_total }}">0</span>
-        <span class="hero-stat-label">Predictions</span>
-      </div>
-      <div class="hero-stat">
-        <span class="hero-stat-val" data-count="{{ win_rate }}">0<small>%</small></span>
-        <span class="hero-stat-label">Win Rate</span>
-      </div>
-      <div class="hero-stat">
-        <span class="hero-stat-val">{{ "OPEN" if in_window else "CLOSED" }}</span>
-        <span class="hero-stat-label">Window</span>
-      </div>
-    </div>
-  </div>
-
-  <div class="hero-visual">
-    <!-- Crypto chart card -->
-    <div class="chart-card">
-      <div class="chart-head">
-        <div class="chart-title"><span class="dot" style="background:var(--green)"></span> BTC/USD · {{ btc_trend or "LIVE" }}</div>
-        <span class="chart-change">+2.4%</span>
-      </div>
-      <svg class="chart-svg" viewBox="0 0 440 140" fill="none">
-        <defs>
-          <linearGradient id="chartGrad" x1="0" y1="0" x2="0" y2="1">
-            <stop offset="0%" stop-color="#16a34a" stop-opacity=".18"/>
-            <stop offset="100%" stop-color="#16a34a" stop-opacity="0"/>
-          </linearGradient>
-        </defs>
-        <path d="M0 120 C40 110,60 95,80 100 C100 105,120 85,160 70 C200 55,220 75,260 50 C300 25,320 40,360 20 C380 10,420 30,440 15" stroke="#16a34a" stroke-width="2.5" fill="none"/>
-        <path d="M0 120 C40 110,60 95,80 100 C100 105,120 85,160 70 C200 55,220 75,260 50 C300 25,320 40,360 20 C380 10,420 30,440 15 L440 140 L0 140 Z" fill="url(#chartGrad)"/>
-        <circle cx="440" cy="15" r="4" fill="#16a34a"/>
-        <circle cx="440" cy="15" r="8" fill="#16a34a" opacity=".3">
-          <animate attributeName="r" values="8;14;8" dur="2s" repeatCount="indefinite"/>
-          <animate attributeName="opacity" values=".3;0;.3" dur="2s" repeatCount="indefinite"/>
-        </circle>
-      </svg>
-      <div class="chart-labels"><span>12h ago</span><span>8h</span><span>4h</span><span>Now</span></div>
+      <a href="/app" class="btn">View Live Dashboard <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12h14M12 5l7 7-7 7"/></svg></a>
     </div>
 
-    <!-- Football match card -->
-    <div class="match-card">
-      <div class="match-header">
-        <span class="match-league">EPL</span>
-        <span class="match-time">SAT 12:30</span>
+    <div class="stats-bar">
+      <div class="stat">
+        <div class="stat-value" data-count="{{ crypto_total }}">0</div>
+        <div class="stat-label">Total Predictions</div>
       </div>
-      <div class="match-teams">
-        <div class="match-team"><span><span class="flag">🏴</span> Brentford</span><span style="color:var(--ink-4)">46.8%</span></div>
-        <div class="match-team"><span><span class="flag">⚪</span> Fulham</span><span style="color:var(--ink-4)">28.5%</span></div>
+      <div class="stat">
+        <div class="stat-value" data-count="{{ markets_total }}">0</div>
+        <div class="stat-label">Markets Tracked</div>
       </div>
-      <div class="match-pick">
-        <span class="match-pick-label">AI Pick: BTTS Yes</span>
-        <span class="match-pick-val">58%</span>
-      </div>
-    </div>
-
-    <!-- OTP card -->
-    <div class="otp-card">
-      <div class="otp-title">Off The Pitch</div>
-      <div class="otp-item"><span class="otp-badge otp-yes">YES</span> 4+ cards: 62%</div>
-      <div class="otp-item"><span class="otp-badge otp-yes">YES</span> Over 2.5: 55%</div>
-      <div class="otp-item"><span class="otp-badge otp-no">NO</span> 11+ corners: 60%</div>
-    </div>
-  </div>
-</section>
-
-<!-- FEATURES -->
-<section class="features reveal" id="features">
-  <div class="section-eyebrow">What we do</div>
-  <h2 class="section-heading">Four engines, one <span class="accent">edge.</span></h2>
-  <p class="section-desc">Each module targets a different opportunity class. Together they cover crypto prices, match outcomes, and football props on Limitless Exchange.</p>
-
-  <div class="feat-grid">
-    <div class="feat">
-      <div class="feat-icon">📈</div>
-      <div class="feat-name">Crypto Scanner</div>
-      <div class="feat-text">Monitors BTC, ETH, SOL, ADA and more. Fires when price direction, trend, and odds window all align.</div>
-      <div class="feat-tag">Every 5 min</div>
-    </div>
-    <div class="feat">
-      <div class="feat-icon">⚽</div>
-      <div class="feat-name">Accumulators</div>
-      <div class="feat-text">4-tier system building 2x, 3x, 10x, and 100x slips from 200+ live football matches daily.</div>
-      <div class="feat-tag">4 tiers</div>
-    </div>
-    <div class="feat">
-      <div class="feat-icon">🎯</div>
-      <div class="feat-name">OTP Props</div>
-      <div class="feat-text">Hybrid engine: statistical heuristics from real match data + AI backup. Cards, corners, goals, BTTS.</div>
-      <div class="feat-tag">Free + instant</div>
-    </div>
-    <div class="feat">
-      <div class="feat-icon">✅</div>
-      <div class="feat-name">Outcome Tracking</div>
-      <div class="feat-text">Every pick auto-resolves against real match results. Win rates are earned, not claimed.</div>
-      <div class="feat-tag">Auto-resolve</div>
-    </div>
-  </div>
-</section>
-
-<!-- HOW IT WORKS -->
-<section class="how reveal" id="how">
-  <div class="how-inner">
-    <div class="section-eyebrow">The process</div>
-    <h2 class="section-heading">Scan. Analyze. <span class="accent">Decide.</span></h2>
-    <p class="section-desc">Complexity under the hood, simplicity in your hands.</p>
-
-    <div class="steps">
-      <div class="step">
-        <div class="step-num">1</div>
-        <div class="step-icon">⟳</div>
-        <div class="step-title">We scan</div>
-        <div class="step-desc">Every 5 minutes, the bot pulls all active markets from Limitless. Crypto prices, football fixtures, prop markets — all checked in real time against your strategy rules.</div>
-      </div>
-      <div class="step">
-        <div class="step-num">2</div>
-        <div class="step-icon">◎</div>
-        <div class="step-title">AI analyzes</div>
-        <div class="step-desc">Football heuristics from decades of data. Claude AI for edge cases. Each pick includes confidence, reasoning, and the exact market link. No black boxes.</div>
-      </div>
-      <div class="step">
-        <div class="step-num">3</div>
-        <div class="step-icon">→</div>
-        <div class="step-title">You decide</div>
-        <div class="step-desc">Signals hit Telegram instantly. Click through to Limitless, place the bet, or skip it. The dashboard tracks everything — so you know what is working.</div>
+      <div class="stat">
+        <div class="stat-value" data-count="{{ win_rate }}">0<span style="font-size:.6em">%</span></div>
+        <div class="stat-label">Win Rate</div>
       </div>
     </div>
   </div>
 </section>
 
-<!-- STATS -->
-<section class="stats reveal" id="stats">
-  <div class="section-eyebrow">Live numbers</div>
-  <h2 class="section-heading">Proof is in the <span class="accent">data.</span></h2>
-
-  <div class="stats-row">
-    <div class="stat">
-      <div class="stat-num" data-count="{{ crypto_total }}">0</div>
-      <div class="stat-unit">Total predictions</div>
-    </div>
-    <div class="stat">
-      <div class="stat-num" data-count="{{ markets_total }}">0</div>
-      <div class="stat-unit">Markets monitored</div>
-    </div>
-    <div class="stat">
-      <div class="stat-num" data-count="{{ win_rate }}">0<small>%</small></div>
-      <div class="stat-unit">Win rate</div>
-    </div>
-    <div class="stat">
-      <div class="stat-num">5<small>min</small></div>
-      <div class="stat-unit">Scan interval</div>
-    </div>
-  </div>
-</section>
-
-<!-- PLANS -->
-<section class="plans reveal" id="plans">
-  <div class="plans-inner">
-    <div class="section-eyebrow">Access</div>
-    <h2 class="section-heading">Start free. <span class="accent">Upgrade later.</span></h2>
-
-    <div class="plan-grid">
-      <div class="plan">
-        <div class="plan-name">Observer</div>
-        <div class="plan-price">Free</div>
-        <div class="plan-desc">Browse the dashboard, see resolved picks and win rates.</div>
-        <ul class="plan-features">
-          <li>View dashboard</li>
-          <li>Resolved pick history</li>
-          <li>Public stats</li>
-        </ul>
-        <a href="/app" class="btn btn-outline">View dashboard</a>
+<section class="features">
+  <div class="container">
+    <h2 class="section-title">Four prediction engines working for you</h2>
+    <div class="features-grid">
+      <div class="feature-card">
+        <div class="feature-icon">₿</div>
+        <div class="feature-title">Crypto Scanner</div>
+        <div class="feature-desc">Monitors price movements every 5 minutes. Fires signals when trends align with your strategy rules and Lagos trading hours.</div>
       </div>
-      <div class="plan plan-featured">
-        <div class="plan-name">Operator</div>
-        <div class="plan-price">$29 <small>/mo</small></div>
-        <div class="plan-desc">Full access: every signal, every market, every engine.</div>
-        <ul class="plan-features">
-          <li>Telegram alerts</li>
-          <li>4-tier accumulators</li>
-          <li>OTP props</li>
-          <li>Crypto signals</li>
-          <li>Outcome tracking</li>
-        </ul>
-        <a href="/app" class="btn btn-green">Coming soon</a>
+      <div class="feature-card">
+        <div class="feature-icon">⚽</div>
+        <div class="feature-title">Football Accumulators</div>
+        <div class="feature-desc">Builds 4-tier betting slips targeting 2x, 3x, 10x, and 100x returns. Each match appears once across all tiers.</div>
       </div>
-      <div class="plan">
-        <div class="plan-name">Desk</div>
-        <div class="plan-price">Custom</div>
-        <div class="plan-desc">For teams running custom strategies at scale.</div>
-        <ul class="plan-features">
-          <li>Custom rules engine</li>
-          <li>API access</li>
-          <li>Dedicated support</li>
-        </ul>
-        <a href="#" class="btn btn-outline">Contact</a>
+      <div class="feature-card">
+        <div class="feature-icon">📊</div>
+        <div class="feature-title">Off-the-Pitch Props</div>
+        <div class="feature-desc">Analyzes player and match props using real bookmaker statistics. Hybrid engine combines heuristics with AI.</div>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon">✓</div>
+        <div class="feature-title">Auto Tracking</div>
+        <div class="feature-desc">Every prediction is tracked and resolved automatically using live match data. See what actually works.</div>
       </div>
     </div>
   </div>
 </section>
 
-<!-- FOOTER -->
-<footer>
-  <div class="footer-top">
-    <div class="footer-brand">
-      <a href="/" class="logo">
-        <div class="logo-icon">
-          <svg viewBox="0 0 24 24"><polyline points="22 7 13.5 15.5 8.5 10.5 2 17"/><polyline points="16 7 22 7 22 13"/></svg>
+<section class="preview">
+  <div class="container">
+    <h2 class="preview-title">Live market intelligence</h2>
+    <div class="preview-grid">
+      
+      <div class="preview-card">
+        <h3>Crypto Signals</h3>
+        <div class="chart-bars">
+          <div class="bar positive" style="height:45%"><span class="bar-label">Mon</span></div>
+          <div class="bar positive" style="height:68%"><span class="bar-label">Tue</span></div>
+          <div class="bar negative" style="height:32%"><span class="bar-label">Wed</span></div>
+          <div class="bar positive" style="height:78%"><span class="bar-label">Thu</span></div>
+          <div class="bar positive" style="height:52%"><span class="bar-label">Fri</span></div>
+          <div class="bar positive" style="height:85%"><span class="bar-label">Sat</span></div>
+          <div class="bar positive" style="height:61%"><span class="bar-label">Sun</span></div>
         </div>
-        <span class="logo-text">Cmvng<span>.</span></span>
-      </a>
-      <p>Prediction intelligence for operators. Not a signal group — a system.</p>
-    </div>
-    <div class="footer-col">
-      <h5>Product</h5>
-      <a href="/app">Dashboard</a>
-      <a href="/app/football">Football</a>
-      <a href="#features">Features</a>
-    </div>
-    <div class="footer-col">
-      <h5>Resources</h5>
-      <a href="#how">How it works</a>
-      <a href="#stats">Statistics</a>
-    </div>
-    <div class="footer-col">
-      <h5>Connect</h5>
-      <a href="#">Telegram</a>
-      <a href="https://limitless.exchange" target="_blank">Limitless</a>
+      </div>
+
+      <div class="preview-card">
+        <h3>Football Accumulators</h3>
+        <div class="football-field">
+          <div class="field-stat">{{ markets_total }}</div>
+          <div class="field-label">Active markets this week</div>
+        </div>
+      </div>
+
     </div>
   </div>
-  <div class="footer-bar">
-    <span>© 2026 Cmvng Predictions</span>
-    <span>Not financial advice</span>
+</section>
+
+<section class="cta">
+  <div class="container">
+    <h2>Start tracking predictions</h2>
+    <p>Free access to live dashboard and Telegram alerts</p>
+    <a href="/app" class="btn">Open Dashboard <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12h14M12 5l7 7-7 7"/></svg></a>
+  </div>
+</section>
+
+</main>
+
+<footer>
+  <div class="container">
+    <p>Cmvng Predictions · <a href="/app">Dashboard</a> · <a href="/app/football">Football</a> · Built for Limitless Exchange</p>
   </div>
 </footer>
 
 <script>
 // Count-up animation
-const countObs = new IntersectionObserver((entries) => {
-  entries.forEach(entry => {
-    if (!entry.isIntersecting) return;
-    const el = entry.target;
-    if (el.dataset.counted) return;
-    el.dataset.counted = '1';
-    const target = parseFloat(el.dataset.count) || 0;
-    const suffix = el.querySelector('small')?.outerHTML || '';
+const obs = new IntersectionObserver((entries) => {
+  entries.forEach(e => {
+    if (!e.isIntersecting || e.target.dataset.counted) return;
+    e.target.dataset.counted = '1';
+    const target = parseFloat(e.target.dataset.count) || 0;
     const duration = 1200;
     const start = performance.now();
     const tick = (now) => {
-      const p = Math.min(1, (now - start) / duration);
-      const eased = 1 - Math.pow(1 - p, 3);
-      const val = target * eased;
-      el.innerHTML = (target < 10 ? val.toFixed(1) : Math.round(val).toLocaleString()) + suffix;
-      if (p < 1) requestAnimationFrame(tick);
+      const elapsed = now - start;
+      const progress = Math.min(elapsed / duration, 1);
+      const eased = 1 - Math.pow(1 - progress, 3);
+      const current = Math.round(target * eased);
+      e.target.innerHTML = current.toLocaleString() + (e.target.innerHTML.includes('%') ? '<span style="font-size:.6em">%</span>' : '');
+      if (progress < 1) requestAnimationFrame(tick);
     };
     requestAnimationFrame(tick);
-    countObs.unobserve(el);
   });
-}, { threshold: 0.4 });
-document.querySelectorAll('[data-count]').forEach(el => countObs.observe(el));
-
-// Reveal on scroll
-const revealObs = new IntersectionObserver((entries) => {
-  entries.forEach(e => { if (e.isIntersecting) e.target.classList.add('in'); });
-}, { threshold: 0.1 });
-document.querySelectorAll('.reveal').forEach(el => revealObs.observe(el));
+}, {threshold: 0.4});
+document.querySelectorAll('[data-count]').forEach(el => obs.observe(el));
 </script>
 
 </body></html>"""
