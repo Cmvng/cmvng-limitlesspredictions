@@ -690,32 +690,23 @@ def _fetch_market_details(slug):
         return None
 
 def _sign_order(order_data, verifying_contract):
-    """Sign order with EIP-712 — using exact Limitless quickstart implementation."""
+    """Sign order with EIP-712."""
     try:
         from eth_account import Account
         from eth_account.messages import encode_typed_data
         from web3 import Web3
 
-        CHAIN_ID = 8453  # Base
+        CHAIN_ID = 8453
         vc = Web3.to_checksum_address(verifying_contract)
-        print("Signing with verifyingContract: {}".format(vc))
 
-        # Exact domain from Limitless docs
-        domain = {
+        domain_data = {
             "name": "Limitless CTF Exchange",
             "version": "1",
             "chainId": CHAIN_ID,
             "verifyingContract": vc,
         }
 
-        # Exact types from Limitless docs
         types = {
-            "EIP712Domain": [
-                {"name": "name", "type": "string"},
-                {"name": "version", "type": "string"},
-                {"name": "chainId", "type": "uint256"},
-                {"name": "verifyingContract", "type": "address"},
-            ],
             "Order": [
                 {"name": "salt", "type": "uint256"},
                 {"name": "maker", "type": "address"},
@@ -732,7 +723,6 @@ def _sign_order(order_data, verifying_contract):
             ],
         }
 
-        # Ensure all values are proper types for EIP-712
         message = {
             "salt": int(order_data["salt"]),
             "maker": Web3.to_checksum_address(order_data["maker"]),
@@ -750,52 +740,11 @@ def _sign_order(order_data, verifying_contract):
 
         account = Account.from_key(LIMITLESS_PRIV_KEY)
 
-        # Try encode_typed_data with full structured data (Limitless Python quickstart format)
-        full_data = {
-            "types": types,
-            "primaryType": "Order",
-            "domain": domain,
-            "message": message,
-        }
-
-        try:
-            # Method 1: encode_structured_data (older eth-account)
-            from eth_account.messages import encode_structured_data
-            signable = encode_structured_data(full_data)
-            signed = account.sign_message(signable)
-            print("Signed OK (encode_structured_data)")
-            return signed.signature.hex()
-        except (ImportError, TypeError):
-            pass
-
-        try:
-            # Method 2: encode_typed_data with full dict (newer eth-account)
-            signable = encode_typed_data(full_data)
-            signed = account.sign_message(signable)
-            print("Signed OK (encode_typed_data dict)")
-            return signed.signature.hex()
-        except TypeError:
-            pass
-
-        try:
-            # Method 3: encode_typed_data with separate args
-            signable = encode_typed_data(domain, types, message)
-            signed = account.sign_message(signable)
-            print("Signed OK (encode_typed_data args)")
-            return signed.signature.hex()
-        except TypeError:
-            pass
-
-        try:
-            # Method 4: Account.sign_typed_data (newest eth-account)
-            signed = account.sign_typed_data(domain, types, message)
-            print("Signed OK (sign_typed_data)")
-            return signed.signature.hex()
-        except (AttributeError, TypeError):
-            pass
-
-        print("Signing FAILED: no compatible signing method found")
-        return None
+        # encode_typed_data(domain, types, primaryType, message) — Python 3.13 / eth-account >= 0.12
+        signable = encode_typed_data(domain_data, types, "Order", message)
+        signed = account.sign_message(signable)
+        print("Signed OK: {}...".format(signed.signature.hex()[:20]))
+        return signed.signature.hex()
     except Exception as e:
         print("Signing error: {}".format(e))
         import traceback
