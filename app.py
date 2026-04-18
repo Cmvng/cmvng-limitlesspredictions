@@ -822,17 +822,16 @@ def analyze_match_with_claude(match):
         return None
 
 def build_accumulators(picks):
-    """Build 2x / 3x / 10x / 100x accumulators. Each MATCH appears in at most ONE tier."""
+    """Build 2x / 3x / 10x / 100x accumulators. Each MATCH appears in at most ONE tier.
+    Smart distribution so all 4 tiers get populated."""
     if not picks:
         return {}
 
-    # Group by match, keep best pick per match for safe/medium
     match_groups = {}
     for p in picks:
         m = (p.get("match") or "").strip()
         if not m:
             continue
-        # Filter out picks with blank/invalid values
         pv = (p.get("pick_value") or "").strip()
         if not pv or pv == "—":
             continue
@@ -841,11 +840,10 @@ def build_accumulators(picks):
     for m in match_groups:
         match_groups[m].sort(key=lambda p: p.get("confidence", 0), reverse=True)
 
-    # Track used matches GLOBALLY — each match can only appear in ONE tier
     used_matches = set()
 
-    def build_tier(target_odds, strategy):
-        """strategy: safe | medium | value | mega"""
+    def build_tier(target_odds, strategy, max_picks=None):
+        """Build a tier with optional max_picks cap to leave picks for other tiers."""
         tier_picks = []
         cumulative = 1.0
         candidates = []
@@ -858,38 +856,45 @@ def build_accumulators(picks):
             conf = float(best.get("confidence") or 0)
 
             if strategy == "safe":
-                # Very high confidence, low odds
                 if conf >= 85 and implied >= 1.03:
                     candidates.append((best, match, implied, conf))
             elif strategy == "medium":
-                # Balanced
-                if 75 <= conf < 90 and 1.15 <= implied <= 1.60:
-                    candidates.append((best, match, implied, conf))
-            elif strategy == "value":
-                # Higher odds picks from any pick per match (not just best)
+                # Any pick per match, wider range
                 for p in match_picks:
                     pi = float(p.get("implied_odds") or 1.0)
                     pc = float(p.get("confidence") or 0)
-                    if 1.50 <= pi <= 2.50 and pc >= 65:
+                    if 75 <= pc < 90 and 1.15 <= pi <= 1.70:
+                        candidates.append((p, match, pi, pc))
+                        break
+                else:
+                    # Fallback: accept the best pick if in acceptable range
+                    if 70 <= conf < 90 and implied >= 1.20:
+                        candidates.append((best, match, implied, conf))
+            elif strategy == "value":
+                for p in match_picks:
+                    pi = float(p.get("implied_odds") or 1.0)
+                    pc = float(p.get("confidence") or 0)
+                    if 1.50 <= pi <= 2.80 and pc >= 60:
                         candidates.append((p, match, pi, pc))
                         break
             elif strategy == "mega":
-                # Mega long shots — very high odds, acceptable confidence
                 for p in match_picks:
                     pi = float(p.get("implied_odds") or 1.0)
                     pc = float(p.get("confidence") or 0)
-                    if pi >= 2.50 and pc >= 55:
+                    if pi >= 2.50 and pc >= 50:
                         candidates.append((p, match, pi, pc))
                         break
 
         if strategy in ("safe", "medium"):
-            candidates.sort(key=lambda x: -x[3])  # highest confidence first
+            candidates.sort(key=lambda x: -x[3])
         else:
-            candidates.sort(key=lambda x: -x[2])  # highest odds first
+            candidates.sort(key=lambda x: -x[2])
 
         for pick, match, implied, conf in candidates:
             if match in used_matches:
                 continue
+            if max_picks and len(tier_picks) >= max_picks:
+                break
             if cumulative >= target_odds:
                 break
             tier_picks.append(pick)
@@ -898,10 +903,16 @@ def build_accumulators(picks):
 
         return {"picks": tier_picks, "total_odds": round(cumulative, 2)}
 
-    safe = build_tier(2.0, "safe")
-    medium = build_tier(3.0, "medium")
-    value = build_tier(10.0, "value")
-    mega = build_tier(100.0, "mega")
+    total_matches = len(match_groups)
+    # Limit each tier to leave picks for others — divide available matches fairly
+    safe_cap   = max(3, min(6, total_matches // 3))
+    medium_cap = max(3, min(5, total_matches // 4))
+    value_cap  = max(3, min(5, total_matches // 4))
+
+    safe   = build_tier(2.0,   "safe",   max_picks=safe_cap)
+    medium = build_tier(3.0,   "medium", max_picks=medium_cap)
+    value  = build_tier(10.0,  "value",  max_picks=value_cap)
+    mega   = build_tier(100.0, "mega")  # no cap, uses what's left
 
     return {
         "safe_2x":   safe,
@@ -916,33 +927,53 @@ def build_accumulators(picks):
 # ═══════════════════════════════════════════════════════════
 
 def is_otp_market(market):
-    """Detect if this is a football/sports prop market (not crypto price)"""
+    """Detect football/sports prop markets vs crypto/stock price markets.
+    Multi-strategy: category ID, automationType, title patterns."""
     title = market.get("title", "") or ""
-    cats  = market.get("categories", []) or []
-    tags  = market.get("tags", []) or []
-    
-    # Clear sports indicators
-    sport_signals = ["Football", "Soccer", "Sports", "Basketball", "Tennis",
-                     "NBA", "NFL", "EPL", "UCL", "Premier League", "Off the Pitch"]
-    if any(s in cats or s in tags for s in sport_signals):
-        return True
-    
-    # Title-based detection — football prop patterns
-    football_keywords = [
-        "goals", "assists", "shots", "fouls", "corners", "yellow card",
-        "red card", "substitution", "possession", "saves", "penalty",
-        "vs ", " vs.", "to win", "to score", "clean sheet", "Manchester",
-        "Arsenal", "Chelsea", "Liverpool", "Real Madrid", "Barcelona",
-        "first half", "second half", "extra time", "shots on target"
-    ]
+    cats = market.get("categories", []) or []
+    tags = market.get("tags", []) or []
+    automation = (market.get("automationType") or "").lower()
+
     title_lower = title.lower()
-    if any(kw.lower() in title_lower for kw in football_keywords):
-        # Exclude crypto that happens to mention "goals"
-        if "$" in title and ("above $" in title_lower or "below $" in title_lower):
-            # Price market with dollar sign — skip
-            return False
+
+    # EXCLUDE: crypto/stock price markets (strongest signal)
+    is_price_market = (
+        "above $" in title_lower or
+        "below $" in title_lower or
+        automation == "lumy"  # lumy is price oracle markets
+    )
+    if is_price_market:
+        return False
+
+    # INCLUDE signals for sports/OTP
+    # Strategy 1: automationType
+    if automation in ("sports", "sport"):
         return True
-    
+
+    # Strategy 2: category hints
+    sport_cats = ["Football", "Soccer", "Sports", "Basketball", "Tennis",
+                  "NBA", "NFL", "EPL", "UCL", "Premier League",
+                  "Off the Pitch", "Props", "Matches"]
+    if any(s.lower() in [c.lower() for c in cats] or s.lower() in [t.lower() for t in tags]
+           for s in sport_cats):
+        return True
+
+    # Strategy 3: title patterns (team vs team, prop language)
+    # "Team A vs Team B" pattern
+    if " vs " in title_lower or " vs." in title_lower:
+        return True
+
+    # OTP-specific language
+    otp_patterns = [
+        "to record", "to score", "to win", "to make",
+        "more goals", "more assists", "more shots",
+        "more fouls", "more corners", "more tackles",
+        "first to score", "clean sheet", "to commit",
+        "yellow card", "red card", "penalty", "substitut"
+    ]
+    if any(p in title_lower for p in otp_patterns):
+        return True
+
     return False
 
 def analyze_otp_market_with_claude(market, parsed_odds):
@@ -1051,37 +1082,51 @@ def save_and_alert_otp(market, parsed, analysis):
         print("OTP alert error: {}".format(e))
 
 def run_otp_scan():
-    """Scan Limitless for Off The Pitch / sports markets and analyze them"""
+    """Scan Limitless for sports/OTP markets using multiple strategies."""
     import requests as req
     if not ANTHROPIC_KEY:
         print("OTP scan skipped — no ANTHROPIC_API_KEY")
         return 0
     try:
-        # Try sports automation type first (most reliable for OTP markets)
         otp_markets = []
+
+        # Strategy 1: fetch with sports automation filter
         try:
             r = req.get(
-                "{}/markets/active?automationType=sports&limit=50".format(LIMITLESS_API),
+                "{}/markets/active?automationType=sports&limit=100".format(LIMITLESS_API),
                 timeout=15
             )
             if r.status_code == 200:
                 otp_markets = r.json().get("data", [])
-                print("OTP via automationType=sports: {} markets".format(len(otp_markets)))
-        except:
-            pass
+                print("OTP strategy 1 (automationType=sports): {} markets".format(len(otp_markets)))
+        except Exception as e:
+            print("OTP strategy 1 failed: {}".format(e))
 
-        # Fallback: fetch all markets and filter for football-like content
+        # Strategy 2: fetch ALL markets and aggressively filter
         if not otp_markets:
-            r = req.get("{}/markets/active".format(LIMITLESS_API), timeout=15)
-            if r.status_code != 200:
-                return 0
-            all_markets = r.json().get("data", [])
-            otp_markets = [m for m in all_markets if is_otp_market(m)]
-            print("OTP via title detection: {} markets (from {} total)".format(
-                len(otp_markets), len(all_markets)))
+            try:
+                # Fetch multiple pages
+                for page in range(1, 4):  # up to 3 pages
+                    r = req.get(
+                        "{}/markets/active?page={}&limit=50".format(LIMITLESS_API, page),
+                        timeout=15
+                    )
+                    if r.status_code != 200:
+                        break
+                    markets = r.json().get("data", [])
+                    if not markets:
+                        break
+                    page_otp = [m for m in markets if is_otp_market(m)]
+                    otp_markets.extend(page_otp)
+                    if len(markets) < 50:
+                        break  # last page
+                print("OTP strategy 2 (title filter across pages): {} markets found".format(
+                    len(otp_markets)))
+            except Exception as e:
+                print("OTP strategy 2 failed: {}".format(e))
 
         if not otp_markets:
-            print("OTP scan: no sports/OTP markets available right now")
+            print("OTP scan: NO sports markets found — this likely means none are live now")
             return 0
         
         # Get already-alerted
@@ -1599,10 +1644,10 @@ FOOTBALL_HTML = """<!DOCTYPE html>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600&family=Inter+Tight:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <style>
-:root{--bg:#fafaf7;--bg-subtle:#f4f3ed;--surface:#fff;--border:#ececea;--border-strong:#dcdbd7;--accent:#1a3d2e;--accent-muted:#2d5a42;--accent-soft:#e8efe9;--positive:#1a7046;--positive-bg:#e8f3ed;--negative:#b4322e;--negative-bg:#f7e7e5;--warning:#8a6a2f;--warning-bg:#f5eedb;--info:#2d4a7a;--info-bg:#e5ecf5;--ink:#1a1a17;--ink-2:#3a3a35;--ink-3:#6b6b64;--ink-4:#9c9c94;--display:'Fraunces',Georgia,serif;--sans:'Inter Tight',sans-serif;--mono:'JetBrains Mono',monospace}
+:root{--bg:#fafaf7;--bg-subtle:#f4f3ed;--surface:#fff;--border:#ececea;--border-strong:#dcdbd7;--accent:#1a3d2e;--accent-muted:#2d5a42;--accent-soft:#e8efe9;--positive:#1a7046;--positive-bg:#e8f3ed;--negative:#b4322e;--negative-bg:#f7e7e5;--warning:#8a6a2f;--warning-bg:#f5eedb;--info:#2d4a7a;--info-bg:#e5ecf5;--mega:#7c3aed;--mega-bg:#ede9fe;--ink:#1a1a17;--ink-2:#3a3a35;--ink-3:#6b6b64;--ink-4:#9c9c94;--display:'Fraunces',Georgia,serif;--sans:'Inter Tight',sans-serif;--mono:'JetBrains Mono',monospace}
 *{box-sizing:border-box;margin:0;padding:0}
 body{font-family:var(--sans);background:var(--bg);color:var(--ink);-webkit-font-smoothing:antialiased;min-height:100vh}
-.app{max-width:1380px;margin:0 auto;position:relative}
+.app{max-width:1380px;margin:0 auto}
 .hdr{padding:24px 40px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:20px;border-bottom:1px solid var(--border)}
 .brand{display:flex;align-items:center;gap:14px}
 .brand-mark{width:38px;height:38px;border-radius:10px;background:var(--accent);display:flex;align-items:center;justify-content:center;position:relative}
@@ -1610,50 +1655,61 @@ body{font-family:var(--sans);background:var(--bg);color:var(--ink);-webkit-font-
 .brand-mark::after{content:'';position:absolute;width:4px;height:4px;background:var(--bg);border-radius:50%}
 .brand-text h1{font-family:var(--display);font-weight:500;font-size:19px;letter-spacing:-.02em}
 .brand-text small{font-size:10px;font-family:var(--mono);color:var(--ink-4);text-transform:uppercase;letter-spacing:.12em}
-.hdr-right{display:flex;align-items:center;gap:16px;flex-wrap:wrap}
 .nav-tabs{display:flex;gap:4px;background:var(--bg-subtle);border-radius:10px;padding:3px}
-.nav-tab{padding:7px 14px;font-size:12px;font-weight:500;cursor:pointer;color:var(--ink-3);border-radius:8px;text-decoration:none}
+.nav-tab{padding:7px 14px;font-size:12px;font-weight:500;color:var(--ink-3);border-radius:8px;text-decoration:none}
 .nav-tab.active{background:var(--surface);color:var(--ink);box-shadow:0 1px 2px rgba(0,0,0,.04)}
-.hero{padding:48px 40px 32px;border-bottom:1px solid var(--border)}
+.hero{padding:44px 40px 28px;border-bottom:1px solid var(--border)}
 .hero-label{font-size:10px;font-family:var(--mono);color:var(--ink-4);text-transform:uppercase;letter-spacing:.15em;margin-bottom:12px;display:flex;align-items:center;gap:10px}
 .hero-label::before{content:'';width:24px;height:1px;background:var(--ink-4)}
-.hero-title{font-family:var(--display);font-weight:400;font-size:clamp(34px,4.8vw,52px);line-height:1.03;letter-spacing:-.035em;margin-bottom:14px}
+.hero-title{font-family:var(--display);font-weight:400;font-size:clamp(32px,4.5vw,46px);line-height:1.03;letter-spacing:-.035em;margin-bottom:14px}
 .hero-title em{font-style:italic;color:var(--accent)}
-.hero-sub{font-size:15px;color:var(--ink-3);max-width:560px;line-height:1.55}
-.section-head{padding:32px 40px 20px;display:flex;align-items:baseline;justify-content:space-between;flex-wrap:wrap;gap:14px}
-.section-title{font-family:var(--display);font-weight:500;font-size:22px;letter-spacing:-.02em}
-.section-count{font-size:11px;font-family:var(--mono);color:var(--ink-4);background:var(--bg-subtle);padding:3px 8px;border-radius:100px;margin-left:10px}
-.btn{font-family:var(--sans);font-size:13px;font-weight:500;padding:9px 16px;border-radius:8px;border:1px solid var(--border);background:var(--surface);color:var(--ink);cursor:pointer;display:inline-flex;align-items:center;gap:7px}
-.btn-primary{background:var(--accent);color:var(--bg);border-color:var(--accent)}
-.btn-primary:hover{background:var(--accent-muted)}
-.accas{padding:0 40px 32px;display:grid;grid-template-columns:repeat(auto-fit,minmax(380px,1fr));gap:24px}
-.acca{background:var(--surface);border:1px solid var(--border);border-radius:16px;padding:28px;position:relative;overflow:hidden}
-.acca-safe{border-top:3px solid var(--positive)}
-.acca-medium{border-top:3px solid var(--warning)}
-.acca-value{border-top:3px solid var(--accent)}
-.acca-mega{border-top:3px solid #a855f7}
-.acca-head{display:flex;align-items:flex-start;justify-content:space-between;margin-bottom:18px}
-.acca-title{font-family:var(--display);font-weight:500;font-size:22px;letter-spacing:-.02em}
-.acca-desc{font-size:12px;color:var(--ink-4);margin-top:4px;font-family:var(--mono)}
-.acca-odds{font-family:var(--mono);font-weight:600;font-size:24px;color:var(--accent);letter-spacing:-.02em;text-align:right}
-.acca-odds small{font-size:9px;font-weight:400;color:var(--ink-4);display:block;text-transform:uppercase;letter-spacing:.1em;margin-top:2px}
-.pick{padding:14px 0;border-top:1px solid var(--border);display:flex;justify-content:space-between;align-items:flex-start;gap:16px}
-.pick:last-child{border-bottom:none}
-.pick-body{flex:1;min-width:0}
-.pick-match{font-size:13px;color:var(--ink);font-weight:500;margin-bottom:4px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.pick-bet{font-size:11px;color:var(--ink-3);font-family:var(--mono);text-transform:uppercase;letter-spacing:.06em}
-.pick-val{font-weight:600;color:var(--accent)}
-.pick-right{display:flex;flex-direction:column;align-items:flex-end;gap:4px;flex-shrink:0}
-.pick-conf{font-family:var(--mono);font-size:11px;color:var(--positive);font-weight:600}
-.status-tag{display:inline-flex;align-items:center;gap:4px;padding:2px 7px;border-radius:100px;font-size:10px;font-weight:500;font-family:var(--sans)}
+.hero-sub{font-size:15px;color:var(--ink-3);max-width:600px;line-height:1.55}
+.stats-row{padding:20px 40px;display:grid;grid-template-columns:repeat(5,1fr);gap:0;border-bottom:1px solid var(--border);background:var(--surface)}
+.stats-row .stat{padding:0 24px;border-left:1px solid var(--border)}
+.stats-row .stat:first-child{padding-left:0;border-left:none}
+.stat-label{font-size:10px;font-family:var(--mono);color:var(--ink-4);text-transform:uppercase;letter-spacing:.14em;margin-bottom:8px;font-weight:500}
+.stat-value{font-family:var(--display);font-weight:400;font-size:30px;line-height:1;letter-spacing:-.03em}
+.tier-section{padding:36px 40px 8px}
+.tier-header{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:20px;flex-wrap:wrap}
+.tier-title{font-family:var(--display);font-weight:500;font-size:24px;letter-spacing:-.02em;display:flex;align-items:center;gap:10px}
+.tier-badge{font-size:10px;font-family:var(--mono);color:var(--ink-4);background:var(--bg-subtle);padding:4px 10px;border-radius:100px;letter-spacing:.08em;text-transform:uppercase}
+.tier-desc{font-size:13px;color:var(--ink-3)}
+.slips-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:20px;padding:0 40px 20px}
+.slip{background:var(--surface);border:1px solid var(--border);border-radius:14px;overflow:hidden;transition:all .2s;position:relative}
+.slip:hover{border-color:var(--border-strong);transform:translateY(-1px);box-shadow:0 4px 16px rgba(0,0,0,.03)}
+.slip-safe{border-top:3px solid var(--positive)}
+.slip-medium{border-top:3px solid var(--warning)}
+.slip-value{border-top:3px solid var(--accent)}
+.slip-mega{border-top:3px solid var(--mega)}
+.slip-head{padding:16px 20px;background:var(--bg-subtle);display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid var(--border)}
+.slip-label{font-family:var(--display);font-weight:500;font-size:15px;letter-spacing:-.01em}
+.slip-odds{font-family:var(--mono);font-weight:600;font-size:17px;color:var(--accent)}
+.slip-body{padding:4px 0}
+.match-row{padding:14px 20px;border-bottom:1px solid var(--border);display:flex;flex-direction:column;gap:6px}
+.match-row:last-child{border-bottom:none}
+.match-teams{font-weight:500;color:var(--ink);font-size:14px;line-height:1.3}
+.match-meta{display:flex;align-items:center;gap:8px;font-size:11px;color:var(--ink-4);font-family:var(--mono);flex-wrap:wrap}
+.meta-league{background:var(--accent-soft);color:var(--accent);padding:2px 6px;border-radius:4px;font-weight:500}
+.meta-sep{color:var(--border-strong)}
+.pick-line{display:flex;align-items:center;gap:10px;margin-top:4px;flex-wrap:wrap}
+.pick-type{font-size:11px;color:var(--ink-3);font-family:var(--mono);text-transform:uppercase;letter-spacing:.06em}
+.pick-value{font-weight:600;color:var(--accent);font-size:13px;background:var(--accent-soft);padding:2px 8px;border-radius:4px}
+.pick-conf{font-family:var(--mono);font-size:11px;color:var(--ink-3);margin-left:auto}
+.conf-bar{flex:1;max-width:60px;height:3px;background:var(--border);border-radius:2px;overflow:hidden;margin-left:10px}
+.conf-bar-fill{height:100%;background:var(--positive);border-radius:2px}
+.status-chip{display:inline-flex;align-items:center;gap:4px;padding:2px 8px;border-radius:100px;font-size:10px;font-weight:500;margin-left:6px}
 .status-pending{background:var(--info-bg);color:var(--info)}
 .status-won{background:var(--positive-bg);color:var(--positive)}
 .status-lost{background:var(--negative-bg);color:var(--negative)}
-.status-check{background:var(--warning-bg);color:var(--warning)}
-.status-expired{background:var(--bg-subtle);color:var(--ink-4)}
-.otp-wrap{margin:0 40px 32px;background:var(--surface);border:1px solid var(--border);border-radius:14px;overflow:hidden}
+.status-live{background:var(--warning-bg);color:var(--warning)}
+.section-head{padding:40px 40px 16px;display:flex;align-items:baseline;justify-content:space-between;gap:14px;flex-wrap:wrap}
+.section-title{font-family:var(--display);font-weight:500;font-size:22px;letter-spacing:-.02em}
+.btn{font-family:var(--sans);font-size:13px;font-weight:500;padding:9px 16px;border-radius:8px;border:1px solid var(--border);background:var(--surface);color:var(--ink);cursor:pointer;display:inline-flex;align-items:center;gap:7px}
+.btn-primary{background:var(--accent);color:var(--bg);border-color:var(--accent)}
+.btn-primary:hover{background:var(--accent-muted)}
+.otp-wrap,.hist-wrap{margin:0 40px 24px;background:var(--surface);border:1px solid var(--border);border-radius:14px;overflow:hidden}
+table{width:100%;border-collapse:collapse;font-size:13px;min-width:700px}
 .table-scroll{overflow-x:auto}
-table{width:100%;border-collapse:collapse;font-size:13px;min-width:800px}
 thead{background:var(--bg-subtle);border-bottom:1px solid var(--border)}
 thead th{text-align:left;padding:14px 16px;font-size:10px;font-family:var(--mono);font-weight:500;color:var(--ink-3);text-transform:uppercase;letter-spacing:.1em;white-space:nowrap}
 thead th:first-child{padding-left:24px}
@@ -1663,45 +1719,37 @@ tbody td:first-child{padding-left:24px}
 tbody td:last-child{padding-right:24px}
 tbody tr:last-child td{border-bottom:none}
 tbody tr:hover{background:var(--bg)}
-.empty{padding:80px 40px;text-align:center;color:var(--ink-3)}
-.empty-mark{width:56px;height:56px;border-radius:14px;background:var(--bg-subtle);display:inline-flex;align-items:center;justify-content:center;font-size:22px;margin-bottom:16px;border:1px solid var(--border)}
-.empty h3{font-family:var(--display);font-size:20px;margin-bottom:10px;color:var(--ink);font-weight:500}
-.empty p{font-size:14px;max-width:440px;margin:0 auto;line-height:1.6}
-.footer{padding:24px 40px 40px;border-top:1px solid var(--border);text-align:center;font-size:11px;font-family:var(--mono);color:var(--ink-4)}
-.stats-row{padding:20px 40px;display:grid;grid-template-columns:repeat(4,1fr);gap:0;border-bottom:1px solid var(--border)}
-.stats-row .stat{padding:0 24px;border-left:1px solid var(--border)}
-.stats-row .stat:first-child{padding-left:0;border-left:none}
-.stat-label{font-size:10px;font-family:var(--mono);color:var(--ink-4);text-transform:uppercase;letter-spacing:.14em;margin-bottom:8px;font-weight:500}
-.stat-value{font-family:var(--display);font-weight:400;font-size:32px;line-height:1;letter-spacing:-.03em}
-.stat-value.is-positive{color:var(--positive)}.stat-value.is-negative{color:var(--negative)}
+.empty{padding:60px 40px;text-align:center;color:var(--ink-3)}
+.empty-mark{width:52px;height:52px;border-radius:14px;background:var(--bg-subtle);display:inline-flex;align-items:center;justify-content:center;font-size:22px;margin-bottom:14px;border:1px solid var(--border)}
+.empty h3{font-family:var(--display);font-size:19px;margin-bottom:10px;color:var(--ink);font-weight:500}
+.empty p{font-size:14px;max-width:460px;margin:0 auto;line-height:1.6}
+.footer{padding:28px 40px 48px;border-top:1px solid var(--border);text-align:center;font-size:11px;font-family:var(--mono);color:var(--ink-4);margin-top:24px}
+@media(max-width:800px){.stats-row{grid-template-columns:repeat(3,1fr)}.stat:nth-child(n+4){border-top:1px solid var(--border);padding-top:16px;margin-top:16px}.hero,.stats-row,.tier-section,.section-head,.footer{padding-left:20px;padding-right:20px}.slips-grid,.otp-wrap,.hist-wrap{margin-left:20px;margin-right:20px;padding-left:0;padding-right:0}}
 </style></head><body>
 <div class="app">
 <header class="hdr">
   <div class="brand"><div class="brand-mark"></div>
     <div class="brand-text"><h1>Limitless</h1><small>CMVNG · Football Picks</small></div></div>
-  <div class="hdr-right">
+  <div style="display:flex;gap:12px">
     <nav class="nav-tabs">
       <a href="/" class="nav-tab">Crypto</a>
       <a href="/football" class="nav-tab active">Football</a>
     </nav>
   </div>
 </header>
+
 <section class="hero">
-  <div class="hero-label">Accumulator Engine</div>
-  <h2 class="hero-title">Stacked picks,<br><em>unique selections.</em></h2>
-  <p class="hero-sub">Daily football analysis using real match data and AI-powered reasoning. Each match appears in only one tier — highest confidence picks go to Safe, mid-confidence builds Medium, value-hunts fill the 10x tier.</p>
+  <div class="hero-label">Daily Accumulators</div>
+  <h2 class="hero-title">Grouped picks,<br><em>calculated payouts.</em></h2>
+  <p class="hero-sub">Four strategy tiers — 2x, 3x, 10x, 100x — each split into multiple independent slips. Pick the slip you like best, place it as a single accumulator bet. Past matches are filtered out automatically.</p>
 </section>
 
 <div class="stats-row">
-  <div class="stat"><div class="stat-label">Safe Tier</div><div class="stat-value">{{ stats.safe }}</div></div>
-  <div class="stat"><div class="stat-label">Medium Tier</div><div class="stat-value">{{ stats.medium }}</div></div>
-  <div class="stat"><div class="stat-label">Value Tier</div><div class="stat-value">{{ stats.value }}</div></div>
+  <div class="stat"><div class="stat-label">2x Slips</div><div class="stat-value" style="color:var(--positive)">{{ stats.safe_slips_count }}</div></div>
+  <div class="stat"><div class="stat-label">3x Slips</div><div class="stat-value" style="color:var(--warning)">{{ stats.medium_slips_count }}</div></div>
+  <div class="stat"><div class="stat-label">10x Slips</div><div class="stat-value" style="color:var(--accent)">{{ stats.value_slips_count }}</div></div>
+  <div class="stat"><div class="stat-label">100x Slips</div><div class="stat-value" style="color:var(--mega)">{{ stats.mega_slips_count }}</div></div>
   <div class="stat"><div class="stat-label">OTP Picks</div><div class="stat-value">{{ otp_picks|length }}</div></div>
-</div>
-
-<div class="section-head">
-  <div><span class="section-title">Current Accumulators</span><span class="section-count">{{ acca_total }} active picks</span></div>
-  <button class="btn btn-primary" onclick="fetch('/otp/scan').then(()=>alert('OTP scan triggered'))">◎ Scan OTP</button>
 </div>
 
 {% if not has_keys %}
@@ -1710,95 +1758,110 @@ tbody tr:hover{background:var(--bg)}
   <h3>Setup required</h3>
   <p>Football module needs <code style="font-family:var(--mono);background:var(--bg-subtle);padding:2px 6px;border-radius:4px">ANTHROPIC_API_KEY</code> in Railway environment variables.</p>
 </div>
-{% elif not (safe_picks or medium_picks or value_picks) %}
+{% elif acca_total == 0 and not otp_picks %}
 <div class="empty">
   <div class="empty-mark">⚽</div>
-  <h3>Building accumulators</h3>
-  <p>The football analyzer runs every 6 hours. It scans today's fixtures, analyzes each match with Claude, and builds three unique accumulator tiers. Wait ~5 minutes for the first run.</p>
+  <h3>Building picks</h3>
+  <p>The football analyzer runs every 6 hours. It scans tomorrow's fixtures, analyzes each match with AI, and builds multiple accumulator slips per tier. Manual trigger: hit <code>/scan</code> endpoint.</p>
 </div>
 {% else %}
-<div class="accas">
 
-  <div class="acca acca-safe">
-    <div class="acca-head">
-      <div>
-        <div class="acca-title">🟢 Safe</div>
-        <div class="acca-desc">High confidence · ~2x payout</div>
-      </div>
-      <div class="acca-odds">{{ "%.2f"|format(stats.safe_odds) }}x<small>total</small></div>
-    </div>
-    {% for p in safe_picks %}
-    <div class="pick">
-      <div class="pick-body">
-        <div class="pick-match">{{ p.match_id }}</div>
-        <div class="pick-bet">{{ p.pick_type.replace("_", " ") }} — <span class="pick-val">{{ p.pick_value }}</span></div>
-      </div>
-      <div class="pick-right">
-        <span class="pick-conf">{{ p.confidence|int }}%</span>
-        <span class="status-tag status-{{ p.status|lower|replace(' ', '-') if p.status else 'pending' }}">
-          {{ p.status or 'Pending' }}
-        </span>
+{# Helper macro to render match meta - kickoff time + league #}
+{% macro match_meta(pick) -%}
+  <div class="match-meta">
+    {% if pick.competition %}<span class="meta-league">{{ pick.competition }}</span>{% endif %}
+    {% if pick.kickoff_time %}
+      <span class="meta-sep">·</span>
+      <span>{{ pick.kickoff_time[:16].replace("T"," ") }}</span>
+    {% endif %}
+  </div>
+{%- endmacro %}
+
+{% macro render_slip(slip, tier_class) %}
+<div class="slip slip-{{ tier_class }}">
+  <div class="slip-head">
+    <div class="slip-label">Slip #{{ slip.slip_number }}</div>
+    <div class="slip-odds">{{ "%.2f"|format(slip.total_odds) }}x</div>
+  </div>
+  <div class="slip-body">
+    {% for pick in slip.picks %}
+    <div class="match-row">
+      <div class="match-teams">{{ pick.match_id or (pick.home_team + " vs " + pick.away_team) }}</div>
+      {{ match_meta(pick) }}
+      <div class="pick-line">
+        <span class="pick-type">{{ pick.pick_type.replace("_", " ") }}</span>
+        <span class="pick-value">{{ pick.pick_value or "—" }}</span>
+        <div class="conf-bar"><div class="conf-bar-fill" style="width:{{ pick.confidence|int }}%"></div></div>
+        <span class="pick-conf">{{ pick.confidence|int }}%</span>
       </div>
     </div>
     {% endfor %}
-    {% if not safe_picks %}<div style="padding:14px 0;color:var(--ink-4);font-size:13px;font-style:italic">No picks available</div>{% endif %}
   </div>
+</div>
+{% endmacro %}
 
-  <div class="acca acca-medium">
-    <div class="acca-head">
-      <div>
-        <div class="acca-title">🟡 Medium</div>
-        <div class="acca-desc">Balanced risk · ~3x payout</div>
-      </div>
-      <div class="acca-odds">{{ "%.2f"|format(stats.medium_odds) }}x<small>total</small></div>
+{% if safe_slips %}
+<div class="tier-section">
+  <div class="tier-header">
+    <div>
+      <div class="tier-title">🟢 2x Slips <span class="tier-badge">Safe</span></div>
+      <div class="tier-desc">High confidence picks · ~2x total payout per slip</div>
     </div>
-    {% for p in medium_picks %}
-    <div class="pick">
-      <div class="pick-body">
-        <div class="pick-match">{{ p.match_id }}</div>
-        <div class="pick-bet">{{ p.pick_type.replace("_", " ") }} — <span class="pick-val">{{ p.pick_value }}</span></div>
-      </div>
-      <div class="pick-right">
-        <span class="pick-conf">{{ p.confidence|int }}%</span>
-        <span class="status-tag status-{{ p.status|lower|replace(' ', '-') if p.status else 'pending' }}">
-          {{ p.status or 'Pending' }}
-        </span>
-      </div>
-    </div>
-    {% endfor %}
-    {% if not medium_picks %}<div style="padding:14px 0;color:var(--ink-4);font-size:13px;font-style:italic">No picks available</div>{% endif %}
   </div>
-
-  <div class="acca acca-value">
-    <div class="acca-head">
-      <div>
-        <div class="acca-title">🔥 Value</div>
-        <div class="acca-desc">Big payout · ~10x target</div>
-      </div>
-      <div class="acca-odds">{{ "%.2f"|format(stats.value_odds) }}x<small>total</small></div>
-    </div>
-    {% for p in value_picks %}
-    <div class="pick">
-      <div class="pick-body">
-        <div class="pick-match">{{ p.match_id }}</div>
-        <div class="pick-bet">{{ p.pick_type.replace("_", " ") }} — <span class="pick-val">{{ p.pick_value }}</span></div>
-      </div>
-      <div class="pick-right">
-        <span class="pick-conf">{{ p.confidence|int }}%</span>
-        <span class="status-tag status-{{ p.status|lower|replace(' ', '-') if p.status else 'pending' }}">
-          {{ p.status or 'Pending' }}
-        </span>
-      </div>
-    </div>
-    {% endfor %}
-    {% if not value_picks %}<div style="padding:14px 0;color:var(--ink-4);font-size:13px;font-style:italic">No picks available</div>{% endif %}
-  </div>
-
+</div>
+<div class="slips-grid">
+  {% for slip in safe_slips %}{{ render_slip(slip, "safe") }}{% endfor %}
 </div>
 {% endif %}
 
+{% if medium_slips %}
+<div class="tier-section">
+  <div class="tier-header">
+    <div>
+      <div class="tier-title">🟡 3x Slips <span class="tier-badge">Medium</span></div>
+      <div class="tier-desc">Balanced risk · ~3x total payout per slip</div>
+    </div>
+  </div>
+</div>
+<div class="slips-grid">
+  {% for slip in medium_slips %}{{ render_slip(slip, "medium") }}{% endfor %}
+</div>
+{% endif %}
+
+{% if value_slips %}
+<div class="tier-section">
+  <div class="tier-header">
+    <div>
+      <div class="tier-title">🔥 10x Slips <span class="tier-badge">Value</span></div>
+      <div class="tier-desc">Higher risk, higher reward · ~10x per slip</div>
+    </div>
+  </div>
+</div>
+<div class="slips-grid">
+  {% for slip in value_slips %}{{ render_slip(slip, "value") }}{% endfor %}
+</div>
+{% endif %}
+
+{% if mega_slips %}
+<div class="tier-section">
+  <div class="tier-header">
+    <div>
+      <div class="tier-title">🚀 100x Slips <span class="tier-badge">Mega</span></div>
+      <div class="tier-desc">Long shot · massive payout potential</div>
+    </div>
+  </div>
+</div>
+<div class="slips-grid">
+  {% for slip in mega_slips %}{{ render_slip(slip, "mega") }}{% endfor %}
+</div>
+{% endif %}
+
+{% endif %}
+
+<!-- Off The Pitch Section -->
 <div class="section-head">
-  <div><span class="section-title">Off The Pitch Picks</span><span class="section-count">Limitless · {{ otp_picks|length }}</span></div>
+  <div><span class="section-title">Off The Pitch · Limitless</span></div>
+  <button class="btn btn-primary" onclick="fetch('/otp/scan').then(r=>r.json()).then(d=>alert('OTP scan triggered. Wait ~30s then refresh.'))">◎ Scan OTP</button>
 </div>
 
 {% if otp_picks %}
@@ -1806,17 +1869,17 @@ tbody tr:hover{background:var(--bg)}
   <div class="table-scroll">
     <table>
       <thead><tr>
-        <th>Market</th><th>Pick</th><th>Odds</th><th>Confidence</th><th>Reasoning</th><th>Status</th>
+        <th>Market</th><th>Pick</th><th>Odds</th><th>Conf</th><th>Reasoning</th><th>Status</th>
       </tr></thead>
       <tbody>
         {% for p in otp_picks %}
         <tr>
-          <td style="font-weight:500;color:var(--ink);max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ p.match_id }}</td>
-          <td><span class="status-tag status-{{ 'won' if p.pick_value == 'YES' else 'lost' }}">{{ p.pick_value }}</span></td>
+          <td style="font-weight:500;color:var(--ink);max-width:320px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ p.match_id }}</td>
+          <td><span class="pick-value">{{ p.pick_value }}</span></td>
           <td style="font-family:var(--mono);font-weight:600">{{ "%.1f"|format(p.implied_odds) }}%</td>
-          <td><span style="font-family:var(--mono);color:var(--positive);font-weight:600">{{ p.confidence|int }}%</span></td>
+          <td><span class="pick-conf">{{ p.confidence|int }}%</span></td>
           <td style="color:var(--ink-3);font-size:12px;max-width:280px">{{ p.reasoning }}</td>
-          <td><span class="status-tag status-{{ p.status|lower|replace(' ', '-') }}">{{ p.status }}</span></td>
+          <td><span class="status-chip status-{{ p.status|lower|replace(' ', '-')|replace('✅', 'won')|replace('❌', 'lost') }}">{{ p.status }}</span></td>
         </tr>
         {% endfor %}
       </tbody>
@@ -1827,11 +1890,39 @@ tbody tr:hover{background:var(--bg)}
 <div class="empty">
   <div class="empty-mark">⚽</div>
   <h3>No OTP picks yet</h3>
-  <p>The Off The Pitch scanner runs every 30 minutes during Lagos trading hours. It uses AI to identify mispriced football prop markets on Limitless. Click <b>Scan OTP</b> to trigger a manual scan.</p>
+  <p>The Off The Pitch scanner pulls football prop markets from Limitless every 30 minutes. If the scanner runs but finds nothing, no sports markets are live in that window. Tap <b>Scan OTP</b> to trigger a manual scan now.</p>
 </div>
 {% endif %}
 
-<footer class="footer">Accumulators update every 6 hours · OTP scans every 30 minutes · Auto-refresh 60s</footer>
+<!-- History Section -->
+{% if history_picks %}
+<div class="section-head">
+  <div><span class="section-title">Recent Results</span></div>
+</div>
+<div class="hist-wrap">
+  <div class="table-scroll">
+    <table>
+      <thead><tr>
+        <th>Match</th><th>League</th><th>Pick</th><th>Confidence</th><th>Outcome</th><th>Resolved</th>
+      </tr></thead>
+      <tbody>
+        {% for p in history_picks %}
+        <tr>
+          <td style="font-weight:500;color:var(--ink);max-width:260px">{{ p.match_id }}</td>
+          <td style="font-family:var(--mono);font-size:11px;color:var(--ink-3)">{{ p.competition or "—" }}</td>
+          <td><span class="pick-value">{{ p.pick_value or "—" }}</span> <small style="color:var(--ink-4)">{{ p.pick_type.replace("_", " ") }}</small></td>
+          <td><span class="pick-conf">{{ p.confidence|int }}%</span></td>
+          <td><span class="status-chip {{ 'status-won' if '✅' in (p.status or '') else 'status-lost' }}">{{ p.status }}</span></td>
+          <td style="font-family:var(--mono);font-size:11px;color:var(--ink-4)">{{ p.resolved_at[:16].replace("T"," ") if p.resolved_at else "—" }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% endif %}
+
+<footer class="footer">Accumulators update every 6 hours · Past matches auto-filtered · Auto-refresh 60s</footer>
 </div>
 
 <script>setTimeout(()=>location.reload(),60000);</script>
@@ -1865,24 +1956,70 @@ def dashboard():
         in_window=is_lagos_window()
     )
 
+def _group_picks_into_slips(picks, target_odds, max_picks_per_slip=5):
+    """Group picks into multiple accumulator slips each reaching target odds."""
+    if not picks:
+        return []
+    sorted_picks = sorted(picks, key=lambda p: float(p.get("confidence") or 0), reverse=True)
+    slips = []
+    current_slip = []
+    current_odds = 1.0
+    slip_number = 1
+    for pick in sorted_picks:
+        odds = float(pick.get("implied_odds") or 1.0)
+        if odds < 1.0:
+            continue
+        current_slip.append(pick)
+        current_odds *= odds
+        if current_odds >= target_odds or len(current_slip) >= max_picks_per_slip:
+            slips.append({"picks": current_slip, "total_odds": round(current_odds, 2),
+                          "slip_number": slip_number})
+            current_slip = []
+            current_odds = 1.0
+            slip_number += 1
+    if current_slip and current_odds >= 1.3:
+        slips.append({"picks": current_slip, "total_odds": round(current_odds, 2),
+                      "slip_number": slip_number})
+    return slips
+
+def _is_kickoff_future(kickoff_str):
+    """Check if kickoff is in future or within last 15 mins (still live)."""
+    if not kickoff_str:
+        return True
+    try:
+        dt = datetime.fromisoformat(kickoff_str.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt > datetime.now(timezone.utc) - timedelta(minutes=15)
+    except:
+        return True
+
 @app.route("/football")
 def football_page():
     has_keys = bool(ANTHROPIC_KEY)
     try:
         conn = get_db()
-        # OTP picks (last 30 pending or recently resolved)
+        # OTP pending picks
         rows = conn.run(
             "SELECT * FROM football_picks WHERE pick_type='limitless_otp' "
-            "ORDER BY id DESC LIMIT 30"
+            "AND status='Pending' ORDER BY id DESC LIMIT 50"
         )
         cols = [c['name'] for c in conn.columns]
         otp_picks = [dict(zip(cols, r)) for r in rows]
 
-        # Current accumulator picks — show Pending + any resolved in last 48hrs
+        # Recent resolved history (last 72hrs)
+        rows_hist = conn.run(
+            "SELECT * FROM football_picks "
+            "WHERE status IN ('\u2705 Won', '\u274c Lost') "
+            "AND resolved_at IS NOT NULL ORDER BY id DESC LIMIT 30"
+        )
+        cols_h = [c['name'] for c in conn.columns]
+        history_picks = [dict(zip(cols_h, r)) for r in rows_hist]
+
+        # Active accumulator picks (only Pending)
         rows2 = conn.run(
             "SELECT * FROM football_picks "
-            "WHERE pick_type != 'limitless_otp' "
-            "AND (status = 'Pending' OR fired_at::timestamptz > NOW() - INTERVAL '48 hours') "
+            "WHERE pick_type != 'limitless_otp' AND status='Pending' "
             "ORDER BY confidence DESC"
         )
         cols2 = [c['name'] for c in conn.columns]
@@ -1891,39 +2028,45 @@ def football_page():
     except Exception as e:
         print("Football page error: {}".format(e))
         otp_picks = []
+        history_picks = []
         all_acca = []
+
+    # Filter: only keep picks for FUTURE matches
+    all_acca = [p for p in all_acca if _is_kickoff_future(p.get("kickoff_time", ""))]
 
     # Split by tier
     safe_picks   = [p for p in all_acca if p.get("accumulator_tier") == "safe_2x"]
     medium_picks = [p for p in all_acca if p.get("accumulator_tier") == "medium_3x"]
     value_picks  = [p for p in all_acca if p.get("accumulator_tier") == "value_10x"]
+    mega_picks   = [p for p in all_acca if p.get("accumulator_tier") == "mega_100x"]
 
-    # Calculate total odds per tier
-    def calc_odds(picks):
-        total = 1.0
-        for p in picks:
-            o = float(p.get("implied_odds") or 1.0)
-            if o > 1.0:
-                total *= o
-        return total
+    # Group each tier into multiple slips
+    safe_slips   = _group_picks_into_slips(safe_picks,   target_odds=2.0,   max_picks_per_slip=4)
+    medium_slips = _group_picks_into_slips(medium_picks, target_odds=3.0,   max_picks_per_slip=4)
+    value_slips  = _group_picks_into_slips(value_picks,  target_odds=10.0,  max_picks_per_slip=5)
+    mega_slips   = _group_picks_into_slips(mega_picks,   target_odds=100.0, max_picks_per_slip=7)
 
     stats = {
-        "safe":        len(safe_picks),
-        "medium":      len(medium_picks),
-        "value":       len(value_picks),
-        "safe_odds":   calc_odds(safe_picks),
-        "medium_odds": calc_odds(medium_picks),
-        "value_odds":  calc_odds(value_picks),
+        "safe":   len(safe_picks),
+        "medium": len(medium_picks),
+        "value":  len(value_picks),
+        "mega":   len(mega_picks),
+        "safe_slips_count":   len(safe_slips),
+        "medium_slips_count": len(medium_slips),
+        "value_slips_count":  len(value_slips),
+        "mega_slips_count":   len(mega_slips),
     }
-    acca_total = len(safe_picks) + len(medium_picks) + len(value_picks)
+    acca_total = len(all_acca)
 
     return render_template_string(
         FOOTBALL_HTML,
         has_keys=has_keys,
         otp_picks=otp_picks,
-        safe_picks=safe_picks,
-        medium_picks=medium_picks,
-        value_picks=value_picks,
+        history_picks=history_picks,
+        safe_slips=safe_slips,
+        medium_slips=medium_slips,
+        value_slips=value_slips,
+        mega_slips=mega_slips,
         stats=stats,
         acca_total=acca_total,
     )
