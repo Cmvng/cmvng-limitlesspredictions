@@ -801,8 +801,22 @@ def execute_trade(parsed_market, score, prediction_id):
             print("Auto-trade skipped: no positionIds for {} — found: {}".format(slug[:40], position_ids))
             return False
 
-        # positionIds[0] = YES token, positionIds[1] = NO token
-        token_id = position_ids[0] if bet_side == "YES" else position_ids[1]
+        # positionIds or tokens dict — get YES and NO token IDs
+        token_id = None
+        tokens = market_data.get("tokens", {})
+        if isinstance(tokens, dict):
+            if bet_side == "YES":
+                token_id = tokens.get("yes") or tokens.get("Yes") or tokens.get("YES")
+            else:
+                token_id = tokens.get("no") or tokens.get("No") or tokens.get("NO")
+        if not token_id and position_ids and len(position_ids) >= 2:
+            token_id = position_ids[0] if bet_side == "YES" else position_ids[1]
+
+        if not token_id:
+            print("Auto-trade skipped: can't find {} token ID for {}".format(bet_side, slug[:40]))
+            return False
+
+        print("Token resolved: {} = {} for {}".format(bet_side, str(token_id)[:30], slug[:30]))
 
         # 2. Build order
         # For a BUY order: makerAmount = USDC we pay, takerAmount = shares we receive
@@ -852,26 +866,33 @@ def execute_trade(parsed_market, score, prediction_id):
             return False
 
         # 4. Submit FOK order (Fill or Kill = instant market buy)
+        #    Limitless expects: {order: {...}, orderType: "FOK", marketSlug: "..."}
         order_payload = {
-            "salt": str(salt),
-            "maker": wallet_addr,
-            "signer": wallet_addr,
-            "taker": ZERO_ADDR,
-            "tokenId": str(token_id),
-            "makerAmount": str(maker_amount),
-            "takerAmount": str(taker_amount),
-            "expiration": "0",
-            "nonce": "0",
-            "feeRateBps": "0",
-            "side": "0",
-            "signatureType": "0",
-            "signature": "0x" + signature if not signature.startswith("0x") else signature,
+            "order": {
+                "salt": salt,
+                "maker": wallet_addr,
+                "signer": wallet_addr,
+                "taker": ZERO_ADDR,
+                "tokenId": str(token_id),
+                "makerAmount": maker_amount,
+                "takerAmount": taker_amount,
+                "expiration": "0",
+                "nonce": 0,
+                "feeRateBps": 0,
+                "side": 0,  # BUY
+                "signatureType": 0,  # EOA
+                "signature": "0x" + signature if not signature.startswith("0x") else signature,
+            },
             "orderType": "FOK",
+            "marketSlug": slug,
         }
 
         order_body = json.dumps(order_payload)
         path = "/orders"
         headers = _hmac_headers("POST", path, order_body)
+
+        print("Submitting order: {} {} on {} stake=${:.2f}".format(
+            bet_side, "BUY", slug[:40], stake))
 
         r = req.post(
             "{}{}".format(LIMITLESS_API, path),
