@@ -1,5 +1,6 @@
 flask
 pg8000
 requests
+yfinance
 eth-account
 web3
