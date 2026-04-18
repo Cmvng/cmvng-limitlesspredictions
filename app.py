@@ -1015,6 +1015,68 @@ def record_trade_outcome(prediction_id, won, stake_amount):
         print("Trade #{} LOST: stake ${:.2f}, balance ${:.2f}".format(
             prediction_id, stake_amount, _trading_state["last_balance"]))
 
+def _auto_redeem_positions():
+    """Auto-redeem winning positions on Limitless to convert shares back to USDC."""
+    if not _has_trading_keys():
+        return
+    import requests as req
+    try:
+        # Get our positions
+        path = "/portfolio/positions"
+        headers = _hmac_headers("GET", path)
+        r = req.get("{}{}".format(LIMITLESS_API, path), headers=headers, timeout=10)
+
+        if r.status_code != 200:
+            # Try with wallet address
+            try:
+                from eth_account import Account
+                account = Account.from_key(LIMITLESS_PRIV_KEY)
+                path2 = "/portfolio/positions?account={}".format(account.address)
+                h2 = _hmac_headers("GET", path2)
+                r = req.get("{}{}".format(LIMITLESS_API, path2), headers=h2, timeout=10)
+            except:
+                pass
+
+        if r.status_code != 200:
+            return
+
+        positions = r.json()
+        clob_positions = positions.get("clob", []) if isinstance(positions, dict) else positions if isinstance(positions, list) else []
+
+        redeemed = 0
+        for pos in clob_positions:
+            market = pos.get("market", {})
+            market_status = (market.get("status") or "").upper()
+            market_slug = market.get("slug", "")
+            condition_id = market.get("conditionId", "")
+
+            if market_status not in ("RESOLVED", "EXPIRED"):
+                continue
+            if not market_slug:
+                continue
+
+            try:
+                redeem_path = "/portfolio/redeem"
+                redeem_body = json.dumps({"marketSlug": market_slug, "conditionId": condition_id})
+                redeem_headers = _hmac_headers("POST", redeem_path, redeem_body)
+                rr = req.post("{}{}".format(LIMITLESS_API, redeem_path),
+                              headers=redeem_headers, data=redeem_body, timeout=15)
+                if rr.status_code in (200, 201):
+                    redeemed += 1
+                    print("Auto-redeemed: {}".format(market_slug[:40]))
+                    send_telegram("💰 <b>Auto-redeemed</b>\n📌 {}".format(
+                        market.get("title", market_slug)[:60]))
+                elif rr.status_code != 400:  # 400 = already redeemed, skip silently
+                    print("Redeem failed {}: {} {}".format(market_slug[:30], rr.status_code, rr.text[:80]))
+            except Exception as e:
+                print("Redeem error {}: {}".format(market_slug[:30], e))
+            time.sleep(1)
+
+        if redeemed > 0:
+            print("Auto-redeemed {} positions".format(redeemed))
+    except Exception as e:
+        print("Auto-redeem error: {}".format(e))
+
 # ═══════════════════════════════════════════════════════════
 # SCANNER
 # ═══════════════════════════════════════════════════════════
@@ -1318,6 +1380,11 @@ def outcome_loop():
             check_football_outcomes()
         except Exception as e:
             print("FB outcome error: {}".format(e))
+        # Auto-redeem resolved positions every cycle
+        try:
+            _auto_redeem_positions()
+        except Exception as e:
+            print("Auto-redeem loop error: {}".format(e))
         time.sleep(300)
 
 # ═══════════════════════════════════════════════════════════
