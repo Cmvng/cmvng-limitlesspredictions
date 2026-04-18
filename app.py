@@ -831,20 +831,24 @@ def analyze_match_with_claude(match):
             "Football match: {} vs {}\n"
             "League: {}\n"
             "Kickoff: {}\n\n"
-            "Return a JSON array of 5-8 DIVERSE prediction picks covering different risk levels.\n\n"
-            "REQUIRED DISTRIBUTION:\n"
-            "- 2 SAFE picks: confidence 85-95, implied_odds 1.03-1.25\n"
-            "- 2 MEDIUM picks: confidence 75-84, implied_odds 1.25-1.60\n"
-            "- 2 VALUE picks: confidence 65-74, implied_odds 1.60-2.50\n"
-            "- 1-2 MEGA LONGSHOT picks: confidence 55-70, implied_odds 2.50-8.00 (for 100x accumulator)\n\n"
+            "Act like a football betting analyst. Return a JSON array of 8-12 REALISTIC prediction picks with REALISTIC BOOKMAKER ODDS.\n\n"
+            "REQUIRED MIX (give me variety):\n"
+            "- 3 SAFE picks (confidence 80-95): odds 1.18-1.40\n"
+            "  Examples: Over 0.5 goals (1.10), Over 1.5 goals (1.35), match to have a corner (1.15)\n"
+            "- 3 MEDIUM picks (confidence 70-82): odds 1.50-2.00\n"
+            "  Examples: BTTS Yes (1.75), Over 2.5 goals (1.85), double chance home/draw (1.40)\n"
+            "- 3 VALUE picks (confidence 60-72): odds 2.00-3.50\n"
+            "  Examples: match winner home (2.20), over 3.5 goals (2.50), first to score away (2.80)\n"
+            "- 2 MEGA LONGSHOT picks (confidence 40-60): odds 4.00-10.00\n"
+            "  Examples: correct score (6.00), both teams to score AND over 3.5 goals (3.50), team to win by 2+ (4.50)\n\n"
             "STRICT RULES:\n"
-            "- pick_value MUST be ONE OF (exact match): Yes, No, Home, Away, Draw, Over, Under\n"
-            "- pick_type MUST be one of: match_winner, both_teams_score, over_0.5_goals, over_1.5_goals, over_2.5_goals, over_3.5_goals, draw_no_bet, double_chance\n"
+            "- pick_value MUST be ONE OF: Yes, No, Home, Away, Draw, Over, Under\n"
+            "- pick_type options: match_winner, both_teams_score, over_0.5_goals, over_1.5_goals, over_2.5_goals, over_3.5_goals, draw_no_bet, double_chance, over_0.5_corners_ht, over_2.5_cards, over_9.5_corners, first_half_over_0.5, first_half_over_1.5, clean_sheet_home, clean_sheet_away, win_to_nil_home, win_to_nil_away, home_or_draw, away_or_draw, btts_and_over_2.5\n"
+            "- implied_odds MUST be realistic bookmaker-style decimal odds (1.10-10.00)\n"
             "- NEVER leave pick_value blank\n"
-            "- implied_odds must be realistic decimal odds (1.01-10.00)\n"
-            "- reasoning: max 100 chars, useful context\n\n"
-            'Example: [{{"pick_type":"over_0.5_goals","pick_value":"Yes","confidence":92,"implied_odds":1.06,"reasoning":"both teams avg 2.1 goals scored"}},'
-            '{{"pick_type":"match_winner","pick_value":"Home","confidence":68,"implied_odds":2.10,"reasoning":"home team 7W-1L last 8 home games"}}]\n\n'
+            "- reasoning: max 80 chars, betting-analyst style\n\n"
+            "Spread your picks across DIFFERENT bet types (not all over 0.5 goals). Use your knowledge of team form, recent results, and realistic probabilities.\n\n"
+            'Example pick: {{"pick_type":"both_teams_score","pick_value":"Yes","confidence":75,"implied_odds":1.72,"reasoning":"both avg 1.4 goals scored, 1.2 conceded last 5"}}\n\n'
             "Output ONLY the JSON array. No markdown, no preamble, no commentary."
         ).format(home, away, comp, kickoff)
 
@@ -857,7 +861,7 @@ def analyze_match_with_claude(match):
             },
             json={
                 "model": "claude-haiku-4-5-20251001",
-                "max_tokens": 2048,
+                "max_tokens": 3000,
                 "messages": [{"role": "user", "content": prompt}]
             },
             timeout=30
@@ -910,32 +914,35 @@ def build_accumulators(picks):
             conf = float(best.get("confidence") or 0)
 
             if strategy == "safe":
-                if conf >= 85 and implied >= 1.03:
-                    candidates.append((best, match, implied, conf))
-            elif strategy == "medium":
-                # Any pick per match, wider range
+                # Safe = high confidence (80+) AND odds 1.15-1.50 (each pick contributes ~1.3 avg)
                 for p in match_picks:
                     pi = float(p.get("implied_odds") or 1.0)
                     pc = float(p.get("confidence") or 0)
-                    if 75 <= pc < 90 and 1.15 <= pi <= 1.70:
+                    if pc >= 80 and 1.15 <= pi <= 1.50:
                         candidates.append((p, match, pi, pc))
                         break
-                else:
-                    # Fallback: accept the best pick if in acceptable range
-                    if 70 <= conf < 90 and implied >= 1.20:
-                        candidates.append((best, match, implied, conf))
-            elif strategy == "value":
+            elif strategy == "medium":
+                # Medium = decent confidence (70+) AND odds 1.40-2.00
                 for p in match_picks:
                     pi = float(p.get("implied_odds") or 1.0)
                     pc = float(p.get("confidence") or 0)
-                    if 1.50 <= pi <= 2.80 and pc >= 60:
+                    if 70 <= pc < 90 and 1.40 <= pi <= 2.10:
+                        candidates.append((p, match, pi, pc))
+                        break
+            elif strategy == "value":
+                # Value = moderate confidence (60+) AND odds 2.00-4.00
+                for p in match_picks:
+                    pi = float(p.get("implied_odds") or 1.0)
+                    pc = float(p.get("confidence") or 0)
+                    if 60 <= pc < 80 and 2.00 <= pi <= 4.00:
                         candidates.append((p, match, pi, pc))
                         break
             elif strategy == "mega":
+                # Mega = high-odds long shots (odds 3.5+)
                 for p in match_picks:
                     pi = float(p.get("implied_odds") or 1.0)
                     pc = float(p.get("confidence") or 0)
-                    if pi >= 2.50 and pc >= 50:
+                    if pi >= 3.50 and pc >= 40:
                         candidates.append((p, match, pi, pc))
                         break
 
@@ -1201,7 +1208,7 @@ def run_otp_scan():
         conn.close()
         
         count = 0
-        for market in otp_markets[:15]:  # Cap at 15 to control costs
+        for market in otp_markets[:30]:  # Cap at 30 to control costs
             try:
                 mid = str(market.get("id", ""))
                 if mid in alerted_ids:
@@ -1223,7 +1230,7 @@ def run_otp_scan():
                 yes_odds = yes_raw if yes_raw > 1 else yes_raw * 100
                 
                 # Only analyze markets with interesting odds (not extremes)
-                if yes_odds < 20 or yes_odds > 90:
+                if yes_odds < 15 or yes_odds > 92:
                     continue
                 
                 parsed = {
@@ -1239,7 +1246,7 @@ def run_otp_scan():
                 analysis = analyze_otp_market_with_claude(market, parsed)
                 if analysis and analysis.get("action") in ("YES", "NO"):
                     # Only fire if AI confidence >= 75
-                    if analysis.get("confidence", 0) >= 75:
+                    if analysis.get("confidence", 0) >= 65:
                         save_and_alert_otp(market, parsed, analysis)
                         count += 1
                         time.sleep(2)
@@ -2111,8 +2118,10 @@ def dashboard():
         in_window=is_lagos_window()
     )
 
-def _group_picks_into_slips(picks, target_odds, max_picks_per_slip=5):
-    """Group picks into multiple accumulator slips each reaching target odds."""
+def _group_picks_into_slips(picks, target_odds, hard_max_picks=10):
+    """Group picks into multiple accumulator slips, each REACHING at minimum the target odds.
+    Will keep adding picks until target is hit or hard_max_picks reached.
+    Incomplete slips (below target) are discarded unless no full slip exists."""
     if not picks:
         return []
     sorted_picks = sorted(picks, key=lambda p: float(p.get("confidence") or 0), reverse=True)
@@ -2120,19 +2129,27 @@ def _group_picks_into_slips(picks, target_odds, max_picks_per_slip=5):
     current_slip = []
     current_odds = 1.0
     slip_number = 1
+
     for pick in sorted_picks:
         odds = float(pick.get("implied_odds") or 1.0)
         if odds < 1.0:
             continue
         current_slip.append(pick)
         current_odds *= odds
-        if current_odds >= target_odds or len(current_slip) >= max_picks_per_slip:
+        # Close slip ONLY when target is reached (not before)
+        if current_odds >= target_odds:
             slips.append({"picks": current_slip, "total_odds": round(current_odds, 2),
                           "slip_number": slip_number})
             current_slip = []
             current_odds = 1.0
             slip_number += 1
-    if current_slip and current_odds >= 1.3:
+        elif len(current_slip) >= hard_max_picks:
+            # Too many picks, odds still below target — skip this slip, start fresh
+            current_slip = []
+            current_odds = 1.0
+
+    # If NO full slips were built AND we have a partial one that's reasonable, include it
+    if not slips and current_slip and current_odds >= target_odds * 0.7:
         slips.append({"picks": current_slip, "total_odds": round(current_odds, 2),
                       "slip_number": slip_number})
     return slips
@@ -2196,10 +2213,10 @@ def football_page():
     mega_picks   = [p for p in all_acca if p.get("accumulator_tier") == "mega_100x"]
 
     # Group each tier into multiple slips
-    safe_slips   = _group_picks_into_slips(safe_picks,   target_odds=2.0,   max_picks_per_slip=4)
-    medium_slips = _group_picks_into_slips(medium_picks, target_odds=3.0,   max_picks_per_slip=4)
-    value_slips  = _group_picks_into_slips(value_picks,  target_odds=10.0,  max_picks_per_slip=5)
-    mega_slips   = _group_picks_into_slips(mega_picks,   target_odds=100.0, max_picks_per_slip=7)
+    safe_slips   = _group_picks_into_slips(safe_picks,   target_odds=2.0,   hard_max_picks=8)
+    medium_slips = _group_picks_into_slips(medium_picks, target_odds=3.0,   hard_max_picks=8)
+    value_slips  = _group_picks_into_slips(value_picks,  target_odds=10.0,  hard_max_picks=10)
+    mega_slips   = _group_picks_into_slips(mega_picks,   target_odds=100.0, hard_max_picks=12)
 
     stats = {
         "safe":   len(safe_picks),
