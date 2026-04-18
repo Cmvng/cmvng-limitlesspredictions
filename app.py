@@ -691,6 +691,50 @@ def _normalize_fixture(match, source):
         }
     return None
 
+def _fetch_limitless_football_matches():
+    """Pull football matches directly from Limitless category 49.
+    These are the actual matches available as markets — the ones we can bet on."""
+    raw_markets = _fetch_limitless_category(49, limit=25, pages=10)
+    fixtures = []
+    seen_match_ids = set()
+    for m in raw_markets:
+        title = m.get("title", "") or ""
+        # Titles look like: "⚽ EPL, Brentford vs Fulham, Apr 18, 2026"
+        # Parse: emoji + league, home vs away, date
+        import re
+        match = re.match(r'^[⚽\s]*([^,]+),\s*(.+?)\s+vs\s+(.+?),\s*(.+)$', title)
+        if not match:
+            continue
+        league = match.group(1).strip()
+        home = match.group(2).strip()
+        away = match.group(3).strip()
+        date_str = match.group(4).strip()
+
+        # Get kickoff from expirationTimestamp
+        exp_ts = m.get("expirationTimestamp", 0)
+        kickoff = ""
+        if exp_ts:
+            try:
+                kickoff = datetime.fromtimestamp(exp_ts / 1000, tz=timezone.utc).isoformat()
+            except:
+                pass
+
+        match_key = "{}|{}|{}".format(home, away, date_str)
+        if match_key in seen_match_ids:
+            continue
+        seen_match_ids.add(match_key)
+
+        fixtures.append({
+            "id": m.get("id"),
+            "homeTeam": {"name": home},
+            "awayTeam": {"name": away},
+            "competition": {"name": league},
+            "utcDate": kickoff,
+            "source": "limitless",
+            "slug": m.get("slug", ""),
+        })
+    return fixtures
+
 def _fetch_api_football():
     """Fetch from API-Football via RapidAPI (100/day free tier)"""
     key = os.environ.get("API_FOOTBALL_KEY", "")
@@ -757,16 +801,20 @@ def _fetch_thesportsdb():
         return []
 
 def get_todays_fixtures():
-    """Try all 3 football APIs in order: API-Football → football-data.org → TheSportsDB"""
-    # Try API-Football first (richest data)
+    """Primary: Limitless own matches (so we bet on markets that exist).
+    Fallbacks: API-Football → football-data.org → TheSportsDB."""
+    # Limitless first — these are the actual betting markets
+    fixtures = _fetch_limitless_football_matches()
+    if fixtures:
+        print("Using Limitless native matches: {} fixtures".format(len(fixtures)))
+        return fixtures
+    # External APIs as fallback (only useful if you have their keys)
     fixtures = _fetch_api_football()
     if fixtures:
         return fixtures
-    # Fallback to football-data.org
     fixtures = _fetch_football_data()
     if fixtures:
         return fixtures
-    # Final fallback — TheSportsDB (no key needed)
     return _fetch_thesportsdb()
 
 def analyze_match_with_claude(match):
@@ -1087,8 +1135,35 @@ def save_and_alert_otp(market, parsed, analysis):
     except Exception as e:
         print("OTP alert error: {}".format(e))
 
+# Limitless category IDs (discovered via /debug/otp):
+LIMITLESS_CAT_MATCHES = 49   # 217 football matches
+LIMITLESS_CAT_OTP     = 50   # 66 "Off The Pitch" prop markets
+LIMITLESS_CAT_PROPS   = 66   # 316 generic props
+
+def _fetch_limitless_category(category_id, limit=25, pages=4):
+    """Fetch markets from a specific Limitless category. API caps limit at 25."""
+    import requests as req
+    markets = []
+    try:
+        for page in range(1, pages + 1):
+            r = req.get(
+                "{}/markets/active/{}?limit={}&page={}".format(LIMITLESS_API, category_id, limit, page),
+                timeout=15
+            )
+            if r.status_code != 200:
+                break
+            data = r.json().get("data", [])
+            if not data:
+                break
+            markets.extend(data)
+            if len(data) < limit:
+                break
+    except Exception as e:
+        print("Fetch category {} error: {}".format(category_id, e))
+    return markets
+
 def run_otp_scan():
-    """Scan Limitless for sports/OTP markets using multiple strategies."""
+    """Scan Limitless for sports/OTP markets using proven category endpoints."""
     import requests as req
     if not ANTHROPIC_KEY:
         print("OTP scan skipped — no ANTHROPIC_API_KEY")
@@ -1096,63 +1171,26 @@ def run_otp_scan():
     try:
         otp_markets = []
 
-        # Strategy 1: fetch with sports automation filter
-        try:
-            r = req.get(
-                "{}/markets/active?automationType=sports&limit=100".format(LIMITLESS_API),
-                timeout=15
-            )
-            if r.status_code == 200:
-                otp_markets = r.json().get("data", [])
-                print("OTP strategy 1 (automationType=sports): {} markets".format(len(otp_markets)))
-        except Exception as e:
-            print("OTP strategy 1 failed: {}".format(e))
+        # Strategy 1: direct category fetch — Off The Pitch category
+        otp_only = _fetch_limitless_category(LIMITLESS_CAT_OTP, limit=25, pages=4)
+        print("OTP scan: category 50 (OTP) returned {} markets".format(len(otp_only)))
+        otp_markets.extend(otp_only)
 
-        # Strategy 2: fetch pages with larger limit
-        if not otp_markets:
-            try:
-                for page in range(1, 6):  # up to 5 pages x 100 = 500 markets
-                    r = req.get(
-                        "{}/markets/active?page={}&limit=100".format(LIMITLESS_API, page),
-                        timeout=15
-                    )
-                    if r.status_code != 200:
-                        break
-                    markets = r.json().get("data", [])
-                    if not markets:
-                        break
-                    page_otp = [m for m in markets if is_otp_market(m)]
-                    otp_markets.extend(page_otp)
-                    print("  Page {}: {}/{} are OTP".format(page, len(page_otp), len(markets)))
-                    if len(markets) < 100:
-                        break
-                print("OTP strategy 2 (paginated filter): {} markets found".format(
-                    len(otp_markets)))
-            except Exception as e:
-                print("OTP strategy 2 failed: {}".format(e))
-
-        # Strategy 3: try search endpoint for football terms
-        if not otp_markets:
-            try:
-                search_terms = ["goals", "score", "corners", "cards", "winner"]
-                for term in search_terms:
-                    r = req.get(
-                        "{}/markets/search?query={}&limit=20".format(LIMITLESS_API, term),
-                        timeout=10
-                    )
-                    if r.status_code == 200:
-                        results = r.json().get("data", [])
-                        for m in results:
-                            if is_otp_market(m) and m not in otp_markets:
-                                otp_markets.append(m)
-                    time.sleep(0.5)
-                print("OTP strategy 3 (search): {} markets found".format(len(otp_markets)))
-            except Exception as e:
-                print("OTP strategy 3 failed: {}".format(e))
+        # Strategy 2: also include Props category (these are football prop markets)
+        props = _fetch_limitless_category(LIMITLESS_CAT_PROPS, limit=25, pages=6)
+        print("OTP scan: category 66 (Props) returned {} markets".format(len(props)))
+        # Deduplicate by market ID
+        seen_ids = set(m.get("id") for m in otp_markets)
+        for m in props:
+            if m.get("id") not in seen_ids:
+                otp_markets.append(m)
+                seen_ids.add(m.get("id"))
 
         if not otp_markets:
-            print("OTP scan: NO sports markets found — this likely means none are live now")
+            print("OTP scan: categories returned 0 markets — API may be having issues")
             return 0
+
+        print("OTP scan: {} total prop/OTP markets to analyze".format(len(otp_markets)))
         
         # Get already-alerted
         conn = get_db()
