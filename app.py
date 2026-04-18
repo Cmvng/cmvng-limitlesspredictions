@@ -535,6 +535,42 @@ def _reset_daily_counters():
         _trading_state["last_reset"] = today
         print("Trading: daily counters reset for {}".format(today))
 
+def _get_limitless_profile_id():
+    """Fetch our profile ID from Limitless — needed for ownerId in orders."""
+    import requests as req
+    if _trading_state.get("profile_id"):
+        return _trading_state["profile_id"]
+    try:
+        from eth_account import Account
+        account = Account.from_key(LIMITLESS_PRIV_KEY)
+        wallet_addr = account.address
+
+        path = "/profiles/{}".format(wallet_addr)
+        headers = _hmac_headers("GET", path)
+        r = req.get("{}{}".format(LIMITLESS_API, path), headers=headers, timeout=10)
+        if r.status_code == 200:
+            data = r.json()
+            pid = data.get("id")
+            if pid:
+                _trading_state["profile_id"] = pid
+                _trading_state["wallet_addr"] = wallet_addr
+                print("Profile ID: {} for wallet {}".format(pid, wallet_addr[:10]))
+                return pid
+        # Try without HMAC (public endpoint)
+        r2 = req.get("{}{}".format(LIMITLESS_API, path), timeout=10)
+        if r2.status_code == 200:
+            data2 = r2.json()
+            pid = data2.get("id")
+            if pid:
+                _trading_state["profile_id"] = pid
+                _trading_state["wallet_addr"] = wallet_addr
+                print("Profile ID (public): {} for wallet {}".format(pid, wallet_addr[:10]))
+                return pid
+        print("Profile fetch failed: {} {}".format(r.status_code, r.text[:100]))
+    except Exception as e:
+        print("Profile error: {}".format(e))
+    return None
+
 def _get_limitless_balance():
     """Fetch USDC balance from Limitless.
     Tries multiple endpoints since the API structure varies."""
@@ -866,7 +902,12 @@ def execute_trade(parsed_market, score, prediction_id):
             return False
 
         # 4. Submit FOK order (Fill or Kill = instant market buy)
-        #    Limitless expects: {order: {...}, orderType: "FOK", marketSlug: "..."}
+        #    Limitless expects: {order: {...}, orderType: "FOK", marketSlug: "...", ownerId: ...}
+        profile_id = _get_limitless_profile_id()
+        if not profile_id:
+            print("Auto-trade skipped: can't get profile ID")
+            return False
+
         order_payload = {
             "order": {
                 "salt": salt,
@@ -885,6 +926,7 @@ def execute_trade(parsed_market, score, prediction_id):
             },
             "orderType": "FOK",
             "marketSlug": slug,
+            "ownerId": profile_id,
         }
 
         order_body = json.dumps(order_payload)
