@@ -607,8 +607,47 @@ def _fetch_market_details(slug):
             timeout=10
         )
         if r.status_code == 200:
-            return r.json()
-        print("Market details failed for {}: {}".format(slug, r.status_code))
+            data = r.json()
+            # Log the keys we got so we can debug field names
+            print("Market {} keys: {}".format(slug[:40], list(data.keys())[:15]))
+
+            # Handle different possible field names for venue
+            venue = data.get("venue") or data.get("clob") or data.get("exchange") or {}
+            if not venue and data.get("exchangeAddress"):
+                venue = {"exchange": data["exchangeAddress"]}
+
+            # Handle different possible field names for position IDs
+            pos_ids = data.get("positionIds") or data.get("tokenIds") or data.get("tokens") or []
+            if not pos_ids:
+                # Some responses have tokens as a dict {yes: "id", no: "id"}
+                tokens = data.get("tokens", {})
+                if isinstance(tokens, dict):
+                    yes_id = tokens.get("yes") or tokens.get("YES") or tokens.get("0")
+                    no_id = tokens.get("no") or tokens.get("NO") or tokens.get("1")
+                    if yes_id and no_id:
+                        pos_ids = [yes_id, no_id]
+                elif isinstance(tokens, list) and len(tokens) >= 2:
+                    pos_ids = tokens
+
+            # Store back into data for the caller
+            data["venue"] = venue
+            data["positionIds"] = pos_ids
+
+            if not venue.get("exchange") and not pos_ids:
+                print("Market details WARNING: no venue or positionIds found. Full response keys: {}".format(
+                    list(data.keys())))
+                # Print a sample of the data to help debug
+                for k in list(data.keys())[:10]:
+                    v = data[k]
+                    if isinstance(v, (str, int, float, bool)):
+                        print("  {}: {}".format(k, str(v)[:80]))
+                    elif isinstance(v, dict):
+                        print("  {}: dict with keys {}".format(k, list(v.keys())[:5]))
+                    elif isinstance(v, list):
+                        print("  {}: list len {}".format(k, len(v)))
+
+            return data
+        print("Market details failed for {}: {} {}".format(slug[:40], r.status_code, r.text[:100]))
         return None
     except Exception as e:
         print("Market details error: {}".format(e))
