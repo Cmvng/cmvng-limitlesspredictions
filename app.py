@@ -861,6 +861,8 @@ def execute_trade(parsed_market, score, prediction_id):
                 _trading_state["daily_profit"],
                 _trading_state["daily_loss"],
             )
+            # Update tracked balance (subtract stake — shares are pending)
+            _trading_state["last_balance"] = round(balance - stake, 2)
             send_telegram(trade_msg)
             print("AUTO-TRADE #{}: {} {} ${:.2f} on {}".format(
                 prediction_id, bet_side, slug[:30], stake, parsed_market["title"][:40]))
@@ -878,11 +880,24 @@ def execute_trade(parsed_market, score, prediction_id):
         return False
 
 def record_trade_outcome(prediction_id, won, stake_amount):
-    """Record win/loss for daily P&L tracking."""
+    """Record win/loss for daily P&L tracking and update balance."""
     if won:
-        _trading_state["daily_profit"] += stake_amount * 0.15  # approx profit at 85% odds
+        # Winning: shares pay $1 each. Profit = payout - stake
+        # At avg 85% odds: bought at $0.85, pays $1 → profit = $0.15/share
+        # But we track by stake: if we staked $3 at 85%, we get back $3.53
+        # For simplicity: add back the full stake + estimated profit
+        payout = stake_amount / 0.85  # approximate — shares bought at ~85% pay $1
+        profit = payout - stake_amount
+        _trading_state["daily_profit"] += profit
+        _trading_state["last_balance"] = round(
+            (_trading_state.get("last_balance") or 0) + payout, 2)
+        print("Trade #{} WON: stake ${:.2f}, payout ${:.2f}, profit ${:.2f}, balance ${:.2f}".format(
+            prediction_id, stake_amount, payout, profit, _trading_state["last_balance"]))
     else:
+        # Losing: shares are worthless. Stake already subtracted when trade was placed.
         _trading_state["daily_loss"] += stake_amount
+        print("Trade #{} LOST: stake ${:.2f}, balance ${:.2f}".format(
+            prediction_id, stake_amount, _trading_state["last_balance"]))
 
 # ═══════════════════════════════════════════════════════════
 # SCANNER
@@ -1155,15 +1170,28 @@ def outcome_loop():
                         s=status, o=outcome, r=now.isoformat(), i=p["id"]
                     )
                     conn2.close()
+
+                    # Update auto-trading balance if this was an auto-trade
+                    size_rec = p.get("size_rec") or ""
+                    if "AUTO $" in size_rec:
+                        try:
+                            stake_str = size_rec.split("AUTO $")[1].split(" |")[0]
+                            stake_amt = float(stake_str)
+                            record_trade_outcome(p["id"], won, stake_amt)
+                        except:
+                            pass
+
                     emoji = "✅" if won else "❌"
+                    bal_str = " | Balance: ${:.2f}".format(_trading_state.get("last_balance", 0)) if _has_trading_keys() else ""
                     send_telegram(
                         "{} <b>PREDICTION {} — #{}</b>\n"
                         "──────────────────────────\n"
                         "📌 {}\n"
                         "<b>Closed:</b> {}\n"
-                        "<b>Baseline:</b> {}".format(
+                        "<b>Baseline:</b> {}{}".format(
                             emoji, outcome, p["id"], p["title"],
-                            fmt_price(price), fmt_price(p["baseline"])
+                            fmt_price(price), fmt_price(p["baseline"]),
+                            bal_str
                         )
                     )
                 except Exception as e:
