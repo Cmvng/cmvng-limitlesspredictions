@@ -536,9 +536,10 @@ def _reset_daily_counters():
         print("Trading: daily counters reset for {}".format(today))
 
 def _get_limitless_profile_id():
-    """Fetch our profile ID from Limitless — needed for ownerId in orders."""
+    """Fetch our profile ID and fee rate from Limitless."""
     import requests as req
-    if _trading_state.get("profile_id"):
+    # Return cached if we have BOTH profile_id and fee_rate
+    if _trading_state.get("profile_id") and _trading_state.get("fee_rate_bps"):
         return _trading_state["profile_id"]
     try:
         from eth_account import Account
@@ -548,23 +549,20 @@ def _get_limitless_profile_id():
         path = "/profiles/{}".format(wallet_addr)
         headers = _hmac_headers("GET", path)
         r = req.get("{}{}".format(LIMITLESS_API, path), headers=headers, timeout=10)
+        if r.status_code != 200:
+            r = req.get("{}{}".format(LIMITLESS_API, path), timeout=10)
+
         if r.status_code == 200:
             data = r.json()
             pid = data.get("id")
             if pid:
                 _trading_state["profile_id"] = pid
                 _trading_state["wallet_addr"] = wallet_addr
-                print("Profile ID: {} for wallet {}".format(pid, wallet_addr[:10]))
-                return pid
-        # Try without HMAC (public endpoint)
-        r2 = req.get("{}{}".format(LIMITLESS_API, path), timeout=10)
-        if r2.status_code == 200:
-            data2 = r2.json()
-            pid = data2.get("id")
-            if pid:
-                _trading_state["profile_id"] = pid
-                _trading_state["wallet_addr"] = wallet_addr
-                print("Profile ID (public): {} for wallet {}".format(pid, wallet_addr[:10]))
+                # Get fee rate from rank
+                rank = data.get("rank", {})
+                fee_bps = rank.get("feeRateBps", 200)  # default 200 bps = 2%
+                _trading_state["fee_rate_bps"] = fee_bps
+                print("Profile ID: {} | Fee: {} bps | Wallet: {}".format(pid, fee_bps, wallet_addr[:10]))
                 return pid
         print("Profile fetch failed: {} {}".format(r.status_code, r.text[:100]))
     except Exception as e:
@@ -887,9 +885,9 @@ def execute_trade(parsed_market, score, prediction_id):
             "tokenId": int(token_id),
             "makerAmount": maker_amount,
             "takerAmount": taker_amount,
-            "expiration": 0,  # no expiration
+            "expiration": 0,
             "nonce": 0,
-            "feeRateBps": 0,
+            "feeRateBps": _trading_state.get("fee_rate_bps", 200),
             "side": 0,  # BUY
             "signatureType": 0,  # EOA
         }
@@ -907,6 +905,8 @@ def execute_trade(parsed_market, score, prediction_id):
             print("Auto-trade skipped: can't get profile ID")
             return False
 
+        fee_bps = _trading_state.get("fee_rate_bps", 200)
+
         order_payload = {
             "order": {
                 "salt": salt,
@@ -918,7 +918,7 @@ def execute_trade(parsed_market, score, prediction_id):
                 "takerAmount": taker_amount,
                 "expiration": "0",
                 "nonce": 0,
-                "feeRateBps": 0,
+                "feeRateBps": fee_bps,
                 "side": 0,  # BUY
                 "signatureType": 0,  # EOA
                 "signature": "0x" + signature if not signature.startswith("0x") else signature,
