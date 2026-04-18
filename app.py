@@ -15,6 +15,10 @@ DATABASE_URL     = os.environ.get("DATABASE_URL", "")
 ANTHROPIC_KEY    = os.environ.get("ANTHROPIC_API_KEY", "")
 FOOTBALL_DATA_KEY = os.environ.get("FOOTBALL_DATA_KEY", "")
 
+# Auto-trading credentials
+LIMITLESS_API_KEY    = os.environ.get("LIMITLESS_API_KEY", "")      # lmts_...
+LIMITLESS_PRIV_KEY   = os.environ.get("LIMITLESS_PRIVATE_KEY", "")  # 0x...
+
 LAGOS_TZ      = timezone(timedelta(hours=1))
 LIMITLESS_API = "https://api.limitless.exchange"
 
@@ -22,6 +26,22 @@ LIMITLESS_API = "https://api.limitless.exchange"
 _btc_trend_cache = {"trend": None, "price": None, "sma10": None, "updated": None}
 # Debug log for last scan
 _last_scan_log = {"time": None, "total": 0, "qualified": 0, "filtered": []}
+
+# ═══════════════════════════════════════════════════════════
+# AUTO-TRADING STATE
+# ═══════════════════════════════════════════════════════════
+_trading_state = {
+    "enabled": True,             # Kill switch — set False to stop all trades
+    "daily_loss": 0.0,           # Accumulated losses today (USDC)
+    "daily_profit": 0.0,         # Accumulated profits today
+    "trades_today": 0,           # Number of trades placed today
+    "last_reset": None,          # When daily counters last reset
+    "last_balance": None,        # Cached balance
+    "high_pct": 0.15,            # 15% of balance on HIGH confidence
+    "medium_pct": 0.08,          # 8% of balance on MEDIUM confidence
+    "daily_loss_limit_pct": 0.25,# Stop after 25% daily loss
+    "min_stake": 1.0,            # Limitless minimum $1
+}
 
 FAVOURITE_HOURLY = ["ADA", "BNB", "HYPE"]
 
@@ -263,9 +283,11 @@ def score_market(p, btc_trend, price, debug_log=None):
 
     is_fav = p["asset"] in FAVOURITE_HOURLY
 
-    # 1. Time window
-    if not is_lagos_window() and not is_fav:
-        return reject("outside Lagos window")
+    # 1. Time window — skip if auto-trading is off AND outside Lagos window
+    #    When auto-trading is on, scan 24/7
+    auto_trading_on = bool(LIMITLESS_API_KEY and LIMITLESS_PRIV_KEY and _trading_state.get("enabled"))
+    if not auto_trading_on and not is_lagos_window() and not is_fav:
+        return reject("outside Lagos window (auto-trade off)")
 
     # 2. Expiry filter
     if p["is_short"]:
@@ -459,8 +481,338 @@ def save_and_alert(p, score, price, btc_trend):
         )
         send_telegram(msg)
         print("ALERT #{}: {} {} at {:.1f}%".format(pid, bet_side, p["title"][:50], score["bet_odds"]))
+
+        # Auto-trade if enabled
+        if LIMITLESS_API_KEY and LIMITLESS_PRIV_KEY:
+            try:
+                execute_trade(p, score, pid)
+            except Exception as te:
+                print("Auto-trade error for #{}: {}".format(pid, te))
+
     except Exception as e:
         print("Alert error: {}".format(e))
+
+# ═══════════════════════════════════════════════════════════
+# AUTO-TRADING ENGINE
+# ═══════════════════════════════════════════════════════════
+
+def _reset_daily_counters():
+    """Reset daily P&L counters at midnight Lagos time."""
+    today = datetime.now(LAGOS_TZ).strftime("%Y-%m-%d")
+    if _trading_state["last_reset"] != today:
+        _trading_state["daily_loss"] = 0.0
+        _trading_state["daily_profit"] = 0.0
+        _trading_state["trades_today"] = 0
+        _trading_state["last_reset"] = today
+        print("Trading: daily counters reset for {}".format(today))
+
+def _get_limitless_balance():
+    """Fetch USDC balance from Limitless portfolio."""
+    import requests as req
+    try:
+        r = req.get(
+            "{}/portfolio/allowance".format(LIMITLESS_API),
+            headers={"X-API-Key": LIMITLESS_API_KEY},
+            timeout=10
+        )
+        if r.status_code == 200:
+            data = r.json()
+            # Balance is in USDC (6 decimals) — convert to dollars
+            balance = float(data.get("balance", 0)) / 1e6 if data.get("balance", 0) > 100 else float(data.get("balance", 0))
+            _trading_state["last_balance"] = balance
+            return balance
+        else:
+            print("Balance check failed: {} {}".format(r.status_code, r.text[:100]))
+            return _trading_state.get("last_balance")
+    except Exception as e:
+        print("Balance error: {}".format(e))
+        return _trading_state.get("last_balance")
+
+def _fetch_market_details(slug):
+    """Fetch full market details including venue and positionIds."""
+    import requests as req
+    try:
+        r = req.get(
+            "{}/markets/{}".format(LIMITLESS_API, slug),
+            headers={"X-API-Key": LIMITLESS_API_KEY},
+            timeout=10
+        )
+        if r.status_code == 200:
+            return r.json()
+        print("Market details failed for {}: {}".format(slug, r.status_code))
+        return None
+    except Exception as e:
+        print("Market details error: {}".format(e))
+        return None
+
+def _sign_order(order_data, verifying_contract):
+    """Sign order with EIP-712."""
+    try:
+        from eth_account import Account
+        from eth_account.messages import encode_typed_data
+        from web3 import Web3
+    except ImportError:
+        print("Auto-trade ERROR: eth-account or web3 not installed. Add to requirements.txt: eth-account web3")
+        return None
+    try:
+        from eth_account import Account
+        from eth_account.messages import encode_typed_data
+        from web3 import Web3
+
+        CHAIN_ID = 8453  # Base
+
+        domain = {
+            "name": "Limitless CTF Exchange",
+            "version": "1",
+            "chainId": CHAIN_ID,
+            "verifyingContract": Web3.to_checksum_address(verifying_contract),
+        }
+        types = {
+            "Order": [
+                {"name": "salt", "type": "uint256"},
+                {"name": "maker", "type": "address"},
+                {"name": "signer", "type": "address"},
+                {"name": "taker", "type": "address"},
+                {"name": "tokenId", "type": "uint256"},
+                {"name": "makerAmount", "type": "uint256"},
+                {"name": "takerAmount", "type": "uint256"},
+                {"name": "expiration", "type": "uint256"},
+                {"name": "nonce", "type": "uint256"},
+                {"name": "feeRateBps", "type": "uint256"},
+                {"name": "side", "type": "uint8"},
+                {"name": "signatureType", "type": "uint8"},
+            ],
+        }
+
+        signable = encode_typed_data(domain, types, order_data)
+        account = Account.from_key(LIMITLESS_PRIV_KEY)
+        signed = account.sign_message(signable)
+        return signed.signature.hex()
+    except Exception as e:
+        print("Signing error: {}".format(e))
+        return None
+
+def _is_safe_trading_window():
+    """Check if current time is safe for auto-trading.
+    Pauses during US session (1pm-6pm Lagos / 12:00-17:00 UTC) when
+    major economic news can cause sudden price spikes."""
+    hour = datetime.now(LAGOS_TZ).hour
+    # 1pm-6pm Lagos = danger zone (US session opens, news drops)
+    if 13 <= hour < 18:
+        return False
+    return True
+
+def execute_trade(parsed_market, score, prediction_id):
+    """Execute a trade on Limitless Exchange.
+    Returns True if trade was placed, False otherwise."""
+    import requests as req
+
+    # Pre-checks
+    if not LIMITLESS_API_KEY or not LIMITLESS_PRIV_KEY:
+        print("Auto-trade skipped: missing API key or private key")
+        return False
+
+    if not _trading_state["enabled"]:
+        print("Auto-trade skipped: kill switch active")
+        return False
+
+    # US session protection — no auto-trades during 1pm-6pm Lagos
+    if not _is_safe_trading_window():
+        print("Auto-trade paused: US session window (1pm-6pm Lagos) — signal-only mode")
+        return False
+
+    _reset_daily_counters()
+
+    # Check daily loss limit
+    balance = _get_limitless_balance()
+    if balance is None:
+        print("Auto-trade skipped: cannot fetch balance")
+        return False
+
+    daily_limit = balance * _trading_state["daily_loss_limit_pct"]
+    if _trading_state["daily_loss"] >= daily_limit:
+        print("Auto-trade STOPPED: daily loss ${:.2f} >= limit ${:.2f}".format(
+            _trading_state["daily_loss"], daily_limit))
+        send_telegram(
+            "⚠️ <b>Daily loss limit reached</b>\n"
+            "Lost: ${:.2f} | Limit: ${:.2f}\n"
+            "Auto-trading paused until tomorrow.\n"
+            "Use /trading/start to override.".format(
+                _trading_state["daily_loss"], daily_limit))
+        _trading_state["enabled"] = False
+        return False
+
+    # Calculate stake
+    confidence = score.get("confidence", "MEDIUM")
+    if confidence == "HIGH":
+        stake = max(_trading_state["min_stake"], round(balance * _trading_state["high_pct"], 2))
+    else:
+        stake = max(_trading_state["min_stake"], round(balance * _trading_state["medium_pct"], 2))
+
+    # Don't bet more than we have
+    if stake > balance:
+        stake = max(_trading_state["min_stake"], round(balance * 0.5, 2))
+    if stake > balance:
+        print("Auto-trade skipped: balance ${:.2f} too low for min stake".format(balance))
+        return False
+
+    bet_side = score.get("bet_side", "YES")
+    slug = parsed_market.get("slug", "")
+
+    if not slug:
+        print("Auto-trade skipped: no slug for market")
+        return False
+
+    try:
+        # 1. Fetch market details (venue + positionIds)
+        market_data = _fetch_market_details(slug)
+        if not market_data:
+            print("Auto-trade skipped: couldn't fetch market details for {}".format(slug))
+            return False
+
+        venue = market_data.get("venue", {})
+        exchange_addr = venue.get("exchange", "")
+        position_ids = market_data.get("positionIds", [])
+
+        if not exchange_addr or len(position_ids) < 2:
+            print("Auto-trade skipped: missing venue/positionIds for {}".format(slug))
+            return False
+
+        # positionIds[0] = YES token, positionIds[1] = NO token
+        token_id = position_ids[0] if bet_side == "YES" else position_ids[1]
+
+        # 2. Build order
+        # For a BUY order: makerAmount = USDC we pay, takerAmount = shares we receive
+        # Price = odds as decimal (e.g. 85% = 0.85)
+        odds_decimal = score["bet_odds"] / 100.0
+        if bet_side == "NO":
+            price = 1.0 - odds_decimal  # NO price = 1 - YES price
+        else:
+            price = odds_decimal
+
+        # Shares = stake / price (how many shares we get for our USDC)
+        num_shares = stake / price
+        maker_amount = int(stake * 1e6)        # USDC in 6 decimals
+        taker_amount = int(num_shares * 1e6)   # Shares in 6 decimals
+
+        from web3 import Web3
+        from eth_account import Account
+
+        account = Account.from_key(LIMITLESS_PRIV_KEY)
+        wallet_addr = account.address
+
+        # Generate unique salt
+        import random
+        salt = int(time.time() * 1000) * 1000 + random.randint(0, 999)
+
+        ZERO_ADDR = "0x0000000000000000000000000000000000000000"
+
+        order_data = {
+            "salt": salt,
+            "maker": Web3.to_checksum_address(wallet_addr),
+            "signer": Web3.to_checksum_address(wallet_addr),
+            "taker": Web3.to_checksum_address(ZERO_ADDR),
+            "tokenId": int(token_id),
+            "makerAmount": maker_amount,
+            "takerAmount": taker_amount,
+            "expiration": 0,  # no expiration
+            "nonce": 0,
+            "feeRateBps": 0,
+            "side": 0,  # BUY
+            "signatureType": 0,  # EOA
+        }
+
+        # 3. Sign
+        signature = _sign_order(order_data, exchange_addr)
+        if not signature:
+            print("Auto-trade skipped: signing failed")
+            return False
+
+        # 4. Submit FOK order (Fill or Kill = instant market buy)
+        order_payload = {
+            "salt": str(salt),
+            "maker": wallet_addr,
+            "signer": wallet_addr,
+            "taker": ZERO_ADDR,
+            "tokenId": str(token_id),
+            "makerAmount": str(maker_amount),
+            "takerAmount": str(taker_amount),
+            "expiration": "0",
+            "nonce": "0",
+            "feeRateBps": "0",
+            "side": "0",
+            "signatureType": "0",
+            "signature": "0x" + signature if not signature.startswith("0x") else signature,
+            "orderType": "FOK",
+        }
+
+        r = req.post(
+            "{}/orders".format(LIMITLESS_API),
+            headers={
+                "X-API-Key": LIMITLESS_API_KEY,
+                "Content-Type": "application/json",
+            },
+            json=order_payload,
+            timeout=15,
+        )
+
+        if r.status_code in (200, 201):
+            _trading_state["trades_today"] += 1
+            result_data = r.json() if r.text else {}
+
+            # Update DB with trade info
+            try:
+                conn = get_db()
+                conn.run(
+                    "UPDATE limitless_predictions SET size_rec=:s WHERE id=:i",
+                    s="AUTO ${:.2f} | {}".format(stake, bet_side), i=prediction_id
+                )
+                conn.close()
+            except:
+                pass
+
+            trade_msg = (
+                "🤖 <b>AUTO-TRADE PLACED</b>\n"
+                "──────────────────────────\n"
+                "📌 {}\n"
+                "<b>Side:</b> BUY {} shares\n"
+                "<b>Stake:</b> ${:.2f}\n"
+                "<b>Price:</b> {:.3f}\n"
+                "<b>Shares:</b> {:.1f}\n"
+                "<b>Balance:</b> ${:.2f}\n"
+                "<b>Trade #:</b> {} today\n"
+                "──────────────────────────\n"
+                "📊 Daily P&L: +${:.2f} / -${:.2f}"
+            ).format(
+                parsed_market["title"],
+                bet_side, stake, price, num_shares,
+                balance - stake,
+                _trading_state["trades_today"],
+                _trading_state["daily_profit"],
+                _trading_state["daily_loss"],
+            )
+            send_telegram(trade_msg)
+            print("AUTO-TRADE #{}: {} {} ${:.2f} on {}".format(
+                prediction_id, bet_side, slug[:30], stake, parsed_market["title"][:40]))
+            return True
+        else:
+            error_msg = r.text[:200] if r.text else "unknown error"
+            print("Auto-trade FAILED: {} - {}".format(r.status_code, error_msg))
+            send_telegram("❌ <b>Trade failed</b>\n{}\nError: {}".format(
+                parsed_market["title"][:50], error_msg[:100]))
+            return False
+
+    except Exception as e:
+        print("Auto-trade error: {}".format(e))
+        send_telegram("❌ <b>Trade error</b>\n{}".format(str(e)[:100]))
+        return False
+
+def record_trade_outcome(prediction_id, won, stake_amount):
+    """Record win/loss for daily P&L tracking."""
+    if won:
+        _trading_state["daily_profit"] += stake_amount * 0.15  # approx profit at 85% odds
+    else:
+        _trading_state["daily_loss"] += stake_amount
 
 # ═══════════════════════════════════════════════════════════
 # SCANNER
@@ -1934,6 +2286,62 @@ def update_prediction(pred_id, status):
 def manual_scan():
     threading.Thread(target=run_scan, daemon=True).start()
     return {"status": "scan triggered"}, 200
+
+@app.route("/trading/stop", methods=["GET"])
+def trading_stop():
+    """Kill switch — immediately stop all auto-trading."""
+    _trading_state["enabled"] = False
+    send_telegram("🛑 <b>Auto-trading STOPPED</b>\nKill switch activated. Signals still fire but no trades placed.\nUse /trading/start to resume.")
+    return {"status": "auto-trading stopped", "enabled": False}, 200
+
+@app.route("/trading/start", methods=["GET"])
+def trading_start():
+    """Resume auto-trading."""
+    _trading_state["enabled"] = True
+    _reset_daily_counters()
+    balance = _get_limitless_balance()
+    send_telegram("✅ <b>Auto-trading RESUMED</b>\nBalance: ${:.2f}\nHIGH stake: {:.0f}% | MEDIUM stake: {:.0f}%\nDaily loss limit: {:.0f}%".format(
+        balance or 0,
+        _trading_state["high_pct"] * 100,
+        _trading_state["medium_pct"] * 100,
+        _trading_state["daily_loss_limit_pct"] * 100,
+    ))
+    return {"status": "auto-trading started", "enabled": True, "balance": balance}, 200
+
+@app.route("/trading/status", methods=["GET"])
+def trading_status():
+    """Check current auto-trading status."""
+    balance = _get_limitless_balance()
+    return {
+        "enabled": _trading_state["enabled"],
+        "balance": balance,
+        "safe_window": _is_safe_trading_window(),
+        "current_hour_lagos": datetime.now(LAGOS_TZ).hour,
+        "mode": "AUTO-TRADING" if _trading_state["enabled"] and _is_safe_trading_window() else "SIGNALS ONLY (US session)" if _trading_state["enabled"] and not _is_safe_trading_window() else "STOPPED (kill switch)",
+        "daily_loss": _trading_state["daily_loss"],
+        "daily_profit": _trading_state["daily_profit"],
+        "trades_today": _trading_state["trades_today"],
+        "high_pct": _trading_state["high_pct"],
+        "medium_pct": _trading_state["medium_pct"],
+        "daily_loss_limit_pct": _trading_state["daily_loss_limit_pct"],
+        "has_keys": bool(LIMITLESS_API_KEY and LIMITLESS_PRIV_KEY),
+        "schedule": "AUTO: 6am-1pm & 6pm-6am Lagos | SIGNALS ONLY: 1pm-6pm Lagos",
+    }, 200
+
+@app.route("/trading/set", methods=["GET"])
+def trading_set():
+    """Adjust trading parameters. Usage: /trading/set?high=0.15&medium=0.08&loss_limit=0.25"""
+    if request.args.get("high"):
+        _trading_state["high_pct"] = float(request.args["high"])
+    if request.args.get("medium"):
+        _trading_state["medium_pct"] = float(request.args["medium"])
+    if request.args.get("loss_limit"):
+        _trading_state["daily_loss_limit_pct"] = float(request.args["loss_limit"])
+    return {
+        "high_pct": _trading_state["high_pct"],
+        "medium_pct": _trading_state["medium_pct"],
+        "daily_loss_limit_pct": _trading_state["daily_loss_limit_pct"],
+    }, 200
 
 @app.route("/football/clear", methods=["GET"])
 def clear_football_picks():
