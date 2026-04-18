@@ -1389,7 +1389,10 @@ def save_and_alert_otp(market, parsed, analysis):
              accumulator_tier, status, fired_at)
             VALUES (:mid, :h, :a, :c, :k, 'limitless_otp', :pv, :conf, :r, :o, 'single', 'Pending', :now)
             RETURNING id""",
-            mid=parsed["market_id"], h="", a="", c="Limitless OTP",
+            mid=parsed["title"][:200],  # Save the market TITLE, not the ID
+            h=str(parsed.get("market_id", ""))[:50],  # Store ID in home_team field for reference
+            a=parsed.get("slug", "")[:100],  # Slug in away_team for link reconstruction
+            c="Limitless OTP",
             k=parsed["expiry_dt"].isoformat(), pv=action,
             conf=conf, r=reasoning[:200],
             o=parsed["yes_odds"] if action == "YES" else (100 - parsed["yes_odds"]),
@@ -1484,12 +1487,12 @@ def run_otp_scan():
 
         print("OTP scan: {} total prop/OTP markets to analyze".format(len(otp_markets)))
         
-        # Get already-alerted
+        # Get already-alerted (we now store market ID in home_team field for OTP rows)
         conn = get_db()
         alerted = conn.run(
-            "SELECT match_id FROM football_picks WHERE fired_at::timestamptz > NOW() - INTERVAL '6 hours' AND pick_type='limitless_otp'"
+            "SELECT home_team FROM football_picks WHERE fired_at::timestamptz > NOW() - INTERVAL '6 hours' AND pick_type='limitless_otp'"
         )
-        alerted_ids = set(str(r[0]) for r in alerted)
+        alerted_ids = set(str(r[0]) for r in alerted if r[0])
         conn.close()
         
         count = 0
@@ -1845,6 +1848,18 @@ def debug_otp():
             report["strategies"]["category_{}".format(cat_id)] = {"error": str(e)}
 
     return jsonify(report)
+
+@app.route("/otp/clear", methods=["GET"])
+def clear_otp_picks():
+    """One-time cleanup: wipe old OTP picks that have market IDs instead of titles."""
+    try:
+        conn = get_db()
+        # Delete all existing OTP picks so next scan generates fresh ones with titles
+        conn.run("DELETE FROM football_picks WHERE pick_type='limitless_otp'")
+        conn.close()
+        return {"status": "cleared all OTP picks — run /otp/scan to regenerate"}, 200
+    except Exception as e:
+        return {"error": str(e)}, 500
 
 @app.route("/otp/scan", methods=["GET"])
 def manual_otp_scan():
@@ -2369,7 +2384,13 @@ tbody tr:hover{background:var(--bg)}
       <tbody>
         {% for p in otp_picks %}
         <tr>
-          <td style="font-weight:500;color:var(--ink);max-width:320px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ p.match_id }}</td>
+          <td style="font-weight:500;color:var(--ink);max-width:360px" title="{{ p.match_id }}">
+            {% if p.away_team %}
+              <a href="https://limitless.exchange/markets/{{ p.away_team }}" target="_blank" style="color:var(--ink);text-decoration:none">{{ p.match_id }}</a>
+            {% else %}
+              {{ p.match_id }}
+            {% endif %}
+          </td>
           <td><span class="pick-value">{{ p.pick_value }}</span></td>
           <td style="font-family:var(--mono);font-weight:600">{{ "%.1f"|format(p.implied_odds) }}%</td>
           <td><span class="pick-conf">{{ p.confidence|int }}%</span></td>
