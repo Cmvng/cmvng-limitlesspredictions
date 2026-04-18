@@ -288,11 +288,11 @@ def score_market(p, btc_trend, price, debug_log=None):
     # 5. Determine margin thresholds based on timeframe
     #    Shorter timeframes need less margin because price has less time to move
     if p["is_short"] and p["mins_left"] <= 30:
-        margin_thresh_aligned = 0.1    # 0.1% when trend helps
-        margin_thresh_against = 0.3    # 0.3% when trend fights
+        margin_thresh_aligned = 0.05   # 0.05% when trend helps (~$42 on BTC)
+        margin_thresh_against = 0.15   # 0.15% when trend fights (~$126 on BTC)
     elif p["hours_left"] <= 2:
-        margin_thresh_aligned = 0.3
-        margin_thresh_against = 1.0
+        margin_thresh_aligned = 0.15   # 0.15% (~$2.43 on ETH)
+        margin_thresh_against = 0.4    # 0.4% (~$6.48 on ETH)
     else:
         margin_thresh_aligned = 0.5
         margin_thresh_against = 2.0
