@@ -3482,11 +3482,6 @@ tbody tr:hover{background:var(--bg)}
   <p>Results will appear here once matches have been played and resolved. Each day shows which accumulators won and which picks caused losses.</p>
 </div>
 {% endif %}
-{% else %}
-<div class="empty" style="padding:32px">
-  <p>No resolved picks yet. Results appear here after matches finish (checked every 5 minutes, 2 hours after kickoff).</p>
-</div>
-{% endif %}
 
 <footer class="footer">Accumulators update every 6 hours · Past matches auto-filtered · Auto-refresh 60s</footer>
 </div>
