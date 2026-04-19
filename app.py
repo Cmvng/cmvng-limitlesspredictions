@@ -1031,10 +1031,35 @@ def _place_gtc_order(slug, bet_side, token_id, stake, price_per_share, exchange_
     account = Account.from_key(LIMITLESS_PRIV_KEY)
     wallet_addr = account.address
 
-    # For GTC: makerAmount = USDC to spend, takerAmount = shares to receive
-    num_shares = stake / price_per_share
+    # Round price to 3 decimal places (API requirement)
+    price_per_share = round(price_per_share, 3)
+
+    # For GTC: makerAmount = USDC to spend, takerAmount = contracts to receive
+    # Key constraint: price × contracts must be an exact integer (no decimals)
+    # price is in 3 decimals (e.g. 0.825), contracts are integers
+    # price(0.825) × contracts(N) must = integer
+    # So contracts must be divisible by 1000/gcd(price_int, 1000)
+    # Simplest: make contracts = makerAmount / price, then round to nearest valid tick
+
+    price_int = int(price_per_share * 1000)  # e.g. 0.825 → 825
+    if price_int <= 0:
+        return None
+
+    # Calculate contracts such that price × contracts is exactly makerAmount
     maker_amount = int(stake * 1e6)  # USDC in 6 decimals
-    taker_amount = int(num_shares * 1e6)  # shares in 6 decimals
+    # contracts = makerAmount / price, but must satisfy: price * contracts = integer
+    # Since price has 3 decimals: price = P/1000, so P * contracts must be divisible by 1000
+    # contracts must be a multiple of 1000 / gcd(P, 1000)
+    import math
+    tick = 1000 // math.gcd(price_int, 1000)
+    raw_contracts = maker_amount / (price_int / 1000)
+    taker_amount = int(raw_contracts // tick) * tick  # Round down to nearest valid tick
+
+    if taker_amount <= 0:
+        taker_amount = tick  # Minimum 1 tick
+
+    # Recalculate makerAmount to match exactly: maker = price * contracts
+    maker_amount = int(price_per_share * taker_amount)
 
     salt = int(time.time() * 1000) * 1000 + random.randint(0, 999)
     ZERO_ADDR = "0x0000000000000000000000000000000000000000"
@@ -1073,7 +1098,7 @@ def _place_gtc_order(slug, bet_side, token_id, stake, price_per_share, exchange_
             "side": 0,
             "signatureType": 0,
             "signature": "0x" + signature if not signature.startswith("0x") else signature,
-            "price": round(price_per_share, 4),
+            "price": round(price_per_share, 3),
         },
         "orderType": "GTC",
         "marketSlug": slug,
@@ -1345,7 +1370,7 @@ def execute_trade(parsed_market, score, prediction_id):
             displayed_price = odds_decimal
 
         # Ceiling: displayed price + small buffer (never pay more than this)
-        ceiling = round(min(displayed_price + 0.03, 0.95), 4)
+        ceiling = round(min(displayed_price + 0.03, 0.95), 3)
 
         # Starting bid: use midpoint from the CORRECT side prices
         # For NO side, bid/ask must be in NO-share terms (small numbers like 0.08-0.15)
@@ -1356,7 +1381,7 @@ def execute_trade(parsed_market, score, prediction_id):
                 # Prices are from wrong side — invert them
                 print("Price inversion detected: mid={:.4f} vs displayed={:.4f} — inverting".format(midpoint, displayed_price))
                 best_bid = round(1.0 - best_ask, 4)
-                best_ask = round(1.0 - best_bid, 4) if best_bid < 1 else 0.01
+                best_ask = round(1.0 - best_bid, 3) if best_bid < 1 else 0.01
                 midpoint = round((best_bid + best_ask) / 2, 4)
 
         if midpoint and best_bid:
@@ -1387,7 +1412,7 @@ def execute_trade(parsed_market, score, prediction_id):
             return success
 
         # Clamp start price
-        start_price = round(max(0.01, min(start_price, ceiling)), 4)
+        start_price = round(max(0.01, min(start_price, ceiling)), 3)
 
         print("Aggressive bid: {} {} start=${:.4f} ceiling=${:.4f} bid=${} ask={}".format(
             bet_side, slug[:25], start_price, ceiling,
@@ -1442,7 +1467,7 @@ def execute_trade(parsed_market, score, prediction_id):
 
             if new_bid and new_bid >= current_price:
                 # Someone topped us — outbid by $0.01
-                new_price = round(new_bid + 0.01, 4)
+                new_price = round(new_bid + 0.01, 3)
                 if new_price > ceiling:
                     print("Bid war hit ceiling ${:.4f} — stopping".format(ceiling))
                     break
