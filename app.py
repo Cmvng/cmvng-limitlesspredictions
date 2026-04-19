@@ -1185,14 +1185,40 @@ def _auto_redeem_positions():
 
             try:
                 redeem_path = "/portfolio/redeem"
-                redeem_body = json.dumps({"marketSlug": market_slug, "conditionId": condition_id})
+                # Try with just conditionId (marketSlug was rejected)
+                redeem_body = json.dumps({"conditionId": condition_id})
                 redeem_headers = _hmac_headers("POST", redeem_path, redeem_body)
                 rr = req.post("{}{}".format(LIMITLESS_API, redeem_path),
                               headers=redeem_headers, data=redeem_body, timeout=15)
-                print("  Redeem {}: {} {}".format(market_slug[:30], rr.status_code, rr.text[:100]))
                 if rr.status_code in (200, 201):
                     redeemed += 1
                     send_telegram("💰 <b>Auto-redeemed</b>\n📌 {}".format(title[:60]))
+                    print("  Redeemed OK: {}".format(title[:40]))
+                elif rr.status_code == 400 and "should not exist" not in rr.text:
+                    # Already redeemed or nothing to redeem
+                    pass
+                else:
+                    # Try with slug instead of marketSlug
+                    redeem_body2 = json.dumps({"slug": market_slug, "conditionId": condition_id})
+                    redeem_headers2 = _hmac_headers("POST", redeem_path, redeem_body2)
+                    rr2 = req.post("{}{}".format(LIMITLESS_API, redeem_path),
+                                   headers=redeem_headers2, data=redeem_body2, timeout=15)
+                    if rr2.status_code in (200, 201):
+                        redeemed += 1
+                        send_telegram("💰 <b>Auto-redeemed</b>\n📌 {}".format(title[:60]))
+                        print("  Redeemed OK (slug): {}".format(title[:40]))
+                    else:
+                        # Try empty body (maybe redeem all at once)
+                        redeem_body3 = json.dumps({})
+                        redeem_headers3 = _hmac_headers("POST", redeem_path, redeem_body3)
+                        rr3 = req.post("{}{}".format(LIMITLESS_API, redeem_path),
+                                       headers=redeem_headers3, data=redeem_body3, timeout=15)
+                        print("  Redeem attempts: conditionId={} slug={} empty={}".format(
+                            rr.status_code, rr2.status_code, rr3.status_code))
+                        if rr3.status_code in (200, 201):
+                            redeemed += 1
+                            send_telegram("💰 <b>Auto-redeemed all</b>")
+                            break  # redeemed everything at once
             except Exception as e:
                 print("  Redeem error {}: {}".format(market_slug[:30], e))
             time.sleep(1)
