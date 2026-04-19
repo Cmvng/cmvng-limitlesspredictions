@@ -132,6 +132,33 @@ def init_db():
         conn.run("ALTER TABLE limitless_predictions ADD COLUMN IF NOT EXISTS bet_side TEXT DEFAULT 'YES'")
     except:
         pass
+    # Paper trading table — records simulated trades at lower odds
+    conn.run("""
+        CREATE TABLE IF NOT EXISTS paper_trades (
+            id            SERIAL PRIMARY KEY,
+            market_id     TEXT,
+            title         TEXT,
+            asset         TEXT,
+            direction     TEXT,
+            baseline      REAL,
+            bet_odds      REAL,
+            bet_side      TEXT DEFAULT 'YES',
+            current_price REAL,
+            hours_left    REAL,
+            market_type   TEXT,
+            trend_source  TEXT,
+            trend_dir     TEXT,
+            sma_dir       TEXT,
+            tv_dir        TEXT,
+            simulated_stake REAL DEFAULT 1.0,
+            simulated_payout REAL,
+            status        TEXT DEFAULT 'Pending',
+            outcome       TEXT,
+            fired_at      TEXT,
+            resolved_at   TEXT,
+            slug          TEXT
+        )
+    """)
     conn.close()
     print("DB initialized OK")
 
@@ -1843,7 +1870,296 @@ def scan_loop():
     time.sleep(30)
     while True:
         run_scan()
+        # Run paper scanner after real scanner (uses same market data)
+        try:
+            run_paper_scan()
+        except Exception as e:
+            print("Paper scan error: {}".format(e))
         time.sleep(300)
+
+# ═══════════════════════════════════════════════════════════
+# PAPER TRADING — simulated trades at lower odds for testing
+# ═══════════════════════════════════════════════════════════
+
+def _score_paper_trade(p, price):
+    """Score a market for paper trading. Accepts 40-72% odds when ALL trends agree.
+    Returns score dict or None if rejected."""
+    if price is None:
+        return None
+
+    asset = p["asset"]
+    hours_left = p["hours_left"]
+
+    # Get per-pair trend
+    asset_trend = get_asset_trend(asset, hours_left)
+    trend_dir = asset_trend["direction"]
+    trend_source = asset_trend["source"]
+
+    # Get individual components
+    tv = _tv_trends.get(asset.upper())
+    tv_dir = tv["dir"] if tv else None
+    sma_dir = _pair_sma_cache.get(asset.upper(), {}).get("trend")
+    btc_trend = _btc_trend_cache.get("trend")
+
+    # Paper trading only when we have trend data
+    if not trend_dir:
+        return None
+
+    # Calculate margin
+    margin = abs(price - p["baseline"])
+    margin_pct = (margin / p["baseline"] * 100) if p["baseline"] > 0 else 0
+
+    # Minimum margin: 0.05% for short-term, 0.3% for daily
+    min_margin = 0.05 if p["is_short"] else 0.3
+    if margin_pct < min_margin:
+        return None
+
+    # Determine YES or NO odds
+    yes_odds = p["yes_odds"]
+    no_odds = 100 - yes_odds
+
+    if p["direction"] == "above":
+        price_is_above = price > p["baseline"]
+        price_is_below = price < p["baseline"]
+    else:
+        price_is_above = price < p["baseline"]
+        price_is_below = price > p["baseline"]
+
+    bet_side = None
+    effective_odds = None
+
+    # Check if price position ALIGNS with trend direction
+    if price_is_above:
+        # Price above baseline → YES bet makes sense
+        if p["direction"] == "above":
+            trend_aligned = (trend_dir == "BUY")
+        else:
+            trend_aligned = (trend_dir == "SELL")
+
+        if trend_aligned and 30 <= yes_odds <= 72:
+            bet_side = "YES"
+            effective_odds = yes_odds
+
+    if bet_side is None and price_is_below:
+        # Price below baseline → NO bet makes sense
+        if p["direction"] == "above":
+            trend_aligned = (trend_dir == "SELL")
+        else:
+            trend_aligned = (trend_dir == "BUY")
+
+        if trend_aligned and 30 <= no_odds <= 72:
+            bet_side = "NO"
+            effective_odds = no_odds
+
+    if bet_side is None:
+        return None
+
+    # ALL signals must agree for paper trade
+    # Count how many signals agree
+    signals_agree = 0
+    total_signals = 0
+
+    if btc_trend:
+        total_signals += 1
+        if p["direction"] == "above":
+            if (bet_side == "YES" and btc_trend == "BUY") or (bet_side == "NO" and btc_trend == "SELL"):
+                signals_agree += 1
+        else:
+            if (bet_side == "YES" and btc_trend == "SELL") or (bet_side == "NO" and btc_trend == "BUY"):
+                signals_agree += 1
+
+    if sma_dir:
+        total_signals += 1
+        if p["direction"] == "above":
+            if (bet_side == "YES" and sma_dir == "BUY") or (bet_side == "NO" and sma_dir == "SELL"):
+                signals_agree += 1
+        else:
+            if (bet_side == "YES" and sma_dir == "SELL") or (bet_side == "NO" and sma_dir == "BUY"):
+                signals_agree += 1
+
+    if tv_dir:
+        total_signals += 1
+        if p["direction"] == "above":
+            if (bet_side == "YES" and tv_dir == "BUY") or (bet_side == "NO" and tv_dir == "SELL"):
+                signals_agree += 1
+        else:
+            if (bet_side == "YES" and tv_dir == "SELL") or (bet_side == "NO" and tv_dir == "BUY"):
+                signals_agree += 1
+
+    # Need at least 2 signals agreeing (out of btc, sma, tv)
+    if signals_agree < 2 or total_signals < 2:
+        return None
+
+    # Calculate simulated P&L
+    share_price = effective_odds / 100.0
+    if bet_side == "NO":
+        share_price = 1.0 - share_price
+    sim_stake = 1.0  # Always $1 for paper
+    sim_payout = sim_stake / share_price if share_price > 0 else 0
+
+    # Market type label
+    if p["is_short"] and p["mins_left"] <= 20:
+        mtype = "15M"
+    elif p["is_short"]:
+        mtype = "1H"
+    else:
+        mtype = "Daily"
+
+    return {
+        "bet_side": bet_side,
+        "bet_odds": effective_odds,
+        "trend_source": trend_source,
+        "trend_dir": trend_dir,
+        "sma_dir": sma_dir or "—",
+        "tv_dir": tv_dir or "—",
+        "btc_dir": btc_trend or "—",
+        "sim_stake": sim_stake,
+        "sim_payout": round(sim_payout, 4),
+        "margin_pct": margin_pct,
+        "market_type": mtype,
+        "signals_agree": signals_agree,
+        "total_signals": total_signals,
+    }
+
+def run_paper_scan():
+    """Scan all markets for paper trades at 40-72% odds with full trend alignment."""
+    import requests as req
+    try:
+        r = req.get("{}/markets/active".format(LIMITLESS_API), timeout=15)
+        if r.status_code != 200:
+            return
+        markets = r.json().get("data", [])
+
+        # Get already-recorded paper trades (avoid duplicates)
+        conn = get_db()
+        try:
+            recorded = conn.run(
+                "SELECT market_id FROM paper_trades WHERE fired_at::timestamptz > NOW() - INTERVAL '6 hours'"
+            )
+            recorded_ids = set(str(row[0]) for row in recorded)
+        except:
+            recorded_ids = set()
+        conn.close()
+
+        price_cache = {}
+        count = 0
+        for market in markets:
+            try:
+                parsed = parse_market(market)
+                if not parsed:
+                    continue
+                if parsed["market_id"] in recorded_ids:
+                    continue
+                asset = parsed["asset"]
+                if asset not in price_cache:
+                    price_cache[asset] = get_price(asset)
+                price = price_cache[asset]
+
+                scored = _score_paper_trade(parsed, price)
+                if not scored:
+                    continue
+
+                # Save paper trade
+                now = datetime.now(timezone.utc).isoformat()
+                conn2 = get_db()
+                conn2.run(
+                    """INSERT INTO paper_trades
+                    (market_id, title, asset, direction, baseline, bet_odds, bet_side,
+                     current_price, hours_left, market_type, trend_source, trend_dir,
+                     sma_dir, tv_dir, simulated_stake, simulated_payout, status, fired_at, slug)
+                    VALUES (:mid, :ttl, :ast, :dir, :base, :odds, :bs,
+                            :pr, :hrs, :mt, :ts, :td,
+                            :sd, :tvd, :ss, :sp, 'Pending', :now, :slg)""",
+                    mid=parsed["market_id"], ttl=parsed["title"], ast=asset,
+                    dir=parsed["direction"], base=parsed["baseline"],
+                    odds=scored["bet_odds"], bs=scored["bet_side"],
+                    pr=price, hrs=round(parsed["hours_left"], 2),
+                    mt=scored["market_type"], ts=scored["trend_source"],
+                    td=scored["trend_dir"], sd=scored["sma_dir"], tvd=scored["tv_dir"],
+                    ss=scored["sim_stake"], sp=scored["sim_payout"],
+                    now=now, slg=parsed["slug"]
+                )
+                conn2.close()
+                recorded_ids.add(parsed["market_id"])
+                count += 1
+            except Exception as e:
+                print("Paper trade error: {}".format(e))
+
+        if count > 0:
+            print("Paper trades: {} new signals recorded".format(count))
+    except Exception as e:
+        print("Paper scan error: {}".format(e))
+
+def resolve_paper_trades():
+    """Auto-resolve paper trades when markets expire."""
+    try:
+        conn = get_db()
+        rows = conn.run("SELECT * FROM paper_trades WHERE status='Pending'")
+        cols = [c['name'] for c in conn.columns]
+        items = [dict(zip(cols, r)) for r in rows]
+        conn.close()
+
+        if not items:
+            return
+
+        now = datetime.now(timezone.utc)
+        resolved = 0
+        for p in items:
+            try:
+                if not p.get("fired_at") or not p.get("asset") or p.get("baseline") is None:
+                    continue
+
+                fired = datetime.fromisoformat(p["fired_at"])
+                if fired.tzinfo is None:
+                    fired = fired.replace(tzinfo=timezone.utc)
+                hours_left = float(p.get("hours_left") or 0)
+                if hours_left <= 0:
+                    hours_left = 0.25
+                expiry = fired + timedelta(hours=hours_left)
+                if now < expiry:
+                    continue
+
+                price = get_price(p["asset"])
+                if price is None:
+                    continue
+
+                baseline = float(p["baseline"])
+                direction = p.get("direction") or "above"
+                market_resolved_true = (price > baseline) if direction == "above" else (price < baseline)
+
+                bet_side = p.get("bet_side") or "YES"
+                if bet_side == "YES":
+                    won = market_resolved_true
+                else:
+                    won = not market_resolved_true
+
+                outcome = "WIN" if won else "LOSS"
+                status = "✅ Won" if won else "❌ Lost"
+
+                # Calculate P&L
+                stake = float(p.get("simulated_stake") or 1.0)
+                odds = float(p.get("bet_odds") or 50)
+                share_price = odds / 100.0
+                if bet_side == "NO":
+                    share_price = 1.0 - share_price
+                payout = (stake / share_price) if won else 0
+                profit = round(payout - stake, 4) if won else round(-stake, 4)
+
+                conn2 = get_db()
+                conn2.run(
+                    "UPDATE paper_trades SET status=:s, outcome=:o, resolved_at=:r, simulated_payout=:p WHERE id=:i",
+                    s=status, o=outcome, r=now.isoformat(),
+                    p=round(payout, 4), i=p["id"]
+                )
+                conn2.close()
+                resolved += 1
+            except Exception as e:
+                print("Paper resolve #{}: {}".format(p.get("id"), e))
+
+        if resolved > 0:
+            print("Paper trades: {} resolved".format(resolved))
+    except Exception as e:
+        print("Paper resolve error: {}".format(e))
 
 # ═══════════════════════════════════════════════════════════
 # OUTCOME CHECKER
@@ -2419,6 +2735,11 @@ def outcome_loop():
             _auto_redeem_positions()
         except Exception as e:
             print("Auto-redeem loop error: {}".format(e))
+        # Resolve paper trades
+        try:
+            resolve_paper_trades()
+        except Exception as e:
+            print("Paper resolve loop error: {}".format(e))
         time.sleep(300)
 
 # ═══════════════════════════════════════════════════════════
@@ -4078,15 +4399,18 @@ tbody tr:hover{background:var(--bg)}
       <a href="/" class="nav-tab">Home</a>
       <a href="/app" class="nav-tab active">Crypto</a>
       <a href="/app/football" class="nav-tab">Football</a>
+      <a href="/app/paper" class="nav-tab">Paper</a>
     </nav>
     <div class="pills">
       <span class="pill pill-active">
         <span class="dot live"></span>
         24/7 Active
       </span>
-      <span class="pill {{ 'pill-btc-up' if btc_trend == 'BUY' else 'pill-btc-down' if btc_trend == 'SELL' else '' }}">
-        BTC {{ '↗ BUY' if btc_trend == 'BUY' else '↘ SELL' if btc_trend == 'SELL' else '— N/A' }}
+      {% for pair_name, pair_dir in pair_trends %}
+      <span class="pill {{ 'pill-btc-up' if pair_dir == 'BUY' else 'pill-btc-down' if pair_dir == 'SELL' else '' }}" style="font-size:10px;padding:4px 8px">
+        {{ pair_name }} {{ '↗' if pair_dir == 'BUY' else '↘' if pair_dir == 'SELL' else '—' }}
       </span>
+      {% endfor %}
     </div>
   </div>
 </header>
@@ -4774,9 +5098,24 @@ def dashboard():
     today = sum(1 for p in preds if p.get("fired_at", "").startswith(today_str))
     stats = {"total": total, "wins": wins, "losses": losses,
              "pending": pending, "wr": wr, "today": today}
+    # Build per-pair trend list for header display
+    display_pairs = ["BTC", "ETH", "SOL", "XRP", "DOGE", "ADA", "BNB", "ZEC"]
+    pair_trends = []
+    for p in display_pairs:
+        # Check TV signal first, then SMA, then BTC fallback
+        tv = _tv_trends.get(p)
+        sma = _pair_sma_cache.get(p)
+        if tv:
+            pair_trends.append((p, tv["dir"]))
+        elif sma:
+            pair_trends.append((p, sma["trend"]))
+        elif p == "BTC" and _btc_trend_cache.get("trend"):
+            pair_trends.append((p, _btc_trend_cache["trend"]))
+
     return render_template_string(
         DASHBOARD_HTML, preds=preds, stats=stats,
         btc_trend=_btc_trend_cache.get("trend"),
+        pair_trends=pair_trends,
         in_window=is_lagos_window()
     )
 
@@ -5045,9 +5384,242 @@ def football_page():
         daily_results=daily_results,
     )
 
-# ═══════════════════════════════════════════════════════════
-# STARTUP
-# ═══════════════════════════════════════════════════════════
+@app.route("/app/paper")
+def paper_page():
+    """Paper trading results page — simulated trades at lower odds with trend alignment."""
+    try:
+        conn = get_db()
+        # All paper trades ordered by newest first
+        rows = conn.run("SELECT * FROM paper_trades ORDER BY id DESC LIMIT 200")
+        cols = [c['name'] for c in conn.columns]
+        trades = [dict(zip(cols, r)) for r in rows]
+        conn.close()
+    except Exception as e:
+        print("Paper page error: {}".format(e))
+        trades = []
+
+    # Calculate stats
+    total = len(trades)
+    wins = sum(1 for t in trades if t.get("outcome") == "WIN")
+    losses = sum(1 for t in trades if t.get("outcome") == "LOSS")
+    pending = sum(1 for t in trades if t.get("status") == "Pending")
+    resolved = wins + losses
+    win_rate = round(wins / resolved * 100, 1) if resolved > 0 else 0
+
+    # Simulated P&L
+    total_profit = 0
+    for t in trades:
+        if t.get("outcome") == "WIN":
+            total_profit += float(t.get("simulated_payout") or 0) - float(t.get("simulated_stake") or 1)
+        elif t.get("outcome") == "LOSS":
+            total_profit -= float(t.get("simulated_stake") or 1)
+    total_profit = round(total_profit, 2)
+
+    # Stats by market type
+    type_stats = {}
+    for t in trades:
+        mt = t.get("market_type") or "Unknown"
+        if mt not in type_stats:
+            type_stats[mt] = {"w": 0, "l": 0, "p": 0, "profit": 0.0}
+        if t.get("outcome") == "WIN":
+            type_stats[mt]["w"] += 1
+            type_stats[mt]["profit"] += float(t.get("simulated_payout") or 0) - float(t.get("simulated_stake") or 1)
+        elif t.get("outcome") == "LOSS":
+            type_stats[mt]["l"] += 1
+            type_stats[mt]["profit"] -= float(t.get("simulated_stake") or 1)
+        else:
+            type_stats[mt]["p"] += 1
+
+    # Stats by asset
+    asset_stats = {}
+    for t in trades:
+        a = t.get("asset") or "?"
+        if a not in asset_stats:
+            asset_stats[a] = {"w": 0, "l": 0, "profit": 0.0}
+        if t.get("outcome") == "WIN":
+            asset_stats[a]["w"] += 1
+            asset_stats[a]["profit"] += float(t.get("simulated_payout") or 0) - float(t.get("simulated_stake") or 1)
+        elif t.get("outcome") == "LOSS":
+            asset_stats[a]["l"] += 1
+            asset_stats[a]["profit"] -= float(t.get("simulated_stake") or 1)
+
+    paper_html = """<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Paper Trading — Limitless CMVNG</title>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600&family=Inter+Tight:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+:root{--bg:#fafaf7;--surface:#fff;--border:#ececea;--accent:#1a3d2e;--positive:#1a7046;--positive-bg:#e8f3ed;--negative:#b4322e;--negative-bg:#f7e7e5;--warning:#8a6a2f;--warning-bg:#f5eedb;--ink:#1a1a17;--ink-2:#3a3a35;--ink-3:#6b6b64;--ink-4:#9c9c94;--display:'Fraunces',Georgia,serif;--sans:'Inter Tight',sans-serif;--mono:'JetBrains Mono',monospace}
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:var(--sans);background:var(--bg);color:var(--ink)}
+.app{max-width:1380px;margin:0 auto}
+.hdr{padding:24px 40px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:20px;border-bottom:1px solid var(--border)}
+.brand{display:flex;align-items:center;gap:14px}
+.brand-mark{width:38px;height:38px;border-radius:10px;background:var(--accent);display:flex;align-items:center;justify-content:center}
+.brand-mark::before{content:'';width:14px;height:14px;border:2px solid var(--bg);border-radius:50%}
+.brand-text h1{font-family:var(--display);font-weight:500;font-size:19px}
+.brand-text small{font-size:10px;font-family:var(--mono);color:var(--ink-4);text-transform:uppercase;letter-spacing:.12em}
+.nav-tabs{display:flex;gap:4px;background:#f4f3ed;border-radius:10px;padding:3px}
+.nav-tab{padding:7px 14px;font-size:12px;font-weight:500;color:var(--ink-3);border-radius:8px;text-decoration:none}
+.nav-tab.active{background:var(--surface);color:var(--ink);box-shadow:0 1px 2px rgba(0,0,0,.04)}
+.hero{padding:44px 40px 28px;border-bottom:1px solid var(--border)}
+.hero-label{font-size:10px;font-family:var(--mono);color:var(--ink-4);text-transform:uppercase;letter-spacing:.15em;margin-bottom:12px;display:flex;align-items:center;gap:10px}
+.hero-label::before{content:'';width:24px;height:1px;background:var(--ink-4)}
+.hero-title{font-family:var(--display);font-weight:400;font-size:clamp(28px,4vw,42px);line-height:1.05;letter-spacing:-.03em;margin-bottom:14px}
+.hero-title em{font-style:italic;color:var(--accent)}
+.hero-sub{font-size:15px;color:var(--ink-3);max-width:620px;line-height:1.55}
+.stats-row{padding:20px 40px;display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:0;border-bottom:1px solid var(--border);background:var(--surface)}
+.stat{padding:0 24px;border-left:1px solid var(--border)}
+.stat:first-child{padding-left:0;border-left:none}
+.stat-label{font-size:10px;font-family:var(--mono);color:var(--ink-4);text-transform:uppercase;letter-spacing:.14em;margin-bottom:8px}
+.stat-value{font-family:var(--display);font-weight:400;font-size:26px;line-height:1;letter-spacing:-.03em}
+.section{padding:28px 40px}
+.section-title{font-family:var(--display);font-weight:500;font-size:20px;letter-spacing:-.02em;margin-bottom:16px}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:14px;margin-bottom:28px}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:16px 20px}
+.card-label{font-size:10px;font-family:var(--mono);color:var(--ink-4);text-transform:uppercase;letter-spacing:.1em;margin-bottom:8px}
+.card-value{font-family:var(--display);font-size:22px;font-weight:500}
+.card-sub{font-size:11px;color:var(--ink-3);margin-top:4px;font-family:var(--mono)}
+table{width:100%;border-collapse:collapse;font-size:13px;background:var(--surface);border-radius:12px;overflow:hidden;border:1px solid var(--border)}
+thead{background:#f4f3ed;border-bottom:1px solid var(--border)}
+th{text-align:left;padding:10px 14px;font-size:10px;font-family:var(--mono);color:var(--ink-3);text-transform:uppercase;letter-spacing:.08em;white-space:nowrap}
+td{padding:10px 14px;border-bottom:1px solid #f4f3ed;color:var(--ink-2)}
+tr:last-child td{border-bottom:none}
+tr:hover td{background:#fafaf7}
+.won{background:var(--positive-bg);color:var(--positive);padding:2px 8px;border-radius:20px;font-size:11px;font-weight:600}
+.lost{background:var(--negative-bg);color:var(--negative);padding:2px 8px;border-radius:20px;font-size:11px;font-weight:600}
+.pend{background:var(--warning-bg);color:var(--warning);padding:2px 8px;border-radius:20px;font-size:11px;font-weight:600}
+.pos{color:var(--positive);font-weight:600}.neg{color:var(--negative);font-weight:600}
+.tw{overflow-x:auto}
+.footer{padding:28px 40px 48px;border-top:1px solid var(--border);text-align:center;font-size:11px;font-family:var(--mono);color:var(--ink-4);margin-top:24px}
+@media(max-width:800px){.stats-row,.section,.hero,.hdr,.footer{padding-left:20px;padding-right:20px}}
+</style></head><body>
+<div class="app">
+<header class="hdr">
+  <div class="brand"><div class="brand-mark"></div>
+    <div class="brand-text"><h1>Limitless</h1><small>CMVNG · Paper Trading</small></div></div>
+  <nav class="nav-tabs">
+    <a href="/" class="nav-tab">Home</a>
+    <a href="/app" class="nav-tab">Crypto</a>
+    <a href="/app/football" class="nav-tab">Football</a>
+      <a href="/app/paper" class="nav-tab">Paper</a>
+    <a href="/app/paper" class="nav-tab active">Paper</a>
+  </nav>
+</header>
+
+<section class="hero">
+  <div class="hero-label">Simulation Mode</div>
+  <h2 class="hero-title">Lower odds,<br><em>higher profit?</em></h2>
+  <p class="hero-sub">Testing trades at 40-72% odds where ALL trend signals agree (TV strategy + SMA + BTC). No real money — just tracking what would happen. Every $1 simulated stake at 50% odds returns $2 on a win.</p>
+</section>
+
+<div class="stats-row">
+  <div class="stat"><div class="stat-label">Total</div><div class="stat-value">""" + str(total) + """</div></div>
+  <div class="stat"><div class="stat-label">Win Rate</div><div class="stat-value """ + ("pos" if win_rate >= 55 else "neg" if win_rate < 45 else "") + """">""" + str(win_rate) + """%</div></div>
+  <div class="stat"><div class="stat-label">Wins</div><div class="stat-value pos">""" + str(wins) + """</div></div>
+  <div class="stat"><div class="stat-label">Losses</div><div class="stat-value neg">""" + str(losses) + """</div></div>
+  <div class="stat"><div class="stat-label">Pending</div><div class="stat-value">""" + str(pending) + """</div></div>
+  <div class="stat"><div class="stat-label">Sim P&L</div><div class="stat-value """ + ("pos" if total_profit >= 0 else "neg") + """">$""" + str(total_profit) + """</div></div>
+</div>
+
+<div class="section">
+  <div class="section-title">By Timeframe</div>
+  <div class="cards">"""
+
+    for mt in ["15M", "1H", "Daily"]:
+        s = type_stats.get(mt, {"w": 0, "l": 0, "p": 0, "profit": 0})
+        t = s["w"] + s["l"]
+        wr = round(s["w"] / t * 100, 1) if t > 0 else 0
+        paper_html += """
+    <div class="card">
+      <div class="card-label">""" + mt + """</div>
+      <div class="card-value">""" + str(wr) + """%</div>
+      <div class="card-sub">""" + str(s["w"]) + """W / """ + str(s["l"]) + """L / """ + str(s["p"]) + """P · $""" + str(round(s["profit"], 2)) + """</div>
+    </div>"""
+
+    paper_html += """
+  </div>
+  <div class="section-title">By Asset</div>
+  <div class="cards">"""
+
+    for a in sorted(asset_stats.keys()):
+        s = asset_stats[a]
+        t = s["w"] + s["l"]
+        wr = round(s["w"] / t * 100, 1) if t > 0 else 0
+        paper_html += """
+    <div class="card">
+      <div class="card-label">""" + a + """</div>
+      <div class="card-value">""" + str(wr) + """%</div>
+      <div class="card-sub">""" + str(s["w"]) + """W / """ + str(s["l"]) + """L · $""" + str(round(s["profit"], 2)) + """</div>
+    </div>"""
+
+    paper_html += """
+  </div>
+</div>
+
+<div class="section">
+  <div class="section-title">Trade Log</div>
+  <div class="tw">
+    <table>
+      <thead><tr>
+        <th>#</th><th>Market</th><th>Asset</th><th>Side</th><th>Odds</th><th>Type</th>
+        <th>TV</th><th>SMA</th><th>BTC</th><th>Sim P&L</th><th>Status</th><th>Time</th>
+      </tr></thead>
+      <tbody>"""
+
+    if not trades:
+        paper_html += """<tr><td colspan="12" style="text-align:center;padding:40px;color:var(--ink-3)">📊 No paper trades yet — scanner will start recording when trend-aligned signals appear at 40-72% odds</td></tr>"""
+
+    for t in trades:
+        odds = t.get("bet_odds") or 0
+        stake = float(t.get("simulated_stake") or 1)
+        payout = float(t.get("simulated_payout") or 0)
+        if t.get("outcome") == "WIN":
+            pl = "+${:.2f}".format(payout - stake)
+            pl_cls = "pos"
+        elif t.get("outcome") == "LOSS":
+            pl = "-${:.2f}".format(stake)
+            pl_cls = "neg"
+        else:
+            pl = "—"
+            pl_cls = ""
+
+        status_cls = "won" if "Won" in (t.get("status") or "") else "lost" if "Lost" in (t.get("status") or "") else "pend"
+        fired = (t.get("fired_at") or "")[:16].replace("T", " ")
+
+        paper_html += """
+        <tr>
+          <td style="color:var(--ink-4)">{}</td>
+          <td style="font-weight:500;max-width:280px">{}</td>
+          <td>{}</td>
+          <td style="font-weight:600">{}</td>
+          <td style="font-family:var(--mono)">{:.1f}%</td>
+          <td>{}</td>
+          <td style="font-family:var(--mono);font-size:11px">{}</td>
+          <td style="font-family:var(--mono);font-size:11px">{}</td>
+          <td style="font-family:var(--mono);font-size:11px">{}</td>
+          <td class="{}">{}</td>
+          <td><span class="{}">{}</span></td>
+          <td style="font-size:11px;color:var(--ink-4)">{}</td>
+        </tr>""".format(
+            t.get("id", ""), (t.get("title") or "")[:50], t.get("asset", ""),
+            t.get("bet_side", ""), odds, t.get("market_type", ""),
+            t.get("tv_dir", "—"), t.get("sma_dir", "—"), t.get("trend_dir", "—"),
+            pl_cls, pl, status_cls, t.get("status", "Pending"), fired
+        )
+
+    paper_html += """
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<footer class="footer">Paper trading · No real money · Simulated $1 stakes · Auto-resolves every 5 min · Auto-refresh 60s</footer>
+</div>
+<script>setTimeout(()=>location.reload(),60000);</script>
+</body></html>"""
+
+    return paper_html
 
 try:
     init_db()
