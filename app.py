@@ -1002,17 +1002,17 @@ def execute_trade(parsed_market, score, prediction_id):
         order_payload = {
             "order": {
                 "salt": salt,
-                "maker": wallet_addr,
-                "signer": wallet_addr,
-                "taker": ZERO_ADDR,
+                "maker": Web3.to_checksum_address(wallet_addr),
+                "signer": Web3.to_checksum_address(wallet_addr),
+                "taker": Web3.to_checksum_address(ZERO_ADDR),
                 "tokenId": str(token_id),
                 "makerAmount": maker_amount,
                 "takerAmount": taker_amount,
-                "expiration": "0",
+                "expiration": 0,
                 "nonce": 0,
                 "feeRateBps": fee_bps,
-                "side": 0,  # BUY
-                "signatureType": 0,  # EOA
+                "side": 0,
+                "signatureType": 0,
                 "signature": "0x" + signature if not signature.startswith("0x") else signature,
             },
             "orderType": "FOK",
