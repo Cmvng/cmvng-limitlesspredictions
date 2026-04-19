@@ -43,11 +43,25 @@ _trading_state = {
     "trades_today": 0,           # Number of trades placed today
     "last_reset": None,          # When daily counters last reset
     "last_balance": None,        # Cached balance
-    "high_pct": 0.15,            # 15% of balance on HIGH confidence
-    "medium_pct": 0.08,          # 8% of balance on MEDIUM confidence
-    "daily_loss_limit_pct": 0.50,# Stop after 50% daily loss
+    "high_pct": 0.125,           # 12.5% of balance on HIGH confidence ($2.50 on $20)
+    "medium_pct": 0.05,          # 5% of balance on MEDIUM confidence ($1.00 on $20)
+    "daily_loss_limit_pct": 0.80,# Stop after 80% daily loss
     "min_stake": 1.0,            # Limitless minimum $1
-    "starting_balance": 23.0,    # Manual fallback balance — update via /trading/set?balance=X
+    "starting_balance": 20.0,    # Bot 1 starting balance
+}
+
+# Bot 2: Low odds strategy (20-72%, trends aligned)
+_bot2_state = {
+    "enabled": True,
+    "balance": 20.0,             # Separate $20 balance
+    "daily_loss": 0.0,
+    "daily_profit": 0.0,
+    "trades_today": 0,
+    "last_reset": None,
+    "stake_pct": 0.05,           # 5% of balance per trade
+    "min_stake": 1.0,            # Limitless minimum $1
+    "max_loss_pct": 0.50,        # Stop at 50% total loss (not daily — total)
+    "starting_balance": 20.0,    # Starting balance for loss tracking
 }
 
 FAVOURITE_HOURLY = ["ADA", "BNB", "DOGE"]
@@ -2022,9 +2036,26 @@ def _score_paper_trade(p, price):
     }
 
 def run_paper_scan():
-    """Scan all markets for paper trades at 40-72% odds with full trend alignment."""
+    """Bot 2: Scan markets at 20-72% odds with full trend alignment.
+    Records to paper_trades table AND places real trades with separate $20 balance."""
     import requests as req
     try:
+        # Check if Bot 2 is enabled and has balance
+        if not _bot2_state["enabled"]:
+            return
+        if not _has_trading_keys():
+            return
+
+        # Check total loss limit (50% of starting balance)
+        total_lost = _bot2_state["starting_balance"] - _bot2_state["balance"]
+        max_loss = _bot2_state["starting_balance"] * _bot2_state["max_loss_pct"]
+        if total_lost >= max_loss:
+            print("Bot2 STOPPED: total loss ${:.2f} >= limit ${:.2f}".format(total_lost, max_loss))
+            _bot2_state["enabled"] = False
+            send_telegram("⚠️ <b>Bot 2 stopped — 50% loss limit reached</b>\nLost: ${:.2f} of ${:.2f}".format(
+                total_lost, _bot2_state["starting_balance"]))
+            return
+
         r = req.get("{}/markets/active".format(LIMITLESS_API), timeout=15)
         if r.status_code != 200:
             return
@@ -2041,11 +2072,26 @@ def run_paper_scan():
             recorded_ids = set()
         conn.close()
 
+        # Also skip markets Bot 1 already took
+        try:
+            conn3 = get_db()
+            bot1_rows = conn3.run(
+                "SELECT market_id FROM limitless_predictions WHERE fired_at::timestamptz > NOW() - INTERVAL '6 hours'"
+            )
+            bot1_ids = set(str(row[0]) for row in bot1_rows)
+            conn3.close()
+        except:
+            bot1_ids = set()
+
         price_cache = {}
         count = 0
-        skipped_reasons = {"no_parse": 0, "duplicate": 0, "no_score": 0, "odds_range": 0}
+        skipped_reasons = {"no_parse": 0, "duplicate": 0, "no_score": 0, "odds_range": 0, "bot1_took": 0}
         for market in markets:
             try:
+                # Stop if balance depleted during scan
+                if _bot2_state["balance"] < _bot2_state["min_stake"]:
+                    break
+
                 parsed = parse_market(market)
                 if not parsed:
                     skipped_reasons["no_parse"] += 1
@@ -2053,8 +2099,11 @@ def run_paper_scan():
                 if parsed["market_id"] in recorded_ids:
                     skipped_reasons["duplicate"] += 1
                     continue
+                if parsed["market_id"] in bot1_ids:
+                    skipped_reasons["bot1_took"] += 1
+                    continue
 
-                # Skip markets the real bot already took (odds 73%+)
+                # Only take markets in 20-72% range (Bot 1 handles 73-99%)
                 yes_odds = parsed["yes_odds"]
                 no_odds = 100 - yes_odds
                 if not (20 <= yes_odds <= 72 or 20 <= no_odds <= 72):
@@ -2071,7 +2120,20 @@ def run_paper_scan():
                     skipped_reasons["no_score"] += 1
                     continue
 
-                # Save paper trade
+                # Calculate Bot 2 stake (5% of balance, min $1)
+                stake = max(_bot2_state["min_stake"], round(_bot2_state["balance"] * _bot2_state["stake_pct"], 2))
+                if stake > _bot2_state["balance"]:
+                    stake = _bot2_state["min_stake"]
+                if stake > _bot2_state["balance"]:
+                    break
+
+                scored["sim_stake"] = stake
+                share_price = scored["bet_odds"] / 100.0
+                if scored["bet_side"] == "NO":
+                    share_price = 1.0 - share_price
+                scored["sim_payout"] = round(stake / share_price, 4) if share_price > 0 else 0
+
+                # Save to paper_trades table
                 now = datetime.now(timezone.utc).isoformat()
                 conn2 = get_db()
                 conn2.run(
@@ -2081,30 +2143,46 @@ def run_paper_scan():
                      sma_dir, tv_dir, simulated_stake, simulated_payout, status, fired_at, slug)
                     VALUES (:mid, :ttl, :ast, :dir, :base, :odds, :bs,
                             :pr, :hrs, :mt, :ts, :td,
-                            :sd, :tvd, :ss, :sp, 'Pending', :now, :slg)""",
+                            :sd, :tvd, :ss, :sp, 'Pending', :now, :slg)
+                    RETURNING id""",
                     mid=parsed["market_id"], ttl=parsed["title"], ast=asset,
                     dir=parsed["direction"], base=parsed["baseline"],
                     odds=scored["bet_odds"], bs=scored["bet_side"],
                     pr=price, hrs=round(parsed["hours_left"], 2),
                     mt=scored["market_type"], ts=scored["trend_source"],
                     td=scored["trend_dir"], sd=scored["sma_dir"], tvd=scored["tv_dir"],
-                    ss=scored["sim_stake"], sp=scored["sim_payout"],
+                    ss=stake, sp=scored["sim_payout"],
                     now=now, slg=parsed["slug"]
                 )
+                paper_id = conn2.columns  # just need the insert to succeed
                 conn2.close()
                 recorded_ids.add(parsed["market_id"])
+
+                # Place REAL trade via Bot 2
+                try:
+                    success = execute_trade(parsed, scored, None)
+                    if success:
+                        _bot2_state["balance"] = round(_bot2_state["balance"] - stake, 2)
+                        _bot2_state["trades_today"] += 1
+                        print("Bot2 TRADE: {} {} ${:.2f} on {} | bal=${:.2f}".format(
+                            scored["bet_side"], parsed["asset"], stake, parsed["title"][:30], _bot2_state["balance"]))
+                except Exception as te:
+                    print("Bot2 trade error: {}".format(te))
+
                 count += 1
+                time.sleep(1)
             except Exception as e:
-                print("Paper trade error: {}".format(e))
+                print("Bot2 scan error: {}".format(e))
 
         if count > 0:
-            print("Paper trades: {} new signals recorded".format(count))
+            print("Bot2: {} trades | bal=${:.2f}".format(count, _bot2_state["balance"]))
         else:
-            print("Paper scan: 0 qualified (skip: {} no_parse, {} dup, {} odds_range, {} no_score)".format(
+            print("Bot2 scan: 0 qualified (skip: parse={} dup={} odds={} score={} bot1={})".format(
                 skipped_reasons["no_parse"], skipped_reasons["duplicate"],
-                skipped_reasons["odds_range"], skipped_reasons["no_score"]))
+                skipped_reasons["odds_range"], skipped_reasons["no_score"],
+                skipped_reasons.get("bot1_took", 0)))
     except Exception as e:
-        print("Paper scan error: {}".format(e))
+        print("Bot2 scan error: {}".format(e))
 
 def resolve_paper_trades():
     """Auto-resolve paper trades when markets expire."""
@@ -2169,6 +2247,25 @@ def resolve_paper_trades():
                 )
                 conn2.close()
                 resolved += 1
+
+                # Update Bot 2 balance
+                if won:
+                    _bot2_state["balance"] = round(_bot2_state["balance"] + payout, 2)
+                    _bot2_state["daily_profit"] = round(_bot2_state["daily_profit"] + (payout - stake), 2)
+                else:
+                    _bot2_state["daily_loss"] = round(_bot2_state["daily_loss"] + stake, 2)
+
+                # Telegram notification for Bot 2 trades
+                emoji = "✅" if won else "❌"
+                send_telegram(
+                    "{} <b>BOT2 {} — #{}</b>\n"
+                    "📌 {}\n"
+                    "<b>Stake:</b> ${:.2f} | <b>Payout:</b> ${:.2f}\n"
+                    "<b>Bot2 Balance:</b> ${:.2f}".format(
+                        emoji, outcome, p["id"], (p.get("title") or "")[:50],
+                        stake, payout, _bot2_state["balance"]))
+                print("Bot2 #{} {}: stake=${:.2f} payout=${:.2f} bal=${:.2f}".format(
+                    p["id"], outcome, stake, payout, _bot2_state["balance"]))
             except Exception as e:
                 print("Paper resolve #{}: {}".format(p.get("id"), e))
 
@@ -3896,6 +3993,50 @@ def trading_set():
         "balance": _trading_state.get("last_balance"),
     }, 200
 
+@app.route("/bot2/status", methods=["GET"])
+def bot2_status():
+    """Check Bot 2 (low odds) status."""
+    total_lost = _bot2_state["starting_balance"] - _bot2_state["balance"]
+    return {
+        "enabled": _bot2_state["enabled"],
+        "balance": _bot2_state["balance"],
+        "starting_balance": _bot2_state["starting_balance"],
+        "total_lost": round(total_lost, 2),
+        "loss_limit": _bot2_state["max_loss_pct"],
+        "stake_pct": _bot2_state["stake_pct"],
+        "current_stake": max(_bot2_state["min_stake"], round(_bot2_state["balance"] * _bot2_state["stake_pct"], 2)),
+        "daily_profit": _bot2_state["daily_profit"],
+        "daily_loss": _bot2_state["daily_loss"],
+        "trades_today": _bot2_state["trades_today"],
+        "mode": "Bot 2: Low Odds (20-72%) with trend alignment",
+    }, 200
+
+@app.route("/bot2/set", methods=["GET"])
+def bot2_set():
+    """Adjust Bot 2 parameters. /bot2/set?balance=20&stake=0.05&loss=0.50"""
+    if request.args.get("balance"):
+        _bot2_state["balance"] = float(request.args["balance"])
+        _bot2_state["starting_balance"] = float(request.args["balance"])
+    if request.args.get("stake"):
+        _bot2_state["stake_pct"] = float(request.args["stake"])
+    if request.args.get("loss"):
+        _bot2_state["max_loss_pct"] = float(request.args["loss"])
+    return {
+        "balance": _bot2_state["balance"],
+        "stake_pct": _bot2_state["stake_pct"],
+        "max_loss_pct": _bot2_state["max_loss_pct"],
+    }, 200
+
+@app.route("/bot2/start", methods=["GET"])
+def bot2_start():
+    _bot2_state["enabled"] = True
+    return {"status": "Bot 2 started", "balance": _bot2_state["balance"]}, 200
+
+@app.route("/bot2/stop", methods=["GET"])
+def bot2_stop():
+    _bot2_state["enabled"] = False
+    return {"status": "Bot 2 stopped", "balance": _bot2_state["balance"]}, 200
+
 @app.route("/football/clear", methods=["GET"])
 def clear_football_picks():
     """Wipe old accumulator picks with broken formatting. Run once, then /football/scan."""
@@ -5428,17 +5569,18 @@ tr:hover td{background:#fafaf7}
 
 <section class="hero">
   <div class="hero-label">Simulation Mode</div>
-  <h2 class="hero-title">Lower odds,<br><em>higher profit?</em></h2>
-  <p class="hero-sub">Testing trades at 40-72% odds where ALL trend signals agree (TV strategy + SMA + BTC). No real money — just tracking what would happen. Every $1 simulated stake at 50% odds returns $2 on a win.</p>
+  <h2 class="hero-title">Bot 2 — Lower odds,<br><em>higher profit?</em></h2>
+  <p class="hero-sub">Real trades at 20-72% odds where ALL trend signals agree (TV strategy + SMA + BTC). Separate $20 balance, 5% stake per trade, compounding. Stops at 50% total loss.</p>
 </section>
 
 <div class="stats-row">
+  <div class="stat"><div class="stat-label">Bot2 Balance</div><div class="stat-value">$""" + str(_bot2_state["balance"]) + """</div></div>
   <div class="stat"><div class="stat-label">Total</div><div class="stat-value">""" + str(total) + """</div></div>
   <div class="stat"><div class="stat-label">Win Rate</div><div class="stat-value """ + ("pos" if win_rate >= 55 else "neg" if win_rate < 45 else "") + """">""" + str(win_rate) + """%</div></div>
   <div class="stat"><div class="stat-label">Wins</div><div class="stat-value pos">""" + str(wins) + """</div></div>
   <div class="stat"><div class="stat-label">Losses</div><div class="stat-value neg">""" + str(losses) + """</div></div>
   <div class="stat"><div class="stat-label">Pending</div><div class="stat-value">""" + str(pending) + """</div></div>
-  <div class="stat"><div class="stat-label">Sim P&L</div><div class="stat-value """ + ("pos" if total_profit >= 0 else "neg") + """">$""" + str(total_profit) + """</div></div>
+  <div class="stat"><div class="stat-label">Status</div><div class="stat-value """ + ("pos" if _bot2_state["enabled"] else "neg") + """">""" + ("LIVE" if _bot2_state["enabled"] else "STOPPED") + """</div></div>
 </div>
 
 <div class="section">
