@@ -45,15 +45,14 @@ _trading_state = {
     "starting_balance": 20.0,    # Manual fallback balance
 }
 
-FAVOURITE_HOURLY = ["ADA", "BNB", "HYPE"]
+FAVOURITE_HOURLY = ["ADA", "BNB", "DOGE"]
 
 YAHOO_MAP = {
     "BTC":"BTC-USD",  "ETH":"ETH-USD",  "SOL":"SOL-USD",
     "ADA":"ADA-USD",  "BNB":"BNB-USD",  "DOGE":"DOGE-USD",
     "XRP":"XRP-USD",  "AVAX":"AVAX-USD","LINK":"LINK-USD",
     "LTC":"LTC-USD",  "BCH":"BCH-USD",  "XLM":"XLM-USD",
-    "HYPE":"HYPE-USD","SUI":"SUI-USD",  "ZEC":"ZEC-USD",
-    "XMR":"XMR-USD",  "ONDO":"ONDO-USD","MNT":"MNT-USD",
+    "ZEC":"ZEC-USD",  "ONDO":"ONDO-USD",
     "DOT":"DOT-USD",  "UNI":"UNI-USD",  "ATOM":"ATOM-USD",
     "TRX":"TRX-USD",  "APT":"APT-USD",  "ARB":"ARB-USD",
     "OP":"OP-USD",    "NEAR":"NEAR-USD","TON":"TON-USD",
@@ -690,21 +689,14 @@ def _fetch_market_details(slug):
         return None
 
 def _sign_order(order_data, verifying_contract):
-    """Sign order with EIP-712 using eth_account."""
+    """Sign order with EIP-712."""
     try:
         from eth_account import Account
-        from eth_account.messages import encode_typed_data
         from web3 import Web3
 
         CHAIN_ID = 8453
         vc = Web3.to_checksum_address(verifying_contract)
-
-        domain_data = {
-            "name": "Limitless CTF Exchange",
-            "version": "1",
-            "chainId": CHAIN_ID,
-            "verifyingContract": vc,
-        }
+        account = Account.from_key(LIMITLESS_PRIV_KEY)
 
         message = {
             "salt": int(order_data["salt"]),
@@ -721,85 +713,25 @@ def _sign_order(order_data, verifying_contract):
             "signatureType": int(order_data["signatureType"]),
         }
 
-        account = Account.from_key(LIMITLESS_PRIV_KEY)
-
-        # Only Order type — NO EIP712Domain in this dict
-        order_types = {
-            "Order": [
-                {"name": "salt", "type": "uint256"},
-                {"name": "maker", "type": "address"},
-                {"name": "signer", "type": "address"},
-                {"name": "taker", "type": "address"},
-                {"name": "tokenId", "type": "uint256"},
-                {"name": "makerAmount", "type": "uint256"},
-                {"name": "takerAmount", "type": "uint256"},
-                {"name": "expiration", "type": "uint256"},
-                {"name": "nonce", "type": "uint256"},
-                {"name": "feeRateBps", "type": "uint256"},
-                {"name": "side", "type": "uint8"},
-                {"name": "signatureType", "type": "uint8"},
-            ],
-        }
-
-        # Try Account.sign_typed_data (available in eth-account >= 0.9)
-        try:
-            signed = account.sign_typed_data(domain_data, order_types, "Order", message)
-            print("Signed OK (sign_typed_data): {}...".format(signed.signature.hex()[:20]))
-            return signed.signature.hex()
-        except Exception as e1:
-            print("sign_typed_data attempt: {}".format(e1))
-
-        # Try encode_typed_data with 3 args (domain, types_without_EIP712Domain, message)
-        try:
-            signable = encode_typed_data(domain_data, order_types, message)
-            signed = account.sign_message(signable)
-            print("Signed OK (encode_typed_data 3-arg): {}...".format(signed.signature.hex()[:20]))
-            return signed.signature.hex()
-        except Exception as e2:
-            print("encode_typed_data 3-arg attempt: {}".format(e2))
-
-        # Try encode_typed_data as single full message dict
-        try:
-            full_msg = {
-                "types": {
-                    "EIP712Domain": [
-                        {"name": "name", "type": "string"},
-                        {"name": "version", "type": "string"},
-                        {"name": "chainId", "type": "uint256"},
-                        {"name": "verifyingContract", "type": "address"},
-                    ],
-                    "Order": order_types["Order"],
-                },
-                "primaryType": "Order",
-                "domain": domain_data,
-                "message": message,
-            }
-            signable = encode_typed_data(full_msg)
-            signed = account.sign_message(signable)
-            print("Signed OK (encode_typed_data full): {}...".format(signed.signature.hex()[:20]))
-            return signed.signature.hex()
-        except Exception as e3:
-            print("encode_typed_data full attempt: {}".format(e3))
-
-        # Last resort: manual EIP-712 hash
+        # Method 1: Manual EIP-712 — mathematically correct, no library quirks
         try:
             from eth_abi import encode as abi_encode
-            from eth_utils import keccak
+            try:
+                from eth_utils import keccak
+            except ImportError:
+                keccak = lambda **kwargs: Web3.keccak(text=kwargs.get("text", "")) if "text" in kwargs else Web3.keccak(kwargs.get("primitive", b""))
 
-            # Hash the types
             order_type_str = "Order(uint256 salt,address maker,address signer,address taker,uint256 tokenId,uint256 makerAmount,uint256 takerAmount,uint256 expiration,uint256 nonce,uint256 feeRateBps,uint8 side,uint8 signatureType)"
             ORDER_TYPEHASH = keccak(text=order_type_str)
 
             domain_type_str = "EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"
             DOMAIN_TYPEHASH = keccak(text=domain_type_str)
 
-            # Domain separator
             domain_sep = keccak(abi_encode(
                 ['bytes32', 'bytes32', 'bytes32', 'uint256', 'address'],
                 [DOMAIN_TYPEHASH, keccak(text="Limitless CTF Exchange"), keccak(text="1"), CHAIN_ID, vc]
             ))
 
-            # Struct hash
             struct_hash = keccak(abi_encode(
                 ['bytes32', 'uint256', 'address', 'address', 'address', 'uint256', 'uint256', 'uint256', 'uint256', 'uint256', 'uint256', 'uint8', 'uint8'],
                 [ORDER_TYPEHASH, message["salt"], message["maker"], message["signer"], message["taker"],
@@ -807,13 +739,52 @@ def _sign_order(order_data, verifying_contract):
                  message["nonce"], message["feeRateBps"], message["side"], message["signatureType"]]
             ))
 
-            # Final hash: \x19\x01 + domainSeparator + structHash
             msg_hash = keccak(b'\x19\x01' + domain_sep + struct_hash)
-            signed = account.signHash(msg_hash)
-            print("Signed OK (manual EIP-712): {}...".format(signed.signature.hex()[:20]))
+            signed = account.unsafe_sign_hash(msg_hash)
+            print("Signed OK (manual): {}...".format(signed.signature.hex()[:20]))
             return signed.signature.hex()
-        except Exception as e4:
-            print("Manual EIP-712 attempt: {}".format(e4))
+        except AttributeError:
+            # older eth-account uses signHash instead of unsafe_sign_hash
+            try:
+                signed = account.signHash(msg_hash)
+                print("Signed OK (manual-legacy): {}...".format(signed.signature.hex()[:20]))
+                return signed.signature.hex()
+            except Exception as e_legacy:
+                print("Manual signing failed: {}".format(e_legacy))
+        except Exception as e1:
+            print("Manual EIP-712 failed: {}".format(e1))
+
+        # Method 2: encode_typed_data 3-arg fallback
+        try:
+            from eth_account.messages import encode_typed_data
+            domain_data = {
+                "name": "Limitless CTF Exchange",
+                "version": "1",
+                "chainId": CHAIN_ID,
+                "verifyingContract": vc,
+            }
+            order_types = {
+                "Order": [
+                    {"name": "salt", "type": "uint256"},
+                    {"name": "maker", "type": "address"},
+                    {"name": "signer", "type": "address"},
+                    {"name": "taker", "type": "address"},
+                    {"name": "tokenId", "type": "uint256"},
+                    {"name": "makerAmount", "type": "uint256"},
+                    {"name": "takerAmount", "type": "uint256"},
+                    {"name": "expiration", "type": "uint256"},
+                    {"name": "nonce", "type": "uint256"},
+                    {"name": "feeRateBps", "type": "uint256"},
+                    {"name": "side", "type": "uint8"},
+                    {"name": "signatureType", "type": "uint8"},
+                ],
+            }
+            signable = encode_typed_data(domain_data, order_types, message)
+            signed = account.sign_message(signable)
+            print("Signed OK (encode_typed_data): {}...".format(signed.signature.hex()[:20]))
+            return signed.signature.hex()
+        except Exception as e2:
+            print("encode_typed_data failed: {}".format(e2))
 
         print("ALL signing methods failed")
         return None
@@ -969,6 +940,13 @@ def execute_trade(parsed_market, score, prediction_id):
 
         ZERO_ADDR = "0x0000000000000000000000000000000000000000"
 
+        # Fetch profile BEFORE signing to ensure fee_rate_bps is cached
+        profile_id = _get_limitless_profile_id()
+        if not profile_id:
+            print("Auto-trade skipped: can't get profile ID")
+            return False
+        fee_bps = _trading_state.get("fee_rate_bps", 300)
+
         order_data = {
             "salt": salt,
             "maker": Web3.to_checksum_address(wallet_addr),
@@ -979,7 +957,7 @@ def execute_trade(parsed_market, score, prediction_id):
             "takerAmount": taker_amount,
             "expiration": 0,
             "nonce": 0,
-            "feeRateBps": _trading_state.get("fee_rate_bps", 200),
+            "feeRateBps": fee_bps,
             "side": 0,  # BUY
             "signatureType": 0,  # EOA
         }
@@ -990,15 +968,7 @@ def execute_trade(parsed_market, score, prediction_id):
             print("Auto-trade skipped: signing failed")
             return False
 
-        # 4. Submit FOK order (Fill or Kill = instant market buy)
-        #    Limitless expects: {order: {...}, orderType: "FOK", marketSlug: "...", ownerId: ...}
-        profile_id = _get_limitless_profile_id()
-        if not profile_id:
-            print("Auto-trade skipped: can't get profile ID")
-            return False
-
-        fee_bps = _trading_state.get("fee_rate_bps", 200)
-
+        # 4. Submit FOK order
         order_payload = {
             "order": {
                 "salt": salt,
@@ -1460,17 +1430,28 @@ def outcome_loop():
             now = datetime.now(timezone.utc)
             for p in items:
                 try:
+                    # Skip if missing critical fields
+                    if not p.get("fired_at") or not p.get("asset") or p.get("baseline") is None:
+                        print("Outcome #{}: skipping — missing fields (asset={}, baseline={})".format(
+                            p.get("id"), p.get("asset"), p.get("baseline")))
+                        continue
+
                     fired = datetime.fromisoformat(p["fired_at"])
                     if fired.tzinfo is None:
                         fired = fired.replace(tzinfo=timezone.utc)
-                    expiry = fired + timedelta(hours=float(p["hours_left"] or 0))
+                    hours_left = float(p.get("hours_left") or 0)
+                    if hours_left <= 0:
+                        hours_left = 0.25  # default 15 min if missing
+                    expiry = fired + timedelta(hours=hours_left)
                     if now < expiry:
                         continue
                     price = get_price(p["asset"])
                     if price is None:
                         continue
+                    baseline = float(p["baseline"])
+                    direction = p.get("direction") or "above"
                     # Determine if the market question resolved true or false
-                    market_resolved_true = (price > p["baseline"]) if p["direction"] == "above" else (price < p["baseline"])
+                    market_resolved_true = (price > baseline) if direction == "above" else (price < baseline)
                     # Check if our bet side won
                     bet_side = p.get("bet_side") or "YES"
                     if bet_side == "YES":
@@ -1497,15 +1478,17 @@ def outcome_loop():
                             pass
 
                     emoji = "✅" if won else "❌"
-                    bal_str = " | Balance: ${:.2f}".format(_trading_state.get("last_balance", 0)) if _has_trading_keys() else ""
+                    title = p.get("title") or "Unknown market"
+                    bal = _trading_state.get("last_balance")
+                    bal_str = " | Balance: ${:.2f}".format(bal) if _has_trading_keys() and bal is not None else ""
                     send_telegram(
                         "{} <b>PREDICTION {} — #{}</b>\n"
                         "──────────────────────────\n"
                         "📌 {}\n"
                         "<b>Closed:</b> {}\n"
                         "<b>Baseline:</b> {}{}".format(
-                            emoji, outcome, p["id"], p["title"],
-                            fmt_price(price), fmt_price(p["baseline"]),
+                            emoji, outcome, p["id"], title,
+                            fmt_price(price), fmt_price(baseline),
                             bal_str
                         )
                     )
