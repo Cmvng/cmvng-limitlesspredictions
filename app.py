@@ -1259,10 +1259,9 @@ def _fetch_match_result(match_name):
     """Try to fetch final score from available football APIs"""
     import requests as req
     try:
-        # Try API-Football first
+        # Try API-Football first (if key exists)
         key = os.environ.get("API_FOOTBALL_KEY", "")
         if key:
-            # Search for the match in finished fixtures (last 3 days)
             for days_back in range(4):
                 date = (datetime.now(LAGOS_TZ) - timedelta(days=days_back)).strftime("%Y-%m-%d")
                 r = req.get(
@@ -1274,14 +1273,70 @@ def _fetch_match_result(match_name):
                     for fx in r.json().get("response", []):
                         home = fx.get("teams", {}).get("home", {}).get("name", "")
                         away = fx.get("teams", {}).get("away", {}).get("name", "")
-                        if home and away and (home in match_name or away in match_name):
-                            if home in match_name and away in match_name:
+                        if home and away and home in match_name and away in match_name:
+                            return {
+                                "home": home, "away": away,
+                                "home_goals": fx.get("goals", {}).get("home"),
+                                "away_goals": fx.get("goals", {}).get("away"),
+                                "status": "finished",
+                            }
+
+        # Try football-data.org (if key exists)
+        if FOOTBALL_DATA_KEY:
+            for days_back in range(4):
+                date = (datetime.now(LAGOS_TZ) - timedelta(days=days_back)).strftime("%Y-%m-%d")
+                try:
+                    r = req.get(
+                        "https://api.football-data.org/v4/matches?dateFrom={}&dateTo={}&status=FINISHED".format(date, date),
+                        headers={"X-Auth-Token": FOOTBALL_DATA_KEY},
+                        timeout=15
+                    )
+                    if r.status_code == 200:
+                        for m in r.json().get("matches", []):
+                            home = m.get("homeTeam", {}).get("name", "")
+                            away = m.get("awayTeam", {}).get("name", "")
+                            if home and away and (home in match_name or away in match_name):
+                                if home in match_name and away in match_name:
+                                    ft = m.get("score", {}).get("fullTime", {})
+                                    return {
+                                        "home": home, "away": away,
+                                        "home_goals": ft.get("home"),
+                                        "away_goals": ft.get("away"),
+                                        "status": "finished",
+                                    }
+                except:
+                    pass
+
+        # Fallback: try free API (api.football-data.org with no key — limited)
+        try:
+            yesterday = (datetime.now(LAGOS_TZ) - timedelta(days=1)).strftime("%Y-%m-%d")
+            today = datetime.now(LAGOS_TZ).strftime("%Y-%m-%d")
+            for date in [today, yesterday]:
+                r = req.get(
+                    "https://api.football-data.org/v4/matches?dateFrom={}&dateTo={}&status=FINISHED".format(date, date),
+                    timeout=10
+                )
+                if r.status_code == 200:
+                    for m in r.json().get("matches", []):
+                        home = m.get("homeTeam", {}).get("name", "")
+                        away = m.get("awayTeam", {}).get("name", "")
+                        # Fuzzy match — check if team names appear in the match_name string
+                        home_short = home.split(" ")[-1] if home else ""
+                        away_short = away.split(" ")[-1] if away else ""
+                        if (home_short and away_short and
+                            home_short.lower() in match_name.lower() and
+                            away_short.lower() in match_name.lower()):
+                            ft = m.get("score", {}).get("fullTime", {})
+                            if ft.get("home") is not None:
                                 return {
                                     "home": home, "away": away,
-                                    "home_goals": fx.get("goals", {}).get("home"),
-                                    "away_goals": fx.get("goals", {}).get("away"),
+                                    "home_goals": ft.get("home"),
+                                    "away_goals": ft.get("away"),
                                     "status": "finished",
                                 }
+        except:
+            pass
+
         return None
     except Exception as e:
         print("Match result fetch error: {}".format(e))
@@ -1339,30 +1394,90 @@ def check_football_outcomes():
         rows = conn.run(
             "SELECT id, match_id, pick_type, pick_value, kickoff_time, fired_at "
             "FROM football_picks "
-            "WHERE status='Pending' AND accumulator_tier IN ('safe_2x','medium_3x','value_10x','value_100x')"
+            "WHERE status='Pending' AND accumulator_tier IN ('safe_2x','medium_3x','value_10x','mega_100x')"
         )
         cols = [c['name'] for c in conn.columns]
         picks = [dict(zip(cols, r)) for r in rows]
         conn.close()
-        now = datetime.now(timezone.utc)
-        resolved_count = 0
-        for p in picks:
-            try:
-                ko = p.get("kickoff_time", "")
-                # Only check matches that are at least 2 hours past kickoff
-                if ko:
-                    try:
-                        ko_dt = datetime.fromisoformat(ko.replace("Z", "+00:00"))
-                        if ko_dt.tzinfo is None:
-                            ko_dt = ko_dt.replace(tzinfo=timezone.utc)
-                        if now < ko_dt + timedelta(hours=2):
-                            continue  # Too early
-                    except:
-                        pass
 
-                result = _fetch_match_result(p.get("match_id", ""))
+        if not picks:
+            return
+
+        now = datetime.now(timezone.utc)
+
+        # Filter to only picks whose matches should have finished (2+ hours past kickoff)
+        ready_picks = []
+        for p in picks:
+            ko = p.get("kickoff_time", "")
+            if ko:
+                try:
+                    ko_dt = datetime.fromisoformat(ko.replace("Z", "+00:00"))
+                    if ko_dt.tzinfo is None:
+                        ko_dt = ko_dt.replace(tzinfo=timezone.utc)
+                    if now < ko_dt + timedelta(hours=2):
+                        continue  # Too early
+                except:
+                    pass
+            ready_picks.append(p)
+
+        if not ready_picks:
+            return
+
+        print("Football outcomes: {} picks ready to check".format(len(ready_picks)))
+
+        # Batch fetch results — get all finished matches from last 3 days
+        import requests as req
+        all_results = {}
+
+        # Try football-data.org first (batch fetch)
+        if FOOTBALL_DATA_KEY:
+            for days_back in range(3):
+                date = (datetime.now(LAGOS_TZ) - timedelta(days=days_back)).strftime("%Y-%m-%d")
+                try:
+                    r = req.get(
+                        "https://api.football-data.org/v4/matches?dateFrom={}&dateTo={}&status=FINISHED".format(date, date),
+                        headers={"X-Auth-Token": FOOTBALL_DATA_KEY},
+                        timeout=15
+                    )
+                    if r.status_code == 200:
+                        for m in r.json().get("matches", []):
+                            home = m.get("homeTeam", {}).get("name", "")
+                            away = m.get("awayTeam", {}).get("name", "")
+                            ft = m.get("score", {}).get("fullTime", {})
+                            if home and away and ft.get("home") is not None:
+                                key = "{} vs {}".format(home, away)
+                                all_results[key] = {
+                                    "home": home, "away": away,
+                                    "home_goals": ft["home"], "away_goals": ft["away"],
+                                    "status": "finished",
+                                }
+                    time.sleep(1)
+                except Exception as e:
+                    print("Football results fetch: {}".format(e))
+
+        print("Football outcomes: {} finished matches loaded".format(len(all_results)))
+
+        resolved_count = 0
+        for p in ready_picks:
+            try:
+                match_id = p.get("match_id", "")
+
+                # Find matching result using fuzzy matching
+                result = None
+                for key, res in all_results.items():
+                    home_short = res["home"].split(" ")[-1].lower()
+                    away_short = res["away"].split(" ")[-1].lower()
+                    if (home_short in match_id.lower() and away_short in match_id.lower()):
+                        result = res
+                        break
+
+                # If batch didn't find it, try individual fetch
                 if not result:
-                    # Mark as needs check only if > 24h past kickoff
+                    result = _fetch_match_result(match_id)
+
+                if not result:
+                    # Mark as needs check if > 24h past kickoff
+                    ko = p.get("kickoff_time", "")
                     if ko:
                         try:
                             ko_dt = datetime.fromisoformat(ko.replace("Z", "+00:00"))
@@ -1392,9 +1507,9 @@ def check_football_outcomes():
                 )
                 conn2.close()
                 resolved_count += 1
-                print("Football #{} -> {} (score: {}-{})".format(
-                    p["id"], outcome, result.get("home_goals"), result.get("away_goals")))
-                # Notify on Telegram
+                print("Football #{} -> {} (score: {}-{}) {}".format(
+                    p["id"], outcome, result.get("home_goals"), result.get("away_goals"), match_id[:40]))
+
                 try:
                     emoji = "✅" if won else "❌"
                     send_telegram(
@@ -1403,14 +1518,14 @@ def check_football_outcomes():
                         "⚽ Final: {}-{}\n"
                         "🎯 Pick: {} = {}".format(
                             emoji, outcome, p["id"],
-                            p.get("match_id", ""),
+                            match_id,
                             result.get("home_goals", "?"), result.get("away_goals", "?"),
                             p.get("pick_type", ""), p.get("pick_value", "")
                         )
                     )
                 except:
                     pass
-                time.sleep(0.5)  # pace API calls
+                time.sleep(0.5)
             except Exception as e:
                 print("Football outcome #{}: {}".format(p["id"], e))
         if resolved_count > 0:
