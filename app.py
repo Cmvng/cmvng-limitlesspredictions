@@ -740,8 +740,32 @@ def _sign_order(order_data, verifying_contract):
 
         account = Account.from_key(LIMITLESS_PRIV_KEY)
 
-        # encode_typed_data(domain, types, primaryType, message) — Python 3.13 / eth-account >= 0.12
-        signable = encode_typed_data(domain_data, types, "Order", message)
+        # encode_typed_data takes exactly 3 args: (domain_data, message_types, message_data)
+        # message_types must include EIP712Domain + Order types
+        all_types = {
+            "EIP712Domain": [
+                {"name": "name", "type": "string"},
+                {"name": "version", "type": "string"},
+                {"name": "chainId", "type": "uint256"},
+                {"name": "verifyingContract", "type": "address"},
+            ],
+            "Order": [
+                {"name": "salt", "type": "uint256"},
+                {"name": "maker", "type": "address"},
+                {"name": "signer", "type": "address"},
+                {"name": "taker", "type": "address"},
+                {"name": "tokenId", "type": "uint256"},
+                {"name": "makerAmount", "type": "uint256"},
+                {"name": "takerAmount", "type": "uint256"},
+                {"name": "expiration", "type": "uint256"},
+                {"name": "nonce", "type": "uint256"},
+                {"name": "feeRateBps", "type": "uint256"},
+                {"name": "side", "type": "uint8"},
+                {"name": "signatureType", "type": "uint8"},
+            ],
+        }
+
+        signable = encode_typed_data(domain_data, all_types, message)
         signed = account.sign_message(signable)
         print("Signed OK: {}...".format(signed.signature.hex()[:20]))
         return signed.signature.hex()
