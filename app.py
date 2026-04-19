@@ -1114,35 +1114,71 @@ def _auto_redeem_positions():
     import requests as req
     try:
         # Get our positions
-        path = "/portfolio/positions"
-        headers = _hmac_headers("GET", path)
-        r = req.get("{}{}".format(LIMITLESS_API, path), headers=headers, timeout=10)
+        from eth_account import Account
+        account = Account.from_key(LIMITLESS_PRIV_KEY)
+        wallet = account.address
 
-        if r.status_code != 200:
-            # Try with wallet address
+        # Try multiple position endpoints
+        positions_data = None
+        for try_path in [
+            "/portfolio/positions",
+            "/portfolio/positions?account={}".format(wallet),
+            "/public-portfolio/positions/{}".format(wallet),
+        ]:
             try:
-                from eth_account import Account
-                account = Account.from_key(LIMITLESS_PRIV_KEY)
-                path2 = "/portfolio/positions?account={}".format(account.address)
-                h2 = _hmac_headers("GET", path2)
-                r = req.get("{}{}".format(LIMITLESS_API, path2), headers=h2, timeout=10)
+                h = _hmac_headers("GET", try_path.split("?")[0])
+                r = req.get("{}{}".format(LIMITLESS_API, try_path), headers=h, timeout=10)
+                if r.status_code == 200:
+                    positions_data = r.json()
+                    print("Redeem: got positions from {} — type: {}".format(
+                        try_path[:40], type(positions_data).__name__))
+                    break
+            except:
+                continue
+
+        # Also try without HMAC for public endpoints
+        if positions_data is None:
+            try:
+                pub_path = "/public-portfolio/positions/{}".format(wallet)
+                r = req.get("{}{}".format(LIMITLESS_API, pub_path), timeout=10)
+                if r.status_code == 200:
+                    positions_data = r.json()
+                    print("Redeem: got positions from public endpoint")
             except:
                 pass
 
-        if r.status_code != 200:
+        if positions_data is None:
+            print("Redeem: could not fetch positions")
             return
 
-        positions = r.json()
-        clob_positions = positions.get("clob", []) if isinstance(positions, dict) else positions if isinstance(positions, list) else []
+        # Parse positions — could be dict with "clob" key or a list
+        clob_positions = []
+        if isinstance(positions_data, dict):
+            clob_positions = positions_data.get("clob", [])
+            if not clob_positions:
+                # Maybe it's flat
+                clob_positions = positions_data.get("positions", [])
+            if not clob_positions and "data" in positions_data:
+                clob_positions = positions_data["data"]
+            print("Redeem: {} clob positions found (dict keys: {})".format(
+                len(clob_positions), list(positions_data.keys())[:5]))
+        elif isinstance(positions_data, list):
+            clob_positions = positions_data
+            print("Redeem: {} positions found (list)".format(len(clob_positions)))
 
         redeemed = 0
         for pos in clob_positions:
             market = pos.get("market", {})
-            market_status = (market.get("status") or "").upper()
-            market_slug = market.get("slug", "")
-            condition_id = market.get("conditionId", "")
+            market_status = (market.get("status") or pos.get("status") or "").upper()
+            market_slug = market.get("slug") or pos.get("slug") or ""
+            condition_id = market.get("conditionId") or pos.get("conditionId") or ""
 
-            if market_status not in ("RESOLVED", "EXPIRED"):
+            # Log all positions for debugging
+            title = market.get("title") or pos.get("title") or "?"
+            print("  Position: {} | status={} | slug={}".format(
+                title[:40], market_status, market_slug[:30]))
+
+            if market_status not in ("RESOLVED", "EXPIRED", "SETTLED"):
                 continue
             if not market_slug:
                 continue
@@ -1153,15 +1189,12 @@ def _auto_redeem_positions():
                 redeem_headers = _hmac_headers("POST", redeem_path, redeem_body)
                 rr = req.post("{}{}".format(LIMITLESS_API, redeem_path),
                               headers=redeem_headers, data=redeem_body, timeout=15)
+                print("  Redeem {}: {} {}".format(market_slug[:30], rr.status_code, rr.text[:100]))
                 if rr.status_code in (200, 201):
                     redeemed += 1
-                    print("Auto-redeemed: {}".format(market_slug[:40]))
-                    send_telegram("💰 <b>Auto-redeemed</b>\n📌 {}".format(
-                        market.get("title", market_slug)[:60]))
-                elif rr.status_code != 400:  # 400 = already redeemed, skip silently
-                    print("Redeem failed {}: {} {}".format(market_slug[:30], rr.status_code, rr.text[:80]))
+                    send_telegram("💰 <b>Auto-redeemed</b>\n📌 {}".format(title[:60]))
             except Exception as e:
-                print("Redeem error {}: {}".format(market_slug[:30], e))
+                print("  Redeem error {}: {}".format(market_slug[:30], e))
             time.sleep(1)
 
         if redeemed > 0:
