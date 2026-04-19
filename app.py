@@ -1008,7 +1008,7 @@ def execute_trade(parsed_market, score, prediction_id):
                 "tokenId": str(token_id),
                 "makerAmount": maker_amount,
                 "takerAmount": taker_amount,
-                "expiration": 0,
+                "expiration": "0",
                 "nonce": 0,
                 "feeRateBps": fee_bps,
                 "side": 0,
