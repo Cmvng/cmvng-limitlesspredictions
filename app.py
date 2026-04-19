@@ -1058,8 +1058,9 @@ def _place_gtc_order(slug, bet_side, token_id, stake, price_per_share, exchange_
     if taker_amount <= 0:
         taker_amount = tick  # Minimum 1 tick
 
-    # Recalculate makerAmount to match exactly: maker = price * contracts
-    maker_amount = int(price_per_share * taker_amount)
+    # Recalculate makerAmount using integer math to avoid floating point errors
+    # price_per_share = price_int / 1000, so maker = price_int * contracts / 1000
+    maker_amount = (price_int * taker_amount) // 1000
 
     salt = int(time.time() * 1000) * 1000 + random.randint(0, 999)
     ZERO_ADDR = "0x0000000000000000000000000000000000000000"
