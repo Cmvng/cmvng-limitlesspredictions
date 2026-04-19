@@ -1655,7 +1655,7 @@ def _auto_redeem_positions():
                           "name": "balanceOf", "outputs": [{"name": "balance", "type": "uint256"}],
                           "type": "function"}]
                 )
-                raw_bal = usdc_contract.functions.balanceOf(Web3.to_checksum_address(wallet_addr)).call()
+                raw_bal = usdc_contract.functions.balanceOf(Web3.to_checksum_address(wallet)).call()
                 on_chain_balance = raw_bal / 1e6
                 if on_chain_balance > 0:
                     _trading_state["last_balance"] = round(on_chain_balance, 2)
