@@ -25,6 +25,10 @@ LIMITLESS_API = "https://api.limitless.exchange"
 
 # Global BTC trend cache
 _btc_trend_cache = {"trend": None, "price": None, "sma10": None, "updated": None}
+# Per-pair trend from TradingView webhooks
+_tv_trends = {}  # {"BTC": {"dir": "BUY", "tf": "15M", "updated": "2026-...", "entry": 75600}, ...}
+# Per-pair SMA cache for individual asset trend analysis
+_pair_sma_cache = {}  # {"ETH": {"trend": "BUY", "price": 2340, "sma10": 2330, "updated": "..."}, ...}
 # Debug log for last scan
 _last_scan_log = {"time": None, "total": 0, "qualified": 0, "filtered": []}
 
@@ -193,9 +197,102 @@ def get_btc_trend():
         print("BTC trend error: {}".format(e))
         return _btc_trend_cache.get("trend")
 
-# ═══════════════════════════════════════════════════════════
-# HELPERS
-# ═══════════════════════════════════════════════════════════
+def get_pair_sma_trend(asset):
+    """Calculate SMA10 trend for any individual asset (not just BTC)."""
+    import yfinance as yf
+    symbol = YAHOO_MAP.get(asset.upper())
+    if not symbol:
+        return None
+    try:
+        ticker = yf.Ticker(symbol)
+        hist = ticker.history(period="2d", interval="1h")
+        if hist.empty or len(hist) < 10:
+            cached = _pair_sma_cache.get(asset.upper())
+            return cached.get("trend") if cached else None
+        closes = hist["Close"].tolist()
+        current = closes[-1]
+        sma10 = sum(closes[-10:]) / 10
+        trend = "BUY" if current > sma10 else "SELL"
+        _pair_sma_cache[asset.upper()] = {
+            "trend": trend, "price": current, "sma10": sma10,
+            "updated": datetime.now(timezone.utc).isoformat()
+        }
+        return trend
+    except:
+        cached = _pair_sma_cache.get(asset.upper())
+        return cached.get("trend") if cached else None
+
+def get_asset_trend(asset, market_timeframe_hours):
+    """Get combined trend for an asset using TradingView webhooks + SMA.
+    Returns dict: {"direction": "BUY/SELL", "confidence": "HIGH/MEDIUM/LOW", "source": "..."}
+    Logic:
+    - Short-term (<=0.5h): prefer TV webhook if fresh, else per-pair SMA
+    - Hourly (0.5-2h): combine webhook + SMA
+    - Daily (>2h): use SMA only (webhook is too short-term)
+    - BTC trend always consulted as macro overlay
+    """
+    btc_trend = _btc_trend_cache.get("trend")
+    asset_upper = asset.upper()
+
+    # Get TV webhook signal if available and fresh (< 2 hours old)
+    tv = _tv_trends.get(asset_upper)
+    tv_dir = None
+    tv_fresh = False
+    if tv:
+        try:
+            tv_updated = datetime.fromisoformat(tv["updated"])
+            if tv_updated.tzinfo is None:
+                tv_updated = tv_updated.replace(tzinfo=timezone.utc)
+            age_hours = (datetime.now(timezone.utc) - tv_updated).total_seconds() / 3600
+            if age_hours < 2:
+                tv_dir = tv["dir"]
+                tv_fresh = True
+        except:
+            pass
+
+    # Get SMA trend for this specific asset
+    sma_dir = get_pair_sma_trend(asset_upper) if asset_upper in YAHOO_MAP else None
+    # If no per-pair SMA, fall back to BTC trend
+    if not sma_dir:
+        sma_dir = btc_trend
+
+    # Combine based on market timeframe
+    if market_timeframe_hours <= 0.5:
+        # Short-term: trust TV webhook first
+        if tv_fresh and tv_dir:
+            if tv_dir == sma_dir or tv_dir == btc_trend:
+                return {"direction": tv_dir, "confidence": "HIGH", "source": "webhook+trend agree"}
+            else:
+                return {"direction": tv_dir, "confidence": "MEDIUM", "source": "webhook only"}
+        elif sma_dir:
+            if sma_dir == btc_trend:
+                return {"direction": sma_dir, "confidence": "HIGH", "source": "sma+btc agree"}
+            else:
+                return {"direction": sma_dir, "confidence": "MEDIUM", "source": "sma only"}
+    elif market_timeframe_hours <= 2:
+        # Hourly: combine both
+        if tv_fresh and tv_dir and sma_dir:
+            if tv_dir == sma_dir:
+                return {"direction": tv_dir, "confidence": "HIGH", "source": "webhook+sma agree"}
+            else:
+                return {"direction": sma_dir, "confidence": "MEDIUM", "source": "sma (webhook disagrees)"}
+        elif sma_dir:
+            if sma_dir == btc_trend:
+                return {"direction": sma_dir, "confidence": "HIGH", "source": "sma+btc agree"}
+            else:
+                return {"direction": sma_dir, "confidence": "MEDIUM", "source": "sma only"}
+    else:
+        # Daily: use SMA only
+        if sma_dir:
+            if sma_dir == btc_trend:
+                return {"direction": sma_dir, "confidence": "HIGH", "source": "sma+btc agree (daily)"}
+            else:
+                return {"direction": sma_dir, "confidence": "MEDIUM", "source": "sma only (btc disagrees)"}
+
+    # Fallback: BTC trend
+    if btc_trend:
+        return {"direction": btc_trend, "confidence": "MEDIUM", "source": "btc fallback"}
+    return {"direction": None, "confidence": "LOW", "source": "no data"}
 
 def is_lagos_window():
     hour = datetime.now(LAGOS_TZ).hour
@@ -284,8 +381,7 @@ def score_market(p, btc_trend, price, debug_log=None):
 
     is_fav = p["asset"] in FAVOURITE_HOURLY
 
-    # 1. Time window — skip if auto-trading is off AND outside Lagos window
-    #    When auto-trading is on, scan 24/7
+    # 1. Time window — scan 24/7 when auto-trading is on
     auto_trading_on = bool(_has_trading_keys() and _trading_state.get("enabled"))
     if not auto_trading_on and not is_lagos_window() and not is_fav:
         return reject("outside Lagos window (auto-trade off)")
@@ -308,19 +404,24 @@ def score_market(p, btc_trend, price, debug_log=None):
     margin = abs(price - p["baseline"])
     margin_pct = (margin / p["baseline"] * 100) if p["baseline"] > 0 else 0
 
-    # 5. Determine margin thresholds based on timeframe
-    #    Shorter timeframes need less margin because price has less time to move
+    # 5. Determine margin thresholds
     if p["is_short"] and p["mins_left"] <= 30:
-        margin_thresh_aligned = 0.05   # 0.05% when trend helps (~$42 on BTC)
-        margin_thresh_against = 0.15   # 0.15% when trend fights (~$126 on BTC)
+        margin_thresh_aligned = 0.05
+        margin_thresh_against = 0.15
     elif p["hours_left"] <= 2:
-        margin_thresh_aligned = 0.15   # 0.15% (~$2.43 on ETH)
-        margin_thresh_against = 0.4    # 0.4% (~$6.48 on ETH)
+        margin_thresh_aligned = 0.15
+        margin_thresh_against = 0.4
     else:
         margin_thresh_aligned = 0.5
         margin_thresh_against = 2.0
 
-    # 6. Determine bet side: YES or NO
+    # 6. Get per-pair trend (combined webhook + SMA + BTC)
+    asset_trend = get_asset_trend(p["asset"], p["hours_left"])
+    trend_dir = asset_trend["direction"]  # BUY or SELL
+    trend_confidence = asset_trend["confidence"]  # HIGH, MEDIUM, LOW
+    trend_source = asset_trend["source"]
+
+    # 7. Determine bet side: YES or NO
     yes_odds = p["yes_odds"]
     no_odds = 100 - yes_odds
 
@@ -328,7 +429,6 @@ def score_market(p, btc_trend, price, debug_log=None):
         price_is_above = price > p["baseline"]
         price_is_below = price < p["baseline"]
     else:
-        # "below" market: price_is_above means price IS below baseline (winning side for YES)
         price_is_above = price < p["baseline"]
         price_is_below = price > p["baseline"]
 
@@ -336,29 +436,22 @@ def score_market(p, btc_trend, price, debug_log=None):
     effective_odds = None
 
     if price_is_above:
-        # Price is on YES side — check YES odds
         if 73 <= yes_odds <= 99:
             bet_side = "YES"
             effective_odds = yes_odds
-            # BTC alignment for YES
             if p["direction"] == "above":
-                btc_aligned = (btc_trend == "BUY") if btc_trend else True
+                trend_aligned = (trend_dir == "BUY") if trend_dir else True
             else:
-                btc_aligned = (btc_trend == "SELL") if btc_trend else True
-        else:
-            # YES odds out of range — maybe NO qualifies?
-            pass
+                trend_aligned = (trend_dir == "SELL") if trend_dir else True
 
     if bet_side is None and price_is_below:
-        # Price is on NO side — check NO odds
         if 73 <= no_odds <= 99:
             bet_side = "NO"
             effective_odds = no_odds
-            # BTC alignment for NO (opposite direction)
             if p["direction"] == "above":
-                btc_aligned = (btc_trend == "SELL") if btc_trend else True
+                trend_aligned = (trend_dir == "SELL") if trend_dir else True
             else:
-                btc_aligned = (btc_trend == "BUY") if btc_trend else True
+                trend_aligned = (trend_dir == "BUY") if trend_dir else True
         else:
             return reject("NO odds {:.1f}% outside 73-99% range".format(no_odds))
 
@@ -368,25 +461,30 @@ def score_market(p, btc_trend, price, debug_log=None):
         else:
             return reject("price on wrong side and NO odds {:.1f}% outside range".format(no_odds))
 
-    # 7. Margin safety check
-    if not btc_aligned and btc_trend:
+    # 8. Margin safety check
+    if not trend_aligned and trend_dir:
         if margin_pct < margin_thresh_against:
-            return reject("{} margin {:.2f}% < {:.1f}% threshold (trend against)".format(
-                bet_side, margin_pct, margin_thresh_against))
+            return reject("{} margin {:.2f}% < {:.1f}% threshold (trend against, {})".format(
+                bet_side, margin_pct, margin_thresh_against, trend_source))
     else:
         if margin_pct < margin_thresh_aligned:
-            return reject("{} margin {:.2f}% < {:.1f}% threshold (even aligned)".format(
-                bet_side, margin_pct, margin_thresh_aligned))
+            return reject("{} margin {:.2f}% < {:.1f}% threshold (even aligned, {})".format(
+                bet_side, margin_pct, margin_thresh_aligned, trend_source))
 
-    # 8. Confidence
-    if not btc_aligned and btc_trend:
+    # 9. Confidence — combines trend alignment + trend confidence + odds
+    if trend_aligned and trend_confidence == "HIGH":
+        if effective_odds >= 85:
+            confidence = "HIGH"
+        else:
+            confidence = "HIGH" if effective_odds >= 80 else "MEDIUM"
+    elif trend_aligned and trend_confidence == "MEDIUM":
+        confidence = "HIGH" if effective_odds >= 90 else "MEDIUM"
+    elif not trend_aligned:
         confidence = "MEDIUM"
-    elif effective_odds >= 90 or (effective_odds >= 80 and btc_aligned):
-        confidence = "HIGH"
     else:
         confidence = "MEDIUM"
 
-    # 9. Size recommendation
+    # 10. Size recommendation
     if effective_odds >= 94:
         size_rec = "$20-50 (high odds — go with size)"
     elif effective_odds >= 85:
@@ -394,7 +492,7 @@ def score_market(p, btc_trend, price, debug_log=None):
     else:
         size_rec = "$5-10 (cautious)"
 
-    # 10. Reversal warning for short-term tight margins
+    # 11. Reversal warning
     reversal = ""
     if p["is_short"] and p["mins_left"] <= 60 and 78 <= effective_odds <= 88:
         reversal = "⚠️ Reversal risk — watch carefully"
@@ -407,7 +505,8 @@ def score_market(p, btc_trend, price, debug_log=None):
         "margin":      margin,
         "margin_pct":  margin_pct,
         "reversal":    reversal,
-        "btc_aligned": btc_aligned,
+        "btc_aligned": trend_aligned,
+        "trend_source": trend_source,
     }
 
 # ═══════════════════════════════════════════════════════════
@@ -802,12 +901,275 @@ def _is_safe_trading_window():
     """Trading runs 24/7 — limit orders provide natural protection during volatile periods."""
     return True
 
+def _fetch_orderbook(slug):
+    """Fetch the live orderbook for a market from Limitless API."""
+    import requests as req
+    try:
+        r = req.get(
+            "{}/trading/orderbook?slug={}".format(LIMITLESS_API, slug),
+            timeout=10
+        )
+        if r.status_code == 200:
+            return r.json()
+    except Exception as e:
+        print("Orderbook fetch error: {}".format(e))
+    return None
+
+def _get_best_prices(orderbook, bet_side):
+    """Extract best bid and ask from orderbook for the given side (YES/NO).
+    Returns (best_bid, best_ask, midpoint) or (None, None, None)."""
+    if not orderbook:
+        return None, None, None
+
+    try:
+        # Limitless orderbook format: {"yes": {"bids": [...], "asks": [...]}, "no": {...}}
+        side_key = bet_side.lower()
+        side_book = orderbook.get(side_key, {})
+
+        bids = side_book.get("bids", [])
+        asks = side_book.get("asks", [])
+
+        # Bids and asks are lists of [price, size] or {"price": x, "size": y}
+        def parse_level(level):
+            if isinstance(level, list) and len(level) >= 2:
+                return float(level[0]), float(level[1])
+            elif isinstance(level, dict):
+                return float(level.get("price", 0)), float(level.get("size", 0))
+            return 0, 0
+
+        best_bid = None
+        if bids:
+            prices = [parse_level(b)[0] for b in bids]
+            prices = [p for p in prices if p > 0]
+            if prices:
+                best_bid = max(prices)
+
+        best_ask = None
+        if asks:
+            prices = [parse_level(a)[0] for a in asks]
+            prices = [p for p in prices if p > 0]
+            if prices:
+                best_ask = min(prices)
+
+        midpoint = None
+        if best_bid and best_ask:
+            midpoint = (best_bid + best_ask) / 2
+
+        return best_bid, best_ask, midpoint
+    except Exception as e:
+        print("Parse orderbook error: {}".format(e))
+        return None, None, None
+
+def _place_gtc_order(slug, bet_side, token_id, stake, price_per_share, exchange_addr, profile_id, fee_bps):
+    """Place a GTC limit order. Returns order_id on success, None on failure."""
+    import requests as req
+    from web3 import Web3
+    from eth_account import Account
+    import random
+
+    account = Account.from_key(LIMITLESS_PRIV_KEY)
+    wallet_addr = account.address
+
+    # For GTC: makerAmount = USDC to spend, takerAmount = shares to receive
+    num_shares = stake / price_per_share
+    maker_amount = int(stake * 1e6)  # USDC in 6 decimals
+    taker_amount = int(num_shares * 1e6)  # shares in 6 decimals
+
+    salt = int(time.time() * 1000) * 1000 + random.randint(0, 999)
+    ZERO_ADDR = "0x0000000000000000000000000000000000000000"
+
+    order_data = {
+        "salt": salt,
+        "maker": Web3.to_checksum_address(wallet_addr),
+        "signer": Web3.to_checksum_address(wallet_addr),
+        "taker": Web3.to_checksum_address(ZERO_ADDR),
+        "tokenId": int(token_id),
+        "makerAmount": maker_amount,
+        "takerAmount": taker_amount,
+        "expiration": 0,
+        "nonce": 0,
+        "feeRateBps": fee_bps,
+        "side": 0,  # BUY
+        "signatureType": 0,
+    }
+
+    signature = _sign_order(order_data, exchange_addr)
+    if not signature:
+        return None
+
+    order_payload = {
+        "order": {
+            "salt": salt,
+            "maker": Web3.to_checksum_address(wallet_addr),
+            "signer": Web3.to_checksum_address(wallet_addr),
+            "taker": Web3.to_checksum_address(ZERO_ADDR),
+            "tokenId": str(token_id),
+            "makerAmount": maker_amount,
+            "takerAmount": taker_amount,
+            "expiration": "0",
+            "nonce": 0,
+            "feeRateBps": fee_bps,
+            "side": 0,
+            "signatureType": 0,
+            "signature": "0x" + signature if not signature.startswith("0x") else signature,
+        },
+        "orderType": "GTC",
+        "marketSlug": slug,
+        "ownerId": profile_id,
+    }
+
+    order_body = json.dumps(order_payload)
+    headers = _hmac_headers("POST", "/orders", order_body)
+
+    try:
+        r = req.post(
+            "{}/orders".format(LIMITLESS_API),
+            headers=headers, data=order_body, timeout=15
+        )
+        if r.status_code in (200, 201):
+            result = r.json() if r.text else {}
+            order_id = result.get("id") or result.get("orderId") or result.get("order", {}).get("id")
+            print("GTC order placed: {} @ ${:.4f} on {} (id={})".format(
+                bet_side, price_per_share, slug[:30], order_id))
+            return order_id
+        else:
+            print("GTC order failed: {} - {}".format(r.status_code, r.text[:150]))
+            return None
+    except Exception as e:
+        print("GTC order error: {}".format(e))
+        return None
+
+def _cancel_order(order_id):
+    """Cancel an order by ID."""
+    import requests as req
+    try:
+        path = "/orders/{}".format(order_id)
+        headers = _hmac_headers("DELETE", path)
+        r = req.delete(
+            "{}{}".format(LIMITLESS_API, path),
+            headers=headers, timeout=10
+        )
+        return r.status_code in (200, 204)
+    except Exception as e:
+        print("Cancel order error: {}".format(e))
+        return False
+
+def _check_order_filled(order_id):
+    """Check if a GTC order has been filled. Returns 'FILLED', 'LIVE', or 'UNKNOWN'."""
+    import requests as req
+    try:
+        path = "/trading/order-status-batch"
+        body = json.dumps({"orderIds": [str(order_id)]})
+        headers = _hmac_headers("POST", path, body)
+        r = req.post(
+            "{}{}".format(LIMITLESS_API, path),
+            headers=headers, data=body, timeout=10
+        )
+        if r.status_code == 200:
+            data = r.json()
+            if isinstance(data, list) and len(data) > 0:
+                status = data[0].get("status", "").upper()
+                if status in ("FILLED", "MATCHED"):
+                    return "FILLED"
+                elif status in ("LIVE", "OPEN", "ACTIVE"):
+                    return "LIVE"
+                elif status in ("CANCELLED", "EXPIRED"):
+                    return "CANCELLED"
+                return status
+            elif isinstance(data, dict):
+                for k, v in data.items():
+                    if isinstance(v, dict):
+                        status = v.get("status", "").upper()
+                        if status in ("FILLED", "MATCHED"):
+                            return "FILLED"
+                        elif status in ("LIVE", "OPEN", "ACTIVE"):
+                            return "LIVE"
+                        return status
+    except Exception as e:
+        print("Order status check error: {}".format(e))
+    return "UNKNOWN"
+
+def _place_fok_order(slug, bet_side, token_id, stake, exchange_addr, profile_id, fee_bps):
+    """Place a FOK market order (immediate fill at best ask). Returns True if successful."""
+    import requests as req
+    from web3 import Web3
+    from eth_account import Account
+    import random
+
+    account = Account.from_key(LIMITLESS_PRIV_KEY)
+    wallet_addr = account.address
+    maker_amount = int(stake * 1e6)
+    salt = int(time.time() * 1000) * 1000 + random.randint(0, 999)
+    ZERO_ADDR = "0x0000000000000000000000000000000000000000"
+
+    order_data = {
+        "salt": salt,
+        "maker": Web3.to_checksum_address(wallet_addr),
+        "signer": Web3.to_checksum_address(wallet_addr),
+        "taker": Web3.to_checksum_address(ZERO_ADDR),
+        "tokenId": int(token_id),
+        "makerAmount": maker_amount,
+        "takerAmount": 1,  # FOK = 1
+        "expiration": 0,
+        "nonce": 0,
+        "feeRateBps": fee_bps,
+        "side": 0,
+        "signatureType": 0,
+    }
+
+    signature = _sign_order(order_data, exchange_addr)
+    if not signature:
+        return False
+
+    order_payload = {
+        "order": {
+            "salt": salt,
+            "maker": Web3.to_checksum_address(wallet_addr),
+            "signer": Web3.to_checksum_address(wallet_addr),
+            "taker": Web3.to_checksum_address(ZERO_ADDR),
+            "tokenId": str(token_id),
+            "makerAmount": maker_amount,
+            "takerAmount": 1,
+            "expiration": "0",
+            "nonce": 0,
+            "feeRateBps": fee_bps,
+            "side": 0,
+            "signatureType": 0,
+            "signature": "0x" + signature if not signature.startswith("0x") else signature,
+        },
+        "orderType": "FOK",
+        "marketSlug": slug,
+        "ownerId": profile_id,
+    }
+
+    order_body = json.dumps(order_payload)
+    headers = _hmac_headers("POST", "/orders", order_body)
+
+    try:
+        r = req.post(
+            "{}/orders".format(LIMITLESS_API),
+            headers=headers, data=order_body, timeout=15
+        )
+        if r.status_code in (200, 201):
+            print("FOK order filled: {} on {}".format(bet_side, slug[:30]))
+            return True
+        else:
+            print("FOK order failed: {} - {}".format(r.status_code, r.text[:150]))
+            return False
+    except Exception as e:
+        print("FOK error: {}".format(e))
+        return False
+
 def execute_trade(parsed_market, score, prediction_id):
-    """Execute a trade on Limitless Exchange.
-    Returns True if trade was placed, False otherwise."""
+    """Execute a trade using aggressive bidding:
+    1. Check orderbook for best bid/ask
+    2. Place GTC limit at fair price (midpoint or best_bid + 1¢)
+    3. Every 5 seconds, check if filled or topped → outbid
+    4. After 30 seconds if not filled → FOK at the ask (if under ceiling)
+    5. Never pay above ceiling price
+    """
     import requests as req
 
-    # Pre-checks
     if not _has_trading_keys():
         print("Auto-trade skipped: missing trading credentials")
         return False
@@ -816,7 +1178,6 @@ def execute_trade(parsed_market, score, prediction_id):
         print("Auto-trade skipped: kill switch active")
         return False
 
-    # Trading window check (24/7 now)
     if not _is_safe_trading_window():
         return False
 
@@ -848,50 +1209,31 @@ def execute_trade(parsed_market, score, prediction_id):
     else:
         stake = max(_trading_state["min_stake"], round(balance * _trading_state["medium_pct"], 2))
 
-    # Don't bet more than we have
     if stake > balance:
         stake = max(_trading_state["min_stake"], round(balance * 0.5, 2))
     if stake > balance:
-        print("Auto-trade skipped: balance ${:.2f} too low for min stake".format(balance))
+        print("Auto-trade skipped: balance ${:.2f} too low".format(balance))
         return False
 
     bet_side = score.get("bet_side", "YES")
     slug = parsed_market.get("slug", "")
-
     if not slug:
-        print("Auto-trade skipped: no slug for market")
         return False
 
     try:
-        # 1. Fetch market details (venue + positionIds)
+        # 1. Fetch market details
         market_data = _fetch_market_details(slug)
         if not market_data:
-            print("Auto-trade skipped: couldn't fetch market details for {}".format(slug))
+            print("Auto-trade skipped: couldn't fetch market details")
             return False
 
         venue = market_data.get("venue", {})
         exchange_addr = venue.get("exchange", "") if isinstance(venue, dict) else ""
-        print("Venue exchange: {}".format(exchange_addr))
-        position_ids = market_data.get("positionIds") or market_data.get("clobTokenIds") or []
-
-        # Try tokens dict as fallback
-        if not position_ids:
-            tokens = market_data.get("tokens", {})
-            if isinstance(tokens, dict):
-                yes_id = tokens.get("yes") or tokens.get("Yes") or tokens.get("YES")
-                no_id = tokens.get("no") or tokens.get("No") or tokens.get("NO")
-                if yes_id and no_id:
-                    position_ids = [str(yes_id), str(no_id)]
-
         if not exchange_addr:
-            print("Auto-trade skipped: no venue.exchange for {} — market may not support CLOB trading".format(slug[:40]))
+            print("Auto-trade skipped: no venue.exchange")
             return False
 
-        if len(position_ids) < 2:
-            print("Auto-trade skipped: no positionIds for {} — found: {}".format(slug[:40], position_ids))
-            return False
-
-        # positionIds or tokens dict — get YES and NO token IDs
+        # Get token ID
         token_id = None
         tokens = market_data.get("tokens", {})
         if isinstance(tokens, dict):
@@ -899,115 +1241,165 @@ def execute_trade(parsed_market, score, prediction_id):
                 token_id = tokens.get("yes") or tokens.get("Yes") or tokens.get("YES")
             else:
                 token_id = tokens.get("no") or tokens.get("No") or tokens.get("NO")
-        if not token_id and position_ids and len(position_ids) >= 2:
-            token_id = position_ids[0] if bet_side == "YES" else position_ids[1]
-
         if not token_id:
-            print("Auto-trade skipped: can't find {} token ID for {}".format(bet_side, slug[:40]))
+            position_ids = market_data.get("positionIds") or market_data.get("clobTokenIds") or []
+            if len(position_ids) >= 2:
+                token_id = position_ids[0] if bet_side == "YES" else position_ids[1]
+        if not token_id:
+            print("Auto-trade skipped: no {} token ID".format(bet_side))
             return False
 
         print("Token resolved: {} = {} for {}".format(bet_side, str(token_id)[:30], slug[:30]))
 
-        # 2. Build order
-        # FOK (Fill or Kill): makerAmount = USDC to spend (6 decimals), takerAmount = 1
-        maker_amount = int(stake * 1e6)  # USDC in 6 decimals (e.g. $3 = 3000000)
-        taker_amount = 1                  # FOK requires takerAmount = 1
-
-        # Price for display purposes
-        odds_decimal = score["bet_odds"] / 100.0
-        if bet_side == "NO":
-            price = 1.0 - odds_decimal
-        else:
-            price = odds_decimal
-        num_shares = stake / price  # approximate shares we'll receive
-
-        from web3 import Web3
-        from eth_account import Account
-
-        account = Account.from_key(LIMITLESS_PRIV_KEY)
-        wallet_addr = account.address
-
-        # Generate unique salt
-        import random
-        salt = int(time.time() * 1000) * 1000 + random.randint(0, 999)
-
-        ZERO_ADDR = "0x0000000000000000000000000000000000000000"
-
-        # Fetch profile BEFORE signing to ensure fee_rate_bps is cached
+        # Get profile
         profile_id = _get_limitless_profile_id()
         if not profile_id:
-            print("Auto-trade skipped: can't get profile ID")
             return False
         fee_bps = _trading_state.get("fee_rate_bps", 300)
 
-        order_data = {
-            "salt": salt,
-            "maker": Web3.to_checksum_address(wallet_addr),
-            "signer": Web3.to_checksum_address(wallet_addr),
-            "taker": Web3.to_checksum_address(ZERO_ADDR),
-            "tokenId": int(token_id),
-            "makerAmount": maker_amount,
-            "takerAmount": taker_amount,
-            "expiration": 0,
-            "nonce": 0,
-            "feeRateBps": fee_bps,
-            "side": 0,  # BUY
-            "signatureType": 0,  # EOA
-        }
+        # 2. Fetch orderbook to determine pricing
+        orderbook = _fetch_orderbook(slug)
+        best_bid, best_ask, midpoint = _get_best_prices(orderbook, bet_side)
 
-        # 3. Sign
-        signature = _sign_order(order_data, exchange_addr)
-        if not signature:
-            print("Auto-trade skipped: signing failed")
-            return False
+        # Calculate ceiling (max price we'll pay)
+        # Based on odds: at 85% odds, price should be ~$0.85 for YES or ~$0.15 for NO
+        odds_decimal = score["bet_odds"] / 100.0
+        if bet_side == "NO":
+            displayed_price = 1.0 - odds_decimal
+        else:
+            displayed_price = odds_decimal
 
-        # 4. Submit FOK order
-        order_payload = {
-            "order": {
-                "salt": salt,
-                "maker": Web3.to_checksum_address(wallet_addr),
-                "signer": Web3.to_checksum_address(wallet_addr),
-                "taker": Web3.to_checksum_address(ZERO_ADDR),
-                "tokenId": str(token_id),
-                "makerAmount": maker_amount,
-                "takerAmount": taker_amount,
-                "expiration": "0",
-                "nonce": 0,
-                "feeRateBps": fee_bps,
-                "side": 0,
-                "signatureType": 0,
-                "signature": "0x" + signature if not signature.startswith("0x") else signature,
-            },
-            "orderType": "FOK",
-            "marketSlug": slug,
-            "ownerId": profile_id,
-        }
+        # Ceiling: displayed price + small buffer (never pay more than this)
+        ceiling = min(displayed_price + 0.03, 0.95)
 
-        order_body = json.dumps(order_payload)
-        path = "/orders"
-        headers = _hmac_headers("POST", path, order_body)
+        # Starting bid: midpoint or best_bid + $0.01
+        if midpoint and best_bid:
+            start_price = min(midpoint, best_bid + 0.01)
+        elif best_bid:
+            start_price = best_bid + 0.01
+        elif midpoint:
+            start_price = midpoint
+        else:
+            # No orderbook data — fall back to FOK
+            print("No orderbook data — falling back to FOK")
+            success = _place_fok_order(slug, bet_side, token_id, stake, exchange_addr, profile_id, fee_bps)
+            if success:
+                _trading_state["trades_today"] += 1
+                _trading_state["last_balance"] = round(balance - stake, 2)
+                try:
+                    conn = get_db()
+                    conn.run("UPDATE limitless_predictions SET size_rec=:s WHERE id=:i",
+                             s="AUTO ${:.2f} | {} | FOK".format(stake, bet_side), i=prediction_id)
+                    conn.close()
+                except:
+                    pass
+                send_telegram("🤖 <b>AUTO-TRADE (FOK)</b>\n📌 {}\nSide: {} | Stake: ${:.2f}".format(
+                    parsed_market["title"][:50], bet_side, stake))
+            return success
 
-        print("Submitting order: {} {} on {} stake=${:.2f}".format(
-            bet_side, "BUY", slug[:40], stake))
+        # Clamp start price
+        start_price = round(max(0.01, min(start_price, ceiling)), 4)
 
-        r = req.post(
-            "{}{}".format(LIMITLESS_API, path),
-            headers=headers,
-            data=order_body,
-            timeout=15,
-        )
+        print("Aggressive bid: {} {} start=${:.4f} ceiling=${:.4f} bid=${} ask={}".format(
+            bet_side, slug[:25], start_price, ceiling,
+            "{:.4f}".format(best_bid) if best_bid else "?",
+            "{:.4f}".format(best_ask) if best_ask else "?"))
 
-        if r.status_code in (200, 201):
+        # 3. Place GTC limit order at starting price
+        current_price = start_price
+        order_id = _place_gtc_order(slug, bet_side, token_id, stake, current_price,
+                                     exchange_addr, profile_id, fee_bps)
+
+        if not order_id:
+            # GTC failed — try FOK as fallback
+            print("GTC failed — trying FOK fallback")
+            success = _place_fok_order(slug, bet_side, token_id, stake, exchange_addr, profile_id, fee_bps)
+            if success:
+                _trading_state["trades_today"] += 1
+                _trading_state["last_balance"] = round(balance - stake, 2)
+                try:
+                    conn = get_db()
+                    conn.run("UPDATE limitless_predictions SET size_rec=:s WHERE id=:i",
+                             s="AUTO ${:.2f} | {} | FOK-fallback".format(stake, bet_side), i=prediction_id)
+                    conn.close()
+                except:
+                    pass
+                send_telegram("🤖 <b>AUTO-TRADE (FOK fallback)</b>\n📌 {}\nSide: {} | Stake: ${:.2f}".format(
+                    parsed_market["title"][:50], bet_side, stake))
+            return success
+
+        # 4. Aggressive bidding loop — check every 5 seconds for 30 seconds
+        filled = False
+        fill_price = current_price
+        max_checks = 6  # 6 × 5s = 30 seconds
+        for check_num in range(max_checks):
+            time.sleep(5)
+
+            # Check if filled
+            status = _check_order_filled(order_id)
+            if status == "FILLED":
+                filled = True
+                fill_price = current_price
+                print("GTC filled at ${:.4f} after {}s".format(fill_price, (check_num + 1) * 5))
+                break
+
+            if status == "CANCELLED":
+                print("GTC was cancelled externally")
+                break
+
+            # Check if we've been topped — re-fetch orderbook
+            ob = _fetch_orderbook(slug)
+            new_bid, new_ask, new_mid = _get_best_prices(ob, bet_side)
+
+            if new_bid and new_bid >= current_price:
+                # Someone topped us — outbid by $0.01
+                new_price = round(new_bid + 0.01, 4)
+                if new_price > ceiling:
+                    print("Bid war hit ceiling ${:.4f} — stopping".format(ceiling))
+                    break
+
+                # Cancel old order and place new one
+                _cancel_order(order_id)
+                time.sleep(0.5)
+                order_id = _place_gtc_order(slug, bet_side, token_id, stake, new_price,
+                                             exchange_addr, profile_id, fee_bps)
+                if order_id:
+                    current_price = new_price
+                    print("Outbid → ${:.4f} (check {}/{})".format(new_price, check_num + 1, max_checks))
+                else:
+                    print("Outbid order failed — breaking")
+                    break
+
+        # 5. If not filled after 30 seconds — FOK at the ask (if under ceiling)
+        if not filled:
+            # Cancel remaining GTC order
+            if order_id:
+                _cancel_order(order_id)
+                time.sleep(0.5)
+
+            # Check current ask price
+            ob = _fetch_orderbook(slug)
+            _, final_ask, _ = _get_best_prices(ob, bet_side)
+
+            if final_ask and final_ask <= ceiling:
+                print("Not filled after 30s — FOK at ask ${:.4f}".format(final_ask))
+                success = _place_fok_order(slug, bet_side, token_id, stake, exchange_addr, profile_id, fee_bps)
+                if success:
+                    filled = True
+                    fill_price = final_ask
+            else:
+                print("Not filled and ask ${} > ceiling ${:.4f} — walking away".format(
+                    "{:.4f}".format(final_ask) if final_ask else "?", ceiling))
+                return False
+
+        if filled:
             _trading_state["trades_today"] += 1
-            result_data = r.json() if r.text else {}
+            _trading_state["last_balance"] = round(balance - stake, 2)
 
-            # Update DB with trade info
             try:
                 conn = get_db()
-                conn.run(
-                    "UPDATE limitless_predictions SET size_rec=:s WHERE id=:i",
-                    s="AUTO ${:.2f} | {}".format(stake, bet_side), i=prediction_id
-                )
+                conn.run("UPDATE limitless_predictions SET size_rec=:s WHERE id=:i",
+                         s="AUTO ${:.2f} | {} | @{:.4f}".format(stake, bet_side, fill_price), i=prediction_id)
                 conn.close()
             except:
                 pass
@@ -1018,32 +1410,25 @@ def execute_trade(parsed_market, score, prediction_id):
                 "📌 {}\n"
                 "<b>Side:</b> BUY {} shares\n"
                 "<b>Stake:</b> ${:.2f}\n"
-                "<b>Price:</b> {:.3f}\n"
-                "<b>Shares:</b> {:.1f}\n"
+                "<b>Fill Price:</b> {:.4f}\n"
                 "<b>Balance:</b> ${:.2f}\n"
                 "<b>Trade #:</b> {} today\n"
                 "──────────────────────────\n"
                 "📊 Daily P&L: +${:.2f} / -${:.2f}"
             ).format(
                 parsed_market["title"],
-                bet_side, stake, price, num_shares,
+                bet_side, stake, fill_price,
                 balance - stake,
                 _trading_state["trades_today"],
                 _trading_state["daily_profit"],
                 _trading_state["daily_loss"],
             )
-            # Update tracked balance (subtract stake — shares are pending)
-            _trading_state["last_balance"] = round(balance - stake, 2)
             send_telegram(trade_msg)
-            print("AUTO-TRADE #{}: {} {} ${:.2f} on {}".format(
-                prediction_id, bet_side, slug[:30], stake, parsed_market["title"][:40]))
+            print("AUTO-TRADE #{}: {} {} ${:.2f} @{:.4f} on {}".format(
+                prediction_id, bet_side, slug[:30], stake, fill_price, parsed_market["title"][:40]))
             return True
-        else:
-            error_msg = r.text[:200] if r.text else "unknown error"
-            print("Auto-trade FAILED: {} - {}".format(r.status_code, error_msg))
-            send_telegram("❌ <b>Trade failed</b>\n{}\nError: {}".format(
-                parsed_market["title"][:50], error_msg[:100]))
-            return False
+
+        return False
 
     except Exception as e:
         print("Auto-trade error: {}".format(e))
@@ -3225,19 +3610,99 @@ def test():
     btc = get_btc_trend()
     win = is_lagos_window()
     send_telegram(
-        "✅ <b>Limitless Bot v3 — LIVE</b>\n\n"
+        "✅ <b>Limitless Bot v4 — LIVE</b>\n\n"
         "✅ Scanner active (5 min)\n"
-        "✅ Outcome tracker active\n"
+        "✅ Aggressive bidding engine\n"
+        "✅ Per-pair trend analysis\n"
+        "✅ TradingView webhook ready\n"
         "✅ Football module: {}\n"
         "✅ PostgreSQL connected\n\n"
         "<b>BTC:</b> {}\n"
-        "<b>Window:</b> {}".format(
+        "<b>Mode:</b> 24/7 AUTO-TRADING".format(
             "ready" if (ANTHROPIC_KEY and FOOTBALL_DATA_KEY) else "needs keys",
             btc or "Calculating...",
-            "🟢 OPEN" if win else "🔴 CLOSED"
         )
     )
-    return {"status": "ok", "btc_trend": btc, "in_window": win}, 200
+    return {"status": "ok", "btc_trend": btc}, 200
+
+@app.route("/tv", methods=["POST"])
+def tradingview_webhook():
+    """Receive TradingView alerts and store per-pair trend.
+    Expected payload: {"pair":"BTCUSD","timeframe":"15M","direction":"BUY","entry":"75600","sl":"75400","tp":"76000"}
+    """
+    try:
+        data = request.get_json(force=True)
+        if not data:
+            return jsonify({"error": "no data"}), 400
+
+        pair = (data.get("pair") or "").upper()
+        direction = (data.get("direction") or "").upper()
+        timeframe = (data.get("timeframe") or "").upper()
+        entry = data.get("entry")
+        sl = data.get("sl")
+        tp = data.get("tp")
+
+        if not pair or direction not in ("BUY", "SELL"):
+            return jsonify({"error": "missing pair or direction"}), 400
+
+        # Extract asset name (remove USD suffix): BTCUSD → BTC, XAUUSD → XAU
+        asset = pair.replace("USD", "").replace("USDT", "")
+        if not asset:
+            asset = pair
+
+        # Store trend
+        _tv_trends[asset] = {
+            "dir": direction,
+            "tf": timeframe,
+            "entry": float(entry) if entry else None,
+            "sl": float(sl) if sl else None,
+            "tp": float(tp) if tp else None,
+            "updated": datetime.now(timezone.utc).isoformat(),
+            "pair": pair,
+        }
+
+        print("TV webhook: {} {} {} (entry={})".format(asset, direction, timeframe, entry))
+
+        # Send Telegram notification
+        emoji = "🟢" if direction == "BUY" else "🔴"
+        send_telegram(
+            "{} <b>TV Signal — {} {}</b>\n"
+            "Timeframe: {} | Entry: {}\n"
+            "SL: {} | TP: {}".format(
+                emoji, direction, pair, timeframe,
+                entry or "—", sl or "—", tp or "—"
+            )
+        )
+
+        return jsonify({
+            "status": "ok",
+            "asset": asset,
+            "direction": direction,
+            "timeframe": timeframe,
+            "stored_trends": {k: v["dir"] for k, v in _tv_trends.items()},
+        }), 200
+
+    except Exception as e:
+        print("TV webhook error: {}".format(e))
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/tv/status", methods=["GET"])
+def tv_trends_status():
+    """Show current per-pair trends from TradingView webhooks + SMA."""
+    result = {}
+    for asset in list(YAHOO_MAP.keys()) + list(_tv_trends.keys()):
+        if asset in result:
+            continue
+        tv = _tv_trends.get(asset)
+        sma = _pair_sma_cache.get(asset)
+        result[asset] = {
+            "tv_signal": tv["dir"] if tv else None,
+            "tv_timeframe": tv["tf"] if tv else None,
+            "tv_age_min": round((datetime.now(timezone.utc) - datetime.fromisoformat(tv["updated"].replace("Z", "+00:00"))).total_seconds() / 60, 1) if tv and tv.get("updated") else None,
+            "sma_trend": sma["trend"] if sma else None,
+            "btc_trend": _btc_trend_cache.get("trend"),
+        }
+    return jsonify(result), 200
 
 
 # ═══════════════════════════════════════════════════════════
