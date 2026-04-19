@@ -1075,6 +1075,7 @@ def _place_gtc_order(slug, bet_side, token_id, stake, price_per_share, exchange_
             "signature": "0x" + signature if not signature.startswith("0x") else signature,
         },
         "orderType": "GTC",
+        "price": round(price_per_share, 4),
         "marketSlug": slug,
         "ownerId": profile_id,
     }
