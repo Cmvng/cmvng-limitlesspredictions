@@ -1073,14 +1073,15 @@ def _place_gtc_order(slug, bet_side, token_id, stake, price_per_share, exchange_
             "side": 0,
             "signatureType": 0,
             "signature": "0x" + signature if not signature.startswith("0x") else signature,
+            "price": round(price_per_share, 4),
         },
         "orderType": "GTC",
         "marketSlug": slug,
         "ownerId": profile_id,
     }
 
-    print("GTC payload: makerAmt={} takerAmt={} price={:.4f} (ratio)".format(
-        maker_amount, taker_amount, maker_amount / taker_amount if taker_amount else 0))
+    print("GTC payload: price={:.4f} makerAmt={} takerAmt={}".format(
+        price_per_share, maker_amount, taker_amount))
 
     order_body = json.dumps(order_payload)
     headers = _hmac_headers("POST", "/orders", order_body)
