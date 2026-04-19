@@ -1108,123 +1108,109 @@ def record_trade_outcome(prediction_id, won, stake_amount):
             prediction_id, stake_amount, _trading_state["last_balance"]))
 
 def _auto_redeem_positions():
-    """Auto-redeem winning positions on Limitless to convert shares back to USDC."""
+    """Auto-redeem winning positions by calling redeemPositions() on the CTF contract directly."""
     if not _has_trading_keys():
         return
     import requests as req
     try:
-        # Get our positions
         from eth_account import Account
+        from web3 import Web3
+
         account = Account.from_key(LIMITLESS_PRIV_KEY)
         wallet = account.address
 
-        # Try multiple position endpoints
-        positions_data = None
-        for try_path in [
-            "/portfolio/positions",
-            "/portfolio/positions?account={}".format(wallet),
-            "/public-portfolio/positions/{}".format(wallet),
-        ]:
-            try:
-                h = _hmac_headers("GET", try_path.split("?")[0])
-                r = req.get("{}{}".format(LIMITLESS_API, try_path), headers=h, timeout=10)
-                if r.status_code == 200:
-                    positions_data = r.json()
-                    print("Redeem: got positions from {} — type: {}".format(
-                        try_path[:40], type(positions_data).__name__))
-                    break
-            except:
-                continue
+        # Base chain contracts
+        CTF_ADDRESS = "0xC9c98965297Bc527861c898329Ee280632B76e18"
+        USDC_ADDRESS = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+        ZERO_BYTES32 = "0x" + "00" * 32
+        BASE_RPC = "https://mainnet.base.org"
 
-        # Also try without HMAC for public endpoints
-        if positions_data is None:
-            try:
-                pub_path = "/public-portfolio/positions/{}".format(wallet)
-                r = req.get("{}{}".format(LIMITLESS_API, pub_path), timeout=10)
-                if r.status_code == 200:
-                    positions_data = r.json()
-                    print("Redeem: got positions from public endpoint")
-            except:
-                pass
-
-        if positions_data is None:
-            print("Redeem: could not fetch positions")
+        # Get resolved positions from API
+        path = "/portfolio/positions"
+        headers = _hmac_headers("GET", path)
+        r = req.get("{}{}".format(LIMITLESS_API, path), headers=headers, timeout=10)
+        if r.status_code != 200:
             return
 
-        # Parse positions — could be dict with "clob" key or a list
-        clob_positions = []
-        if isinstance(positions_data, dict):
-            clob_positions = positions_data.get("clob", [])
-            if not clob_positions:
-                # Maybe it's flat
-                clob_positions = positions_data.get("positions", [])
-            if not clob_positions and "data" in positions_data:
-                clob_positions = positions_data["data"]
-            print("Redeem: {} clob positions found (dict keys: {})".format(
-                len(clob_positions), list(positions_data.keys())[:5]))
-        elif isinstance(positions_data, list):
-            clob_positions = positions_data
-            print("Redeem: {} positions found (list)".format(len(clob_positions)))
+        positions = r.json()
+        clob_positions = positions.get("clob", []) if isinstance(positions, dict) else []
 
+        resolved = [p for p in clob_positions
+                     if (p.get("market", {}).get("status") or "").upper() in ("RESOLVED", "EXPIRED", "SETTLED")]
+
+        if not resolved:
+            return
+
+        print("Redeem: {} resolved positions to claim".format(len(resolved)))
+
+        # Connect to Base chain
+        w3 = Web3(Web3.HTTPProvider(BASE_RPC))
+        if not w3.is_connected():
+            print("Redeem: can't connect to Base RPC")
+            return
+
+        # Minimal ABI for redeemPositions
+        CTF_ABI = [{
+            "inputs": [
+                {"name": "collateralToken", "type": "address"},
+                {"name": "parentCollectionId", "type": "bytes32"},
+                {"name": "conditionId", "type": "bytes32"},
+                {"name": "indexSets", "type": "uint256[]"}
+            ],
+            "name": "redeemPositions",
+            "outputs": [],
+            "stateMutability": "nonpayable",
+            "type": "function"
+        }]
+
+        ctf = w3.eth.contract(address=Web3.to_checksum_address(CTF_ADDRESS), abi=CTF_ABI)
+        nonce = w3.eth.get_transaction_count(wallet)
         redeemed = 0
-        for pos in clob_positions:
+
+        for pos in resolved:
             market = pos.get("market", {})
-            market_status = (market.get("status") or pos.get("status") or "").upper()
-            market_slug = market.get("slug") or pos.get("slug") or ""
-            condition_id = market.get("conditionId") or pos.get("conditionId") or ""
+            condition_id = market.get("conditionId", "")
+            title = market.get("title", "?")
 
-            # Log all positions for debugging
-            title = market.get("title") or pos.get("title") or "?"
-            print("  Position: {} | status={} | slug={}".format(
-                title[:40], market_status, market_slug[:30]))
-
-            if market_status not in ("RESOLVED", "EXPIRED", "SETTLED"):
-                continue
-            if not market_slug:
+            if not condition_id:
                 continue
 
             try:
-                redeem_path = "/portfolio/redeem"
-                # Try with just conditionId (marketSlug was rejected)
-                redeem_body = json.dumps({"conditionId": condition_id})
-                redeem_headers = _hmac_headers("POST", redeem_path, redeem_body)
-                rr = req.post("{}{}".format(LIMITLESS_API, redeem_path),
-                              headers=redeem_headers, data=redeem_body, timeout=15)
-                if rr.status_code in (200, 201):
+                # indexSets [1, 2] = redeem both YES (index 0) and NO (index 1)
+                tx = ctf.functions.redeemPositions(
+                    Web3.to_checksum_address(USDC_ADDRESS),
+                    bytes.fromhex(ZERO_BYTES32[2:]),
+                    bytes.fromhex(condition_id[2:]) if condition_id.startswith("0x") else bytes.fromhex(condition_id),
+                    [1, 2]
+                ).build_transaction({
+                    "from": wallet,
+                    "nonce": nonce,
+                    "gas": 200000,
+                    "gasPrice": w3.eth.gas_price,
+                    "chainId": 8453,
+                })
+
+                signed_tx = w3.eth.account.sign_transaction(tx, LIMITLESS_PRIV_KEY)
+                tx_hash = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
+                receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=30)
+
+                if receipt.status == 1:
                     redeemed += 1
+                    nonce += 1
+                    print("Redeemed on-chain: {} tx={}".format(title[:40], tx_hash.hex()[:16]))
                     send_telegram("💰 <b>Auto-redeemed</b>\n📌 {}".format(title[:60]))
-                    print("  Redeemed OK: {}".format(title[:40]))
-                elif rr.status_code == 400 and "should not exist" not in rr.text:
-                    # Already redeemed or nothing to redeem
-                    pass
                 else:
-                    # Try with slug instead of marketSlug
-                    redeem_body2 = json.dumps({"slug": market_slug, "conditionId": condition_id})
-                    redeem_headers2 = _hmac_headers("POST", redeem_path, redeem_body2)
-                    rr2 = req.post("{}{}".format(LIMITLESS_API, redeem_path),
-                                   headers=redeem_headers2, data=redeem_body2, timeout=15)
-                    if rr2.status_code in (200, 201):
-                        redeemed += 1
-                        send_telegram("💰 <b>Auto-redeemed</b>\n📌 {}".format(title[:60]))
-                        print("  Redeemed OK (slug): {}".format(title[:40]))
-                    else:
-                        # Try empty body (maybe redeem all at once)
-                        redeem_body3 = json.dumps({})
-                        redeem_headers3 = _hmac_headers("POST", redeem_path, redeem_body3)
-                        rr3 = req.post("{}{}".format(LIMITLESS_API, redeem_path),
-                                       headers=redeem_headers3, data=redeem_body3, timeout=15)
-                        print("  Redeem attempts: conditionId={} slug={} empty={}".format(
-                            rr.status_code, rr2.status_code, rr3.status_code))
-                        if rr3.status_code in (200, 201):
-                            redeemed += 1
-                            send_telegram("💰 <b>Auto-redeemed all</b>")
-                            break  # redeemed everything at once
+                    print("Redeem tx reverted: {} (might already be claimed)".format(title[:40]))
             except Exception as e:
-                print("  Redeem error {}: {}".format(market_slug[:30], e))
-            time.sleep(1)
+                err_str = str(e)
+                if "revert" in err_str.lower() or "execution reverted" in err_str.lower():
+                    print("Redeem skip {}: already claimed or not resolved".format(title[:30]))
+                else:
+                    print("Redeem error {}: {}".format(title[:30], err_str[:80]))
+            time.sleep(2)
 
         if redeemed > 0:
-            print("Auto-redeemed {} positions".format(redeemed))
+            print("Auto-redeemed {} positions on-chain".format(redeemed))
     except Exception as e:
         print("Auto-redeem error: {}".format(e))
 
