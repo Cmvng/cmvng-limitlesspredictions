@@ -740,34 +740,72 @@ def _sign_order(order_data, verifying_contract):
 
         account = Account.from_key(LIMITLESS_PRIV_KEY)
 
-        # encode_typed_data takes exactly 3 args: (domain_data, message_types, message_data)
-        # message_types must include EIP712Domain + Order types
-        all_types = {
-            "EIP712Domain": [
-                {"name": "name", "type": "string"},
-                {"name": "version", "type": "string"},
-                {"name": "chainId", "type": "uint256"},
-                {"name": "verifyingContract", "type": "address"},
-            ],
-            "Order": [
-                {"name": "salt", "type": "uint256"},
-                {"name": "maker", "type": "address"},
-                {"name": "signer", "type": "address"},
-                {"name": "taker", "type": "address"},
-                {"name": "tokenId", "type": "uint256"},
-                {"name": "makerAmount", "type": "uint256"},
-                {"name": "takerAmount", "type": "uint256"},
-                {"name": "expiration", "type": "uint256"},
-                {"name": "nonce", "type": "uint256"},
-                {"name": "feeRateBps", "type": "uint256"},
-                {"name": "side", "type": "uint8"},
-                {"name": "signatureType", "type": "uint8"},
-            ],
+        full_message = {
+            "types": {
+                "EIP712Domain": [
+                    {"name": "name", "type": "string"},
+                    {"name": "version", "type": "string"},
+                    {"name": "chainId", "type": "uint256"},
+                    {"name": "verifyingContract", "type": "address"},
+                ],
+                "Order": [
+                    {"name": "salt", "type": "uint256"},
+                    {"name": "maker", "type": "address"},
+                    {"name": "signer", "type": "address"},
+                    {"name": "taker", "type": "address"},
+                    {"name": "tokenId", "type": "uint256"},
+                    {"name": "makerAmount", "type": "uint256"},
+                    {"name": "takerAmount", "type": "uint256"},
+                    {"name": "expiration", "type": "uint256"},
+                    {"name": "nonce", "type": "uint256"},
+                    {"name": "feeRateBps", "type": "uint256"},
+                    {"name": "side", "type": "uint8"},
+                    {"name": "signatureType", "type": "uint8"},
+                ],
+            },
+            "primaryType": "Order",
+            "domain": domain_data,
+            "message": message,
         }
 
-        signable = encode_typed_data(domain_data, all_types, message)
-        signed = account.sign_message(signable)
-        print("Signed OK: {}...".format(signed.signature.hex()[:20]))
+        # Try Account.sign_typed_data first (newest API, available in eth-account >= 0.10)
+        try:
+            signed = account.sign_typed_data(
+                domain_data,
+                {"Order": full_message["types"]["Order"]},
+                "Order",
+                message
+            )
+            print("Signed OK (sign_typed_data): {}...".format(signed.signature.hex()[:20]))
+            return signed.signature.hex()
+        except Exception as e1:
+            print("sign_typed_data failed: {}".format(e1))
+
+        # Try encode_structured_data (available in some versions)
+        try:
+            from eth_account.messages import encode_structured_data
+            signable = encode_structured_data(full_message)
+            signed = account.sign_message(signable)
+            print("Signed OK (encode_structured_data): {}...".format(signed.signature.hex()[:20]))
+            return signed.signature.hex()
+        except Exception as e2:
+            print("encode_structured_data failed: {}".format(e2))
+
+        # Try encode_typed_data with primitive_type as key
+        try:
+            signable = encode_typed_data(
+                domain_data,
+                {"Order": full_message["types"]["Order"]},
+                message
+            )
+            signed = account.sign_message(signable)
+            print("Signed OK (encode_typed_data 3-arg): {}...".format(signed.signature.hex()[:20]))
+            return signed.signature.hex()
+        except Exception as e3:
+            print("encode_typed_data 3-arg failed: {}".format(e3))
+
+        print("ALL signing methods failed")
+        return None
         return signed.signature.hex()
     except Exception as e:
         print("Signing error: {}".format(e))
