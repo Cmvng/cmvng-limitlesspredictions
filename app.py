@@ -690,7 +690,7 @@ def _fetch_market_details(slug):
         return None
 
 def _sign_order(order_data, verifying_contract):
-    """Sign order with EIP-712."""
+    """Sign order with EIP-712 using eth_account."""
     try:
         from eth_account import Account
         from eth_account.messages import encode_typed_data
@@ -704,23 +704,6 @@ def _sign_order(order_data, verifying_contract):
             "version": "1",
             "chainId": CHAIN_ID,
             "verifyingContract": vc,
-        }
-
-        types = {
-            "Order": [
-                {"name": "salt", "type": "uint256"},
-                {"name": "maker", "type": "address"},
-                {"name": "signer", "type": "address"},
-                {"name": "taker", "type": "address"},
-                {"name": "tokenId", "type": "uint256"},
-                {"name": "makerAmount", "type": "uint256"},
-                {"name": "takerAmount", "type": "uint256"},
-                {"name": "expiration", "type": "uint256"},
-                {"name": "nonce", "type": "uint256"},
-                {"name": "feeRateBps", "type": "uint256"},
-                {"name": "side", "type": "uint8"},
-                {"name": "signatureType", "type": "uint8"},
-            ],
         }
 
         message = {
@@ -740,8 +723,7 @@ def _sign_order(order_data, verifying_contract):
 
         account = Account.from_key(LIMITLESS_PRIV_KEY)
 
-        # encode_typed_data(domain_data, message_types, message_data)
-        # message_types must NOT include EIP712Domain — only custom types
+        # Only Order type — NO EIP712Domain in this dict
         order_types = {
             "Order": [
                 {"name": "salt", "type": "uint256"},
@@ -759,9 +741,85 @@ def _sign_order(order_data, verifying_contract):
             ],
         }
 
-        signable = encode_typed_data(domain_data, order_types, message)
-        signed = account.sign_message(signable)
-        print("Signed OK: {}...".format(signed.signature.hex()[:20]))
+        # Try Account.sign_typed_data (available in eth-account >= 0.9)
+        try:
+            signed = account.sign_typed_data(domain_data, order_types, "Order", message)
+            print("Signed OK (sign_typed_data): {}...".format(signed.signature.hex()[:20]))
+            return signed.signature.hex()
+        except Exception as e1:
+            print("sign_typed_data attempt: {}".format(e1))
+
+        # Try encode_typed_data with 3 args (domain, types_without_EIP712Domain, message)
+        try:
+            signable = encode_typed_data(domain_data, order_types, message)
+            signed = account.sign_message(signable)
+            print("Signed OK (encode_typed_data 3-arg): {}...".format(signed.signature.hex()[:20]))
+            return signed.signature.hex()
+        except Exception as e2:
+            print("encode_typed_data 3-arg attempt: {}".format(e2))
+
+        # Try encode_typed_data as single full message dict
+        try:
+            full_msg = {
+                "types": {
+                    "EIP712Domain": [
+                        {"name": "name", "type": "string"},
+                        {"name": "version", "type": "string"},
+                        {"name": "chainId", "type": "uint256"},
+                        {"name": "verifyingContract", "type": "address"},
+                    ],
+                    "Order": order_types["Order"],
+                },
+                "primaryType": "Order",
+                "domain": domain_data,
+                "message": message,
+            }
+            signable = encode_typed_data(full_msg)
+            signed = account.sign_message(signable)
+            print("Signed OK (encode_typed_data full): {}...".format(signed.signature.hex()[:20]))
+            return signed.signature.hex()
+        except Exception as e3:
+            print("encode_typed_data full attempt: {}".format(e3))
+
+        # Last resort: manual EIP-712 hash
+        try:
+            from eth_abi import encode as abi_encode
+            from eth_utils import keccak
+
+            # Hash the types
+            order_type_str = "Order(uint256 salt,address maker,address signer,address taker,uint256 tokenId,uint256 makerAmount,uint256 takerAmount,uint256 expiration,uint256 nonce,uint256 feeRateBps,uint8 side,uint8 signatureType)"
+            ORDER_TYPEHASH = keccak(text=order_type_str)
+
+            domain_type_str = "EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"
+            DOMAIN_TYPEHASH = keccak(text=domain_type_str)
+
+            # Domain separator
+            domain_sep = keccak(abi_encode(
+                ['bytes32', 'bytes32', 'bytes32', 'uint256', 'address'],
+                [DOMAIN_TYPEHASH, keccak(text="Limitless CTF Exchange"), keccak(text="1"), CHAIN_ID, vc]
+            ))
+
+            # Struct hash
+            struct_hash = keccak(abi_encode(
+                ['bytes32', 'uint256', 'address', 'address', 'address', 'uint256', 'uint256', 'uint256', 'uint256', 'uint256', 'uint256', 'uint8', 'uint8'],
+                [ORDER_TYPEHASH, message["salt"], message["maker"], message["signer"], message["taker"],
+                 message["tokenId"], message["makerAmount"], message["takerAmount"], message["expiration"],
+                 message["nonce"], message["feeRateBps"], message["side"], message["signatureType"]]
+            ))
+
+            # Final hash: \x19\x01 + domainSeparator + structHash
+            msg_hash = keccak(b'\x19\x01' + domain_sep + struct_hash)
+            signed = account.signHash(msg_hash)
+            print("Signed OK (manual EIP-712): {}...".format(signed.signature.hex()[:20]))
+            return signed.signature.hex()
+        except Exception as e4:
+            print("Manual EIP-712 attempt: {}".format(e4))
+
+        print("ALL signing methods failed")
+        return None
+    except Exception as e:
+        print("Signing error: {}".format(e))
+        return None
         return signed.signature.hex()
     except Exception as e:
         print("Signing error: {}".format(e))
