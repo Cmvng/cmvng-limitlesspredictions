@@ -46,7 +46,7 @@ _trading_state = {
     "medium_pct": 0.08,          # 8% of balance on MEDIUM confidence
     "daily_loss_limit_pct": 0.25,# Stop after 25% daily loss
     "min_stake": 1.0,            # Limitless minimum $1
-    "starting_balance": 20.0,    # Manual fallback balance
+    "starting_balance": 23.0,    # Manual fallback balance — update via /trading/set?balance=X
 }
 
 FAVOURITE_HOURLY = ["ADA", "BNB", "DOGE"]
@@ -1077,6 +1077,8 @@ def _place_gtc_order(slug, bet_side, token_id, stake, price_per_share, exchange_
         "orderType": "GTC",
         "marketSlug": slug,
         "ownerId": profile_id,
+        "price": round(price_per_share, 4),
+        "size": round(stake, 2),
     }
 
     order_body = json.dumps(order_payload)
@@ -1644,6 +1646,21 @@ def _auto_redeem_positions():
 
         if redeemed > 0:
             print("Auto-redeemed {} positions on-chain".format(redeemed))
+            # Update balance after redemption — try reading on-chain USDC balance
+            try:
+                usdc_contract = w3.eth.contract(
+                    address=Web3.to_checksum_address("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"),
+                    abi=[{"constant": True, "inputs": [{"name": "_owner", "type": "address"}],
+                          "name": "balanceOf", "outputs": [{"name": "balance", "type": "uint256"}],
+                          "type": "function"}]
+                )
+                raw_bal = usdc_contract.functions.balanceOf(Web3.to_checksum_address(wallet_addr)).call()
+                on_chain_balance = raw_bal / 1e6
+                if on_chain_balance > 0:
+                    _trading_state["last_balance"] = round(on_chain_balance, 2)
+                    print("Balance updated after redeem: ${:.2f}".format(on_chain_balance))
+            except Exception as be:
+                print("Balance update after redeem failed: {}".format(be))
     except Exception as e:
         print("Auto-redeem error: {}".format(e))
 
@@ -3949,9 +3966,9 @@ tbody tr:hover{background:var(--bg)}
       <a href="/app/football" class="nav-tab">Football</a>
     </nav>
     <div class="pills">
-      <span class="pill {{ 'pill-active' if in_window else 'pill-inactive' }}">
+      <span class="pill pill-active">
         <span class="dot live"></span>
-        {{ 'Window Open' if in_window else 'Window Closed' }}
+        24/7 Active
       </span>
       <span class="pill {{ 'pill-btc-up' if btc_trend == 'BUY' else 'pill-btc-down' if btc_trend == 'SELL' else '' }}">
         BTC {{ '↗ BUY' if btc_trend == 'BUY' else '↘ SELL' if btc_trend == 'SELL' else '— N/A' }}
