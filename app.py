@@ -44,7 +44,7 @@ _trading_state = {
     "last_balance": None,        # Cached balance
     "high_pct": 0.15,            # 15% of balance on HIGH confidence
     "medium_pct": 0.08,          # 8% of balance on MEDIUM confidence
-    "daily_loss_limit_pct": 0.25,# Stop after 25% daily loss
+    "daily_loss_limit_pct": 0.50,# Stop after 50% daily loss
     "min_stake": 1.0,            # Limitless minimum $1
     "starting_balance": 23.0,    # Manual fallback balance — update via /trading/set?balance=X
 }
@@ -1077,9 +1077,10 @@ def _place_gtc_order(slug, bet_side, token_id, stake, price_per_share, exchange_
         "orderType": "GTC",
         "marketSlug": slug,
         "ownerId": profile_id,
-        "price": round(price_per_share, 4),
-        "size": round(stake, 2),
     }
+
+    print("GTC payload: makerAmt={} takerAmt={} price={:.4f} (ratio)".format(
+        maker_amount, taker_amount, maker_amount / taker_amount if taker_amount else 0))
 
     order_body = json.dumps(order_payload)
     headers = _hmac_headers("POST", "/orders", order_body)
