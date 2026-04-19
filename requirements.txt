@@ -3,4 +3,5 @@ pg8000
 requests
 yfinance
 eth-account
+eth-abi
 web3
