@@ -1370,8 +1370,16 @@ def execute_trade(parsed_market, score, prediction_id):
             # YES share price matches odds. At 85% YES odds, share costs ~$0.85
             displayed_price = odds_decimal
 
-        # Ceiling: displayed price + small buffer (never pay more than this)
-        ceiling = round(min(displayed_price + 0.03, 0.95), 3)
+        # Ceiling: maximum price we'll pay — up to 93% chance (0.93 for YES, 0.07 for NO)
+        # This gives room to bid aggressively while still maintaining edge
+        max_odds = 0.93  # Never pay more than 93 cents per share
+        if bet_side == "YES":
+            ceiling = round(min(max_odds, 0.95), 3)
+        else:
+            # For NO, ceiling in NO-share terms = 1 - min_yes_price
+            # At 93% max: NO ceiling = 1 - 0.07 = 0.93... but NO shares are cheap
+            # Just cap at max_odds for NO side too
+            ceiling = round(min(1.0 - (1.0 - max_odds), 0.95), 3)
 
         # Starting bid: use midpoint from the CORRECT side prices
         # For NO side, bid/ask must be in NO-share terms (small numbers like 0.08-0.15)
@@ -1502,10 +1510,16 @@ def execute_trade(parsed_market, score, prediction_id):
                 if success:
                     filled = True
                     fill_price = final_ask
-            else:
-                print("Not filled and ask ${} > ceiling ${:.4f} — walking away".format(
-                    "{:.4f}".format(final_ask) if final_ask else "?", ceiling))
+            elif final_ask and final_ask > ceiling:
+                print("Not filled and ask ${:.4f} > ceiling ${:.4f} — walking away".format(final_ask, ceiling))
                 return False
+            else:
+                # Orderbook unavailable (404) — FOK anyway, the signal is still valid
+                print("Not filled after 30s, orderbook unavailable — FOK fallback")
+                success = _place_fok_order(slug, bet_side, token_id, stake, exchange_addr, profile_id, fee_bps)
+                if success:
+                    filled = True
+                    fill_price = displayed_price  # Approximate
 
         if filled:
             _trading_state["trades_today"] += 1
