@@ -316,7 +316,7 @@ def _poll_signals_db():
         # Get the latest signal per pair (most recent fired_at)
         rows = conn.run(
             "SELECT DISTINCT ON (pair) pair, direction, timeframe, entry, sl, tp, fired_at "
-            "FROM signals WHERE status = 'Pending' OR fired_at > NOW() - INTERVAL '4 hours' "
+            "FROM signals WHERE status = 'Pending' OR fired_at::timestamptz > NOW() - INTERVAL '4 hours' "
             "ORDER BY pair, fired_at DESC"
         )
         cols = [c['name'] for c in conn.columns]
