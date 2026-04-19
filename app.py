@@ -1075,7 +1075,6 @@ def _place_gtc_order(slug, bet_side, token_id, stake, price_per_share, exchange_
             "signature": "0x" + signature if not signature.startswith("0x") else signature,
         },
         "orderType": "GTC",
-        "price": round(price_per_share, 4),
         "marketSlug": slug,
         "ownerId": profile_id,
     }
@@ -1332,24 +1331,39 @@ def execute_trade(parsed_market, score, prediction_id):
                     "{:.4f}".format(best_ask) if best_ask else "?",
                     "{:.4f}".format(midpoint) if midpoint else "?"))
 
-        # Calculate ceiling (max price we'll pay)
-        # Based on odds: at 85% odds, price should be ~$0.85 for YES or ~$0.15 for NO
+        # Calculate ceiling (max price we'll pay for this share)
         odds_decimal = score["bet_odds"] / 100.0
         if bet_side == "NO":
+            # NO share price = 1 - YES_price. At 91.9% NO odds, YES is ~8.1%, NO share costs ~$0.081
             displayed_price = 1.0 - odds_decimal
         else:
+            # YES share price matches odds. At 85% YES odds, share costs ~$0.85
             displayed_price = odds_decimal
 
         # Ceiling: displayed price + small buffer (never pay more than this)
-        ceiling = min(displayed_price + 0.03, 0.95)
+        ceiling = round(min(displayed_price + 0.03, 0.95), 4)
 
-        # Starting bid: midpoint or best_bid + $0.01
+        # Starting bid: use midpoint from the CORRECT side prices
+        # For NO side, bid/ask must be in NO-share terms (small numbers like 0.08-0.15)
+        # Check if the prices make sense for the bet side
+        if best_bid and best_ask:
+            # Sanity check: prices should be close to displayed_price
+            if abs(midpoint - displayed_price) > 0.30:
+                # Prices are from wrong side — invert them
+                print("Price inversion detected: mid={:.4f} vs displayed={:.4f} — inverting".format(midpoint, displayed_price))
+                best_bid = round(1.0 - best_ask, 4)
+                best_ask = round(1.0 - best_bid, 4) if best_bid < 1 else 0.01
+                midpoint = round((best_bid + best_ask) / 2, 4)
+
         if midpoint and best_bid:
             start_price = min(midpoint, best_bid + 0.01)
         elif best_bid:
             start_price = best_bid + 0.01
         elif midpoint:
             start_price = midpoint
+        elif displayed_price:
+            # Use displayed price as starting point
+            start_price = displayed_price - 0.01
         else:
             # No orderbook data — fall back to FOK
             print("No orderbook data — falling back to FOK")
