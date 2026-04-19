@@ -1936,7 +1936,7 @@ def _score_paper_trade(p, price):
         else:
             trend_aligned = (trend_dir == "SELL")
 
-        if trend_aligned and 30 <= yes_odds <= 72:
+        if trend_aligned and 20 <= yes_odds <= 72:
             bet_side = "YES"
             effective_odds = yes_odds
 
@@ -1947,7 +1947,7 @@ def _score_paper_trade(p, price):
         else:
             trend_aligned = (trend_dir == "BUY")
 
-        if trend_aligned and 30 <= no_odds <= 72:
+        if trend_aligned and 20 <= no_odds <= 72:
             bet_side = "NO"
             effective_odds = no_odds
 
@@ -2043,13 +2043,24 @@ def run_paper_scan():
 
         price_cache = {}
         count = 0
+        skipped_reasons = {"no_parse": 0, "duplicate": 0, "no_score": 0, "odds_range": 0}
         for market in markets:
             try:
                 parsed = parse_market(market)
                 if not parsed:
+                    skipped_reasons["no_parse"] += 1
                     continue
                 if parsed["market_id"] in recorded_ids:
+                    skipped_reasons["duplicate"] += 1
                     continue
+
+                # Skip markets the real bot already took (odds 73%+)
+                yes_odds = parsed["yes_odds"]
+                no_odds = 100 - yes_odds
+                if not (20 <= yes_odds <= 72 or 20 <= no_odds <= 72):
+                    skipped_reasons["odds_range"] += 1
+                    continue
+
                 asset = parsed["asset"]
                 if asset not in price_cache:
                     price_cache[asset] = get_price(asset)
@@ -2057,6 +2068,7 @@ def run_paper_scan():
 
                 scored = _score_paper_trade(parsed, price)
                 if not scored:
+                    skipped_reasons["no_score"] += 1
                     continue
 
                 # Save paper trade
@@ -2087,6 +2099,10 @@ def run_paper_scan():
 
         if count > 0:
             print("Paper trades: {} new signals recorded".format(count))
+        else:
+            print("Paper scan: 0 qualified (skip: {} no_parse, {} dup, {} odds_range, {} no_score)".format(
+                skipped_reasons["no_parse"], skipped_reasons["duplicate"],
+                skipped_reasons["odds_range"], skipped_reasons["no_score"]))
     except Exception as e:
         print("Paper scan error: {}".format(e))
 
