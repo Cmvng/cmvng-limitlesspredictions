@@ -905,15 +905,76 @@ def _fetch_orderbook(slug):
     """Fetch the live orderbook for a market from Limitless API."""
     import requests as req
     try:
+        # Try authenticated request first
+        path = "/trading/orderbook?slug={}".format(slug)
+        headers = _hmac_headers("GET", path) if _has_trading_keys() else {}
         r = req.get(
-            "{}/trading/orderbook?slug={}".format(LIMITLESS_API, slug),
+            "{}{}".format(LIMITLESS_API, path),
+            headers=headers,
             timeout=10
         )
         if r.status_code == 200:
-            return r.json()
+            data = r.json()
+            if data:
+                return data
+            print("Orderbook empty for {}".format(slug[:30]))
+        else:
+            print("Orderbook HTTP {}: {}".format(r.status_code, r.text[:100] if r.text else ""))
     except Exception as e:
         print("Orderbook fetch error: {}".format(e))
     return None
+
+def _get_best_prices_from_market(market_data, bet_side):
+    """Extract approximate best prices from market details (tradePrices/prices fields).
+    Used as fallback when orderbook endpoint returns no data."""
+    try:
+        # tradePrices has buy/sell for yes side
+        trade_prices = market_data.get("tradePrices", {})
+        prices = market_data.get("prices", [])
+
+        yes_price = None
+        no_price = None
+
+        if isinstance(prices, list) and len(prices) >= 2:
+            yes_price = float(prices[0])
+            no_price = float(prices[1])
+        elif isinstance(prices, dict):
+            yes_price = float(prices.get("yes", 0) or 0)
+            no_price = float(prices.get("no", 0) or 0)
+
+        if not yes_price and not no_price:
+            return None, None, None
+
+        # For YES side
+        if bet_side == "YES":
+            if trade_prices:
+                buy = trade_prices.get("buy", {})
+                sell = trade_prices.get("sell", {})
+                best_bid = float(buy.get("yes", 0) or 0) if isinstance(buy, dict) else None
+                best_ask = float(sell.get("yes", 0) or 0) if isinstance(sell, dict) else None
+                if best_bid and best_ask:
+                    return best_bid, best_ask, (best_bid + best_ask) / 2
+            if yes_price:
+                # Estimate spread: ±2%
+                return yes_price * 0.97, yes_price * 1.03, yes_price
+        else:
+            # NO side: invert YES prices
+            if trade_prices:
+                buy = trade_prices.get("buy", {})
+                sell = trade_prices.get("sell", {})
+                # NO buy price = 1 - YES sell price
+                yes_sell = float(sell.get("yes", 0) or 0) if isinstance(sell, dict) else None
+                yes_buy = float(buy.get("yes", 0) or 0) if isinstance(buy, dict) else None
+                if yes_sell and yes_buy:
+                    no_bid = round(1 - yes_sell, 4)  # Bid for NO = 1 - Ask for YES
+                    no_ask = round(1 - yes_buy, 4)   # Ask for NO = 1 - Bid for YES
+                    return no_bid, no_ask, (no_bid + no_ask) / 2
+            if no_price:
+                return no_price * 0.97, no_price * 1.03, no_price
+
+    except Exception as e:
+        print("Market prices parse error: {}".format(e))
+    return None, None, None
 
 def _get_best_prices(orderbook, bet_side):
     """Extract best bid and ask from orderbook for the given side (YES/NO).
@@ -1260,6 +1321,15 @@ def execute_trade(parsed_market, score, prediction_id):
         # 2. Fetch orderbook to determine pricing
         orderbook = _fetch_orderbook(slug)
         best_bid, best_ask, midpoint = _get_best_prices(orderbook, bet_side)
+
+        # Fallback: use market data prices if orderbook returned nothing
+        if best_bid is None and best_ask is None:
+            best_bid, best_ask, midpoint = _get_best_prices_from_market(market_data, bet_side)
+            if midpoint:
+                print("Using market prices (orderbook empty): bid={} ask={} mid={}".format(
+                    "{:.4f}".format(best_bid) if best_bid else "?",
+                    "{:.4f}".format(best_ask) if best_ask else "?",
+                    "{:.4f}".format(midpoint) if midpoint else "?"))
 
         # Calculate ceiling (max price we'll pay)
         # Based on odds: at 85% odds, price should be ~$0.85 for YES or ~$0.15 for NO
