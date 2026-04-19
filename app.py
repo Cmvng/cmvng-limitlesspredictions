@@ -799,13 +799,7 @@ def _sign_order(order_data, verifying_contract):
         return None
 
 def _is_safe_trading_window():
-    """Check if current time is safe for auto-trading.
-    Pauses during US session (1pm-6pm Lagos / 12:00-17:00 UTC) when
-    major economic news can cause sudden price spikes."""
-    hour = datetime.now(LAGOS_TZ).hour
-    # 1pm-6pm Lagos = danger zone (US session opens, news drops)
-    if 13 <= hour < 18:
-        return False
+    """Trading runs 24/7 — limit orders provide natural protection during volatile periods."""
     return True
 
 def execute_trade(parsed_market, score, prediction_id):
@@ -822,9 +816,8 @@ def execute_trade(parsed_market, score, prediction_id):
         print("Auto-trade skipped: kill switch active")
         return False
 
-    # US session protection — no auto-trades during 1pm-6pm Lagos
+    # Trading window check (24/7 now)
     if not _is_safe_trading_window():
-        print("Auto-trade paused: US session window (1pm-6pm Lagos) — signal-only mode")
         return False
 
     _reset_daily_counters()
@@ -1368,43 +1361,248 @@ def _evaluate_pick_result(pick, result):
     hg = int(result["home_goals"])
     ag = int(result["away_goals"])
     total = hg + ag
-    pick_type = (pick.get("pick_type") or "").lower()
+    btts = hg > 0 and ag > 0
+
+    # Combine pick_type and pick_value for flexible matching
+    pick_type = (pick.get("pick_type") or "").lower().replace(" ", "_").replace("-", "_")
     pick_value = (pick.get("pick_value") or "").lower().strip()
+    combined = "{} {}".format(pick_type, pick_value).lower()
 
     try:
-        if "over_0.5" in pick_type:
-            return total > 0 if pick_value in ("yes", "over") else total == 0
-        elif "over_1.5" in pick_type:
-            return total > 1 if pick_value in ("yes", "over") else total <= 1
-        elif "over_2.5" in pick_type:
-            return total > 2 if pick_value in ("yes", "over") else total <= 2
-        elif "over_3.5" in pick_type:
-            return total > 3 if pick_value in ("yes", "over") else total <= 3
-        elif "both_teams_score" in pick_type or "btts" in pick_type:
-            btts = hg > 0 and ag > 0
-            return btts if pick_value in ("yes",) else not btts
-        elif "match_winner" in pick_type or "winner" in pick_type:
-            if pick_value in ("home",):
+        # Over X.5 Goals
+        if "over" in combined and "goal" in combined:
+            if "0.5" in combined:
+                return total > 0
+            elif "1.5" in combined:
+                return total > 1
+            elif "2.5" in combined:
+                return total > 2
+            elif "3.5" in combined:
+                return total > 3
+            elif "4.5" in combined:
+                return total > 4
+
+        # Under X.5 Goals
+        if "under" in combined and "goal" in combined:
+            if "0.5" in combined:
+                return total == 0
+            elif "1.5" in combined:
+                return total <= 1
+            elif "2.5" in combined:
+                return total <= 2
+            elif "3.5" in combined:
+                return total <= 3
+
+        # BTTS & Over 2.5 (combined market)
+        if "btts" in combined and "over" in combined:
+            if "2.5" in combined:
+                return btts and total > 2
+            elif "3.5" in combined:
+                return btts and total > 3
+
+        # Both Teams Score / BTTS
+        if "both_teams" in combined or "btts" in combined:
+            if "yes" in pick_value or "yes" in pick_type:
+                return btts
+            elif "no" in pick_value or "no" in pick_type:
+                return not btts
+            return btts  # default to yes
+
+        # Home Win
+        if "home" in combined and "win" in combined and "to_nil" not in combined:
+            return hg > ag
+
+        # Away Win
+        if "away" in combined and "win" in combined and "to_nil" not in combined:
+            return ag > hg
+
+        # Home Win to Nil
+        if "home" in combined and "to_nil" in combined:
+            return hg > ag and ag == 0
+
+        # Away Win to Nil
+        if "away" in combined and "to_nil" in combined:
+            return ag > hg and hg == 0
+
+        # Draw
+        if pick_value == "draw" or pick_type == "draw":
+            return hg == ag
+
+        # Home or Draw / Double Chance Home
+        if ("home_or_draw" in combined or "home or draw" in combined or
+            ("double_chance" in combined and "home" in pick_value)):
+            return hg >= ag
+
+        # Away or Draw / Double Chance Away
+        if ("away_or_draw" in combined or "away or draw" in combined or
+            ("double_chance" in combined and "away" in pick_value)):
+            return ag >= hg
+
+        # Draw No Bet
+        if "draw_no_bet" in combined or "draw no bet" in combined:
+            if hg == ag:
+                return None  # Draw = refund
+            if "home" in pick_value:
                 return hg > ag
-            elif pick_value in ("away",):
+            elif "away" in pick_value:
                 return ag > hg
-            elif pick_value in ("draw",):
+
+        # Match Winner (generic)
+        if "winner" in combined or "match_winner" in combined:
+            if "home" in pick_value:
+                return hg > ag
+            elif "away" in pick_value:
+                return ag > hg
+            elif "draw" in pick_value:
                 return hg == ag
-        elif "draw_no_bet" in pick_type:
-            if pick_value in ("home",):
-                if hg == ag: return None  # draw = refund, treat as not lost
-                return hg > ag
-            elif pick_value in ("away",):
-                if hg == ag: return None
-                return ag > hg
-        elif "double_chance" in pick_type:
-            if pick_value in ("home",) or "home_or_draw" in pick_value:
-                return hg >= ag
-            elif pick_value in ("away",) or "away_or_draw" in pick_value:
-                return ag >= hg
+
+        # Over/Under goals (plain pick_type format: over_0.5, over_1.5, etc.)
+        if "over_0.5" in pick_type:
+            return total > 0
+        elif "over_1.5" in pick_type:
+            return total > 1
+        elif "over_2.5" in pick_type:
+            return total > 2
+        elif "over_3.5" in pick_type:
+            return total > 3
+
+        # Handicap (basic: home -1)
+        if "handicap" in combined:
+            if "-1" in combined and "home" in combined:
+                return (hg - 1) > ag
+            elif "-1" in combined and "away" in combined:
+                return (ag - 1) > hg
+
+        # 1st Half Over (can't evaluate without half-time data)
+        if "1st_half" in combined or "first_half" in combined or "1st half" in combined:
+            return None  # Can't check without HT data
+
+        # Cards/Corners (can't evaluate without detailed stats)
+        if "card" in combined or "corner" in combined:
+            return None
+
+        print("Unhandled pick: type='{}' value='{}'".format(pick.get("pick_type"), pick.get("pick_value")))
     except Exception as e:
         print("Evaluate error: {}".format(e))
     return None
+
+def _build_match_results_cache():
+    """Batch fetch ALL finished matches from the last 4 days. Returns dict keyed by match fragments."""
+    import requests as req
+    all_matches = []
+
+    if FOOTBALL_DATA_KEY:
+        for days_back in range(4):
+            date = (datetime.now(LAGOS_TZ) - timedelta(days=days_back)).strftime("%Y-%m-%d")
+            try:
+                r = req.get(
+                    "https://api.football-data.org/v4/matches?dateFrom={}&dateTo={}&status=FINISHED".format(date, date),
+                    headers={"X-Auth-Token": FOOTBALL_DATA_KEY},
+                    timeout=15
+                )
+                if r.status_code == 200:
+                    matches = r.json().get("matches", [])
+                    for m in matches:
+                        home = m.get("homeTeam", {}).get("name", "")
+                        away = m.get("awayTeam", {}).get("name", "")
+                        home_short = m.get("homeTeam", {}).get("shortName", "")
+                        away_short = m.get("awayTeam", {}).get("shortName", "")
+                        ft = m.get("score", {}).get("fullTime", {})
+                        if home and away and ft.get("home") is not None:
+                            all_matches.append({
+                                "home": home, "away": away,
+                                "home_short": home_short, "away_short": away_short,
+                                "home_goals": ft["home"], "away_goals": ft["away"],
+                            })
+                    print("Football results cache: {} matches on {}".format(len(matches), date))
+                elif r.status_code == 429:
+                    print("Football results: rate limited, waiting 10s")
+                    time.sleep(10)
+                else:
+                    print("Football results: HTTP {} for {}".format(r.status_code, date))
+                time.sleep(2)  # Respect rate limits
+            except Exception as e:
+                print("Football results fetch error: {}".format(e))
+
+    # Also try API-Football if available
+    api_key = os.environ.get("API_FOOTBALL_KEY", "")
+    if api_key:
+        for days_back in range(4):
+            date = (datetime.now(LAGOS_TZ) - timedelta(days=days_back)).strftime("%Y-%m-%d")
+            try:
+                r = req.get(
+                    "https://v3.football.api-sports.io/fixtures?date={}&status=FT".format(date),
+                    headers={"x-apisports-key": api_key},
+                    timeout=15
+                )
+                if r.status_code == 200:
+                    for fx in r.json().get("response", []):
+                        home = fx.get("teams", {}).get("home", {}).get("name", "")
+                        away = fx.get("teams", {}).get("away", {}).get("name", "")
+                        if home and away:
+                            all_matches.append({
+                                "home": home, "away": away,
+                                "home_short": home.split()[-1] if home else "",
+                                "away_short": away.split()[-1] if away else "",
+                                "home_goals": fx.get("goals", {}).get("home"),
+                                "away_goals": fx.get("goals", {}).get("away"),
+                            })
+                time.sleep(1)
+            except:
+                pass
+
+    print("Football results cache: {} total finished matches loaded".format(len(all_matches)))
+    return all_matches
+
+
+def _match_result_from_cache(match_name, cache):
+    """Find a match result from cache using fuzzy team name matching."""
+    if not match_name:
+        return None
+
+    parts = match_name.split(" vs ")
+    if len(parts) < 2:
+        return None
+
+    search_home = parts[0].strip().lower()
+    search_away = parts[1].strip().lower()
+
+    def get_fragments(name):
+        if not name:
+            return set()
+        frags = set()
+        name_lower = name.lower().strip()
+        frags.add(name_lower)
+        words = name_lower.split()
+        for w in words:
+            if w not in ("fc", "cf", "sc", "ac", "afc", "vs", "de", "la", "el", "1.", "fsv"):
+                if len(w) >= 3:
+                    frags.add(w)
+        return frags
+
+    home_frags = get_fragments(search_home)
+    away_frags = get_fragments(search_away)
+
+    if not home_frags or not away_frags:
+        return None
+
+    for m in cache:
+        api_home_frags = get_fragments(m["home"]) | get_fragments(m.get("home_short", ""))
+        api_away_frags = get_fragments(m["away"]) | get_fragments(m.get("away_short", ""))
+
+        home_match = bool(home_frags & api_home_frags)
+        away_match = bool(away_frags & api_away_frags)
+
+        if home_match and away_match:
+            if m.get("home_goals") is not None:
+                return {
+                    "home": m["home"], "away": m["away"],
+                    "home_goals": m["home_goals"], "away_goals": m["away_goals"],
+                    "status": "finished",
+                }
+
+    return None
+
 
 def check_football_outcomes():
     """Auto-resolve football picks by fetching match results."""
@@ -1424,7 +1622,7 @@ def check_football_outcomes():
 
         now = datetime.now(timezone.utc)
 
-        # Filter to only picks whose matches should have finished
+        # Filter to only picks whose matches should have finished (2+ hours past kickoff)
         ready_picks = []
         for p in picks:
             ko = p.get("kickoff_time", "")
@@ -1440,34 +1638,50 @@ def check_football_outcomes():
             ready_picks.append(p)
 
         if not ready_picks:
+            print("Football outcomes: {} pending picks, none ready yet (all < 2hrs past kickoff)".format(len(picks)))
             return
 
-        print("Football outcomes: {} picks ready to check".format(len(ready_picks)))
+        print("Football outcomes: {} pending, {} ready to check".format(len(picks), len(ready_picks)))
 
-        # Cache results per match to avoid duplicate API calls
-        result_cache = {}
+        # Batch fetch ALL results ONCE — avoids rate limit issues
+        results_cache = _build_match_results_cache()
+
+        if not results_cache:
+            print("Football outcomes: no finished matches found from APIs — check FOOTBALL_DATA_KEY")
+            return
+
+        # Get unique match IDs to avoid duplicate lookups
+        unique_matches = {}
+        for p in ready_picks:
+            mid = p.get("match_id", "")
+            if mid and mid not in unique_matches:
+                unique_matches[mid] = _match_result_from_cache(mid, results_cache)
+
+        matched = sum(1 for v in unique_matches.values() if v is not None)
+        print("Football outcomes: {}/{} unique matches found results".format(matched, len(unique_matches)))
+
+        # Log unmatched for debugging
+        for mid, res in unique_matches.items():
+            if res is None:
+                print("  Unmatched: {}".format(mid[:60]))
+
         resolved_count = 0
-
         for p in ready_picks:
             try:
                 match_id = p.get("match_id", "")
                 if not match_id:
                     continue
 
-                # Use cache if we already fetched this match
-                if match_id not in result_cache:
-                    result_cache[match_id] = _fetch_match_result(match_id)
-                    time.sleep(0.5)
-
-                result = result_cache[match_id]
+                result = unique_matches.get(match_id)
                 if not result:
+                    # Mark as 'Needs Check' if > 48h past kickoff and still no result
                     ko = p.get("kickoff_time", "")
                     if ko:
                         try:
                             ko_dt = datetime.fromisoformat(ko.replace("Z", "+00:00"))
                             if ko_dt.tzinfo is None:
                                 ko_dt = ko_dt.replace(tzinfo=timezone.utc)
-                            if now > ko_dt + timedelta(hours=24):
+                            if now > ko_dt + timedelta(hours=48):
                                 conn2 = get_db()
                                 conn2.run("UPDATE football_picks SET status='Needs Check' WHERE id=:i", i=p["id"])
                                 conn2.close()
@@ -1477,6 +1691,8 @@ def check_football_outcomes():
 
                 won = _evaluate_pick_result(p, result)
                 if won is None:
+                    print("Football #{}: can't evaluate pick_type={} pick_value={}".format(
+                        p["id"], p.get("pick_type"), p.get("pick_value")))
                     continue
 
                 status = "✅ Won" if won else "❌ Lost"
@@ -1489,7 +1705,7 @@ def check_football_outcomes():
                 conn2.close()
                 resolved_count += 1
                 print("Football #{} -> {} ({}-{}) {}".format(
-                    p["id"], outcome, result.get("home_goals"), result.get("away_goals"), match_id[:40]))
+                    p["id"], outcome, result.get("home_goals"), result.get("away_goals"), match_id[:50]))
 
                 try:
                     emoji = "✅" if won else "❌"
@@ -1510,6 +1726,8 @@ def check_football_outcomes():
 
         if resolved_count > 0:
             print("Auto-resolved {} football picks".format(resolved_count))
+        else:
+            print("Football outcomes: 0 resolved this cycle")
     except Exception as e:
         print("Football outcome check error: {}".format(e))
 
@@ -2806,7 +3024,7 @@ def trading_status():
         "balance": balance,
         "safe_window": _is_safe_trading_window(),
         "current_hour_lagos": datetime.now(LAGOS_TZ).hour,
-        "mode": "AUTO-TRADING" if _trading_state["enabled"] and _is_safe_trading_window() else "SIGNALS ONLY (US session)" if _trading_state["enabled"] and not _is_safe_trading_window() else "STOPPED (kill switch)",
+        "mode": "AUTO-TRADING 24/7" if _trading_state["enabled"] else "STOPPED (kill switch)",
         "daily_loss": _trading_state["daily_loss"],
         "daily_profit": _trading_state["daily_profit"],
         "trades_today": _trading_state["trades_today"],
@@ -2814,7 +3032,7 @@ def trading_status():
         "medium_pct": _trading_state["medium_pct"],
         "daily_loss_limit_pct": _trading_state["daily_loss_limit_pct"],
         "has_keys": _has_trading_keys(),
-        "schedule": "AUTO: 6am-1pm & 6pm-6am Lagos | SIGNALS ONLY: 1pm-6pm Lagos",
+        "schedule": "24/7 — no session pauses",
     }, 200
 
 @app.route("/trading/set", methods=["GET"])
