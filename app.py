@@ -2457,15 +2457,8 @@ def run_otp_scan():
         return 0
 
 def otp_loop():
-    """Run OTP scan every 30 minutes"""
-    time.sleep(90)
-    while True:
-        try:
-            if is_lagos_window():
-                run_otp_scan()
-        except Exception as e:
-            print("OTP loop: {}".format(e))
-        time.sleep(1800)  # 30 min
+    """OTP scanning disabled — focus on accumulator tiers only"""
+    return
 
 def save_accumulator_picks(accas):
     """Save accumulator picks to DB — wipes ALL old pending when new batch arrives.
@@ -3304,7 +3297,7 @@ tbody tr:hover{background:var(--bg)}
   <div class="stat"><div class="stat-label">3x Slips</div><div class="stat-value" style="color:var(--warning)">{{ stats.medium_slips_count }}</div></div>
   <div class="stat"><div class="stat-label">10x Slips</div><div class="stat-value" style="color:var(--accent)">{{ stats.value_slips_count }}</div></div>
   <div class="stat"><div class="stat-label">100x Slips</div><div class="stat-value" style="color:var(--mega)">{{ stats.mega_slips_count }}</div></div>
-  <div class="stat"><div class="stat-label">OTP Picks</div><div class="stat-value">{{ otp_picks|length }}</div></div>
+  <div class="stat"><div class="stat-label">Total Picks</div><div class="stat-value">{{ acca_total }}</div></div>
 </div>
 
 {% if not has_keys %}
@@ -3413,51 +3406,11 @@ tbody tr:hover{background:var(--bg)}
 
 {% endif %}
 
-<!-- Off The Pitch Section -->
-<div class="section-head">
-  <div><span class="section-title">Off The Pitch · Limitless</span></div>
-  <button class="btn btn-primary" onclick="fetch('/otp/scan').then(r=>r.json()).then(d=>alert('OTP scan triggered. Wait ~30s then refresh.'))">◎ Scan OTP</button>
-</div>
+<!-- Daily Results Section below -->
 
-{% if otp_picks %}
-<div class="otp-wrap">
-  <div class="table-scroll">
-    <table>
-      <thead><tr>
-        <th>Market</th><th>Pick</th><th>Odds</th><th>Conf</th><th>Reasoning</th><th>Status</th>
-      </tr></thead>
-      <tbody>
-        {% for p in otp_picks %}
-        <tr>
-          <td style="font-weight:500;color:var(--ink);max-width:360px" title="{{ p.match_id }}">
-            {% if p.away_team %}
-              <a href="https://limitless.exchange/markets/{{ p.away_team }}" target="_blank" style="color:var(--ink);text-decoration:none">{{ p.match_id }}</a>
-            {% else %}
-              {{ p.match_id }}
-            {% endif %}
-          </td>
-          <td><span class="pick-value">{{ p.pick_value }}</span></td>
-          <td style="font-family:var(--mono);font-weight:600">{{ "%.1f"|format(p.implied_odds) }}%</td>
-          <td><span class="pick-conf">{{ p.confidence|int }}%</span></td>
-          <td style="color:var(--ink-3);font-size:12px;max-width:280px">{{ p.reasoning }}</td>
-          <td><span class="status-chip status-{{ p.status|lower|replace(' ', '-')|replace('✅', 'won')|replace('❌', 'lost') }}">{{ p.status }}</span></td>
-        </tr>
-        {% endfor %}
-      </tbody>
-    </table>
-  </div>
-</div>
-{% else %}
-<div class="empty">
-  <div class="empty-mark">⚽</div>
-  <h3>No OTP picks yet</h3>
-  <p>The Off The Pitch scanner pulls football prop markets from Limitless every 30 minutes. If the scanner runs but finds nothing, no sports markets are live in that window. Tap <b>Scan OTP</b> to trigger a manual scan now.</p>
-</div>
-{% endif %}
-
-<!-- History Section -->
+<!-- History Section — Daily Results by Tier -->
 <div class="section-head">
-  <div><span class="section-title">Performance Tracker</span></div>
+  <div><span class="section-title">Accumulator Results</span></div>
   <button class="btn" onclick="fetch('/football/scan').then(()=>alert('Football scan triggered'))">⚡ Manual Scan</button>
 </div>
 
@@ -3478,30 +3431,57 @@ tbody tr:hover{background:var(--bg)}
   {% endfor %}
 </div>
 
-{% if history_picks %}
-<div class="hist-wrap">
-  <div class="table-scroll">
-    <table>
-      <thead><tr>
-        <th>Match</th><th>League</th><th>Tier</th><th>Pick</th><th>Conf</th><th>Reasoning</th><th>Outcome</th><th>Resolved</th>
-      </tr></thead>
-      <tbody>
-        {% for p in history_picks %}
-        <tr>
-          <td style="font-weight:500;color:var(--ink);max-width:220px">{{ p.match_id }}</td>
-          <td style="font-family:var(--mono);font-size:11px;color:var(--ink-3)">{{ p.competition or "—" }}</td>
-          <td><span class="tier-badge">{{ p.accumulator_tier or "otp" }}</span></td>
-          <td><span class="pick-value">{{ p.pick_value or "—" }}</span> <small style="color:var(--ink-4)">{{ (p.pick_type or "").replace("_", " ")[:25] }}</small></td>
-          <td><span class="pick-conf">{{ p.confidence|int }}%</span></td>
-          <td style="color:var(--ink-3);font-size:12px;max-width:200px">{{ p.reasoning or "—" }}</td>
-          <td><span class="status-chip {{ 'status-won' if '✅' in (p.status or '') else 'status-lost' }}">{{ p.status }}</span></td>
-          <td style="font-family:var(--mono);font-size:11px;color:var(--ink-4)">{{ p.resolved_at[:16].replace("T"," ") if p.resolved_at else "—" }}</td>
-        </tr>
-        {% endfor %}
-      </tbody>
-    </table>
+<!-- Daily Results grouped by date -->
+{% if daily_results %}
+{% for day in daily_results %}
+<div class="tier-section">
+  <div class="tier-header">
+    <div>
+      <div class="tier-title">📅 {{ day.date_label }}</div>
+      <div class="tier-desc">{{ day.total_picks }} picks · {{ day.wins }} won · {{ day.losses }} lost · {{ day.pending }} pending</div>
+    </div>
   </div>
 </div>
+
+<div class="slips-grid">
+{% for tier in day.tiers %}
+<div class="slip slip-{{ tier.css_class }}" style="border-top:3px solid {{ tier.color }}">
+  <div class="slip-head" style="{% if tier.acca_result == 'WIN' %}background:var(--positive-bg){% elif tier.acca_result == 'LOSS' %}background:var(--negative-bg){% else %}background:var(--bg-subtle){% endif %}">
+    <div class="slip-label">{{ tier.label }}
+      {% if tier.acca_result == 'WIN' %}<span class="status-chip status-won">✅ ACCA WON</span>
+      {% elif tier.acca_result == 'LOSS' %}<span class="status-chip status-lost">❌ ACCA LOST</span>
+      {% else %}<span class="status-chip status-pending">⏳ Pending</span>{% endif %}
+    </div>
+    <div class="slip-odds">{{ tier.picks|length }} picks</div>
+  </div>
+  <div class="slip-body">
+    {% for pick in tier.picks %}
+    <div class="match-row" style="{% if pick.outcome == 'WIN' %}background:var(--positive-bg){% elif pick.outcome == 'LOSS' %}background:var(--negative-bg){% endif %}">
+      <div class="match-teams">
+        {% if pick.outcome == 'WIN' %}✅{% elif pick.outcome == 'LOSS' %}❌{% else %}⏳{% endif %}
+        {{ pick.match_id or (pick.home_team ~ " vs " ~ pick.away_team) }}
+      </div>
+      {{ match_meta(pick) }}
+      <div class="pick-line">
+        <span class="pick-value">{{ pick.pick_value or "—" }}</span>
+        {% if pick.implied_odds %}<span style="font-family:var(--mono);font-size:11px;color:var(--ink-3)">@ {{ "%.2f"|format(pick.implied_odds) }}</span>{% endif %}
+        <span class="pick-conf" style="margin-left:auto">{{ pick.confidence|int }}%</span>
+        {% if pick.outcome == 'LOSS' %}<span style="font-size:11px;color:var(--negative);font-weight:600">← Failed</span>{% endif %}
+      </div>
+    </div>
+    {% endfor %}
+  </div>
+</div>
+{% endfor %}
+</div>
+{% endfor %}
+{% else %}
+<div class="empty">
+  <div class="empty-mark">📊</div>
+  <h3>No results yet</h3>
+  <p>Results will appear here once matches have been played and resolved. Each day shows which accumulators won and which picks caused losses.</p>
+</div>
+{% endif %}
 {% else %}
 <div class="empty" style="padding:32px">
   <p>No resolved picks yet. Results appear here after matches finish (checked every 5 minutes, 2 hours after kickoff).</p>
@@ -3973,6 +3953,94 @@ def football_page():
         perf[k]["rate"] = round(perf[k]["w"] / total * 100, 1) if total > 0 else 0
         perf[k]["total"] = total
 
+    # Build daily results — resolved picks grouped by date and tier
+    daily_results = []
+    try:
+        conn4 = get_db()
+        # Get all resolved accumulator picks from last 14 days
+        hist_rows = conn4.run(
+            "SELECT * FROM football_picks "
+            "WHERE accumulator_tier IN ('safe_2x','medium_3x','value_10x','mega_100x') "
+            "AND fired_at IS NOT NULL "
+            "ORDER BY fired_at DESC"
+        )
+        hist_cols = [c['name'] for c in conn4.columns]
+        all_hist = [dict(zip(hist_cols, r)) for r in hist_rows]
+        conn4.close()
+
+        # Group by date (from fired_at)
+        from collections import defaultdict
+        days = defaultdict(list)
+        for p in all_hist:
+            fa = p.get("fired_at") or ""
+            date_key = fa[:10] if len(fa) >= 10 else "Unknown"
+            days[date_key].append(p)
+
+        tier_config = {
+            "safe_2x":   {"label": "🟢 2x Safe",    "css_class": "safe",   "color": "var(--positive)"},
+            "medium_3x": {"label": "🟡 3x Medium",  "css_class": "medium", "color": "var(--warning)"},
+            "value_10x": {"label": "🔥 10x Value",   "css_class": "value",  "color": "var(--accent)"},
+            "mega_100x": {"label": "🚀 100x Mega",   "css_class": "mega",   "color": "var(--mega)"},
+        }
+
+        for date_key in sorted(days.keys(), reverse=True)[:14]:
+            day_picks = days[date_key]
+            day_wins = sum(1 for p in day_picks if p.get("outcome") == "WIN")
+            day_losses = sum(1 for p in day_picks if p.get("outcome") == "LOSS")
+            day_pending = sum(1 for p in day_picks if p.get("outcome") not in ("WIN", "LOSS"))
+
+            # Group by tier within this day
+            tiers_data = []
+            for tier_key in ["safe_2x", "medium_3x", "value_10x", "mega_100x"]:
+                tier_picks = [p for p in day_picks if p.get("accumulator_tier") == tier_key]
+                if not tier_picks:
+                    continue
+
+                # Determine accumulator result:
+                # ACCA WINS only if ALL picks in the tier won
+                # ACCA LOSES if ANY pick lost
+                # Pending if some haven't resolved yet
+                has_loss = any(p.get("outcome") == "LOSS" for p in tier_picks)
+                all_resolved = all(p.get("outcome") in ("WIN", "LOSS") for p in tier_picks)
+                all_won = all(p.get("outcome") == "WIN" for p in tier_picks)
+
+                if has_loss:
+                    acca_result = "LOSS"
+                elif all_won and all_resolved:
+                    acca_result = "WIN"
+                else:
+                    acca_result = "PENDING"
+
+                tc = tier_config.get(tier_key, {})
+                tiers_data.append({
+                    "tier_key": tier_key,
+                    "label": tc.get("label", tier_key),
+                    "css_class": tc.get("css_class", "safe"),
+                    "color": tc.get("color", "var(--ink)"),
+                    "picks": tier_picks,
+                    "acca_result": acca_result,
+                })
+
+            if tiers_data:
+                # Format date label
+                try:
+                    dt = datetime.strptime(date_key, "%Y-%m-%d")
+                    date_label = dt.strftime("%A, %B %d, %Y")
+                except:
+                    date_label = date_key
+
+                daily_results.append({
+                    "date_key": date_key,
+                    "date_label": date_label,
+                    "total_picks": len(day_picks),
+                    "wins": day_wins,
+                    "losses": day_losses,
+                    "pending": day_pending,
+                    "tiers": tiers_data,
+                })
+    except Exception as e:
+        print("Daily results error: {}".format(e))
+
     return render_template_string(
         FOOTBALL_HTML,
         has_keys=has_keys,
@@ -3985,6 +4053,7 @@ def football_page():
         stats=stats,
         acca_total=acca_total,
         perf=perf,
+        daily_results=daily_results,
     )
 
 # ═══════════════════════════════════════════════════════════
