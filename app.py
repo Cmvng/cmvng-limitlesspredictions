@@ -14,6 +14,7 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 DATABASE_URL     = os.environ.get("DATABASE_URL", "")
 ANTHROPIC_KEY    = os.environ.get("ANTHROPIC_API_KEY", "")
 FOOTBALL_DATA_KEY = os.environ.get("FOOTBALL_DATA_KEY", "")
+SIGNALS_DB_URL   = os.environ.get("SIGNALS_DB_URL", "")  # DB URL of the TradingView signal bot
 
 # Auto-trading credentials (HMAC auth + EIP-712 signing)
 LIMITLESS_TOKEN_ID     = os.environ.get("LIMITLESS_TOKEN_ID", "")      # from Derive Token
@@ -293,6 +294,77 @@ def get_asset_trend(asset, market_timeframe_hours):
     if btc_trend:
         return {"direction": btc_trend, "confidence": "MEDIUM", "source": "btc fallback"}
     return {"direction": None, "confidence": "LOW", "source": "no data"}
+
+def _poll_signals_db():
+    """Read latest signals from the TradingView signal bot's database.
+    Updates _tv_trends with the latest BUY/SELL direction per pair.
+    Only reads — never writes to the other bot's DB."""
+    if not SIGNALS_DB_URL:
+        return
+    try:
+        import urllib.parse
+        db_url = SIGNALS_DB_URL.replace('postgres://', 'postgresql://')
+        url = urllib.parse.urlparse(db_url)
+        conn = pg8000.native.Connection(
+            host=url.hostname,
+            port=url.port or 5432,
+            database=url.path.lstrip('/'),
+            user=url.username,
+            password=url.password,
+            ssl_context=True
+        )
+        # Get the latest signal per pair (most recent fired_at)
+        rows = conn.run(
+            "SELECT DISTINCT ON (pair) pair, direction, timeframe, entry, sl, tp, fired_at "
+            "FROM signals WHERE status = 'Pending' OR fired_at > NOW() - INTERVAL '4 hours' "
+            "ORDER BY pair, fired_at DESC"
+        )
+        cols = [c['name'] for c in conn.columns]
+        signals = [dict(zip(cols, r)) for r in rows]
+        conn.close()
+
+        updated = 0
+        for s in signals:
+            pair = (s.get("pair") or "").upper()
+            direction = (s.get("direction") or "").upper()
+            if not pair or direction not in ("BUY", "SELL"):
+                continue
+            # Extract asset: BTCUSD → BTC, XAUUSD → XAU
+            asset = pair.replace("USD", "").replace("USDT", "")
+            if not asset:
+                asset = pair
+
+            fired_at = s.get("fired_at") or ""
+            if isinstance(fired_at, datetime):
+                fired_at = fired_at.isoformat()
+
+            _tv_trends[asset] = {
+                "dir": direction,
+                "tf": (s.get("timeframe") or "").upper(),
+                "entry": float(s["entry"]) if s.get("entry") else None,
+                "sl": float(s["sl"]) if s.get("sl") else None,
+                "tp": float(s["tp"]) if s.get("tp") else None,
+                "updated": fired_at,
+                "pair": pair,
+                "source": "signals_db",
+            }
+            updated += 1
+
+        if updated > 0:
+            trend_summary = ", ".join("{}={}".format(k, v["dir"]) for k, v in _tv_trends.items())
+            print("Signals DB: {} pairs updated — {}".format(updated, trend_summary))
+    except Exception as e:
+        print("Signals DB poll error: {}".format(e))
+
+def _signals_poll_loop():
+    """Background thread: poll signals DB every 5 minutes."""
+    time.sleep(60)  # Wait for startup
+    while True:
+        try:
+            _poll_signals_db()
+        except Exception as e:
+            print("Signals poll loop error: {}".format(e))
+        time.sleep(300)  # 5 minutes
 
 def is_lagos_window():
     hour = datetime.now(LAGOS_TZ).hour
@@ -4986,7 +5058,11 @@ threading.Thread(target=scan_loop, daemon=True).start()
 threading.Thread(target=outcome_loop, daemon=True).start()
 threading.Thread(target=football_loop, daemon=True).start()
 threading.Thread(target=otp_loop, daemon=True).start()
-print("Limitless Bot v3 — 3 threads running")
+if SIGNALS_DB_URL:
+    threading.Thread(target=_signals_poll_loop, daemon=True).start()
+    print("Limitless Bot v4 — 5 threads running (signals DB connected)")
+else:
+    print("Limitless Bot v4 — 4 threads running (no signals DB — set SIGNALS_DB_URL to connect)")
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
