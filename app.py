@@ -885,64 +885,13 @@ def _get_limitless_profile_id():
     return None
 
 def _get_limitless_balance():
-    """Fetch USDC balance from Limitless.
-    Tries multiple endpoints since the API structure varies."""
-    import requests as req
-    try:
-        # First get our wallet address from the private key
-        try:
-            from eth_account import Account
-            account = Account.from_key(LIMITLESS_PRIV_KEY)
-            wallet_addr = account.address
-        except Exception:
-            print("Balance: can't derive wallet address from private key")
-            return _trading_state.get("last_balance")
-
-        # Try 1: Get profile which may include balance info
-        path = "/profiles/{}".format(wallet_addr)
-        headers = _hmac_headers("GET", path)
-        r = req.get("{}{}".format(LIMITLESS_API, path), headers=headers, timeout=10)
-        if r.status_code == 200:
-            data = r.json()
-            # Store profile ID for later use
-            _trading_state["profile_id"] = data.get("id")
-            _trading_state["wallet_addr"] = wallet_addr
-
-        # Try 2: Trading allowance endpoint
-        for try_path in ["/trading/allowance", "/portfolio/trading-allowance", "/allowance"]:
-            try:
-                h = _hmac_headers("GET", try_path)
-                r2 = req.get("{}{}".format(LIMITLESS_API, try_path), headers=h, timeout=10)
-                if r2.status_code == 200:
-                    data2 = r2.json()
-                    bal = data2.get("balance") or data2.get("allowance") or data2.get("available")
-                    if bal is not None:
-                        balance = float(bal) / 1e6 if float(bal) > 1000 else float(bal)
-                        _trading_state["last_balance"] = balance
-                        print("Balance: ${:.2f} (from {})".format(balance, try_path))
-                        return balance
-            except:
-                continue
-
-        # Try 3: Locked balance endpoint (shows how much is in open orders)
-        path3 = "/trading/locked-balance"
-        h3 = _hmac_headers("GET", path3)
-        r3 = req.get("{}{}".format(LIMITLESS_API, path3), headers=h3, timeout=10)
-        if r3.status_code == 200:
-            print("Locked balance response: {}".format(r3.text[:200]))
-
-        # If we can't get balance from API, use a manual fallback
-        # The user sets their starting balance, and we track P&L from there
-        if _trading_state.get("last_balance") is None:
-            # Default starting balance — user should update via /trading/set?balance=20
-            _trading_state["last_balance"] = _trading_state.get("starting_balance", 20.0)
-            print("Balance: using manual balance ${:.2f} (API endpoints not found)".format(
-                _trading_state["last_balance"]))
-
-        return _trading_state.get("last_balance")
-    except Exception as e:
-        print("Balance error: {}".format(e))
-        return _trading_state.get("last_balance") or _trading_state.get("starting_balance", 20.0)
+    """Return Bot 1's tracked balance. Never fetches from wallet/API to avoid
+    overwriting with total wallet balance that includes all bots."""
+    bal = _trading_state.get("last_balance")
+    if bal is None:
+        bal = _trading_state.get("starting_balance", 20.0)
+        _trading_state["last_balance"] = bal
+    return bal
 
 def _fetch_market_details(slug):
     """Fetch full market details including venue and positionIds.
@@ -1961,15 +1910,18 @@ def _auto_redeem_positions():
                 raw_bal = usdc_contract.functions.balanceOf(Web3.to_checksum_address(wallet)).call()
                 on_chain_balance = raw_bal / 1e6
                 if on_chain_balance > 0:
-                    _trading_state["last_balance"] = round(on_chain_balance, 2)
-                    print("Balance updated after redeem: ${:.2f}".format(on_chain_balance))
+                    # Log wallet balance but do NOT overwrite Bot 1's tracked balance
+                    # Each bot tracks its own balance separately
+                    print("Wallet balance after redeem: ${:.2f}".format(on_chain_balance))
 
-                    # Auto-resume Bot 1 if balance is back above floor
+                    # Auto-resume Bot 1 only if its TRACKED balance is above floor
+                    # (wins from record_trade_outcome update last_balance correctly)
                     floor1 = _trading_state.get("floor_balance", 0)
-                    if not _trading_state["enabled"] and on_chain_balance > floor1 + _trading_state["min_stake"]:
+                    bot1_bal = _trading_state.get("last_balance") or _trading_state.get("starting_balance", 0)
+                    if not _trading_state["enabled"] and bot1_bal > floor1 + _trading_state["min_stake"]:
                         _trading_state["enabled"] = True
-                        print("Bot1 AUTO-RESUMED after redeem: ${:.2f} above floor ${:.2f}".format(on_chain_balance, floor1))
-                        send_telegram("🟢 <b>Bot 1 auto-resumed after redeem</b>\nBalance: ${:.2f} (floor: ${:.2f})".format(on_chain_balance, floor1))
+                        print("Bot1 AUTO-RESUMED: tracked balance ${:.2f} above floor ${:.2f}".format(bot1_bal, floor1))
+                        send_telegram("🟢 <b>Bot 1 auto-resumed</b>\nBalance: ${:.2f} (floor: ${:.2f})".format(bot1_bal, floor1))
             except Exception as be:
                 print("Balance update after redeem failed: {}".format(be))
     except Exception as e:
