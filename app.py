@@ -1781,19 +1781,22 @@ def execute_trade(parsed_market, score, prediction_id):
 def record_trade_outcome(prediction_id, won, stake_amount):
     """Record win/loss for daily P&L tracking and update balance."""
     if won:
-        # Winning: shares pay $1 each. Profit = payout - stake
-        # At avg 85% odds: bought at $0.85, pays $1 → profit = $0.15/share
-        # But we track by stake: if we staked $3 at 85%, we get back $3.53
-        # For simplicity: add back the full stake + estimated profit
-        payout = stake_amount / 0.85  # approximate — shares bought at ~85% pay $1
+        payout = stake_amount / 0.85
         profit = payout - stake_amount
         _trading_state["daily_profit"] += profit
         _trading_state["last_balance"] = round(
             (_trading_state.get("last_balance") or 0) + payout, 2)
         print("Trade #{} WON: stake ${:.2f}, payout ${:.2f}, profit ${:.2f}, balance ${:.2f}".format(
             prediction_id, stake_amount, payout, profit, _trading_state["last_balance"]))
+
+        # Auto-resume if wins bring balance back above floor
+        floor1 = _trading_state.get("floor_balance", 0)
+        bal1 = _trading_state.get("last_balance", 0)
+        if not _trading_state["enabled"] and bal1 > floor1 + _trading_state["min_stake"]:
+            _trading_state["enabled"] = True
+            print("Bot1 AUTO-RESUMED: balance ${:.2f} above floor ${:.2f}".format(bal1, floor1))
+            send_telegram("🟢 <b>Bot 1 auto-resumed</b>\nBalance: ${:.2f} (floor: ${:.2f})".format(bal1, floor1))
     else:
-        # Losing: shares are worthless. Stake already subtracted when trade was placed.
         _trading_state["daily_loss"] += stake_amount
         print("Trade #{} LOST: stake ${:.2f}, balance ${:.2f}".format(
             prediction_id, stake_amount, _trading_state["last_balance"]))
@@ -2716,12 +2719,19 @@ def _resolve_paper_table(table_name):
                 resolved += 1
 
                 # Update Bot 3 balance for paper3_trades
-                if table_name == "paper3_trades" and _bot3_state["enabled"]:
+                if table_name == "paper3_trades":
                     if won:
                         _bot3_state["balance"] = round(_bot3_state["balance"] + payout, 2)
                         _bot3_state["daily_profit"] = round(_bot3_state["daily_profit"] + (payout - stake), 2)
                     else:
                         _bot3_state["daily_loss"] = round(_bot3_state["daily_loss"] + stake, 2)
+
+                    # Auto-resume if wins bring balance back above floor
+                    floor3 = _bot3_state.get("floor_balance", 0)
+                    if not _bot3_state["enabled"] and _bot3_state["balance"] > floor3 + _bot3_state["min_stake"]:
+                        _bot3_state["enabled"] = True
+                        print("Bot3 AUTO-RESUMED: balance ${:.2f} above floor ${:.2f}".format(_bot3_state["balance"], floor3))
+                        send_telegram("🟢 <b>Bot 3 auto-resumed</b>\nBalance: ${:.2f} (floor: ${:.2f})".format(_bot3_state["balance"], floor3))
 
                     emoji = "✅" if won else "❌"
                     send_telegram(
@@ -3101,6 +3111,13 @@ def resolve_paper_trades():
                     _bot2_state["daily_profit"] = round(_bot2_state["daily_profit"] + (payout - stake), 2)
                 else:
                     _bot2_state["daily_loss"] = round(_bot2_state["daily_loss"] + stake, 2)
+
+                # Auto-resume if wins bring balance back above floor
+                floor2 = _bot2_state.get("floor_balance", 0)
+                if not _bot2_state["enabled"] and _bot2_state["balance"] > floor2 + _bot2_state["min_stake"]:
+                    _bot2_state["enabled"] = True
+                    print("Bot2 AUTO-RESUMED: balance ${:.2f} above floor ${:.2f}".format(_bot2_state["balance"], floor2))
+                    send_telegram("🟢 <b>Bot 2 auto-resumed</b>\nBalance: ${:.2f} (floor: ${:.2f})".format(_bot2_state["balance"], floor2))
 
                 # Telegram notification for Bot 2 trades
                 emoji = "✅" if won else "❌"
