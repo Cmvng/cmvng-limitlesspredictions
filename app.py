@@ -1067,6 +1067,19 @@ def _is_safe_trading_window():
     """Trading runs 24/7 — limit orders provide natural protection during volatile periods."""
     return True
 
+def _is_volatile_window():
+    """Check if current time is in a volatile period where Bot 2/3 should pause.
+    Volatile periods (UTC):
+      00:00-01:00 — daily candle close, funding rates, low liquidity
+      13:00-15:00 — US market open, Fed news, economic data
+    """
+    utc_hour = datetime.now(timezone.utc).hour
+    if 0 <= utc_hour < 1:
+        return True
+    if 13 <= utc_hour < 15:
+        return True
+    return False
+
 def _fetch_orderbook(slug):
     """Fetch the live orderbook for a market from Limitless API."""
     import requests as req
@@ -2644,8 +2657,9 @@ def run_paper34_scan():
                             print("Paper3 save error: {}".format(e))
 
                         # Place REAL trade via Bot 3 (if enabled and above floor)
+                        # Skip volatile periods (US open 13-15 UTC, daily close 00-01 UTC)
                         floor3 = _bot3_state.get("floor_balance", 0)
-                        if _bot3_state["enabled"] and _bot3_state["balance"] > floor3:
+                        if _bot3_state["enabled"] and _bot3_state["balance"] > floor3 and not _is_volatile_window():
                             real_stake3 = _calc_bot_stake(_bot3_state)
                             if real_stake3 <= 0:
                                 _bot3_state["enabled"] = False
@@ -2960,6 +2974,10 @@ def run_paper_scan():
         if not _bot2_state["enabled"]:
             return
         if not _has_trading_keys():
+            return
+
+        # Skip volatile periods (US open 13-15 UTC, daily close 00-01 UTC)
+        if _is_volatile_window():
             return
 
         # Check floor balance
