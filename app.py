@@ -1478,13 +1478,10 @@ def _place_fok_order(slug, bet_side, token_id, stake, exchange_addr, profile_id,
         print("FOK error: {}".format(e))
         return False
 
-def execute_trade(parsed_market, score, prediction_id):
-    """Execute a trade using aggressive bidding:
-    1. Check orderbook for best bid/ask
-    2. Place GTC limit at fair price (midpoint or best_bid + 1¢)
-    3. Every 5 seconds, check if filled or topped → outbid
-    4. After 30 seconds if not filled → FOK at the ask (if under ceiling)
-    5. Never pay above ceiling price
+def execute_trade(parsed_market, score, prediction_id, override_stake=None):
+    """Execute a trade using aggressive bidding.
+    If override_stake is provided, uses that exact amount (for Bot 2/3).
+    If None, uses Bot 1's state to calculate stake.
     """
     import requests as req
 
@@ -1492,43 +1489,41 @@ def execute_trade(parsed_market, score, prediction_id):
         print("Auto-trade skipped: missing trading credentials")
         return False
 
-    if not _trading_state["enabled"]:
-        print("Auto-trade skipped: kill switch active")
-        return False
+    # If called by Bot 2/3 with override_stake, skip Bot 1 checks
+    if override_stake is None:
+        if not _trading_state["enabled"]:
+            print("Auto-trade skipped: kill switch active")
+            return False
 
-    if not _is_safe_trading_window():
-        return False
+        if not _is_safe_trading_window():
+            return False
 
-    _reset_daily_counters()
+        _reset_daily_counters()
 
-    # Check daily loss limit
-    balance = _get_limitless_balance()
-    if balance is None:
-        print("Auto-trade skipped: cannot fetch balance")
-        return False
+        # Check daily loss limit
+        balance = _get_limitless_balance()
+        if balance is None:
+            print("Auto-trade skipped: cannot fetch balance")
+            return False
 
-    daily_limit = balance * _trading_state["daily_loss_limit_pct"]
-    if _trading_state["daily_loss"] >= daily_limit:
-        print("Auto-trade STOPPED: daily loss ${:.2f} >= limit ${:.2f}".format(
-            _trading_state["daily_loss"], daily_limit))
-        send_telegram(
-            "⚠️ <b>Daily loss limit reached</b>\n"
-            "Lost: ${:.2f} | Limit: ${:.2f}\n"
-            "Auto-trading paused until tomorrow.\n"
-            "Use /trading/start to override.".format(
+        daily_limit = balance * _trading_state["daily_loss_limit_pct"]
+        if _trading_state["daily_loss"] >= daily_limit:
+            print("Auto-trade STOPPED: daily loss ${:.2f} >= limit ${:.2f}".format(
                 _trading_state["daily_loss"], daily_limit))
-        _trading_state["enabled"] = False
-        return False
-
-    # Calculate stake using shared function (floor + 20% compound threshold)
-    stake = _calc_bot_stake(_trading_state)
-    if stake <= 0:
-        floor = _trading_state.get("floor_balance", 0)
-        if balance <= floor:
-            print("Bot1 STOPPED: balance ${:.2f} at floor ${:.2f}".format(balance, floor))
             _trading_state["enabled"] = False
-            send_telegram("⚠️ <b>Bot 1 stopped — floor reached</b>\nBalance: ${:.2f}".format(balance))
-        return False
+            return False
+
+        # Calculate Bot 1 stake
+        stake = _calc_bot_stake(_trading_state)
+        if stake <= 0:
+            floor = _trading_state.get("floor_balance", 0)
+            if balance <= floor:
+                print("Bot1 STOPPED: balance ${:.2f} at floor ${:.2f}".format(balance, floor))
+                _trading_state["enabled"] = False
+            return False
+    else:
+        # Bot 2/3 passing exact stake — use it directly
+        stake = override_stake
 
     bet_side = score.get("bet_side", "YES")
     slug = parsed_market.get("slug", "")
@@ -2634,7 +2629,7 @@ def run_paper34_scan():
                                 send_telegram("⚠️ <b>Bot 3 stopped — floor reached</b>\nBalance: ${:.2f}".format(_bot3_state["balance"]))
                             elif real_stake3 <= _bot3_state["balance"]:
                                 try:
-                                    success = execute_trade(parsed, scored3, None)
+                                    success = execute_trade(parsed, scored3, None, override_stake=real_stake3)
                                     if success:
                                         _bot3_state["balance"] = round(_bot3_state["balance"] - real_stake3, 2)
                                         _bot3_state["trades_today"] += 1
@@ -3045,7 +3040,7 @@ def run_paper_scan():
 
                 # Place REAL trade via Bot 2
                 try:
-                    success = execute_trade(parsed, scored, None)
+                    success = execute_trade(parsed, scored, None, override_stake=stake)
                     if success:
                         _bot2_state["balance"] = round(_bot2_state["balance"] - stake, 2)
                         _bot2_state["trades_today"] += 1
