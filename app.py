@@ -1478,7 +1478,7 @@ def _place_fok_order(slug, bet_side, token_id, stake, exchange_addr, profile_id,
         print("FOK error: {}".format(e))
         return False
 
-def execute_trade(parsed_market, score, prediction_id, override_stake=None):
+def execute_trade(parsed_market, score, prediction_id, override_stake=None, bot_name=None, bot_balance_after=None):
     """Execute a trade using aggressive bidding.
     If override_stake is provided, uses that exact amount (for Bot 2/3).
     If None, uses Bot 1's state to calculate stake.
@@ -1769,26 +1769,26 @@ def execute_trade(parsed_market, score, prediction_id, override_stake=None):
                 pass
 
             if override_stake is None:
-                # Bot 1 telegram
-                bot_label = "BOT1"
-                bot_balance = (balance or 0) - stake
+                bot_label = "BOT 1"
+                bot_bal = round((balance or 0) - stake, 2)
             else:
-                # Bot 2/3 — figure out which bot
-                bot_label = "BOT"
-                bot_balance = 0
+                bot_label = bot_name or "BOT"
+                bot_bal = bot_balance_after if bot_balance_after is not None else 0
 
             trade_msg = (
-                "🤖 <b>{} AUTO-TRADE PLACED</b>\n"
+                "🤖 <b>{} TRADE PLACED</b>\n"
                 "──────────────────────────\n"
                 "📌 {}\n"
                 "<b>Side:</b> BUY {} shares\n"
                 "<b>Stake:</b> ${:.2f}\n"
                 "<b>Fill Price:</b> {:.4f}\n"
+                "<b>Balance:</b> ${:.2f}\n"
                 "──────────────────────────"
             ).format(
                 bot_label,
                 parsed_market["title"],
                 bet_side, stake, fill_price,
+                bot_bal,
             )
             send_telegram(trade_msg)
             print("AUTO-TRADE #{}: {} {} ${:.2f} @{:.4f} on {}".format(
@@ -1813,6 +1813,17 @@ def record_trade_outcome(prediction_id, won, stake_amount):
         print("Trade #{} WON: stake ${:.2f}, payout ${:.2f}, profit ${:.2f}, balance ${:.2f}".format(
             prediction_id, stake_amount, payout, profit, _trading_state["last_balance"]))
 
+        send_telegram(
+            "✅ <b>BOT 1 WIN</b>\n"
+            "──────────────────────────\n"
+            "📌 Trade #{}\n"
+            "<b>Stake:</b> ${:.2f}\n"
+            "<b>Payout:</b> ${:.2f}\n"
+            "<b>P&L:</b> +${:.2f}\n"
+            "<b>Balance:</b> ${:.2f}\n"
+            "──────────────────────────".format(
+                prediction_id, stake_amount, payout, profit, _trading_state["last_balance"]))
+
         # Auto-resume if wins bring balance back above floor
         floor1 = _trading_state.get("floor_balance", 0)
         bal1 = _trading_state.get("last_balance", 0)
@@ -1824,6 +1835,16 @@ def record_trade_outcome(prediction_id, won, stake_amount):
         _trading_state["daily_loss"] += stake_amount
         print("Trade #{} LOST: stake ${:.2f}, balance ${:.2f}".format(
             prediction_id, stake_amount, _trading_state["last_balance"]))
+
+        send_telegram(
+            "❌ <b>BOT 1 LOSS</b>\n"
+            "──────────────────────────\n"
+            "📌 Trade #{}\n"
+            "<b>Stake:</b> ${:.2f}\n"
+            "<b>P&L:</b> -${:.2f}\n"
+            "<b>Balance:</b> ${:.2f}\n"
+            "──────────────────────────".format(
+                prediction_id, stake_amount, stake_amount, _trading_state.get("last_balance", 0)))
 
 def _auto_redeem_positions():
     """Auto-redeem winning positions by calling redeemPositions() on the CTF contract directly."""
@@ -2637,9 +2658,11 @@ def run_paper34_scan():
                                 send_telegram("⚠️ <b>Bot 3 stopped — floor reached</b>\nBalance: ${:.2f}".format(_bot3_state["balance"]))
                             elif real_stake3 <= _bot3_state["balance"]:
                                 try:
-                                    success = execute_trade(parsed, scored3, None, override_stake=real_stake3)
+                                    bal_after3 = round(_bot3_state["balance"] - real_stake3, 2)
+                                    success = execute_trade(parsed, scored3, None, override_stake=real_stake3,
+                                                           bot_name="BOT 3", bot_balance_after=bal_after3)
                                     if success:
-                                        _bot3_state["balance"] = round(_bot3_state["balance"] - real_stake3, 2)
+                                        _bot3_state["balance"] = bal_after3
                                         _bot3_state["trades_today"] += 1
                                         print("Bot3 TRADE: {} {} ${:.2f} on {} | bal=${:.2f}".format(
                                             scored3["bet_side"], asset, real_stake3, parsed["title"][:30], _bot3_state["balance"]))
@@ -2765,10 +2788,18 @@ def _resolve_paper_table(table_name):
                         send_telegram("🟢 <b>Bot 3 auto-resumed</b>\nBalance: ${:.2f} (floor: ${:.2f})".format(_bot3_state["balance"], floor3))
 
                     emoji = "✅" if won else "❌"
+                    profit_str = "+${:.2f}".format(payout - stake) if won else "-${:.2f}".format(stake)
                     send_telegram(
-                        "{} <b>BOT3 {} — #{}</b>\n📌 {}\n<b>Stake:</b> ${:.2f} | <b>Payout:</b> ${:.2f}\n<b>Bot3 Balance:</b> ${:.2f}".format(
-                            emoji, outcome, p["id"], (p.get("title") or "")[:50],
-                            stake, payout, _bot3_state["balance"]))
+                        "{} <b>BOT 3 {}</b>\n"
+                        "──────────────────────────\n"
+                        "📌 {}\n"
+                        "<b>Stake:</b> ${:.2f}\n"
+                        "<b>Payout:</b> ${:.2f}\n"
+                        "<b>P&L:</b> {}\n"
+                        "<b>Balance:</b> ${:.2f}\n"
+                        "──────────────────────────".format(
+                            emoji, outcome, (p.get("title") or "")[:50],
+                            stake, payout, profit_str, _bot3_state["balance"]))
                     print("Bot3 #{} {}: stake=${:.2f} payout=${:.2f} bal=${:.2f}".format(
                         p["id"], outcome, stake, payout, _bot3_state["balance"]))
             except Exception as e:
@@ -3048,9 +3079,11 @@ def run_paper_scan():
 
                 # Place REAL trade via Bot 2
                 try:
-                    success = execute_trade(parsed, scored, None, override_stake=stake)
+                    bal_after = round(_bot2_state["balance"] - stake, 2)
+                    success = execute_trade(parsed, scored, None, override_stake=stake,
+                                           bot_name="BOT 2", bot_balance_after=bal_after)
                     if success:
-                        _bot2_state["balance"] = round(_bot2_state["balance"] - stake, 2)
+                        _bot2_state["balance"] = bal_after
                         _bot2_state["trades_today"] += 1
                         print("Bot2 TRADE: {} {} ${:.2f} on {} | bal=${:.2f}".format(
                             scored["bet_side"], parsed["asset"], stake, parsed["title"][:30], _bot2_state["balance"]))
@@ -3152,13 +3185,18 @@ def resolve_paper_trades():
 
                 # Telegram notification for Bot 2 trades
                 emoji = "✅" if won else "❌"
+                profit_str = "+${:.2f}".format(payout - stake) if won else "-${:.2f}".format(stake)
                 send_telegram(
-                    "{} <b>BOT2 {} — #{}</b>\n"
+                    "{} <b>BOT 2 {}</b>\n"
+                    "──────────────────────────\n"
                     "📌 {}\n"
-                    "<b>Stake:</b> ${:.2f} | <b>Payout:</b> ${:.2f}\n"
-                    "<b>Bot2 Balance:</b> ${:.2f}".format(
-                        emoji, outcome, p["id"], (p.get("title") or "")[:50],
-                        stake, payout, _bot2_state["balance"]))
+                    "<b>Stake:</b> ${:.2f}\n"
+                    "<b>Payout:</b> ${:.2f}\n"
+                    "<b>P&L:</b> {}\n"
+                    "<b>Balance:</b> ${:.2f}\n"
+                    "──────────────────────────".format(
+                        emoji, outcome, (p.get("title") or "")[:50],
+                        stake, payout, profit_str, _bot2_state["balance"]))
                 print("Bot2 #{} {}: stake=${:.2f} payout=${:.2f} bal=${:.2f}".format(
                     p["id"], outcome, stake, payout, _bot2_state["balance"]))
             except Exception as e:
