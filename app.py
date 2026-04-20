@@ -1939,6 +1939,13 @@ def _auto_redeem_positions():
                 if on_chain_balance > 0:
                     _trading_state["last_balance"] = round(on_chain_balance, 2)
                     print("Balance updated after redeem: ${:.2f}".format(on_chain_balance))
+
+                    # Auto-resume Bot 1 if balance is back above floor
+                    floor1 = _trading_state.get("floor_balance", 0)
+                    if not _trading_state["enabled"] and on_chain_balance > floor1 + _trading_state["min_stake"]:
+                        _trading_state["enabled"] = True
+                        print("Bot1 AUTO-RESUMED after redeem: ${:.2f} above floor ${:.2f}".format(on_chain_balance, floor1))
+                        send_telegram("🟢 <b>Bot 1 auto-resumed after redeem</b>\nBalance: ${:.2f} (floor: ${:.2f})".format(on_chain_balance, floor1))
             except Exception as be:
                 print("Balance update after redeem failed: {}".format(be))
     except Exception as e:
