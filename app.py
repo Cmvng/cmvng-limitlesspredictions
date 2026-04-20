@@ -173,6 +173,59 @@ def init_db():
             slug          TEXT
         )
     """)
+    # Paper 3: Smart Momentum (trend following with multi-indicator confirmation)
+    conn.run("""
+        CREATE TABLE IF NOT EXISTS paper3_trades (
+            id            SERIAL PRIMARY KEY,
+            market_id     TEXT,
+            title         TEXT,
+            asset         TEXT,
+            direction     TEXT,
+            baseline      REAL,
+            bet_odds      REAL,
+            bet_side      TEXT,
+            current_price REAL,
+            hours_left    REAL,
+            market_type   TEXT,
+            indicators    TEXT,
+            score         INTEGER,
+            total_signals INTEGER,
+            simulated_stake REAL DEFAULT 1.0,
+            simulated_payout REAL,
+            status        TEXT DEFAULT 'Pending',
+            outcome       TEXT,
+            fired_at      TEXT,
+            resolved_at   TEXT,
+            slug          TEXT
+        )
+    """)
+    # Paper 4: Reversal Hunter (contrarian with RSI/Bollinger extremes)
+    conn.run("""
+        CREATE TABLE IF NOT EXISTS paper4_trades (
+            id            SERIAL PRIMARY KEY,
+            market_id     TEXT,
+            title         TEXT,
+            asset         TEXT,
+            direction     TEXT,
+            baseline      REAL,
+            bet_odds      REAL,
+            bet_side      TEXT,
+            current_price REAL,
+            hours_left    REAL,
+            market_type   TEXT,
+            indicators    TEXT,
+            reversal_type TEXT,
+            rsi_value     REAL,
+            bollinger_pos TEXT,
+            simulated_stake REAL DEFAULT 1.0,
+            simulated_payout REAL,
+            status        TEXT DEFAULT 'Pending',
+            outcome       TEXT,
+            fired_at      TEXT,
+            resolved_at   TEXT,
+            slug          TEXT
+        )
+    """)
     conn.close()
     print("DB initialized OK")
 
@@ -1889,11 +1942,661 @@ def scan_loop():
             run_paper_scan()
         except Exception as e:
             print("Paper scan error: {}".format(e))
+        # Run Paper 3 & 4 scanners (technical indicators)
+        try:
+            run_paper34_scan()
+        except Exception as e:
+            print("Paper34 scan error: {}".format(e))
         time.sleep(300)
 
 # ═══════════════════════════════════════════════════════════
-# PAPER TRADING — simulated trades at lower odds for testing
+# TECHNICAL INDICATORS CALCULATOR
 # ═══════════════════════════════════════════════════════════
+
+# Cache for technical indicators (avoid re-fetching yfinance per pair per scan)
+_indicator_cache = {}  # {"BTC": {"data": {...}, "updated": datetime}}
+
+def _calculate_indicators(asset):
+    """Calculate all technical indicators for an asset using yfinance hourly data.
+    Returns dict with all indicator readings or None if data unavailable."""
+    import yfinance as yf
+
+    # Check cache (valid for 5 minutes)
+    cache = _indicator_cache.get(asset)
+    if cache and (datetime.now(timezone.utc) - cache["updated"]).total_seconds() < 300:
+        return cache["data"]
+
+    yahoo_map = {
+        "BTC": "BTC-USD", "ETH": "ETH-USD", "SOL": "SOL-USD",
+        "XRP": "XRP-USD", "DOGE": "DOGE-USD", "ADA": "ADA-USD",
+        "BNB": "BNB-USD", "AVAX": "AVAX-USD", "LINK": "LINK-USD",
+        "DOT": "DOT-USD", "LTC": "LTC-USD", "BCH": "BCH-USD",
+        "XLM": "XLM-USD", "UNI": "UNI-USD", "ATOM": "ATOM-USD",
+        "NEAR": "NEAR-USD", "OP": "OP-USD", "ARB": "ARB-USD",
+        "TRX": "TRX-USD", "TON": "TON11419-USD", "ONDO": "ONDO-USD",
+        "XMR": "XMR-USD", "ZEC": "ZEC-USD", "APT": "APT-USD",
+    }
+
+    ticker = yahoo_map.get(asset)
+    if not ticker:
+        return None
+
+    try:
+        df = yf.download(ticker, period="5d", interval="1h", progress=False)
+        if df is None or len(df) < 20:
+            return None
+
+        closes = df["Close"].values.flatten()
+        highs = df["High"].values.flatten()
+        lows = df["Low"].values.flatten()
+        volumes = df["Volume"].values.flatten() if "Volume" in df.columns else None
+
+        n = len(closes)
+        current = float(closes[-1])
+
+        # === SMA10, SMA20 ===
+        sma10 = float(sum(closes[-10:]) / 10) if n >= 10 else None
+        sma20 = float(sum(closes[-20:]) / 20) if n >= 20 else None
+        sma_trend = None
+        if sma10 and sma20:
+            sma_trend = "BUY" if sma10 > sma20 else "SELL"
+
+        # === EMA10, EMA20 ===
+        def calc_ema(data, period):
+            if len(data) < period:
+                return None
+            k = 2.0 / (period + 1)
+            ema = float(data[0])
+            for i in range(1, len(data)):
+                ema = float(data[i]) * k + ema * (1 - k)
+            return ema
+
+        ema10 = calc_ema(closes, 10)
+        ema20 = calc_ema(closes, 20)
+        ema_trend = None
+        if ema10 and ema20:
+            ema_trend = "BUY" if ema10 > ema20 else "SELL"
+
+        # EMA direction (is EMA curving up or down?)
+        ema10_prev = calc_ema(closes[:-1], 10) if n > 11 else None
+        ema_curving = None
+        if ema10 and ema10_prev:
+            ema_curving = "UP" if ema10 > ema10_prev else "DOWN"
+
+        # === RSI(14) ===
+        rsi = None
+        if n >= 15:
+            gains = []
+            losses_list = []
+            for i in range(-14, 0):
+                diff = float(closes[i] - closes[i - 1])
+                if diff > 0:
+                    gains.append(diff)
+                    losses_list.append(0)
+                else:
+                    gains.append(0)
+                    losses_list.append(abs(diff))
+            avg_gain = sum(gains) / 14
+            avg_loss = sum(losses_list) / 14
+            if avg_loss == 0:
+                rsi = 100.0
+            else:
+                rs = avg_gain / avg_loss
+                rsi = 100 - (100 / (1 + rs))
+
+        # === Bollinger Bands (20, 2) ===
+        bb_upper = bb_lower = bb_middle = bb_width = bb_position = None
+        if n >= 20:
+            bb_data = [float(x) for x in closes[-20:]]
+            bb_middle = sum(bb_data) / 20
+            bb_std = (sum((x - bb_middle) ** 2 for x in bb_data) / 20) ** 0.5
+            bb_upper = bb_middle + 2 * bb_std
+            bb_lower = bb_middle - 2 * bb_std
+            bb_width = (bb_upper - bb_lower) / bb_middle if bb_middle > 0 else 0
+
+            # Position within bands: 0 = at lower, 1 = at upper
+            band_range = bb_upper - bb_lower
+            if band_range > 0:
+                bb_position = (current - bb_lower) / band_range
+            else:
+                bb_position = 0.5
+
+        # === Rate of Change (ROC) — 5 period ===
+        roc = None
+        if n >= 6:
+            prev_price = float(closes[-6])
+            if prev_price > 0:
+                roc = ((current - prev_price) / prev_price) * 100
+
+        # === ATR (Average True Range, 14 period) ===
+        atr = None
+        if n >= 15:
+            trs = []
+            for i in range(-14, 0):
+                h = float(highs[i])
+                l = float(lows[i])
+                pc = float(closes[i - 1])
+                tr = max(h - l, abs(h - pc), abs(l - pc))
+                trs.append(tr)
+            atr = sum(trs) / 14
+        atr_pct = (atr / current * 100) if atr and current > 0 else None
+
+        # === Volume analysis ===
+        vol_trend = None
+        vol_spike = False
+        if volumes is not None and n >= 10:
+            try:
+                recent_vol = float(sum(volumes[-3:])) / 3
+                avg_vol = float(sum(volumes[-10:])) / 10
+                if avg_vol > 0:
+                    vol_trend = "RISING" if recent_vol > avg_vol * 1.1 else "FALLING"
+                    vol_spike = recent_vol > avg_vol * 2.0
+            except:
+                pass
+
+        # === Range detection ===
+        is_ranging = False
+        bb_squeeze = False
+        if bb_width is not None and atr_pct is not None:
+            # Bollinger Band Width shrinking = ranging/squeezing
+            if n >= 25:
+                prev_bb_data = [float(x) for x in closes[-25:-5]]
+                prev_mid = sum(prev_bb_data) / 20 if len(prev_bb_data) >= 20 else bb_middle
+                prev_std = (sum((x - prev_mid) ** 2 for x in prev_bb_data) / 20) ** 0.5 if len(prev_bb_data) >= 20 else bb_std
+                prev_width = (2 * prev_std * 2) / prev_mid if prev_mid > 0 else 0
+                bb_squeeze = bb_width < prev_width * 0.7  # Bands tightened 30%+
+
+            is_ranging = bb_width < 0.015 and atr_pct < 0.3  # Very tight bands + low volatility
+
+        result = {
+            "current": current,
+            "sma10": sma10, "sma20": sma20, "sma_trend": sma_trend,
+            "ema10": ema10, "ema20": ema20, "ema_trend": ema_trend,
+            "ema_curving": ema_curving,
+            "rsi": round(rsi, 1) if rsi is not None else None,
+            "bb_upper": bb_upper, "bb_lower": bb_lower, "bb_middle": bb_middle,
+            "bb_width": round(bb_width, 5) if bb_width is not None else None,
+            "bb_position": round(bb_position, 3) if bb_position is not None else None,
+            "roc": round(roc, 3) if roc is not None else None,
+            "atr": atr, "atr_pct": round(atr_pct, 3) if atr_pct is not None else None,
+            "vol_trend": vol_trend, "vol_spike": vol_spike,
+            "is_ranging": is_ranging, "bb_squeeze": bb_squeeze,
+        }
+
+        _indicator_cache[asset] = {"data": result, "updated": datetime.now(timezone.utc)}
+        return result
+    except Exception as e:
+        print("Indicators error {}: {}".format(asset, e))
+        return None
+
+# ═══════════════════════════════════════════════════════════
+# PAPER 3: Smart Momentum — multi-indicator trend following
+# ═══════════════════════════════════════════════════════════
+
+def _score_paper3_trade(p, price, indicators):
+    """Paper 3: Score based on 7 indicators. Need 5/7 agreement + no reversal warnings."""
+    if not indicators or price is None:
+        return None
+
+    asset = p["asset"]
+    rsi = indicators.get("rsi")
+    bb_pos = indicators.get("bb_position")
+    is_ranging = indicators.get("is_ranging", False)
+
+    # Skip if market is ranging (no clear direction)
+    if is_ranging and not indicators.get("bb_squeeze"):
+        return None
+
+    yes_odds = p["yes_odds"]
+    no_odds = 100 - yes_odds
+
+    # Paper 3 odds range: 30-70%
+    if not (30 <= yes_odds <= 70 or 30 <= no_odds <= 70):
+        return None
+
+    # Determine price position relative to baseline
+    if p["direction"] == "above":
+        price_above = price > p["baseline"]
+        price_below = price < p["baseline"]
+    else:
+        price_above = price < p["baseline"]
+        price_below = price > p["baseline"]
+
+    # Collect indicator votes
+    tv = _tv_trends.get(asset.upper())
+    tv_dir = tv["dir"] if tv else None
+    btc_trend = _btc_trend_cache.get("trend")
+    sma_trend = indicators.get("sma_trend")
+    ema_trend = indicators.get("ema_trend")
+    roc = indicators.get("roc")
+
+    # RSI signal (not at extremes)
+    rsi_signal = None
+    rsi_warning = False
+    if rsi is not None:
+        if rsi < 25 or rsi > 75:
+            rsi_warning = True  # Reversal zone — Paper 3 should skip
+        elif rsi < 45:
+            rsi_signal = "SELL"
+        elif rsi > 55:
+            rsi_signal = "BUY"
+        # 45-55 = neutral, no vote
+
+    # Bollinger signal
+    bb_signal = None
+    bb_warning = False
+    if bb_pos is not None:
+        if bb_pos < 0.1 or bb_pos > 0.9:
+            bb_warning = True  # At bands — reversal zone
+        elif bb_pos < 0.4:
+            bb_signal = "SELL"
+        elif bb_pos > 0.6:
+            bb_signal = "BUY"
+
+    # ROC signal
+    roc_signal = None
+    if roc is not None:
+        if roc > 0.05:
+            roc_signal = "BUY"
+        elif roc < -0.05:
+            roc_signal = "SELL"
+
+    # Skip if reversal warnings AND RSI extreme
+    if rsi_warning and bb_warning:
+        return None
+
+    # Count votes for each direction
+    buy_votes = 0
+    sell_votes = 0
+    total_votes = 0
+    indicator_details = []
+
+    for name, signal in [("TV", tv_dir), ("SMA", sma_trend), ("EMA", ema_trend),
+                          ("RSI", rsi_signal), ("BB", bb_signal), ("ROC", roc_signal),
+                          ("BTC", btc_trend)]:
+        if signal == "BUY":
+            buy_votes += 1
+            total_votes += 1
+            indicator_details.append("{}=BUY".format(name))
+        elif signal == "SELL":
+            sell_votes += 1
+            total_votes += 1
+            indicator_details.append("{}=SELL".format(name))
+        else:
+            indicator_details.append("{}=—".format(name))
+
+    # Need at least 5 indicators with opinions AND 5 agreeing on direction
+    if total_votes < 5:
+        return None
+
+    # Determine bet direction
+    bet_side = None
+    effective_odds = None
+    score = 0
+
+    if buy_votes >= 5 and price_above:
+        bet_side = "YES" if p["direction"] == "above" else "NO"
+        effective_odds = yes_odds if bet_side == "YES" else no_odds
+        score = buy_votes
+    elif sell_votes >= 5 and price_below:
+        bet_side = "NO" if p["direction"] == "above" else "YES"
+        effective_odds = no_odds if p["direction"] == "above" else yes_odds
+        score = sell_votes
+
+    if bet_side is None:
+        return None
+
+    # Must be in 30-70% range
+    if effective_odds < 30 or effective_odds > 70:
+        return None
+
+    share_price = effective_odds / 100.0
+    if bet_side == "NO":
+        share_price = 1.0 - (yes_odds / 100.0)
+    sim_payout = round(1.0 / share_price, 4) if share_price > 0 else 0
+
+    mtype = "15M" if p["is_short"] and p["mins_left"] <= 20 else "1H" if p["is_short"] else "Daily"
+
+    return {
+        "bet_side": bet_side,
+        "bet_odds": effective_odds,
+        "score": score,
+        "total_signals": total_votes,
+        "indicators": " | ".join(indicator_details),
+        "rsi": rsi,
+        "bb_pos": bb_pos,
+        "market_type": mtype,
+        "sim_payout": sim_payout,
+    }
+
+# ═══════════════════════════════════════════════════════════
+# PAPER 4: Reversal Hunter — contrarian bets on exhausted trends
+# ═══════════════════════════════════════════════════════════
+
+def _score_paper4_trade(p, price, indicators):
+    """Paper 4: Hunt reversals at RSI extremes + Bollinger bands. Odds 5-55%."""
+    if not indicators or price is None:
+        return None
+
+    rsi = indicators.get("rsi")
+    bb_pos = indicators.get("bb_position")
+    bb_squeeze = indicators.get("bb_squeeze", False)
+
+    if rsi is None or bb_pos is None:
+        return None
+
+    yes_odds = p["yes_odds"]
+    no_odds = 100 - yes_odds
+    roc = indicators.get("roc")
+    vol_spike = indicators.get("vol_spike", False)
+    ema_curving = indicators.get("ema_curving")
+
+    reversal_type = None
+    bet_side = None
+    effective_odds = None
+    confirmations = 0
+
+    # === OVERSOLD REVERSAL (bet for price to go UP) ===
+    if rsi < 30 and bb_pos < 0.15:
+        reversal_type = "OVERSOLD"
+        # Bet YES on "above" markets (price will rise)
+        if p["direction"] == "above":
+            bet_side = "YES"
+            effective_odds = yes_odds
+        else:
+            bet_side = "NO"
+            effective_odds = no_odds
+
+        # Count additional confirmations
+        if roc is not None and roc > -0.5 and roc < 0:
+            confirmations += 1  # Momentum slowing (not crashing anymore)
+        if vol_spike:
+            confirmations += 1  # Volume climax = selling exhaustion
+        if ema_curving == "UP":
+            confirmations += 1  # EMA starting to turn
+        if price < p["baseline"]:
+            confirmations += 1  # Room to bounce back above baseline
+
+    # === OVERBOUGHT REVERSAL (bet for price to go DOWN) ===
+    elif rsi > 70 and bb_pos > 0.85:
+        reversal_type = "OVERBOUGHT"
+        # Bet NO on "above" markets (price will fall)
+        if p["direction"] == "above":
+            bet_side = "NO"
+            effective_odds = no_odds
+        else:
+            bet_side = "YES"
+            effective_odds = yes_odds
+
+        if roc is not None and roc < 0.5 and roc > 0:
+            confirmations += 1  # Momentum slowing
+        if vol_spike:
+            confirmations += 1  # Buying climax
+        if ema_curving == "DOWN":
+            confirmations += 1  # EMA turning down
+        if price > p["baseline"]:
+            confirmations += 1  # Room to drop back below baseline
+
+    # === BOLLINGER SQUEEZE BREAKOUT ===
+    elif bb_squeeze:
+        reversal_type = "SQUEEZE"
+        # Price just broke out of tight range
+        if bb_pos > 0.7:
+            # Broke upward
+            if p["direction"] == "above":
+                bet_side = "YES"
+                effective_odds = yes_odds
+            else:
+                bet_side = "NO"
+                effective_odds = no_odds
+            if roc and roc > 0.1:
+                confirmations += 1
+            if ema_curving == "UP":
+                confirmations += 1
+        elif bb_pos < 0.3:
+            # Broke downward
+            if p["direction"] == "above":
+                bet_side = "NO"
+                effective_odds = no_odds
+            else:
+                bet_side = "YES"
+                effective_odds = yes_odds
+            if roc and roc < -0.1:
+                confirmations += 1
+            if ema_curving == "DOWN":
+                confirmations += 1
+
+    if reversal_type is None or bet_side is None:
+        return None
+
+    # Need at least 1 additional confirmation beyond RSI + BB
+    if confirmations < 1:
+        return None
+
+    # Paper 4 odds range: 5-55% (low odds = high payout)
+    if effective_odds < 5 or effective_odds > 55:
+        return None
+
+    share_price = effective_odds / 100.0
+    if bet_side == "NO":
+        share_price = 1.0 - (yes_odds / 100.0)
+    sim_payout = round(1.0 / share_price, 4) if share_price > 0 else 0
+
+    mtype = "15M" if p["is_short"] and p["mins_left"] <= 20 else "1H" if p["is_short"] else "Daily"
+
+    bb_label = "LOWER" if bb_pos < 0.3 else "UPPER" if bb_pos > 0.7 else "MID"
+
+    indicator_details = "RSI={:.0f} BB={} ROC={} Vol={} EMA={}".format(
+        rsi, bb_label,
+        "{:.2f}%".format(roc) if roc else "—",
+        "SPIKE" if vol_spike else "normal",
+        ema_curving or "—"
+    )
+
+    return {
+        "bet_side": bet_side,
+        "bet_odds": effective_odds,
+        "reversal_type": reversal_type,
+        "rsi": rsi,
+        "bb_pos": bb_pos,
+        "confirmations": confirmations,
+        "indicators": indicator_details,
+        "bollinger_pos": bb_label,
+        "market_type": mtype,
+        "sim_payout": sim_payout,
+    }
+
+# ═══════════════════════════════════════════════════════════
+# PAPER 3 & 4 SCANNER AND RESOLVER
+# ═══════════════════════════════════════════════════════════
+
+def run_paper34_scan():
+    """Scan markets for Paper 3 (momentum) and Paper 4 (reversal) signals."""
+    import requests as req
+    try:
+        r = req.get("{}/markets/active".format(LIMITLESS_API), timeout=15)
+        if r.status_code != 200:
+            return
+        markets = r.json().get("data", [])
+
+        # Get already recorded trades
+        conn = get_db()
+        try:
+            p3_rows = conn.run("SELECT market_id FROM paper3_trades WHERE fired_at::timestamptz > NOW() - INTERVAL '6 hours'")
+            p3_ids = set(str(row[0]) for row in p3_rows)
+        except:
+            p3_ids = set()
+        try:
+            p4_rows = conn.run("SELECT market_id FROM paper4_trades WHERE fired_at::timestamptz > NOW() - INTERVAL '6 hours'")
+            p4_ids = set(str(row[0]) for row in p4_rows)
+        except:
+            p4_ids = set()
+        conn.close()
+
+        price_cache = {}
+        indicator_cache_local = {}
+        p3_count = 0
+        p4_count = 0
+
+        for market in markets:
+            try:
+                parsed = parse_market(market)
+                if not parsed:
+                    continue
+
+                asset = parsed["asset"]
+                if asset not in price_cache:
+                    price_cache[asset] = get_price(asset)
+                price = price_cache[asset]
+                if price is None:
+                    continue
+
+                # Get indicators (cached per asset)
+                if asset not in indicator_cache_local:
+                    indicator_cache_local[asset] = _calculate_indicators(asset)
+                ind = indicator_cache_local[asset]
+                if ind is None:
+                    continue
+
+                now = datetime.now(timezone.utc).isoformat()
+
+                # Paper 3: Smart Momentum
+                if parsed["market_id"] not in p3_ids:
+                    scored3 = _score_paper3_trade(parsed, price, ind)
+                    if scored3:
+                        try:
+                            conn2 = get_db()
+                            conn2.run(
+                                """INSERT INTO paper3_trades
+                                (market_id, title, asset, direction, baseline, bet_odds, bet_side,
+                                 current_price, hours_left, market_type, indicators, score,
+                                 total_signals, simulated_stake, simulated_payout, status, fired_at, slug)
+                                VALUES (:mid, :ttl, :ast, :dir, :base, :odds, :bs,
+                                        :pr, :hrs, :mt, :ind, :sc, :ts, 1.0, :sp, 'Pending', :now, :slg)""",
+                                mid=parsed["market_id"], ttl=parsed["title"], ast=asset,
+                                dir=parsed["direction"], base=parsed["baseline"],
+                                odds=scored3["bet_odds"], bs=scored3["bet_side"],
+                                pr=price, hrs=round(parsed["hours_left"], 2),
+                                mt=scored3["market_type"], ind=scored3["indicators"],
+                                sc=scored3["score"], ts=scored3["total_signals"],
+                                sp=scored3["sim_payout"], now=now, slg=parsed["slug"]
+                            )
+                            conn2.close()
+                            p3_ids.add(parsed["market_id"])
+                            p3_count += 1
+                        except Exception as e:
+                            print("Paper3 save error: {}".format(e))
+
+                # Paper 4: Reversal Hunter
+                if parsed["market_id"] not in p4_ids:
+                    scored4 = _score_paper4_trade(parsed, price, ind)
+                    if scored4:
+                        try:
+                            conn3 = get_db()
+                            conn3.run(
+                                """INSERT INTO paper4_trades
+                                (market_id, title, asset, direction, baseline, bet_odds, bet_side,
+                                 current_price, hours_left, market_type, indicators, reversal_type,
+                                 rsi_value, bollinger_pos, simulated_stake, simulated_payout,
+                                 status, fired_at, slug)
+                                VALUES (:mid, :ttl, :ast, :dir, :base, :odds, :bs,
+                                        :pr, :hrs, :mt, :ind, :rt, :rsi, :bb,
+                                        1.0, :sp, 'Pending', :now, :slg)""",
+                                mid=parsed["market_id"], ttl=parsed["title"], ast=asset,
+                                dir=parsed["direction"], base=parsed["baseline"],
+                                odds=scored4["bet_odds"], bs=scored4["bet_side"],
+                                pr=price, hrs=round(parsed["hours_left"], 2),
+                                mt=scored4["market_type"], ind=scored4["indicators"],
+                                rt=scored4["reversal_type"], rsi=scored4["rsi"],
+                                bb=scored4["bollinger_pos"], sp=scored4["sim_payout"],
+                                now=now, slg=parsed["slug"]
+                            )
+                            conn3.close()
+                            p4_ids.add(parsed["market_id"])
+                            p4_count += 1
+                        except Exception as e:
+                            print("Paper4 save error: {}".format(e))
+
+            except Exception as e:
+                print("Paper34 market error: {}".format(e))
+
+        if p3_count > 0 or p4_count > 0:
+            print("Paper3: {} signals | Paper4: {} signals".format(p3_count, p4_count))
+
+    except Exception as e:
+        print("Paper34 scan error: {}".format(e))
+
+def _resolve_paper_table(table_name):
+    """Generic resolver for paper3_trades and paper4_trades."""
+    try:
+        conn = get_db()
+        rows = conn.run("SELECT * FROM {} WHERE status='Pending'".format(table_name))
+        cols = [c['name'] for c in conn.columns]
+        items = [dict(zip(cols, r)) for r in rows]
+        conn.close()
+
+        if not items:
+            return 0
+
+        now = datetime.now(timezone.utc)
+        resolved = 0
+        for p in items:
+            try:
+                if not p.get("fired_at") or not p.get("asset") or p.get("baseline") is None:
+                    continue
+
+                fired = datetime.fromisoformat(p["fired_at"])
+                if fired.tzinfo is None:
+                    fired = fired.replace(tzinfo=timezone.utc)
+                hours_left = float(p.get("hours_left") or 0)
+                if hours_left <= 0:
+                    hours_left = 0.25
+                expiry = fired + timedelta(hours=hours_left)
+                if now < expiry:
+                    continue
+
+                current_price = get_price(p["asset"])
+                if current_price is None:
+                    continue
+
+                baseline = float(p["baseline"])
+                direction = p.get("direction") or "above"
+                market_resolved_true = (current_price > baseline) if direction == "above" else (current_price < baseline)
+
+                bet_side = p.get("bet_side") or "YES"
+                won = market_resolved_true if bet_side == "YES" else not market_resolved_true
+
+                outcome = "WIN" if won else "LOSS"
+                status = "✅ Won" if won else "❌ Lost"
+
+                stake = float(p.get("simulated_stake") or 1.0)
+                odds = float(p.get("bet_odds") or 50)
+                share_price = odds / 100.0
+                if bet_side == "NO":
+                    share_price = 1.0 - share_price
+                payout = round((stake / share_price) if won else 0, 4)
+
+                conn2 = get_db()
+                conn2.run(
+                    "UPDATE {} SET status=:s, outcome=:o, resolved_at=:r, simulated_payout=:p WHERE id=:i".format(table_name),
+                    s=status, o=outcome, r=now.isoformat(), p=payout, i=p["id"]
+                )
+                conn2.close()
+                resolved += 1
+            except Exception as e:
+                print("{} resolve #{}: {}".format(table_name, p.get("id"), e))
+
+        return resolved
+    except Exception as e:
+        print("{} resolve error: {}".format(table_name, e))
+        return 0
+
+def resolve_paper34_trades():
+    """Resolve both Paper 3 and Paper 4 trades."""
+    r3 = _resolve_paper_table("paper3_trades")
+    r4 = _resolve_paper_table("paper4_trades")
+    if r3 or r4:
+        print("Resolved: Paper3={} Paper4={}".format(r3, r4))
 
 def _score_paper_trade(p, price):
     """Score a market for paper trading. Accepts 40-72% odds when ALL trends agree.
@@ -2853,6 +3556,11 @@ def outcome_loop():
             resolve_paper_trades()
         except Exception as e:
             print("Paper resolve loop error: {}".format(e))
+        # Resolve Paper 3 & 4 trades
+        try:
+            resolve_paper34_trades()
+        except Exception as e:
+            print("Paper34 resolve error: {}".format(e))
         time.sleep(300)
 
 # ═══════════════════════════════════════════════════════════
@@ -4459,7 +5167,9 @@ tbody tr:hover{background:var(--bg)}
       <a href="/" class="nav-tab">Home</a>
       <a href="/app" class="nav-tab active">Crypto</a>
       <a href="/app/football" class="nav-tab">Football</a>
-      <a href="/app/paper" class="nav-tab">Paper</a>
+      <a href="/app/paper" class="nav-tab">Bot 2</a>
+      <a href="/app/paper3" class="nav-tab">Paper 3</a>
+      <a href="/app/paper4" class="nav-tab">Paper 4</a>
     </nav>
     <div class="pills">
       <span class="pill pill-active">
@@ -5562,7 +6272,9 @@ tr:hover td{background:#fafaf7}
     <a href="/" class="nav-tab">Home</a>
     <a href="/app" class="nav-tab">Crypto</a>
     <a href="/app/football" class="nav-tab">Football</a>
-      <a href="/app/paper" class="nav-tab">Paper</a>
+      <a href="/app/paper" class="nav-tab">Bot 2</a>
+      <a href="/app/paper3" class="nav-tab">Paper 3</a>
+      <a href="/app/paper4" class="nav-tab">Paper 4</a>
     <a href="/app/paper" class="nav-tab active">Paper</a>
   </nav>
 </header>
@@ -5681,6 +6393,233 @@ tr:hover td{background:#fafaf7}
 </body></html>"""
 
     return paper_html
+
+def _build_paper_page(table_name, page_title, subtitle, description, extra_cols, nav_active):
+    """Generic page builder for Paper 3 and Paper 4."""
+    try:
+        conn = get_db()
+        rows = conn.run("SELECT * FROM {} ORDER BY id DESC LIMIT 200".format(table_name))
+        cols = [c['name'] for c in conn.columns]
+        trades = [dict(zip(cols, r)) for r in rows]
+        conn.close()
+    except Exception as e:
+        print("{} page error: {}".format(table_name, e))
+        trades = []
+
+    total = len(trades)
+    wins = sum(1 for t in trades if t.get("outcome") == "WIN")
+    losses = sum(1 for t in trades if t.get("outcome") == "LOSS")
+    pending = sum(1 for t in trades if t.get("status") == "Pending")
+    resolved = wins + losses
+    win_rate = round(wins / resolved * 100, 1) if resolved > 0 else 0
+
+    total_profit = 0
+    for t in trades:
+        if t.get("outcome") == "WIN":
+            total_profit += float(t.get("simulated_payout") or 0) - float(t.get("simulated_stake") or 1)
+        elif t.get("outcome") == "LOSS":
+            total_profit -= float(t.get("simulated_stake") or 1)
+    total_profit = round(total_profit, 2)
+
+    # Stats by timeframe
+    type_stats = {}
+    for t in trades:
+        mt = t.get("market_type") or "?"
+        if mt not in type_stats:
+            type_stats[mt] = {"w": 0, "l": 0, "p": 0, "profit": 0.0}
+        if t.get("outcome") == "WIN":
+            type_stats[mt]["w"] += 1
+            type_stats[mt]["profit"] += float(t.get("simulated_payout") or 0) - 1.0
+        elif t.get("outcome") == "LOSS":
+            type_stats[mt]["l"] += 1
+            type_stats[mt]["profit"] -= 1.0
+        else:
+            type_stats[mt]["p"] += 1
+
+    # Stats by asset
+    asset_stats = {}
+    for t in trades:
+        a = t.get("asset") or "?"
+        if a not in asset_stats:
+            asset_stats[a] = {"w": 0, "l": 0, "profit": 0.0}
+        if t.get("outcome") == "WIN":
+            asset_stats[a]["w"] += 1
+            asset_stats[a]["profit"] += float(t.get("simulated_payout") or 0) - 1.0
+        elif t.get("outcome") == "LOSS":
+            asset_stats[a]["l"] += 1
+            asset_stats[a]["profit"] -= 1.0
+
+    html = """<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>""" + page_title + """ — Limitless CMVNG</title>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600&family=Inter+Tight:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+:root{--bg:#fafaf7;--surface:#fff;--border:#ececea;--accent:#1a3d2e;--positive:#1a7046;--positive-bg:#e8f3ed;--negative:#b4322e;--negative-bg:#f7e7e5;--warning:#8a6a2f;--warning-bg:#f5eedb;--ink:#1a1a17;--ink-2:#3a3a35;--ink-3:#6b6b64;--ink-4:#9c9c94;--display:'Fraunces',Georgia,serif;--sans:'Inter Tight',sans-serif;--mono:'JetBrains Mono',monospace}
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:var(--sans);background:var(--bg);color:var(--ink)}
+.app{max-width:1380px;margin:0 auto}
+.hdr{padding:24px 40px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:20px;border-bottom:1px solid var(--border)}
+.brand{display:flex;align-items:center;gap:14px}
+.brand-mark{width:38px;height:38px;border-radius:10px;background:var(--accent);display:flex;align-items:center;justify-content:center}
+.brand-mark::before{content:'';width:14px;height:14px;border:2px solid var(--bg);border-radius:50%}
+.brand-text h1{font-family:var(--display);font-weight:500;font-size:19px}
+.brand-text small{font-size:10px;font-family:var(--mono);color:var(--ink-4);text-transform:uppercase;letter-spacing:.12em}
+.nav-tabs{display:flex;gap:4px;background:#f4f3ed;border-radius:10px;padding:3px;flex-wrap:wrap}
+.nav-tab{padding:7px 14px;font-size:12px;font-weight:500;color:var(--ink-3);border-radius:8px;text-decoration:none}
+.nav-tab.active{background:var(--surface);color:var(--ink);box-shadow:0 1px 2px rgba(0,0,0,.04)}
+.hero{padding:44px 40px 28px;border-bottom:1px solid var(--border)}
+.hero-label{font-size:10px;font-family:var(--mono);color:var(--ink-4);text-transform:uppercase;letter-spacing:.15em;margin-bottom:12px}
+.hero-title{font-family:var(--display);font-weight:400;font-size:clamp(28px,4vw,38px);line-height:1.1;letter-spacing:-.03em;margin-bottom:14px}
+.hero-title em{font-style:italic;color:var(--accent)}
+.hero-sub{font-size:14px;color:var(--ink-3);max-width:620px;line-height:1.55}
+.stats-row{padding:20px 40px;display:grid;grid-template-columns:repeat(auto-fit,minmax(100px,1fr));gap:0;border-bottom:1px solid var(--border);background:var(--surface)}
+.stat{padding:0 20px;border-left:1px solid var(--border)}.stat:first-child{padding-left:0;border-left:none}
+.stat-label{font-size:10px;font-family:var(--mono);color:var(--ink-4);text-transform:uppercase;letter-spacing:.14em;margin-bottom:6px}
+.stat-value{font-family:var(--display);font-weight:400;font-size:24px;letter-spacing:-.03em}
+.section{padding:28px 40px}.section-title{font-family:var(--display);font-weight:500;font-size:18px;margin-bottom:14px}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin-bottom:24px}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:14px 18px}
+.card-label{font-size:10px;font-family:var(--mono);color:var(--ink-4);text-transform:uppercase;letter-spacing:.1em;margin-bottom:6px}
+.card-value{font-family:var(--display);font-size:20px;font-weight:500}
+.card-sub{font-size:11px;color:var(--ink-3);margin-top:3px;font-family:var(--mono)}
+table{width:100%;border-collapse:collapse;font-size:12px;background:var(--surface);border-radius:10px;overflow:hidden;border:1px solid var(--border)}
+thead{background:#f4f3ed}th{text-align:left;padding:8px 12px;font-size:10px;font-family:var(--mono);color:var(--ink-3);text-transform:uppercase;letter-spacing:.06em;white-space:nowrap}
+td{padding:8px 12px;border-bottom:1px solid #f4f3ed;color:var(--ink-2)}tr:last-child td{border-bottom:none}tr:hover td{background:#fafaf7}
+.won{background:var(--positive-bg);color:var(--positive);padding:2px 6px;border-radius:20px;font-size:10px;font-weight:600}
+.lost{background:var(--negative-bg);color:var(--negative);padding:2px 6px;border-radius:20px;font-size:10px;font-weight:600}
+.pend{background:var(--warning-bg);color:var(--warning);padding:2px 6px;border-radius:20px;font-size:10px;font-weight:600}
+.pos{color:var(--positive);font-weight:600}.neg{color:var(--negative);font-weight:600}
+.tw{overflow-x:auto}
+.footer{padding:20px 40px;border-top:1px solid var(--border);text-align:center;font-size:11px;font-family:var(--mono);color:var(--ink-4);margin-top:20px}
+@media(max-width:800px){.stats-row,.section,.hero,.hdr,.footer{padding-left:16px;padding-right:16px}}
+</style></head><body>
+<div class="app">
+<header class="hdr">
+  <div class="brand"><div class="brand-mark"></div>
+    <div class="brand-text"><h1>Limitless</h1><small>CMVNG · """ + page_title + """</small></div></div>
+  <nav class="nav-tabs">
+    <a href="/" class="nav-tab">Home</a>
+    <a href="/app" class="nav-tab">Crypto</a>
+    <a href="/app/paper" class="nav-tab">Bot 2</a>
+    <a href="/app/paper3" class="nav-tab""" + (" active" if nav_active == "paper3" else "") + """">Paper 3</a>
+    <a href="/app/paper4" class="nav-tab""" + (" active" if nav_active == "paper4" else "") + """">Paper 4</a>
+    <a href="/app/football" class="nav-tab">Football</a>
+  </nav>
+</header>
+<section class="hero">
+  <div class="hero-label">""" + subtitle + """</div>
+  <h2 class="hero-title">""" + page_title + """</h2>
+  <p class="hero-sub">""" + description + """</p>
+</section>
+<div class="stats-row">
+  <div class="stat"><div class="stat-label">Total</div><div class="stat-value">""" + str(total) + """</div></div>
+  <div class="stat"><div class="stat-label">Win Rate</div><div class="stat-value """ + ("pos" if win_rate >= 55 else "neg" if win_rate < 45 else "") + """">""" + str(win_rate) + """%</div></div>
+  <div class="stat"><div class="stat-label">Wins</div><div class="stat-value pos">""" + str(wins) + """</div></div>
+  <div class="stat"><div class="stat-label">Losses</div><div class="stat-value neg">""" + str(losses) + """</div></div>
+  <div class="stat"><div class="stat-label">Pending</div><div class="stat-value">""" + str(pending) + """</div></div>
+  <div class="stat"><div class="stat-label">Sim P&L</div><div class="stat-value """ + ("pos" if total_profit >= 0 else "neg") + """">$""" + str(total_profit) + """</div></div>
+</div>
+<div class="section">
+  <div class="section-title">By Timeframe</div>
+  <div class="cards">"""
+
+    for mt in ["15M", "1H", "Daily"]:
+        s = type_stats.get(mt, {"w": 0, "l": 0, "p": 0, "profit": 0})
+        t2 = s["w"] + s["l"]
+        wr = round(s["w"] / t2 * 100, 1) if t2 > 0 else 0
+        html += '<div class="card"><div class="card-label">' + mt + '</div><div class="card-value">' + str(wr) + '%</div><div class="card-sub">' + str(s["w"]) + 'W / ' + str(s["l"]) + 'L · $' + str(round(s["profit"], 2)) + '</div></div>'
+
+    html += '</div><div class="section-title">By Asset</div><div class="cards">'
+
+    for a in sorted(asset_stats.keys()):
+        s = asset_stats[a]
+        t2 = s["w"] + s["l"]
+        wr = round(s["w"] / t2 * 100, 1) if t2 > 0 else 0
+        html += '<div class="card"><div class="card-label">' + a + '</div><div class="card-value">' + str(wr) + '%</div><div class="card-sub">' + str(s["w"]) + 'W / ' + str(s["l"]) + 'L · $' + str(round(s["profit"], 2)) + '</div></div>'
+
+    html += '</div></div><div class="section"><div class="section-title">Trade Log</div><div class="tw"><table><thead><tr>'
+    html += '<th>#</th><th>Market</th><th>Asset</th><th>Side</th><th>Odds</th><th>Type</th>'
+    for col_name in extra_cols:
+        html += '<th>' + col_name + '</th>'
+    html += '<th>Sim P&L</th><th>Status</th><th>Time</th></tr></thead><tbody>'
+
+    if not trades:
+        html += '<tr><td colspan="' + str(9 + len(extra_cols)) + '" style="text-align:center;padding:40px;color:var(--ink-3)">No trades yet — waiting for qualifying signals</td></tr>'
+
+    for t in trades:
+        odds = t.get("bet_odds") or 0
+        payout = float(t.get("simulated_payout") or 0)
+        if t.get("outcome") == "WIN":
+            pl = "+${:.2f}".format(payout - 1.0)
+            pl_cls = "pos"
+        elif t.get("outcome") == "LOSS":
+            pl = "-$1.00"
+            pl_cls = "neg"
+        else:
+            pl = "—"
+            pl_cls = ""
+        status_cls = "won" if "Won" in (t.get("status") or "") else "lost" if "Lost" in (t.get("status") or "") else "pend"
+        fired = (t.get("fired_at") or "")[:16].replace("T", " ")
+
+        html += '<tr>'
+        html += '<td style="color:var(--ink-4)">' + str(t.get("id", "")) + '</td>'
+        html += '<td style="font-weight:500;max-width:240px;overflow:hidden;text-overflow:ellipsis">' + (t.get("title") or "")[:45] + '</td>'
+        html += '<td>' + str(t.get("asset", "")) + '</td>'
+        html += '<td style="font-weight:600">' + str(t.get("bet_side", "")) + '</td>'
+        html += '<td style="font-family:var(--mono)">' + "{:.1f}%".format(odds) + '</td>'
+        html += '<td>' + str(t.get("market_type", "")) + '</td>'
+
+        # Extra columns specific to Paper 3 or 4
+        for col_key in extra_cols:
+            col_key_lower = col_key.lower().replace(" ", "_")
+            if col_key_lower == "indicators":
+                val = (t.get("indicators") or "—")[:50]
+            elif col_key_lower == "score":
+                sc = t.get("score") or ""
+                ts = t.get("total_signals") or ""
+                val = "{}/{}".format(sc, ts) if sc else "—"
+            elif col_key_lower == "reversal":
+                val = t.get("reversal_type") or "—"
+            elif col_key_lower == "rsi":
+                val = "{:.0f}".format(t["rsi_value"]) if t.get("rsi_value") else "—"
+            elif col_key_lower == "bb":
+                val = t.get("bollinger_pos") or "—"
+            else:
+                val = str(t.get(col_key_lower, "—"))
+            html += '<td style="font-family:var(--mono);font-size:10px">' + val + '</td>'
+
+        html += '<td class="' + pl_cls + '">' + pl + '</td>'
+        html += '<td><span class="' + status_cls + '">' + (t.get("status") or "Pending") + '</span></td>'
+        html += '<td style="font-size:10px;color:var(--ink-4)">' + fired + '</td>'
+        html += '</tr>'
+
+    html += '</tbody></table></div></div>'
+    html += '<footer class="footer">Paper trading · $1 simulated stakes · Auto-resolves · Auto-refresh 60s</footer>'
+    html += '</div><script>setTimeout(()=>location.reload(),60000);</script></body></html>'
+    return html
+
+@app.route("/app/paper3")
+def paper3_page():
+    return _build_paper_page(
+        "paper3_trades",
+        "Paper 3 — Smart Momentum",
+        "Multi-Indicator Trend Following",
+        "Trades at 30-70% odds when 5 out of 7 indicators agree (TV, SMA, EMA, RSI, Bollinger, ROC, BTC). Skips reversal zones where RSI is extreme or price is at Bollinger bands. Detects ranging markets via Bollinger squeeze.",
+        ["Score", "Indicators"],
+        "paper3"
+    )
+
+@app.route("/app/paper4")
+def paper4_page():
+    return _build_paper_page(
+        "paper4_trades",
+        "Paper 4 — Reversal Hunter",
+        "Contrarian Reversal Strategy",
+        "Hunts exhausted trends at 5-55% odds. Enters when RSI is extreme (<30 or >70) AND price is at Bollinger bands, with additional confirmation from momentum, volume, or EMA direction. Also catches Bollinger squeeze breakouts. Higher risk, much higher payout per win.",
+        ["Reversal", "RSI", "BB"],
+        "paper4"
+    )
 
 try:
     init_db()
