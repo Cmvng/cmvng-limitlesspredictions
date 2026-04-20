@@ -43,28 +43,79 @@ _trading_state = {
     "trades_today": 0,           # Number of trades placed today
     "last_reset": None,          # When daily counters last reset
     "last_balance": None,        # Cached balance
-    "high_pct": 0.125,           # 12.5% of balance on HIGH confidence ($2.50 on $20)
-    "medium_pct": 0.05,          # 5% of balance on MEDIUM confidence ($1.00 on $20)
+    "high_pct": 0.125,           # 12.5% of balance on HIGH confidence
+    "medium_pct": 0.05,          # 5% of balance on MEDIUM confidence
     "daily_loss_limit_pct": 0.80,# Stop after 80% daily loss
     "min_stake": 1.0,            # Limitless minimum $1
-    "starting_balance": 20.0,    # Bot 1 starting balance
+    "starting_balance": 13.0,    # Bot 1 starting balance
+    "floor_balance": 5.0,        # Never go below this
+    "compound_threshold": 1.20,  # Start compounding after 20% profit
+    "compound_pct": 0.025,       # 2.5% of balance when compounding
 }
 
 # Bot 2: Low odds strategy (20-72%, trends aligned)
 _bot2_state = {
     "enabled": True,
-    "balance": 20.0,             # Separate $20 balance
+    "balance": 50.0,
     "daily_loss": 0.0,
     "daily_profit": 0.0,
     "trades_today": 0,
     "last_reset": None,
-    "stake_pct": 0.05,           # 5% of balance per trade
-    "min_stake": 1.0,            # Limitless minimum $1
-    "max_loss_pct": 0.50,        # Stop at 50% total loss (not daily — total)
-    "starting_balance": 20.0,    # Starting balance for loss tracking
+    "stake_pct": 0.025,          # 2.5% when compounding
+    "min_stake": 1.0,
+    "max_loss_pct": 0.60,        # floor at $20 = 60% loss on $50
+    "starting_balance": 50.0,
+    "floor_balance": 20.0,
+    "compound_threshold": 1.20,  # 20% profit = $60
+}
+
+# Bot 3: Smart Momentum (multi-indicator, 30-70% odds)
+_bot3_state = {
+    "enabled": True,
+    "balance": 20.0,
+    "daily_loss": 0.0,
+    "daily_profit": 0.0,
+    "trades_today": 0,
+    "last_reset": None,
+    "stake_pct": 0.025,          # 2.5% when compounding
+    "min_stake": 1.0,
+    "max_loss_pct": 0.60,        # floor at $8 = 60% loss on $20
+    "starting_balance": 20.0,
+    "floor_balance": 8.0,
+    "compound_threshold": 1.20,  # 20% profit = $24
 }
 
 FAVOURITE_HOURLY = ["ADA", "BNB", "DOGE"]
+
+def _calc_bot_stake(state):
+    """Calculate stake for any bot. $1 fixed until 20% profit, then 2.5% compounding."""
+    balance = state["balance"]
+    starting = state["starting_balance"]
+    threshold = state.get("compound_threshold", 1.20)
+    compound_pct = state.get("compound_pct", state.get("stake_pct", 0.025))
+    min_stake = state.get("min_stake", 1.0)
+    floor = state.get("floor_balance", 0)
+
+    # Check floor
+    if balance <= floor:
+        return 0
+
+    # Check if 20% profit threshold reached
+    if balance >= starting * threshold:
+        # Compounding mode: 2.5% of balance, min $1
+        stake = max(min_stake, round(balance * compound_pct, 2))
+    else:
+        # Fixed $1 until threshold reached
+        stake = min_stake
+
+    # Never bet more than would take us below floor
+    max_allowed = balance - floor
+    if stake > max_allowed:
+        stake = max(min_stake, round(max_allowed, 2))
+    if stake > balance or stake < min_stake:
+        return 0
+
+    return stake
 
 YAHOO_MAP = {
     "BTC":"BTC-USD",  "ETH":"ETH-USD",  "SOL":"SOL-USD",
@@ -1459,17 +1510,14 @@ def execute_trade(parsed_market, score, prediction_id):
         _trading_state["enabled"] = False
         return False
 
-    # Calculate stake
-    confidence = score.get("confidence", "MEDIUM")
-    if confidence == "HIGH":
-        stake = max(_trading_state["min_stake"], round(balance * _trading_state["high_pct"], 2))
-    else:
-        stake = max(_trading_state["min_stake"], round(balance * _trading_state["medium_pct"], 2))
-
-    if stake > balance:
-        stake = max(_trading_state["min_stake"], round(balance * 0.5, 2))
-    if stake > balance:
-        print("Auto-trade skipped: balance ${:.2f} too low".format(balance))
+    # Calculate stake using shared function (floor + 20% compound threshold)
+    stake = _calc_bot_stake(_trading_state)
+    if stake <= 0:
+        floor = _trading_state.get("floor_balance", 0)
+        if balance <= floor:
+            print("Bot1 STOPPED: balance ${:.2f} at floor ${:.2f}".format(balance, floor))
+            _trading_state["enabled"] = False
+            send_telegram("⚠️ <b>Bot 1 stopped — floor reached</b>\nBalance: ${:.2f}".format(balance))
         return False
 
     bet_side = score.get("bet_side", "YES")
@@ -1892,9 +1940,10 @@ def run_scan():
 
         conn = get_db()
         alerted_rows = conn.run(
-            "SELECT market_id FROM limitless_predictions WHERE fired_at::timestamptz > NOW() - INTERVAL '6 hours'"
+            "SELECT market_id, slug FROM limitless_predictions WHERE fired_at::timestamptz > NOW() - INTERVAL '30 hours'"
         )
         alerted_ids = set(str(row[0]) for row in alerted_rows)
+        alerted_slugs = set(str(row[1]) for row in alerted_rows if row[1])
         conn.close()
 
         count = 0
@@ -1907,6 +1956,9 @@ def run_scan():
                     continue
                 if parsed["market_id"] in alerted_ids:
                     continue
+                # Skip if we already traded this exact slug (prevents daily market re-entry)
+                if parsed["slug"] and parsed["slug"] in alerted_slugs:
+                    continue
                 asset = parsed["asset"]
                 if asset not in price_cache:
                     price_cache[asset] = get_price(asset)
@@ -1916,6 +1968,8 @@ def run_scan():
                     continue
                 save_and_alert(parsed, scored, price, btc_trend)
                 alerted_ids.add(parsed["market_id"])
+                if parsed.get("slug"):
+                    alerted_slugs.add(parsed["slug"])
                 _current_cycle_bot1_ids.add(parsed["market_id"])
                 count += 1
                 time.sleep(1)
@@ -2463,12 +2517,12 @@ def run_paper34_scan():
         # Get already recorded trades
         conn = get_db()
         try:
-            p3_rows = conn.run("SELECT market_id FROM paper3_trades WHERE fired_at::timestamptz > NOW() - INTERVAL '6 hours'")
+            p3_rows = conn.run("SELECT market_id FROM paper3_trades WHERE fired_at::timestamptz > NOW() - INTERVAL '30 hours'")
             p3_ids = set(str(row[0]) for row in p3_rows)
         except:
             p3_ids = set()
         try:
-            p4_rows = conn.run("SELECT market_id FROM paper4_trades WHERE fired_at::timestamptz > NOW() - INTERVAL '6 hours'")
+            p4_rows = conn.run("SELECT market_id FROM paper4_trades WHERE fired_at::timestamptz > NOW() - INTERVAL '30 hours'")
             p4_ids = set(str(row[0]) for row in p4_rows)
         except:
             p4_ids = set()
@@ -2505,6 +2559,16 @@ def run_paper34_scan():
                 if parsed["market_id"] not in p3_ids:
                     scored3 = _score_paper3_trade(parsed, price, ind)
                     if scored3:
+                        # Calculate Bot 3 stake using shared function
+                        stake3 = _calc_bot_stake(_bot3_state)
+                        if stake3 <= 0:
+                            stake3 = 1.0  # Still record to DB even if not trading
+
+                        share_price3 = scored3["bet_odds"] / 100.0
+                        if scored3["bet_side"] == "NO":
+                            share_price3 = 1.0 - share_price3
+                        sim_payout3 = round(stake3 / share_price3, 4) if share_price3 > 0 else 0
+
                         try:
                             conn2 = get_db()
                             conn2.run(
@@ -2513,7 +2577,7 @@ def run_paper34_scan():
                                  current_price, hours_left, market_type, indicators, score,
                                  total_signals, simulated_stake, simulated_payout, status, fired_at, slug)
                                 VALUES (:mid, :ttl, :ast, :dir, :base, :odds, :bs,
-                                        :pr, :hrs, :mt, :ind, :sc, :ts, 1.0, :sp, 'Pending', :now, :slg)""",
+                                        :pr, :hrs, :mt, :ind, :sc, :ts, :ss, :sp, 'Pending', :now, :slg)""",
                                 mid=parsed["market_id"], ttl=parsed["title"], ast=asset,
                                 dir=parsed["direction"], base=parsed["baseline"],
                                 odds=scored3["bet_odds"], bs=scored3["bet_side"],
@@ -2521,13 +2585,32 @@ def run_paper34_scan():
                                 mt=scored3["market_type"],
                                 ind="[{}] {}".format(scored3["confidence"], scored3["indicators"]),
                                 sc=scored3["score"], ts=scored3["total_signals"],
-                                sp=scored3["sim_payout"], now=now, slg=parsed["slug"]
+                                ss=stake3, sp=sim_payout3,
+                                now=now, slg=parsed["slug"]
                             )
                             conn2.close()
                             p3_ids.add(parsed["market_id"])
                             p3_count += 1
                         except Exception as e:
                             print("Paper3 save error: {}".format(e))
+
+                        # Place REAL trade via Bot 3 (if enabled and above floor)
+                        floor3 = _bot3_state.get("floor_balance", 0)
+                        if _bot3_state["enabled"] and _bot3_state["balance"] > floor3:
+                            real_stake3 = _calc_bot_stake(_bot3_state)
+                            if real_stake3 <= 0:
+                                _bot3_state["enabled"] = False
+                                send_telegram("⚠️ <b>Bot 3 stopped — floor reached</b>\nBalance: ${:.2f}".format(_bot3_state["balance"]))
+                            elif real_stake3 <= _bot3_state["balance"]:
+                                try:
+                                    success = execute_trade(parsed, scored3, None)
+                                    if success:
+                                        _bot3_state["balance"] = round(_bot3_state["balance"] - real_stake3, 2)
+                                        _bot3_state["trades_today"] += 1
+                                        print("Bot3 TRADE: {} {} ${:.2f} on {} | bal=${:.2f}".format(
+                                            scored3["bet_side"], asset, real_stake3, parsed["title"][:30], _bot3_state["balance"]))
+                                except Exception as te:
+                                    print("Bot3 trade error: {}".format(te))
 
                 # Paper 4: Reversal Hunter
                 if parsed["market_id"] not in p4_ids:
@@ -2631,6 +2714,22 @@ def _resolve_paper_table(table_name):
                 )
                 conn2.close()
                 resolved += 1
+
+                # Update Bot 3 balance for paper3_trades
+                if table_name == "paper3_trades" and _bot3_state["enabled"]:
+                    if won:
+                        _bot3_state["balance"] = round(_bot3_state["balance"] + payout, 2)
+                        _bot3_state["daily_profit"] = round(_bot3_state["daily_profit"] + (payout - stake), 2)
+                    else:
+                        _bot3_state["daily_loss"] = round(_bot3_state["daily_loss"] + stake, 2)
+
+                    emoji = "✅" if won else "❌"
+                    send_telegram(
+                        "{} <b>BOT3 {} — #{}</b>\n📌 {}\n<b>Stake:</b> ${:.2f} | <b>Payout:</b> ${:.2f}\n<b>Bot3 Balance:</b> ${:.2f}".format(
+                            emoji, outcome, p["id"], (p.get("title") or "")[:50],
+                            stake, payout, _bot3_state["balance"]))
+                    print("Bot3 #{} {}: stake=${:.2f} payout=${:.2f} bal=${:.2f}".format(
+                        p["id"], outcome, stake, payout, _bot3_state["balance"]))
             except Exception as e:
                 print("{} resolve #{}: {}".format(table_name, p.get("id"), e))
 
@@ -2797,14 +2896,13 @@ def run_paper_scan():
         if not _has_trading_keys():
             return
 
-        # Check total loss limit (50% of starting balance)
-        total_lost = _bot2_state["starting_balance"] - _bot2_state["balance"]
-        max_loss = _bot2_state["starting_balance"] * _bot2_state["max_loss_pct"]
-        if total_lost >= max_loss:
-            print("Bot2 STOPPED: total loss ${:.2f} >= limit ${:.2f}".format(total_lost, max_loss))
+        # Check floor balance
+        floor = _bot2_state.get("floor_balance", 0)
+        if _bot2_state["balance"] <= floor:
+            print("Bot2 STOPPED: balance ${:.2f} at floor ${:.2f}".format(_bot2_state["balance"], floor))
             _bot2_state["enabled"] = False
-            send_telegram("⚠️ <b>Bot 2 stopped — 50% loss limit reached</b>\nLost: ${:.2f} of ${:.2f}".format(
-                total_lost, _bot2_state["starting_balance"]))
+            send_telegram("⚠️ <b>Bot 2 stopped — floor reached</b>\nBalance: ${:.2f} (floor: ${:.2f})".format(
+                _bot2_state["balance"], floor))
             return
 
         r = req.get("{}/markets/active".format(LIMITLESS_API), timeout=15)
@@ -2816,7 +2914,7 @@ def run_paper_scan():
         conn = get_db()
         try:
             recorded = conn.run(
-                "SELECT market_id FROM paper_trades WHERE fired_at::timestamptz > NOW() - INTERVAL '6 hours'"
+                "SELECT market_id FROM paper_trades WHERE fired_at::timestamptz > NOW() - INTERVAL '30 hours'"
             )
             recorded_ids = set(str(row[0]) for row in recorded)
         except:
@@ -2827,7 +2925,7 @@ def run_paper_scan():
         try:
             conn3 = get_db()
             bot1_rows = conn3.run(
-                "SELECT market_id FROM limitless_predictions WHERE fired_at::timestamptz > NOW() - INTERVAL '6 hours'"
+                "SELECT market_id FROM limitless_predictions WHERE fired_at::timestamptz > NOW() - INTERVAL '30 hours'"
             )
             bot1_ids = set(str(row[0]) for row in bot1_rows)
             conn3.close()
@@ -2839,8 +2937,8 @@ def run_paper_scan():
         skipped_reasons = {"no_parse": 0, "duplicate": 0, "no_score": 0, "odds_range": 0, "bot1_took": 0}
         for market in markets:
             try:
-                # Stop if balance depleted during scan
-                if _bot2_state["balance"] < _bot2_state["min_stake"]:
+                # Stop if balance at floor
+                if _bot2_state["balance"] <= _bot2_state.get("floor_balance", 0):
                     break
 
                 parsed = parse_market(market)
@@ -2871,11 +2969,9 @@ def run_paper_scan():
                     skipped_reasons["no_score"] += 1
                     continue
 
-                # Calculate Bot 2 stake (5% of balance, min $1)
-                stake = max(_bot2_state["min_stake"], round(_bot2_state["balance"] * _bot2_state["stake_pct"], 2))
-                if stake > _bot2_state["balance"]:
-                    stake = _bot2_state["min_stake"]
-                if stake > _bot2_state["balance"]:
+                # Calculate Bot 2 stake using shared function
+                stake = _calc_bot_stake(_bot2_state)
+                if stake <= 0:
                     break
 
                 scored["sim_stake"] = stake
@@ -4487,7 +4583,7 @@ def run_otp_scan():
         # Get already-alerted (we now store market ID in home_team field for OTP rows)
         conn = get_db()
         alerted = conn.run(
-            "SELECT home_team FROM football_picks WHERE fired_at::timestamptz > NOW() - INTERVAL '6 hours' AND pick_type='limitless_otp'"
+            "SELECT home_team FROM football_picks WHERE fired_at::timestamptz > NOW() - INTERVAL '30 hours' AND pick_type='limitless_otp'"
         )
         alerted_ids = set(str(r[0]) for r in alerted if r[0])
         conn.close()
@@ -4713,20 +4809,22 @@ def trading_start():
 def trading_status():
     """Check current auto-trading status."""
     balance = _get_limitless_balance()
+    compound_target = _trading_state["starting_balance"] * _trading_state.get("compound_threshold", 1.20)
+    is_compounding = (balance or 0) >= compound_target
+    current_stake = _calc_bot_stake(_trading_state)
     return {
         "enabled": _trading_state["enabled"],
         "balance": balance,
-        "safe_window": _is_safe_trading_window(),
-        "current_hour_lagos": datetime.now(LAGOS_TZ).hour,
-        "mode": "AUTO-TRADING 24/7" if _trading_state["enabled"] else "STOPPED (kill switch)",
+        "starting_balance": _trading_state["starting_balance"],
+        "floor_balance": _trading_state.get("floor_balance", 0),
+        "compound_after": round(compound_target, 2),
+        "is_compounding": is_compounding,
+        "current_stake": current_stake,
+        "mode": "AUTO-TRADING 24/7" if _trading_state["enabled"] else "STOPPED",
         "daily_loss": _trading_state["daily_loss"],
         "daily_profit": _trading_state["daily_profit"],
         "trades_today": _trading_state["trades_today"],
-        "high_pct": _trading_state["high_pct"],
-        "medium_pct": _trading_state["medium_pct"],
-        "daily_loss_limit_pct": _trading_state["daily_loss_limit_pct"],
         "has_keys": _has_trading_keys(),
-        "schedule": "24/7 — no session pauses",
     }, 200
 
 @app.route("/trading/set", methods=["GET"])
@@ -4742,25 +4840,28 @@ def trading_set():
         bal = float(request.args["balance"])
         _trading_state["last_balance"] = bal
         _trading_state["starting_balance"] = bal
+    if request.args.get("floor"):
+        _trading_state["floor_balance"] = float(request.args["floor"])
     return {
-        "high_pct": _trading_state["high_pct"],
-        "medium_pct": _trading_state["medium_pct"],
-        "daily_loss_limit_pct": _trading_state["daily_loss_limit_pct"],
         "balance": _trading_state.get("last_balance"),
+        "floor_balance": _trading_state.get("floor_balance", 0),
+        "current_stake": _calc_bot_stake(_trading_state),
+        "compound_after": round(_trading_state["starting_balance"] * _trading_state.get("compound_threshold", 1.20), 2),
     }, 200
 
 @app.route("/bot2/status", methods=["GET"])
 def bot2_status():
     """Check Bot 2 (low odds) status."""
-    total_lost = _bot2_state["starting_balance"] - _bot2_state["balance"]
+    compound_target = _bot2_state["starting_balance"] * _bot2_state.get("compound_threshold", 1.20)
+    is_compounding = _bot2_state["balance"] >= compound_target
     return {
         "enabled": _bot2_state["enabled"],
         "balance": _bot2_state["balance"],
         "starting_balance": _bot2_state["starting_balance"],
-        "total_lost": round(total_lost, 2),
-        "loss_limit": _bot2_state["max_loss_pct"],
-        "stake_pct": _bot2_state["stake_pct"],
-        "current_stake": max(_bot2_state["min_stake"], round(_bot2_state["balance"] * _bot2_state["stake_pct"], 2)),
+        "floor_balance": _bot2_state.get("floor_balance", 0),
+        "compound_after": round(compound_target, 2),
+        "is_compounding": is_compounding,
+        "current_stake": _calc_bot_stake(_bot2_state),
         "daily_profit": _bot2_state["daily_profit"],
         "daily_loss": _bot2_state["daily_loss"],
         "trades_today": _bot2_state["trades_today"],
@@ -4769,18 +4870,19 @@ def bot2_status():
 
 @app.route("/bot2/set", methods=["GET"])
 def bot2_set():
-    """Adjust Bot 2 parameters. /bot2/set?balance=20&stake=0.05&loss=0.50"""
+    """Adjust Bot 2 parameters. /bot2/set?balance=50&floor=20"""
     if request.args.get("balance"):
         _bot2_state["balance"] = float(request.args["balance"])
         _bot2_state["starting_balance"] = float(request.args["balance"])
+    if request.args.get("floor"):
+        _bot2_state["floor_balance"] = float(request.args["floor"])
     if request.args.get("stake"):
         _bot2_state["stake_pct"] = float(request.args["stake"])
-    if request.args.get("loss"):
-        _bot2_state["max_loss_pct"] = float(request.args["loss"])
     return {
         "balance": _bot2_state["balance"],
+        "floor_balance": _bot2_state.get("floor_balance", 0),
         "stake_pct": _bot2_state["stake_pct"],
-        "max_loss_pct": _bot2_state["max_loss_pct"],
+        "current_stake": _calc_bot_stake(_bot2_state),
     }, 200
 
 @app.route("/bot2/start", methods=["GET"])
@@ -4792,6 +4894,50 @@ def bot2_start():
 def bot2_stop():
     _bot2_state["enabled"] = False
     return {"status": "Bot 2 stopped", "balance": _bot2_state["balance"]}, 200
+
+@app.route("/bot3/status", methods=["GET"])
+def bot3_status():
+    compound_target = _bot3_state["starting_balance"] * _bot3_state.get("compound_threshold", 1.20)
+    is_compounding = _bot3_state["balance"] >= compound_target
+    return {
+        "enabled": _bot3_state["enabled"],
+        "balance": _bot3_state["balance"],
+        "starting_balance": _bot3_state["starting_balance"],
+        "floor_balance": _bot3_state.get("floor_balance", 0),
+        "compound_after": round(compound_target, 2),
+        "is_compounding": is_compounding,
+        "current_stake": _calc_bot_stake(_bot3_state),
+        "daily_profit": _bot3_state["daily_profit"],
+        "daily_loss": _bot3_state["daily_loss"],
+        "trades_today": _bot3_state["trades_today"],
+        "mode": "Bot 3: Smart Momentum (30-70%) with multi-indicator scoring",
+    }, 200
+
+@app.route("/bot3/set", methods=["GET"])
+def bot3_set():
+    if request.args.get("balance"):
+        _bot3_state["balance"] = float(request.args["balance"])
+        _bot3_state["starting_balance"] = float(request.args["balance"])
+    if request.args.get("floor"):
+        _bot3_state["floor_balance"] = float(request.args["floor"])
+    if request.args.get("stake"):
+        _bot3_state["stake_pct"] = float(request.args["stake"])
+    return {
+        "balance": _bot3_state["balance"],
+        "floor_balance": _bot3_state.get("floor_balance", 0),
+        "stake_pct": _bot3_state["stake_pct"],
+        "current_stake": _calc_bot_stake(_bot3_state),
+    }, 200
+
+@app.route("/bot3/start", methods=["GET"])
+def bot3_start():
+    _bot3_state["enabled"] = True
+    return {"status": "Bot 3 started", "balance": _bot3_state["balance"]}, 200
+
+@app.route("/bot3/stop", methods=["GET"])
+def bot3_stop():
+    _bot3_state["enabled"] = False
+    return {"status": "Bot 3 stopped", "balance": _bot3_state["balance"]}, 200
 
 @app.route("/football/clear", methods=["GET"])
 def clear_football_picks():
@@ -6649,11 +6795,13 @@ td{padding:8px 12px;border-bottom:1px solid #f4f3ed;color:var(--ink-2)}tr:last-c
 
 @app.route("/app/paper3")
 def paper3_page():
+    bal_str = "${:.2f}".format(_bot3_state["balance"])
+    status = "LIVE" if _bot3_state["enabled"] else "STOPPED"
     return _build_paper_page(
         "paper3_trades",
-        "Paper 3 — Smart Momentum",
-        "Multi-Indicator Trend Following",
-        "Trades at 30-70% odds when 5 out of 7 indicators agree (TV, SMA, EMA, RSI, Bollinger, ROC, BTC). Skips reversal zones where RSI is extreme or price is at Bollinger bands. Detects ranging markets via Bollinger squeeze.",
+        "Bot 3 — Smart Momentum",
+        "Multi-Indicator Trend Following · Balance: {} · {}".format(bal_str, status),
+        "Real trades at 30-70% odds when 3+ of 7 indicators agree (TV, SMA, EMA, RSI, Bollinger, ROC, BTC). Skips reversal zones and ranging markets. Confidence tiers: HIGH (5+), MEDIUM (4+), LOW (3+). Compounding with $1 minimum stake, 50% total loss limit.",
         ["Score", "Indicators"],
         "paper3"
     )
