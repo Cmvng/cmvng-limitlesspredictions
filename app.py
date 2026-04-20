@@ -1752,8 +1752,11 @@ def execute_trade(parsed_market, score, prediction_id, override_stake=None):
                         fill_price = displayed_price
 
         if filled:
-            _trading_state["trades_today"] += 1
-            _trading_state["last_balance"] = round(balance - stake, 2)
+            if override_stake is None:
+                # Bot 1: update its tracked balance
+                _trading_state["trades_today"] += 1
+                _trading_state["last_balance"] = round((balance or 0) - stake, 2)
+            # Bot 2/3 handle their own balance tracking outside this function
 
             try:
                 conn = get_db()
@@ -1763,26 +1766,28 @@ def execute_trade(parsed_market, score, prediction_id, override_stake=None):
             except:
                 pass
 
-            trade_msg = (
-                "🤖 <b>AUTO-TRADE PLACED</b>\n"
-                "──────────────────────────\n"
-                "📌 {}\n"
-                "<b>Side:</b> BUY {} shares\n"
-                "<b>Stake:</b> ${:.2f}\n"
-                "<b>Fill Price:</b> {:.4f}\n"
-                "<b>Balance:</b> ${:.2f}\n"
-                "<b>Trade #:</b> {} today\n"
-                "──────────────────────────\n"
-                "📊 Daily P&L: +${:.2f} / -${:.2f}"
-            ).format(
-                parsed_market["title"],
-                bet_side, stake, fill_price,
-                balance - stake,
-                _trading_state["trades_today"],
-                _trading_state["daily_profit"],
-                _trading_state["daily_loss"],
-            )
-            send_telegram(trade_msg)
+            if override_stake is None:
+                # Bot 1 telegram
+                trade_msg = (
+                    "🤖 <b>AUTO-TRADE PLACED</b>\n"
+                    "──────────────────────────\n"
+                    "📌 {}\n"
+                    "<b>Side:</b> BUY {} shares\n"
+                    "<b>Stake:</b> ${:.2f}\n"
+                    "<b>Fill Price:</b> {:.4f}\n"
+                    "<b>Balance:</b> ${:.2f}\n"
+                    "<b>Trade #:</b> {} today\n"
+                    "──────────────────────────\n"
+                    "📊 Daily P&L: +${:.2f} / -${:.2f}"
+                ).format(
+                    parsed_market["title"],
+                    bet_side, stake, fill_price,
+                    (balance or 0) - stake,
+                    _trading_state["trades_today"],
+                    _trading_state["daily_profit"],
+                    _trading_state["daily_loss"],
+                )
+                send_telegram(trade_msg)
             print("AUTO-TRADE #{}: {} {} ${:.2f} @{:.4f} on {}".format(
                 prediction_id, bet_side, slug[:30], stake, fill_price, parsed_market["title"][:40]))
             return True
