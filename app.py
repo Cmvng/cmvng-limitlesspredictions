@@ -1348,19 +1348,27 @@ def _place_gtc_order(slug, bet_side, token_id, stake, price_per_share, exchange_
         return None
 
 def _cancel_order(order_id):
-    """Cancel an order by ID."""
+    """Cancel an order by ID. Retries once if first attempt fails."""
     import requests as req
-    try:
-        path = "/orders/{}".format(order_id)
-        headers = _hmac_headers("DELETE", path)
-        r = req.delete(
-            "{}{}".format(LIMITLESS_API, path),
-            headers=headers, timeout=10
-        )
-        return r.status_code in (200, 204)
-    except Exception as e:
-        print("Cancel order error: {}".format(e))
-        return False
+    for attempt in range(2):
+        try:
+            path = "/orders/{}".format(order_id)
+            headers = _hmac_headers("DELETE", path)
+            r = req.delete(
+                "{}{}".format(LIMITLESS_API, path),
+                headers=headers, timeout=10
+            )
+            if r.status_code in (200, 204):
+                print("Order {} cancelled successfully".format(order_id[:12]))
+                return True
+            else:
+                print("Cancel order {} attempt {}: HTTP {}".format(order_id[:12], attempt + 1, r.status_code))
+        except Exception as e:
+            print("Cancel order error attempt {}: {}".format(attempt + 1, e))
+        if attempt == 0:
+            time.sleep(1)
+    print("WARNING: Failed to cancel order {} — may still be live!".format(order_id[:12]))
+    return False
 
 def _check_order_filled(order_id):
     """Check if a GTC order has been filled. Returns 'FILLED', 'LIVE', or 'UNKNOWN'."""
@@ -1665,10 +1673,10 @@ def execute_trade(parsed_market, score, prediction_id):
                     parsed_market["title"][:50], bet_side, stake))
             return success
 
-        # 4. Aggressive bidding loop — check every 5 seconds for 30 seconds
+        # 4. Aggressive bidding loop — check every 5 seconds for 60 seconds
         filled = False
         fill_price = current_price
-        max_checks = 6  # 6 × 5s = 30 seconds
+        max_checks = 12  # 12 × 5s = 60 seconds
         for check_num in range(max_checks):
             time.sleep(5)
 
@@ -1709,17 +1717,39 @@ def execute_trade(parsed_market, score, prediction_id):
 
         # 5. If not filled after 30 seconds — FOK at the ask (if under ceiling)
         if not filled:
-            # Cancel remaining GTC order
+            # Cancel remaining GTC order — MUST succeed before placing FOK
+            cancel_ok = True
             if order_id:
-                _cancel_order(order_id)
+                cancel_ok = _cancel_order(order_id)
                 time.sleep(0.5)
+
+            if not cancel_ok:
+                # Individual cancel failed — try cancel ALL orders as fallback
+                print("Individual cancel failed — trying cancel-all")
+                try:
+                    import requests as req
+                    path = "/orders"
+                    headers = _hmac_headers("DELETE", path)
+                    r = req.delete("{}{}".format(LIMITLESS_API, path), headers=headers, timeout=10)
+                    if r.status_code in (200, 204):
+                        print("Cancel-all succeeded")
+                        cancel_ok = True
+                    else:
+                        print("Cancel-all failed: HTTP {}".format(r.status_code))
+                except Exception as e:
+                    print("Cancel-all error: {}".format(e))
+
+            if not cancel_ok:
+                # Both cancel methods failed — don't risk double position
+                print("GTC cancel failed — skipping FOK to avoid double position")
+                return False
 
             # Check current ask price
             ob = _fetch_orderbook(slug)
             _, final_ask, _ = _get_best_prices(ob, bet_side)
 
             if final_ask and final_ask <= ceiling:
-                print("Not filled after 30s — FOK at ask ${:.4f}".format(final_ask))
+                print("Not filled after 60s — FOK at ask ${:.4f}".format(final_ask))
                 success = _place_fok_order(slug, bet_side, token_id, stake, exchange_addr, profile_id, fee_bps)
                 if success:
                     filled = True
@@ -1729,7 +1759,7 @@ def execute_trade(parsed_market, score, prediction_id):
                 return False
             else:
                 # Orderbook unavailable (404) — FOK anyway, the signal is still valid
-                print("Not filled after 30s, orderbook unavailable — FOK fallback")
+                print("Not filled after 60s, orderbook unavailable — FOK fallback")
                 success = _place_fok_order(slug, bet_side, token_id, stake, exchange_addr, profile_id, fee_bps)
                 if success:
                     filled = True
