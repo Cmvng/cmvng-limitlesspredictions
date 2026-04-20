@@ -66,7 +66,7 @@ _bot2_state = {
     "max_loss_pct": 0.60,        # floor at $20 = 60% loss on $50
     "starting_balance": 50.0,
     "floor_balance": 20.0,
-    "compound_threshold": 1.20,  # 20% profit = $60
+    "compound_threshold": 1.10,  # 10% profit = $55 (best performer)
 }
 
 # Bot 3: Smart Momentum (multi-indicator, 30-70% odds)
