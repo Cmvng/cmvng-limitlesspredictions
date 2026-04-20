@@ -1626,8 +1626,9 @@ def execute_trade(parsed_market, score, prediction_id, override_stake=None):
             print("No orderbook data — falling back to FOK")
             success = _place_fok_order(slug, bet_side, token_id, stake, exchange_addr, profile_id, fee_bps)
             if success:
-                _trading_state["trades_today"] += 1
-                _trading_state["last_balance"] = round(balance - stake, 2)
+                if override_stake is None:
+                    _trading_state["trades_today"] += 1
+                    _trading_state["last_balance"] = round((balance or 0) - stake, 2)
                 try:
                     conn = get_db()
                     conn.run("UPDATE limitless_predictions SET size_rec=:s WHERE id=:i",
@@ -1657,8 +1658,9 @@ def execute_trade(parsed_market, score, prediction_id, override_stake=None):
             print("GTC failed — trying FOK fallback")
             success = _place_fok_order(slug, bet_side, token_id, stake, exchange_addr, profile_id, fee_bps)
             if success:
-                _trading_state["trades_today"] += 1
-                _trading_state["last_balance"] = round(balance - stake, 2)
+                if override_stake is None:
+                    _trading_state["trades_today"] += 1
+                    _trading_state["last_balance"] = round((balance or 0) - stake, 2)
                 try:
                     conn = get_db()
                     conn.run("UPDATE limitless_predictions SET size_rec=:s WHERE id=:i",
@@ -1768,34 +1770,27 @@ def execute_trade(parsed_market, score, prediction_id, override_stake=None):
 
             if override_stake is None:
                 # Bot 1 telegram
-                trade_msg = (
-                    "🤖 <b>BOT1 TRADE PLACED</b>\n"
-                    "──────────────────────────\n"
-                    "📌 {}\n"
-                    "<b>Side:</b> BUY {} shares\n"
-                    "<b>Stake:</b> ${:.2f}\n"
-                    "<b>Fill Price:</b> {:.4f}\n"
-                    "<b>Balance:</b> ${:.2f}\n"
-                    "──────────────────────────"
-                ).format(
-                    parsed_market["title"],
-                    bet_side, stake, fill_price,
-                    (balance or 0) - stake,
-                )
-                send_telegram(trade_msg)
+                bot_label = "BOT1"
+                bot_balance = (balance or 0) - stake
             else:
-                # Bot 2/3 telegram — identify which bot by checking context
-                send_telegram(
-                    "🤖 <b>TRADE PLACED</b>\n"
-                    "──────────────────────────\n"
-                    "📌 {}\n"
-                    "<b>Side:</b> BUY {} shares\n"
-                    "<b>Stake:</b> ${:.2f}\n"
-                    "<b>Fill Price:</b> {:.4f}\n"
-                    "──────────────────────────".format(
-                        parsed_market["title"],
-                        bet_side, stake, fill_price,
-                    ))
+                # Bot 2/3 — figure out which bot
+                bot_label = "BOT"
+                bot_balance = 0
+
+            trade_msg = (
+                "🤖 <b>{} AUTO-TRADE PLACED</b>\n"
+                "──────────────────────────\n"
+                "📌 {}\n"
+                "<b>Side:</b> BUY {} shares\n"
+                "<b>Stake:</b> ${:.2f}\n"
+                "<b>Fill Price:</b> {:.4f}\n"
+                "──────────────────────────"
+            ).format(
+                bot_label,
+                parsed_market["title"],
+                bet_side, stake, fill_price,
+            )
+            send_telegram(trade_msg)
             print("AUTO-TRADE #{}: {} {} ${:.2f} @{:.4f} on {}".format(
                 prediction_id, bet_side, slug[:30], stake, fill_price, parsed_market["title"][:40]))
             return True
