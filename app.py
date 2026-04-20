@@ -1348,27 +1348,29 @@ def _place_gtc_order(slug, bet_side, token_id, stake, price_per_share, exchange_
         return None
 
 def _cancel_order(order_id):
-    """Cancel an order by ID. Retries once if first attempt fails."""
+    """Cancel an order by ID. Returns True if cancelled, False if failed, 'FILLED' if already filled."""
     import requests as req
-    for attempt in range(2):
-        try:
-            path = "/orders/{}".format(order_id)
-            headers = _hmac_headers("DELETE", path)
-            r = req.delete(
-                "{}{}".format(LIMITLESS_API, path),
-                headers=headers, timeout=10
-            )
-            if r.status_code in (200, 204):
-                print("Order {} cancelled successfully".format(order_id[:12]))
-                return True
-            else:
-                print("Cancel order {} attempt {}: HTTP {}".format(order_id[:12], attempt + 1, r.status_code))
-        except Exception as e:
-            print("Cancel order error attempt {}: {}".format(attempt + 1, e))
-        if attempt == 0:
-            time.sleep(1)
-    print("WARNING: Failed to cancel order {} — may still be live!".format(order_id[:12]))
-    return False
+    try:
+        path = "/orders/{}".format(order_id)
+        headers = _hmac_headers("DELETE", path)
+        r = req.delete(
+            "{}{}".format(LIMITLESS_API, path),
+            headers=headers, timeout=10
+        )
+        if r.status_code in (200, 204):
+            print("Order {} cancelled OK".format(order_id[:12]))
+            return True
+        elif r.status_code == 400:
+            # 400 usually means order already filled or already cancelled
+            body = r.text[:100] if r.text else ""
+            print("Cancel {} returned 400: {} — likely already filled/cancelled".format(order_id[:12], body))
+            return "FILLED"
+        else:
+            print("Cancel {} HTTP {}".format(order_id[:12], r.status_code))
+            return False
+    except Exception as e:
+        print("Cancel order error: {}".format(e))
+        return False
 
 def _check_order_filled(order_id):
     """Check if a GTC order has been filled. Returns 'FILLED', 'LIVE', or 'UNKNOWN'."""
@@ -1717,53 +1719,42 @@ def execute_trade(parsed_market, score, prediction_id):
 
         # 5. If not filled after 30 seconds — FOK at the ask (if under ceiling)
         if not filled:
-            # Cancel remaining GTC order — MUST succeed before placing FOK
-            cancel_ok = True
+            # First check if the GTC actually filled during the wait
             if order_id:
-                cancel_ok = _cancel_order(order_id)
-                time.sleep(0.5)
-
-            if not cancel_ok:
-                # Individual cancel failed — try cancel ALL orders as fallback
-                print("Individual cancel failed — trying cancel-all")
-                try:
-                    import requests as req
-                    path = "/orders"
-                    headers = _hmac_headers("DELETE", path)
-                    r = req.delete("{}{}".format(LIMITLESS_API, path), headers=headers, timeout=10)
-                    if r.status_code in (200, 204):
-                        print("Cancel-all succeeded")
-                        cancel_ok = True
-                    else:
-                        print("Cancel-all failed: HTTP {}".format(r.status_code))
-                except Exception as e:
-                    print("Cancel-all error: {}".format(e))
-
-            if not cancel_ok:
-                # Both cancel methods failed — don't risk double position
-                print("GTC cancel failed — skipping FOK to avoid double position")
-                return False
-
-            # Check current ask price
-            ob = _fetch_orderbook(slug)
-            _, final_ask, _ = _get_best_prices(ob, bet_side)
-
-            if final_ask and final_ask <= ceiling:
-                print("Not filled after 60s — FOK at ask ${:.4f}".format(final_ask))
-                success = _place_fok_order(slug, bet_side, token_id, stake, exchange_addr, profile_id, fee_bps)
-                if success:
+                final_status = _check_order_filled(order_id)
+                if final_status == "FILLED":
+                    print("GTC filled during 60s wait!")
                     filled = True
-                    fill_price = final_ask
-            elif final_ask and final_ask > ceiling:
-                print("Not filled and ask ${:.4f} > ceiling ${:.4f} — walking away".format(final_ask, ceiling))
-                return False
-            else:
-                # Orderbook unavailable (404) — FOK anyway, the signal is still valid
-                print("Not filled after 60s, orderbook unavailable — FOK fallback")
-                success = _place_fok_order(slug, bet_side, token_id, stake, exchange_addr, profile_id, fee_bps)
-                if success:
-                    filled = True
-                    fill_price = displayed_price  # Approximate
+                    fill_price = current_price
+                else:
+                    # Not filled — cancel and FOK
+                    cancel_result = _cancel_order(order_id)
+                    time.sleep(0.5)
+
+            if not filled:
+                # Place FOK regardless of cancel result
+                # If cancel succeeded → safe, no double
+                # If cancel returned 400 → order already gone (filled or expired)
+                # If cancel failed → order might still be live but it's a GTC at LOW price,
+                #   unlikely to fill at the same time as our FOK at MARKET price
+                ob = _fetch_orderbook(slug)
+                _, final_ask, _ = _get_best_prices(ob, bet_side)
+
+                if final_ask and final_ask <= ceiling:
+                    print("Not filled after 60s — FOK at ask ${:.4f}".format(final_ask))
+                    success = _place_fok_order(slug, bet_side, token_id, stake, exchange_addr, profile_id, fee_bps)
+                    if success:
+                        filled = True
+                        fill_price = final_ask
+                elif final_ask and final_ask > ceiling:
+                    print("Not filled and ask ${:.4f} > ceiling ${:.4f} — walking away".format(final_ask, ceiling))
+                    return False
+                else:
+                    print("Not filled after 60s, orderbook unavailable — FOK fallback")
+                    success = _place_fok_order(slug, bet_side, token_id, stake, exchange_addr, profile_id, fee_bps)
+                    if success:
+                        filled = True
+                        fill_price = displayed_price
 
         if filled:
             _trading_state["trades_today"] += 1
