@@ -1916,6 +1916,7 @@ def run_scan():
                     continue
                 save_and_alert(parsed, scored, price, btc_trend)
                 alerted_ids.add(parsed["market_id"])
+                _current_cycle_bot1_ids.add(parsed["market_id"])
                 count += 1
                 time.sleep(1)
             except Exception as e:
@@ -1933,9 +1934,13 @@ def run_scan():
         print("Scanner error: {}".format(e))
         return 0
 
+_current_cycle_bot1_ids = set()  # Shared between scanners in same cycle
+
 def scan_loop():
     time.sleep(30)
     while True:
+        global _current_cycle_bot1_ids
+        _current_cycle_bot1_ids = set()
         run_scan()
         # Run paper scanner after real scanner (uses same market data)
         try:
@@ -2154,13 +2159,18 @@ def _score_paper3_trade(p, price, indicators):
     if not (30 <= yes_odds <= 70 or 30 <= no_odds <= 70):
         return None
 
-    # Determine price position relative to baseline
-    if p["direction"] == "above":
-        price_above = price > p["baseline"]
-        price_below = price < p["baseline"]
-    else:
-        price_above = price < p["baseline"]
-        price_below = price > p["baseline"]
+    # Calculate margin — how far price is from baseline
+    margin = abs(price - p["baseline"])
+    margin_pct = (margin / p["baseline"] * 100) if p["baseline"] > 0 else 0
+
+    # Minimum margin: skip if price is too close to baseline
+    min_margin = 0.05 if p["is_short"] else 0.2
+    if margin_pct < min_margin:
+        return None
+
+    # Check if indicators agree with price position
+    # If indicators say BUY but price is below baseline, that's a contradiction
+    price_above_baseline = price > p["baseline"] if p["direction"] == "above" else price < p["baseline"]
 
     # Collect indicator votes
     tv = _tv_trends.get(asset.upper())
@@ -2229,7 +2239,7 @@ def _score_paper3_trade(p, price, indicators):
     if total_votes < 3:
         return None
 
-    # Determine bet direction — majority wins
+    # Determine bet direction — majority of indicators wins
     bet_side = None
     effective_odds = None
     score = 0
@@ -2238,25 +2248,43 @@ def _score_paper3_trade(p, price, indicators):
     if majority < 3:
         return None
 
-    if buy_votes >= sell_votes and price_above:
-        bet_side = "YES" if p["direction"] == "above" else "NO"
-        effective_odds = yes_odds if bet_side == "YES" else no_odds
+    if buy_votes > sell_votes:
+        # Indicators say BUY — price should go UP
+        if p["direction"] == "above":
+            bet_side = "YES"
+            effective_odds = yes_odds
+        else:
+            bet_side = "NO"
+            effective_odds = no_odds
         score = buy_votes
-    elif sell_votes > buy_votes and price_below:
-        bet_side = "NO" if p["direction"] == "above" else "YES"
-        effective_odds = no_odds if p["direction"] == "above" else yes_odds
+        # Check if price position confirms: indicators say UP, is price already above?
+        price_confirms = price_above_baseline
+    elif sell_votes > buy_votes:
+        # Indicators say SELL — price should go DOWN
+        if p["direction"] == "above":
+            bet_side = "NO"
+            effective_odds = no_odds
+        else:
+            bet_side = "YES"
+            effective_odds = yes_odds
         score = sell_votes
+        # Check if price position confirms: indicators say DOWN, is price already below?
+        price_confirms = not price_above_baseline
+    else:
+        return None
 
     if bet_side is None:
         return None
 
-    # Confidence tiers based on agreement
-    if score >= 5:
+    # Confidence tiers: indicator agreement + margin + price alignment
+    if score >= 5 and margin_pct >= 0.2 and price_confirms:
         confidence = "HIGH"
-    elif score >= 4:
+    elif score >= 4 and margin_pct >= 0.1:
         confidence = "MEDIUM"
-    else:
+    elif score >= 3:
         confidence = "LOW"
+    else:
+        return None
 
     # Must be in 30-70% range
     if effective_odds < 30 or effective_odds > 70:
