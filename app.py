@@ -2225,26 +2225,38 @@ def _score_paper3_trade(p, price, indicators):
         else:
             indicator_details.append("{}=—".format(name))
 
-    # Need at least 5 indicators with opinions AND 5 agreeing on direction
-    if total_votes < 5:
+    # Need at least 3 indicators with opinions AND 3 agreeing on direction
+    if total_votes < 3:
         return None
 
-    # Determine bet direction
+    # Determine bet direction — majority wins
     bet_side = None
     effective_odds = None
     score = 0
+    majority = max(buy_votes, sell_votes)
 
-    if buy_votes >= 5 and price_above:
+    if majority < 3:
+        return None
+
+    if buy_votes >= sell_votes and price_above:
         bet_side = "YES" if p["direction"] == "above" else "NO"
         effective_odds = yes_odds if bet_side == "YES" else no_odds
         score = buy_votes
-    elif sell_votes >= 5 and price_below:
+    elif sell_votes > buy_votes and price_below:
         bet_side = "NO" if p["direction"] == "above" else "YES"
         effective_odds = no_odds if p["direction"] == "above" else yes_odds
         score = sell_votes
 
     if bet_side is None:
         return None
+
+    # Confidence tiers based on agreement
+    if score >= 5:
+        confidence = "HIGH"
+    elif score >= 4:
+        confidence = "MEDIUM"
+    else:
+        confidence = "LOW"
 
     # Must be in 30-70% range
     if effective_odds < 30 or effective_odds > 70:
@@ -2262,6 +2274,7 @@ def _score_paper3_trade(p, price, indicators):
         "bet_odds": effective_odds,
         "score": score,
         "total_signals": total_votes,
+        "confidence": confidence,
         "indicators": " | ".join(indicator_details),
         "rsi": rsi,
         "bb_pos": bb_pos,
@@ -2477,7 +2490,8 @@ def run_paper34_scan():
                                 dir=parsed["direction"], base=parsed["baseline"],
                                 odds=scored3["bet_odds"], bs=scored3["bet_side"],
                                 pr=price, hrs=round(parsed["hours_left"], 2),
-                                mt=scored3["market_type"], ind=scored3["indicators"],
+                                mt=scored3["market_type"],
+                                ind="[{}] {}".format(scored3["confidence"], scored3["indicators"]),
                                 sc=scored3["score"], ts=scored3["total_signals"],
                                 sp=scored3["sim_payout"], now=now, slg=parsed["slug"]
                             )
@@ -2522,6 +2536,12 @@ def run_paper34_scan():
 
         if p3_count > 0 or p4_count > 0:
             print("Paper3: {} signals | Paper4: {} signals".format(p3_count, p4_count))
+        else:
+            # Count how many assets we got indicators for
+            ind_ok = sum(1 for v in indicator_cache_local.values() if v is not None)
+            ind_fail = sum(1 for v in indicator_cache_local.values() if v is None)
+            print("Paper34: 0 signals (indicators: {}ok/{}fail, markets: {})".format(
+                ind_ok, ind_fail, len(markets)))
 
     except Exception as e:
         print("Paper34 scan error: {}".format(e))
