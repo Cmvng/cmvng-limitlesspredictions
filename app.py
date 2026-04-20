@@ -2200,7 +2200,16 @@ def _calculate_indicators(asset):
 # ═══════════════════════════════════════════════════════════
 
 def _score_paper3_trade(p, price, indicators):
-    """Paper 3: Score based on 7 indicators. Need 5/7 agreement + no reversal warnings."""
+    """Paper 3: Smart Momentum scoring.
+    
+    Key rules:
+    1. Need INDEPENDENT signal agreement (not just lagging indicators)
+    2. Must have at least 1 momentum indicator (RSI, BB, ROC) agreeing
+    3. Price position must confirm (indicators say BUY → price above baseline)
+    4. Skip if all indicators are just lagging trend followers
+    5. Odds must be 40-70% (skip 30-40% where market strongly disagrees)
+    6. Skip reversal zones (RSI extreme or BB at bands)
+    """
     if not indicators or price is None:
         return None
 
@@ -2208,147 +2217,151 @@ def _score_paper3_trade(p, price, indicators):
     rsi = indicators.get("rsi")
     bb_pos = indicators.get("bb_position")
     is_ranging = indicators.get("is_ranging", False)
+    roc = indicators.get("roc")
 
-    # Skip if market is ranging (no clear direction)
+    # Skip if market is ranging
     if is_ranging and not indicators.get("bb_squeeze"):
         return None
 
     yes_odds = p["yes_odds"]
     no_odds = 100 - yes_odds
 
-    # Paper 3 odds range: 30-70%
-    if not (30 <= yes_odds <= 70 or 30 <= no_odds <= 70):
+    # TIGHTER odds range: 40-70% (skip 30-40% where market strongly disagrees)
+    if not (40 <= yes_odds <= 70 or 40 <= no_odds <= 70):
         return None
 
-    # Calculate margin — how far price is from baseline
+    # Margin check
     margin = abs(price - p["baseline"])
     margin_pct = (margin / p["baseline"] * 100) if p["baseline"] > 0 else 0
-
-    # Minimum margin: skip if price is too close to baseline
-    min_margin = 0.05 if p["is_short"] else 0.2
+    min_margin = 0.08 if p["is_short"] else 0.3
     if margin_pct < min_margin:
         return None
 
-    # Check if indicators agree with price position
-    # If indicators say BUY but price is below baseline, that's a contradiction
+    # Price position
     price_above_baseline = price > p["baseline"] if p["direction"] == "above" else price < p["baseline"]
 
-    # Collect indicator votes
+    # Collect signals — categorize as TREND vs MOMENTUM
     tv = _tv_trends.get(asset.upper())
     tv_dir = tv["dir"] if tv else None
     btc_trend = _btc_trend_cache.get("trend")
     sma_trend = indicators.get("sma_trend")
     ema_trend = indicators.get("ema_trend")
-    roc = indicators.get("roc")
 
-    # RSI signal (not at extremes)
+    # RSI signal
     rsi_signal = None
     rsi_warning = False
     if rsi is not None:
+        if rsi < 30 or rsi > 70:
+            rsi_warning = True  # Approaching reversal zone
         if rsi < 25 or rsi > 75:
-            rsi_warning = True  # Reversal zone — Paper 3 should skip
-        elif rsi < 45:
+            return None  # Deep reversal zone — hard skip
+        elif rsi < 42:
             rsi_signal = "SELL"
-        elif rsi > 55:
+        elif rsi > 58:
             rsi_signal = "BUY"
-        # 45-55 = neutral, no vote
 
     # Bollinger signal
     bb_signal = None
     bb_warning = False
     if bb_pos is not None:
-        if bb_pos < 0.1 or bb_pos > 0.9:
-            bb_warning = True  # At bands — reversal zone
-        elif bb_pos < 0.4:
+        if bb_pos < 0.15 or bb_pos > 0.85:
+            bb_warning = True
+        if bb_pos < 0.05 or bb_pos > 0.95:
+            return None  # Extreme — hard skip
+        elif bb_pos < 0.35:
             bb_signal = "SELL"
-        elif bb_pos > 0.6:
+        elif bb_pos > 0.65:
             bb_signal = "BUY"
 
     # ROC signal
     roc_signal = None
     if roc is not None:
-        if roc > 0.05:
+        if roc > 0.1:
             roc_signal = "BUY"
-        elif roc < -0.05:
+        elif roc < -0.1:
             roc_signal = "SELL"
 
-    # Skip if reversal warnings AND RSI extreme
+    # Skip if BOTH RSI and BB are warning (approaching reversal)
     if rsi_warning and bb_warning:
         return None
 
-    # Count votes for each direction
-    buy_votes = 0
-    sell_votes = 0
-    total_votes = 0
+    # Count votes in TWO categories
+    trend_buy = 0
+    trend_sell = 0
+    momentum_buy = 0
+    momentum_sell = 0
     indicator_details = []
 
-    for name, signal in [("TV", tv_dir), ("SMA", sma_trend), ("EMA", ema_trend),
-                          ("RSI", rsi_signal), ("BB", bb_signal), ("ROC", roc_signal),
-                          ("BTC", btc_trend)]:
+    # TREND indicators (lag together — count as 1 group max)
+    for name, signal in [("TV", tv_dir), ("SMA", sma_trend), ("EMA", ema_trend), ("BTC", btc_trend)]:
         if signal == "BUY":
-            buy_votes += 1
-            total_votes += 1
+            trend_buy += 1
             indicator_details.append("{}=BUY".format(name))
         elif signal == "SELL":
-            sell_votes += 1
-            total_votes += 1
+            trend_sell += 1
             indicator_details.append("{}=SELL".format(name))
         else:
             indicator_details.append("{}=—".format(name))
 
-    # Need at least 3 indicators with opinions AND 3 agreeing on direction
-    if total_votes < 3:
-        return None
+    # MOMENTUM indicators (independent — each counts)
+    for name, signal in [("RSI", rsi_signal), ("BB", bb_signal), ("ROC", roc_signal)]:
+        if signal == "BUY":
+            momentum_buy += 1
+            indicator_details.append("{}=BUY".format(name))
+        elif signal == "SELL":
+            momentum_sell += 1
+            indicator_details.append("{}=SELL".format(name))
+        else:
+            indicator_details.append("{}=—".format(name))
 
-    # Determine bet direction — majority of indicators wins
+    # CRITICAL: Need at least 1 momentum indicator agreeing
+    # (prevents all-lag-together problem)
+    total_buy = trend_buy + momentum_buy
+    total_sell = trend_sell + momentum_sell
+
+    # Determine direction
     bet_side = None
     effective_odds = None
-    score = 0
-    majority = max(buy_votes, sell_votes)
 
-    if majority < 3:
-        return None
+    if total_buy > total_sell and momentum_buy >= 1 and trend_buy >= 2:
+        # BUY direction: need 1+ momentum + 2+ trend agreeing
+        # Price MUST confirm — if price is below baseline, skip (prevents lag-loss streaks)
+        if price_above_baseline:
+            if p["direction"] == "above":
+                bet_side = "YES"
+                effective_odds = yes_odds
+            else:
+                bet_side = "NO"
+                effective_odds = no_odds
 
-    if buy_votes > sell_votes:
-        # Indicators say BUY — price should go UP
-        if p["direction"] == "above":
-            bet_side = "YES"
-            effective_odds = yes_odds
-        else:
-            bet_side = "NO"
-            effective_odds = no_odds
-        score = buy_votes
-        # Check if price position confirms: indicators say UP, is price already above?
-        price_confirms = price_above_baseline
-    elif sell_votes > buy_votes:
-        # Indicators say SELL — price should go DOWN
-        if p["direction"] == "above":
-            bet_side = "NO"
-            effective_odds = no_odds
-        else:
-            bet_side = "YES"
-            effective_odds = yes_odds
-        score = sell_votes
-        # Check if price position confirms: indicators say DOWN, is price already below?
-        price_confirms = not price_above_baseline
-    else:
-        return None
+    elif total_sell > total_buy and momentum_sell >= 1 and trend_sell >= 2:
+        # SELL direction: price MUST be below baseline to confirm
+        if not price_above_baseline:
+            if p["direction"] == "above":
+                bet_side = "NO"
+                effective_odds = no_odds
+            else:
+                bet_side = "YES"
+                effective_odds = yes_odds
 
     if bet_side is None:
         return None
 
-    # Confidence tiers: indicator agreement + margin + price alignment
-    if score >= 5 and margin_pct >= 0.2 and price_confirms:
-        confidence = "HIGH"
-    elif score >= 4 and margin_pct >= 0.1:
-        confidence = "MEDIUM"
-    elif score >= 3:
-        confidence = "LOW"
-    else:
+    # Must be in 40-70% range
+    if effective_odds < 40 or effective_odds > 70:
         return None
 
-    # Must be in 30-70% range
-    if effective_odds < 30 or effective_odds > 70:
+    # Confidence tiers
+    score = total_buy if total_buy > total_sell else total_sell
+    momentum_score = momentum_buy if total_buy > total_sell else momentum_sell
+
+    if momentum_score >= 2 and score >= 5 and price_above_baseline == (total_buy > total_sell) and margin_pct >= 0.15:
+        confidence = "HIGH"
+    elif momentum_score >= 1 and score >= 4 and margin_pct >= 0.1:
+        confidence = "MEDIUM"
+    elif momentum_score >= 1 and score >= 3:
+        confidence = "LOW"
+    else:
         return None
 
     share_price = effective_odds / 100.0
@@ -2362,7 +2375,7 @@ def _score_paper3_trade(p, price, indicators):
         "bet_side": bet_side,
         "bet_odds": effective_odds,
         "score": score,
-        "total_signals": total_votes,
+        "total_signals": total_buy + total_sell,
         "confidence": confidence,
         "indicators": " | ".join(indicator_details),
         "rsi": rsi,
@@ -2533,6 +2546,13 @@ def run_paper34_scan():
             p4_ids = set(str(row[0]) for row in p4_rows)
         except:
             p4_ids = set()
+        # Get Bot 1 and Bot 2 market IDs to avoid overlap
+        try:
+            bot12_rows = conn.run("""SELECT market_id FROM limitless_predictions WHERE created_at > NOW() - INTERVAL '30 hours'
+                                     UNION SELECT market_id FROM paper_trades WHERE fired_at::timestamptz > NOW() - INTERVAL '30 hours'""")
+            bot12_ids = set(str(row[0]) for row in bot12_rows)
+        except:
+            bot12_ids = set()
         conn.close()
 
         price_cache = {}
@@ -2563,7 +2583,7 @@ def run_paper34_scan():
                 now = datetime.now(timezone.utc).isoformat()
 
                 # Paper 3: Smart Momentum
-                if parsed["market_id"] not in p3_ids:
+                if parsed["market_id"] not in p3_ids and parsed["market_id"] not in bot12_ids:
                     scored3 = _score_paper3_trade(parsed, price, ind)
                     if scored3:
                         # Calculate Bot 3 stake using shared function
