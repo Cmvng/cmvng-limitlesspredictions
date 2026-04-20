@@ -2233,7 +2233,7 @@ def _score_paper3_trade(p, price, indicators):
     # Margin check
     margin = abs(price - p["baseline"])
     margin_pct = (margin / p["baseline"] * 100) if p["baseline"] > 0 else 0
-    min_margin = 0.08 if p["is_short"] else 0.3
+    min_margin = 0.03 if p["is_short"] else 0.15
     if margin_pct < min_margin:
         return None
 
@@ -2252,12 +2252,12 @@ def _score_paper3_trade(p, price, indicators):
     rsi_warning = False
     if rsi is not None:
         if rsi < 30 or rsi > 70:
-            rsi_warning = True  # Approaching reversal zone
+            rsi_warning = True
         if rsi < 25 or rsi > 75:
             return None  # Deep reversal zone — hard skip
-        elif rsi < 42:
+        elif rsi < 45:
             rsi_signal = "SELL"
-        elif rsi > 58:
+        elif rsi > 55:
             rsi_signal = "BUY"
 
     # Bollinger signal
@@ -2268,17 +2268,17 @@ def _score_paper3_trade(p, price, indicators):
             bb_warning = True
         if bb_pos < 0.05 or bb_pos > 0.95:
             return None  # Extreme — hard skip
-        elif bb_pos < 0.35:
+        elif bb_pos < 0.4:
             bb_signal = "SELL"
-        elif bb_pos > 0.65:
+        elif bb_pos > 0.6:
             bb_signal = "BUY"
 
     # ROC signal
     roc_signal = None
     if roc is not None:
-        if roc > 0.1:
+        if roc > 0.05:
             roc_signal = "BUY"
-        elif roc < -0.1:
+        elif roc < -0.05:
             roc_signal = "SELL"
 
     # Skip if BOTH RSI and BB are warning (approaching reversal)
