@@ -1578,6 +1578,11 @@ def execute_trade(parsed_market, score, prediction_id, override_stake=None, bot_
                 if override_stake is None:
                     _trading_state["trades_today"] += 1
                     _trading_state["last_balance"] = round((balance or 0) - stake, 2)
+                    lbl = "BOT 1"
+                    bal_after = _trading_state["last_balance"]
+                else:
+                    lbl = bot_name or "BOT"
+                    bal_after = bot_balance_after or 0
                 try:
                     conn = get_db()
                     conn.run("UPDATE limitless_predictions SET size_rec=:s WHERE id=:i",
@@ -1585,8 +1590,15 @@ def execute_trade(parsed_market, score, prediction_id, override_stake=None, bot_
                     conn.close()
                 except:
                     pass
-                send_telegram("🤖 <b>AUTO-TRADE (FOK)</b>\n📌 {}\nSide: {} | Stake: ${:.2f}".format(
-                    parsed_market["title"][:50], bet_side, stake))
+                send_telegram(
+                    "🤖 <b>{} TRADE PLACED</b>\n"
+                    "──────────────────────────\n"
+                    "📌 {}\n"
+                    "<b>Side:</b> BUY {} shares\n"
+                    "<b>Stake:</b> ${:.2f}\n"
+                    "<b>Balance:</b> ${:.2f}\n"
+                    "──────────────────────────".format(
+                        lbl, parsed_market["title"][:50], bet_side, stake, bal_after))
             return success
 
         # Clamp start price
@@ -1610,6 +1622,11 @@ def execute_trade(parsed_market, score, prediction_id, override_stake=None, bot_
                 if override_stake is None:
                     _trading_state["trades_today"] += 1
                     _trading_state["last_balance"] = round((balance or 0) - stake, 2)
+                    lbl2 = "BOT 1"
+                    bal_after2 = _trading_state["last_balance"]
+                else:
+                    lbl2 = bot_name or "BOT"
+                    bal_after2 = bot_balance_after or 0
                 try:
                     conn = get_db()
                     conn.run("UPDATE limitless_predictions SET size_rec=:s WHERE id=:i",
@@ -1617,8 +1634,15 @@ def execute_trade(parsed_market, score, prediction_id, override_stake=None, bot_
                     conn.close()
                 except:
                     pass
-                send_telegram("🤖 <b>AUTO-TRADE (FOK fallback)</b>\n📌 {}\nSide: {} | Stake: ${:.2f}".format(
-                    parsed_market["title"][:50], bet_side, stake))
+                send_telegram(
+                    "🤖 <b>{} TRADE PLACED</b>\n"
+                    "──────────────────────────\n"
+                    "📌 {}\n"
+                    "<b>Side:</b> BUY {} shares\n"
+                    "<b>Stake:</b> ${:.2f}\n"
+                    "<b>Balance:</b> ${:.2f}\n"
+                    "──────────────────────────".format(
+                        lbl2, parsed_market["title"][:50], bet_side, stake, bal_after2))
             return success
 
         # 4. Aggressive bidding loop — check every 5 seconds for 60 seconds
@@ -2226,8 +2250,8 @@ def _score_paper3_trade(p, price, indicators):
     yes_odds = p["yes_odds"]
     no_odds = 100 - yes_odds
 
-    # TIGHTER odds range: 40-70% (skip 30-40% where market strongly disagrees)
-    if not (40 <= yes_odds <= 70 or 40 <= no_odds <= 70):
+    # Paper 3 odds range: 30-70%
+    if not (30 <= yes_odds <= 70 or 30 <= no_odds <= 70):
         return None
 
     # Margin check
@@ -2285,47 +2309,42 @@ def _score_paper3_trade(p, price, indicators):
     if rsi_warning and bb_warning:
         return None
 
-    # Count votes in TWO categories
-    trend_buy = 0
-    trend_sell = 0
-    momentum_buy = 0
-    momentum_sell = 0
+    # Count ALL votes together (original logic)
+    buy_votes = 0
+    sell_votes = 0
+    total_votes = 0
     indicator_details = []
 
-    # TREND indicators (lag together — count as 1 group max)
-    for name, signal in [("TV", tv_dir), ("SMA", sma_trend), ("EMA", ema_trend), ("BTC", btc_trend)]:
+    for name, signal in [("TV", tv_dir), ("SMA", sma_trend), ("EMA", ema_trend),
+                          ("RSI", rsi_signal), ("BB", bb_signal), ("ROC", roc_signal),
+                          ("BTC", btc_trend)]:
         if signal == "BUY":
-            trend_buy += 1
+            buy_votes += 1
+            total_votes += 1
             indicator_details.append("{}=BUY".format(name))
         elif signal == "SELL":
-            trend_sell += 1
+            sell_votes += 1
+            total_votes += 1
             indicator_details.append("{}=SELL".format(name))
         else:
             indicator_details.append("{}=—".format(name))
 
-    # MOMENTUM indicators (independent — each counts)
-    for name, signal in [("RSI", rsi_signal), ("BB", bb_signal), ("ROC", roc_signal)]:
-        if signal == "BUY":
-            momentum_buy += 1
-            indicator_details.append("{}=BUY".format(name))
-        elif signal == "SELL":
-            momentum_sell += 1
-            indicator_details.append("{}=SELL".format(name))
-        else:
-            indicator_details.append("{}=—".format(name))
+    # Need at least 3 indicators with opinions AND 3 agreeing on direction
+    if total_votes < 3:
+        return None
 
-    # CRITICAL: Need at least 1 momentum indicator agreeing
-    # (prevents all-lag-together problem)
-    total_buy = trend_buy + momentum_buy
-    total_sell = trend_sell + momentum_sell
+    majority = max(buy_votes, sell_votes)
+    if majority < 3:
+        return None
 
     # Determine direction
     bet_side = None
     effective_odds = None
+    score = 0
 
-    if total_buy > total_sell and momentum_buy >= 1 and trend_buy >= 2:
-        # BUY direction: need 1+ momentum + 2+ trend agreeing
-        # Price MUST confirm — if price is below baseline, skip (prevents lag-loss streaks)
+    if buy_votes > sell_votes:
+        score = buy_votes
+        # THE FIX: Price must confirm BUY — price should be above baseline
         if price_above_baseline:
             if p["direction"] == "above":
                 bet_side = "YES"
@@ -2333,9 +2352,11 @@ def _score_paper3_trade(p, price, indicators):
             else:
                 bet_side = "NO"
                 effective_odds = no_odds
+        # If price is below baseline but indicators say BUY → SKIP
 
-    elif total_sell > total_buy and momentum_sell >= 1 and trend_sell >= 2:
-        # SELL direction: price MUST be below baseline to confirm
+    elif sell_votes > buy_votes:
+        score = sell_votes
+        # THE FIX: Price must confirm SELL — price should be below baseline
         if not price_above_baseline:
             if p["direction"] == "above":
                 bet_side = "NO"
@@ -2343,23 +2364,24 @@ def _score_paper3_trade(p, price, indicators):
             else:
                 bet_side = "YES"
                 effective_odds = yes_odds
+        # If price is above baseline but indicators say SELL → SKIP
+
+    else:
+        return None
 
     if bet_side is None:
         return None
 
-    # Must be in 40-70% range
-    if effective_odds < 40 or effective_odds > 70:
+    # Must be in 30-70% range
+    if effective_odds < 30 or effective_odds > 70:
         return None
 
-    # Confidence tiers
-    score = total_buy if total_buy > total_sell else total_sell
-    momentum_score = momentum_buy if total_buy > total_sell else momentum_sell
-
-    if momentum_score >= 2 and score >= 5 and price_above_baseline == (total_buy > total_sell) and margin_pct >= 0.15:
+    # Confidence tiers (original logic)
+    if score >= 5 and margin_pct >= 0.2 and price_above_baseline == (buy_votes > sell_votes):
         confidence = "HIGH"
-    elif momentum_score >= 1 and score >= 4 and margin_pct >= 0.1:
+    elif score >= 4 and margin_pct >= 0.1:
         confidence = "MEDIUM"
-    elif momentum_score >= 1 and score >= 3:
+    elif score >= 3:
         confidence = "LOW"
     else:
         return None
@@ -2375,7 +2397,7 @@ def _score_paper3_trade(p, price, indicators):
         "bet_side": bet_side,
         "bet_odds": effective_odds,
         "score": score,
-        "total_signals": total_buy + total_sell,
+        "total_signals": total_votes,
         "confidence": confidence,
         "indicators": " | ".join(indicator_details),
         "rsi": rsi,
@@ -2583,7 +2605,7 @@ def run_paper34_scan():
                 now = datetime.now(timezone.utc).isoformat()
 
                 # Paper 3: Smart Momentum
-                if parsed["market_id"] not in p3_ids and parsed["market_id"] not in bot12_ids:
+                if parsed["market_id"] not in p3_ids:
                     scored3 = _score_paper3_trade(parsed, price, ind)
                     if scored3:
                         # Calculate Bot 3 stake using shared function
