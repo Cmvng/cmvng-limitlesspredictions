@@ -2059,14 +2059,16 @@ def scan_loop():
 # Cache for technical indicators (avoid re-fetching yfinance per pair per scan)
 _indicator_cache = {}  # {"BTC": {"data": {...}, "updated": datetime}}
 
-def _calculate_indicators(asset):
-    """Calculate all technical indicators for an asset using yfinance hourly data.
-    Returns dict with all indicator readings or None if data unavailable."""
+def _calculate_indicators(asset, timeframe="1h"):
+    """Calculate all technical indicators for an asset.
+    Timeframe: '15m' for 15-min markets, '1h' for hourly, '1d' for daily.
+    Uses matching candle data for accurate readings."""
     import yfinance as yf
 
-    # Check cache (valid for 5 minutes)
-    cache = _indicator_cache.get(asset)
-    if cache and (datetime.now(timezone.utc) - cache["updated"]).total_seconds() < 300:
+    cache_key = "{}_{}".format(asset, timeframe)
+    cache = _indicator_cache.get(cache_key)
+    cache_ttl = 120 if timeframe == "15m" else 300
+    if cache and (datetime.now(timezone.utc) - cache["updated"]).total_seconds() < cache_ttl:
         return cache["data"]
 
     yahoo_map = {
@@ -2085,7 +2087,13 @@ def _calculate_indicators(asset):
         return None
 
     try:
-        df = yf.download(ticker, period="5d", interval="1h", progress=False)
+        if timeframe == "15m":
+            df = yf.download(ticker, period="5d", interval="15m", progress=False)
+        elif timeframe == "1d":
+            df = yf.download(ticker, period="30d", interval="1d", progress=False)
+        else:
+            df = yf.download(ticker, period="5d", interval="1h", progress=False)
+
         if df is None or len(df) < 20:
             return None
 
@@ -2097,14 +2105,12 @@ def _calculate_indicators(asset):
         n = len(closes)
         current = float(closes[-1])
 
-        # === SMA10, SMA20 ===
         sma10 = float(sum(closes[-10:]) / 10) if n >= 10 else None
         sma20 = float(sum(closes[-20:]) / 20) if n >= 20 else None
         sma_trend = None
         if sma10 and sma20:
             sma_trend = "BUY" if sma10 > sma20 else "SELL"
 
-        # === EMA10, EMA20 ===
         def calc_ema(data, period):
             if len(data) < period:
                 return None
@@ -2120,13 +2126,11 @@ def _calculate_indicators(asset):
         if ema10 and ema20:
             ema_trend = "BUY" if ema10 > ema20 else "SELL"
 
-        # EMA direction (is EMA curving up or down?)
         ema10_prev = calc_ema(closes[:-1], 10) if n > 11 else None
         ema_curving = None
         if ema10 and ema10_prev:
             ema_curving = "UP" if ema10 > ema10_prev else "DOWN"
 
-        # === RSI(14) ===
         rsi = None
         if n >= 15:
             gains = []
@@ -2147,8 +2151,8 @@ def _calculate_indicators(asset):
                 rs = avg_gain / avg_loss
                 rsi = 100 - (100 / (1 + rs))
 
-        # === Bollinger Bands (20, 2) ===
         bb_upper = bb_lower = bb_middle = bb_width = bb_position = None
+        bb_std = 0
         if n >= 20:
             bb_data = [float(x) for x in closes[-20:]]
             bb_middle = sum(bb_data) / 20
@@ -2156,22 +2160,18 @@ def _calculate_indicators(asset):
             bb_upper = bb_middle + 2 * bb_std
             bb_lower = bb_middle - 2 * bb_std
             bb_width = (bb_upper - bb_lower) / bb_middle if bb_middle > 0 else 0
-
-            # Position within bands: 0 = at lower, 1 = at upper
             band_range = bb_upper - bb_lower
             if band_range > 0:
                 bb_position = (current - bb_lower) / band_range
             else:
                 bb_position = 0.5
 
-        # === Rate of Change (ROC) — 5 period ===
         roc = None
         if n >= 6:
             prev_price = float(closes[-6])
             if prev_price > 0:
                 roc = ((current - prev_price) / prev_price) * 100
 
-        # === ATR (Average True Range, 14 period) ===
         atr = None
         if n >= 15:
             trs = []
@@ -2184,7 +2184,6 @@ def _calculate_indicators(asset):
             atr = sum(trs) / 14
         atr_pct = (atr / current * 100) if atr and current > 0 else None
 
-        # === Volume analysis ===
         vol_trend = None
         vol_spike = False
         if volumes is not None and n >= 10:
@@ -2197,19 +2196,16 @@ def _calculate_indicators(asset):
             except:
                 pass
 
-        # === Range detection ===
         is_ranging = False
         bb_squeeze = False
         if bb_width is not None and atr_pct is not None:
-            # Bollinger Band Width shrinking = ranging/squeezing
             if n >= 25:
                 prev_bb_data = [float(x) for x in closes[-25:-5]]
                 prev_mid = sum(prev_bb_data) / 20 if len(prev_bb_data) >= 20 else bb_middle
                 prev_std = (sum((x - prev_mid) ** 2 for x in prev_bb_data) / 20) ** 0.5 if len(prev_bb_data) >= 20 else bb_std
                 prev_width = (2 * prev_std * 2) / prev_mid if prev_mid > 0 else 0
-                bb_squeeze = bb_width < prev_width * 0.7  # Bands tightened 30%+
-
-            is_ranging = bb_width < 0.015 and atr_pct < 0.3  # Very tight bands + low volatility
+                bb_squeeze = bb_width < prev_width * 0.7
+            is_ranging = bb_width < 0.015 and atr_pct < 0.3
 
         result = {
             "current": current,
@@ -2224,12 +2220,14 @@ def _calculate_indicators(asset):
             "atr": atr, "atr_pct": round(atr_pct, 3) if atr_pct is not None else None,
             "vol_trend": vol_trend, "vol_spike": vol_spike,
             "is_ranging": is_ranging, "bb_squeeze": bb_squeeze,
+            "timeframe": timeframe,
         }
 
-        _indicator_cache[asset] = {"data": result, "updated": datetime.now(timezone.utc)}
+        _indicator_cache[cache_key] = {"data": result, "updated": datetime.now(timezone.utc)}
         return result
+
     except Exception as e:
-        print("Indicators error {}: {}".format(asset, e))
+        print("Indicators error {} ({}): {}".format(asset, timeframe, e))
         return None
 
 # ═══════════════════════════════════════════════════════════
@@ -2746,10 +2744,20 @@ def run_paper34_scan():
                 if price is None:
                     continue
 
-                # Get indicators (cached per asset)
-                if asset not in indicator_cache_local:
-                    indicator_cache_local[asset] = _calculate_indicators(asset)
-                ind = indicator_cache_local[asset]
+                # Determine timeframe for indicators based on market type
+                mins_left = parsed.get("mins_left", 60)
+                if parsed["is_short"] and mins_left <= 20:
+                    ind_tf = "15m"  # 15-minute market → 15m candles
+                elif parsed["is_short"]:
+                    ind_tf = "1h"   # Hourly market → 1h candles
+                else:
+                    ind_tf = "1d"   # Daily market → daily candles
+
+                # Get indicators (cached per asset + timeframe)
+                ind_cache_key = "{}_{}".format(asset, ind_tf)
+                if ind_cache_key not in indicator_cache_local:
+                    indicator_cache_local[ind_cache_key] = _calculate_indicators(asset, ind_tf)
+                ind = indicator_cache_local[ind_cache_key]
                 if ind is None:
                     continue
 
