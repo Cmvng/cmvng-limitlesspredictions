@@ -2723,7 +2723,9 @@ def run_paper34_scan():
         print("Paper34 scan error: {}".format(e))
 
 def _resolve_paper_table(table_name):
-    """Generic resolver for paper3_trades and paper4_trades."""
+    """Generic resolver for paper3_trades and paper4_trades.
+    Uses Limitless API winningOutcomeIndex for accurate resolution."""
+    import requests as req
     try:
         conn = get_db()
         rows = conn.run("SELECT * FROM {} WHERE status='Pending'".format(table_name))
@@ -2748,19 +2750,40 @@ def _resolve_paper_table(table_name):
                 if hours_left <= 0:
                     hours_left = 0.25
                 expiry = fired + timedelta(hours=hours_left)
-                if now < expiry:
+                # Wait at least 2 minutes past expiry for Limitless to resolve
+                if now < expiry + timedelta(minutes=2):
                     continue
 
-                current_price = get_price(p["asset"])
-                if current_price is None:
-                    continue
+                # Try to get resolution from Limitless API first
+                slug = p.get("slug")
+                won = None
+                if slug:
+                    try:
+                        mr = req.get("{}/markets/{}".format(LIMITLESS_API, slug), timeout=10)
+                        if mr.status_code == 200:
+                            mdata = mr.json()
+                            wi = mdata.get("winningOutcomeIndex")
+                            if wi is not None:
+                                # winningOutcomeIndex: 0=YES won, 1=NO won
+                                market_resolved_yes = (wi == 0)
+                                bet_side = p.get("bet_side") or "YES"
+                                if bet_side == "YES":
+                                    won = market_resolved_yes
+                                else:
+                                    won = not market_resolved_yes
+                    except:
+                        pass
 
-                baseline = float(p["baseline"])
-                direction = p.get("direction") or "above"
-                market_resolved_true = (current_price > baseline) if direction == "above" else (current_price < baseline)
-
-                bet_side = p.get("bet_side") or "YES"
-                won = market_resolved_true if bet_side == "YES" else not market_resolved_true
+                # Fallback: use current price if API didn't resolve
+                if won is None:
+                    current_price = get_price(p["asset"])
+                    if current_price is None:
+                        continue
+                    baseline = float(p["baseline"])
+                    direction = p.get("direction") or "above"
+                    market_resolved_true = (current_price > baseline) if direction == "above" else (current_price < baseline)
+                    bet_side = p.get("bet_side") or "YES"
+                    won = market_resolved_true if bet_side == "YES" else not market_resolved_true
 
                 outcome = "WIN" if won else "LOSS"
                 status = "✅ Won" if won else "❌ Lost"
@@ -3143,22 +3166,42 @@ def resolve_paper_trades():
                 if hours_left <= 0:
                     hours_left = 0.25
                 expiry = fired + timedelta(hours=hours_left)
-                if now < expiry:
+                # Wait at least 2 minutes past expiry for Limitless to resolve
+                if now < expiry + timedelta(minutes=2):
                     continue
 
-                price = get_price(p["asset"])
-                if price is None:
-                    continue
+                # Try to get resolution from Limitless API first
+                slug = p.get("slug")
+                won = None
+                if slug:
+                    try:
+                        mr = req.get("{}/markets/{}".format(LIMITLESS_API, slug), timeout=10)
+                        if mr.status_code == 200:
+                            mdata = mr.json()
+                            wi = mdata.get("winningOutcomeIndex")
+                            if wi is not None:
+                                market_resolved_yes = (wi == 0)
+                                bet_side = p.get("bet_side") or "YES"
+                                if bet_side == "YES":
+                                    won = market_resolved_yes
+                                else:
+                                    won = not market_resolved_yes
+                    except:
+                        pass
 
-                baseline = float(p["baseline"])
-                direction = p.get("direction") or "above"
-                market_resolved_true = (price > baseline) if direction == "above" else (price < baseline)
-
-                bet_side = p.get("bet_side") or "YES"
-                if bet_side == "YES":
-                    won = market_resolved_true
-                else:
-                    won = not market_resolved_true
+                # Fallback: use current price if API didn't resolve
+                if won is None:
+                    price = get_price(p["asset"])
+                    if price is None:
+                        continue
+                    baseline = float(p["baseline"])
+                    direction = p.get("direction") or "above"
+                    market_resolved_true = (price > baseline) if direction == "above" else (price < baseline)
+                    bet_side = p.get("bet_side") or "YES"
+                    if bet_side == "YES":
+                        won = market_resolved_true
+                    else:
+                        won = not market_resolved_true
 
                 outcome = "WIN" if won else "LOSS"
                 status = "✅ Won" if won else "❌ Lost"
@@ -4881,6 +4924,116 @@ def update_prediction(pred_id, status):
 def manual_scan():
     threading.Thread(target=run_scan, daemon=True).start()
     return {"status": "scan triggered"}, 200
+
+@app.route("/recheck", methods=["GET"])
+def recheck_trades():
+    """One-time recheck: re-resolve all recent trades against Limitless API.
+    Corrects any trades that were wrongly marked WIN/LOSS due to price timing."""
+    import requests as req
+    results = {"paper_trades": {"checked": 0, "corrected": 0, "errors": 0, "details": []},
+               "paper3_trades": {"checked": 0, "corrected": 0, "errors": 0, "details": []}}
+
+    for table_name in ["paper_trades", "paper3_trades"]:
+        try:
+            conn = get_db()
+            rows = conn.run("SELECT * FROM {} WHERE status IN ('✅ Won', '❌ Lost') AND fired_at::timestamptz > NOW() - INTERVAL '48 hours'".format(table_name))
+            cols = [c['name'] for c in conn.columns]
+            items = [dict(zip(cols, r)) for r in rows]
+            conn.close()
+
+            for p in items:
+                slug = p.get("slug")
+                if not slug:
+                    continue
+
+                results[table_name]["checked"] += 1
+                try:
+                    mr = req.get("{}/markets/{}".format(LIMITLESS_API, slug), timeout=10)
+                    if mr.status_code != 200:
+                        continue
+                    mdata = mr.json()
+                    wi = mdata.get("winningOutcomeIndex")
+                    if wi is None:
+                        continue  # Not resolved yet on Limitless
+
+                    # winningOutcomeIndex: 0=YES won, 1=NO won
+                    market_resolved_yes = (wi == 0)
+                    bet_side = p.get("bet_side") or "YES"
+                    if bet_side == "YES":
+                        correct_won = market_resolved_yes
+                    else:
+                        correct_won = not market_resolved_yes
+
+                    correct_outcome = "WIN" if correct_won else "LOSS"
+                    correct_status = "✅ Won" if correct_won else "❌ Lost"
+                    current_outcome = p.get("outcome")
+
+                    if current_outcome != correct_outcome:
+                        # WRONG — fix it
+                        stake = float(p.get("simulated_stake") or 1.0)
+                        odds = float(p.get("bet_odds") or 50)
+                        share_price = odds / 100.0
+                        if bet_side == "NO":
+                            share_price = 1.0 - share_price
+                        new_payout = round((stake / share_price) if correct_won else 0, 4)
+
+                        conn2 = get_db()
+                        conn2.run(
+                            "UPDATE {} SET status=:s, outcome=:o, simulated_payout=:p WHERE id=:i".format(table_name),
+                            s=correct_status, o=correct_outcome, p=new_payout, i=p["id"]
+                        )
+                        conn2.close()
+
+                        old_label = "LOSS→WIN" if correct_won else "WIN→LOSS"
+                        results[table_name]["corrected"] += 1
+                        results[table_name]["details"].append(
+                            "#{} {} {} {} (was {})".format(p["id"], p.get("asset","?"), bet_side, old_label, current_outcome))
+
+                        # Update bot balance for corrections
+                        if table_name == "paper_trades" and correct_outcome == "WIN" and current_outcome == "LOSS":
+                            # Was wrongly LOSS, now WIN — add payout back
+                            _bot2_state["balance"] = round(_bot2_state["balance"] + new_payout, 2)
+                        elif table_name == "paper_trades" and correct_outcome == "LOSS" and current_outcome == "WIN":
+                            # Was wrongly WIN, now LOSS — subtract payout
+                            old_payout = float(p.get("simulated_payout") or 0)
+                            _bot2_state["balance"] = round(_bot2_state["balance"] - old_payout, 2)
+                        elif table_name == "paper3_trades" and correct_outcome == "WIN" and current_outcome == "LOSS":
+                            _bot3_state["balance"] = round(_bot3_state["balance"] + new_payout, 2)
+                        elif table_name == "paper3_trades" and correct_outcome == "LOSS" and current_outcome == "WIN":
+                            old_payout = float(p.get("simulated_payout") or 0)
+                            _bot3_state["balance"] = round(_bot3_state["balance"] - old_payout, 2)
+
+                except Exception as e:
+                    results[table_name]["errors"] += 1
+
+                time.sleep(0.3)  # Rate limit API calls
+        except Exception as e:
+            results[table_name]["errors"] += 1
+
+    # Summary
+    total_corrected = results["paper_trades"]["corrected"] + results["paper3_trades"]["corrected"]
+    summary = {
+        "bot2_paper_trades": results["paper_trades"],
+        "bot3_paper3_trades": results["paper3_trades"],
+        "total_corrected": total_corrected,
+        "bot2_balance_after": _bot2_state["balance"],
+        "bot3_balance_after": _bot3_state["balance"],
+    }
+
+    if total_corrected > 0:
+        send_telegram(
+            "🔄 <b>Trade Recheck Complete</b>\n"
+            "──────────────────────────\n"
+            "<b>Bot 2:</b> {} checked, {} corrected\n"
+            "<b>Bot 3:</b> {} checked, {} corrected\n"
+            "<b>Bot 2 Balance:</b> ${:.2f}\n"
+            "<b>Bot 3 Balance:</b> ${:.2f}\n"
+            "──────────────────────────".format(
+                results["paper_trades"]["checked"], results["paper_trades"]["corrected"],
+                results["paper3_trades"]["checked"], results["paper3_trades"]["corrected"],
+                _bot2_state["balance"], _bot3_state["balance"]))
+
+    return summary, 200
 
 @app.route("/trading/stop", methods=["GET"])
 def trading_stop():
