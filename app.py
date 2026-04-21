@@ -1315,6 +1315,8 @@ def _cancel_order(order_id):
     try:
         path = "/orders/{}".format(order_id)
         headers = _hmac_headers("DELETE", path)
+        # DELETE requests must NOT have Content-Type header (no body)
+        headers.pop("Content-Type", None)
         r = req.delete(
             "{}{}".format(LIMITLESS_API, path),
             headers=headers, timeout=10
