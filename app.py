@@ -2104,6 +2104,9 @@ def _calculate_indicators(asset, timeframe="1h"):
             df_1h = yf.download(ticker, period="10d", interval="1h", progress=False)
             if df_1h is None or len(df_1h) < 20:
                 return None
+            # Flatten MultiIndex columns if present
+            if hasattr(df_1h.columns, 'nlevels') and df_1h.columns.nlevels > 1:
+                df_1h.columns = [c[0] if isinstance(c, tuple) else c for c in df_1h.columns]
             # Resample 1H to 4H: group by 4-hour blocks (00,04,08,12,16,20)
             df = df_1h.resample("4h").agg({
                 "Open": "first", "High": "max", "Low": "min",
