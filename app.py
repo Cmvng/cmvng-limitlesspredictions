@@ -72,7 +72,7 @@ _bot2_state = {
 # Bot 3: Smart Momentum (multi-indicator, 30-70% odds)
 _bot3_state = {
     "enabled": False,
-    "balance": 20.0,
+    "balance": 30.0,
     "daily_loss": 0.0,
     "daily_profit": 0.0,
     "trades_today": 0,
@@ -80,7 +80,7 @@ _bot3_state = {
     "stake_pct": 0.025,          # 2.5% when compounding
     "min_stake": 1.0,
     "max_loss_pct": 0.60,
-    "starting_balance": 20.0,
+    "starting_balance": 30.0,
     "floor_balance": 999.0,      # Paper only — set lower to activate
     "compound_threshold": 1.20,  # 20% profit
 }
@@ -2188,6 +2188,108 @@ def _calculate_indicators(asset, timeframe="1h"):
                 bb_squeeze = bb_width < prev_width * 0.7
             is_ranging = bb_width < 0.015 and atr_pct < 0.3
 
+        # === UT Bot (ATR Trailing Stop) ===
+        ut_trend = None
+        if n >= 62:  # need at least atr_period(60) + 2
+            key_value = 4
+            atr_period_ut = 60
+            # Build ATR array
+            tr_list = []
+            for i in range(1, n):
+                h = float(highs[i]); l = float(lows[i]); pc = float(closes[i-1])
+                tr_list.append(max(h - l, abs(h - pc), abs(l - pc)))
+            # UT Bot trailing stop
+            xATRTS = [0.0] * n
+            ut_pos = [0] * n
+            start_i = atr_period_ut
+            xATRTS[start_i] = float(closes[start_i])
+            for i in range(start_i + 1, n):
+                ai = i - 1
+                if ai < atr_period_ut:
+                    xATRTS[i] = xATRTS[i-1]; ut_pos[i] = ut_pos[i-1]; continue
+                atr_val = sum(tr_list[ai-atr_period_ut+1:ai+1]) / atr_period_ut
+                nLoss = key_value * atr_val
+                src = float(closes[i]); src_prev = float(closes[i-1]); prev_ts = xATRTS[i-1]
+                if src > prev_ts and src_prev > prev_ts:
+                    xATRTS[i] = max(prev_ts, src - nLoss)
+                elif src < prev_ts and src_prev < prev_ts:
+                    xATRTS[i] = min(prev_ts, src + nLoss)
+                elif src > prev_ts:
+                    xATRTS[i] = src - nLoss
+                else:
+                    xATRTS[i] = src + nLoss
+                if src_prev < xATRTS[i-1] and src > xATRTS[i]:
+                    ut_pos[i] = 1
+                elif src_prev > xATRTS[i-1] and src < xATRTS[i]:
+                    ut_pos[i] = -1
+                else:
+                    ut_pos[i] = ut_pos[i-1]
+            ut_trend = "BUY" if ut_pos[-1] == 1 else "SELL" if ut_pos[-1] == -1 else None
+
+        # === EMA 20/50/100/200 Stack ===
+        ema_stack = None
+        ema20 = calc_ema(closes, 20) if n >= 20 else None
+        ema50 = calc_ema(closes, 50) if n >= 50 else None
+        ema100 = calc_ema(closes, 100) if n >= 100 else None
+        ema200 = calc_ema(closes, 200) if n >= 200 else None
+        ema_vals = [(p, v) for p, v in [(20, ema20), (50, ema50), (100, ema100), (200, ema200)] if v is not None]
+        if len(ema_vals) >= 2:
+            bull_pairs = 0; total_pairs = 0
+            for ii in range(len(ema_vals)):
+                for jj in range(ii+1, len(ema_vals)):
+                    total_pairs += 1
+                    if ema_vals[ii][1] > ema_vals[jj][1]:
+                        bull_pairs += 1
+            bull_pct = bull_pairs / total_pairs if total_pairs > 0 else 0.5
+            above_cnt = sum(1 for _, v in ema_vals if current > v)
+            above_pct = above_cnt / len(ema_vals)
+            if bull_pct >= 0.9 and above_pct >= 0.75:
+                ema_stack = "STRONG_BUY"
+            elif bull_pct >= 0.6 and above_pct >= 0.5:
+                ema_stack = "BUY"
+            elif bull_pct <= 0.1 and above_pct <= 0.25:
+                ema_stack = "STRONG_SELL"
+            elif bull_pct <= 0.4 and above_pct <= 0.5:
+                ema_stack = "SELL"
+
+        # === Pivot Reversal ===
+        pivot_signal = None
+        left_bars = 4; right_bars = 2
+        if n >= left_bars + right_bars + 5:
+            last_ph = None; last_pl = None
+            for pi in range(n - right_bars - 1, left_bars, -1):
+                # Pivot high
+                is_ph = True
+                for pj in range(1, left_bars + 1):
+                    if pi - pj < 0 or float(highs[pi]) <= float(highs[pi - pj]):
+                        is_ph = False; break
+                if is_ph:
+                    for pj in range(1, right_bars + 1):
+                        if pi + pj >= n or float(highs[pi]) <= float(highs[pi + pj]):
+                            is_ph = False; break
+                if is_ph and last_ph is None:
+                    last_ph = float(highs[pi])
+                # Pivot low
+                is_pl = True
+                for pj in range(1, left_bars + 1):
+                    if pi - pj < 0 or float(lows[pi]) >= float(lows[pi - pj]):
+                        is_pl = False; break
+                if is_pl:
+                    for pj in range(1, right_bars + 1):
+                        if pi + pj >= n or float(lows[pi]) >= float(lows[pi + pj]):
+                            is_pl = False; break
+                if is_pl and last_pl is None:
+                    last_pl = float(lows[pi])
+                if last_ph is not None and last_pl is not None:
+                    break
+            if last_ph is not None or last_pl is not None:
+                if last_ph and current > last_ph:
+                    pivot_signal = "BUY"
+                elif last_pl and current < last_pl:
+                    pivot_signal = "SELL"
+                elif last_ph and last_pl:
+                    pivot_signal = "BUY" if abs(current - last_ph) < abs(current - last_pl) else "SELL"
+
         result = {
             "current": current,
             "sma10": sma10, "sma20": sma20, "sma_trend": sma_trend,
@@ -2202,6 +2304,9 @@ def _calculate_indicators(asset, timeframe="1h"):
             "vol_trend": vol_trend, "vol_spike": vol_spike,
             "is_ranging": is_ranging, "bb_squeeze": bb_squeeze,
             "timeframe": timeframe,
+            "ut_trend": ut_trend,
+            "ema_stack": ema_stack,
+            "pivot_signal": pivot_signal,
         }
 
         _indicator_cache[cache_key] = {"data": result, "updated": datetime.now(timezone.utc)}
@@ -2216,303 +2321,125 @@ def _calculate_indicators(asset, timeframe="1h"):
 # ═══════════════════════════════════════════════════════════
 
 def _score_paper3_trade(p, price, indicators):
-    """Bot 3 v2: Smart Market Reader scoring."""
+    """Bot 3 v3: UT Bot + EMA Stack + Pivots.
+    KEEP: TV signal, SMA trend, BTC trend (proven in Bot 2)
+    NEW: UT Bot (reversal detection), EMA 20/50/100/200 (trend strength), Pivot Reversal (structure)
+    REMOVED: RSI, Bollinger Bands, ROC, old EMA 10/20
+    Rule: Bot 2 >= 1 agreeing + New >= 2 agreeing + price confirms = TRADE
+    """
     if not indicators or price is None:
         return None
 
     asset = p["asset"]
-    rsi = indicators.get("rsi")
-    bb_pos = indicators.get("bb_position")
-    is_ranging = indicators.get("is_ranging", False)
-    bb_squeeze = indicators.get("bb_squeeze", False)
-    roc = indicators.get("roc")
-    sma_trend = indicators.get("sma_trend")
-    ema_trend = indicators.get("ema_trend")
-
-    tv = _tv_trends.get(asset.upper())
-    tv_dir = tv["dir"] if tv else None
-    btc_trend = _btc_trend_cache.get("trend")
-
     yes_odds = p["yes_odds"]
     no_odds = 100 - yes_odds
 
-    # Basic odds filter: 30-70%
+    # Odds filter: 30-70%
     if not (30 <= yes_odds <= 70 or 30 <= no_odds <= 70):
         return None
 
-    # Margin check
-    margin = abs(price - p["baseline"])
-    margin_pct = (margin / p["baseline"] * 100) if p["baseline"] > 0 else 0
-
-    # Price position relative to baseline
+    # Price position
     if p["direction"] == "above":
         price_above = price > p["baseline"]
     else:
         price_above = price < p["baseline"]
 
-    # ============================================
-    # STEP 1: Classify market condition
-    # ============================================
-    # Count Bot 2 signals (the proven foundation)
+    margin_pct = abs(price - p["baseline"]) / p["baseline"] * 100 if p["baseline"] > 0 else 0
+
+    # ── Group 1: Bot 2 signals (proven foundation) ──
+    tv = _tv_trends.get(asset.upper())
+    tv_dir = tv["dir"] if tv else None
+    sma_trend = indicators.get("sma_trend")
+    btc_trend = _btc_trend_cache.get("trend")
+
     bot2_buy = sum(1 for s in [tv_dir, sma_trend, btc_trend] if s == "BUY")
     bot2_sell = sum(1 for s in [tv_dir, sma_trend, btc_trend] if s == "SELL")
-    bot2_total = bot2_buy + bot2_sell
 
-    # Momentum readings
-    rsi_val = rsi if rsi is not None else 50
-    bb_val = bb_pos if bb_pos is not None else 0.5
-    roc_val = roc if roc is not None else 0
+    # ── Group 2: New indicators ──
+    ut_trend = indicators.get("ut_trend")
+    ema_stack = indicators.get("ema_stack")
+    pivot_signal = indicators.get("pivot_signal")
 
-    # EMA adds trend confirmation
-    ema_buy = 1 if ema_trend == "BUY" else 0
-    ema_sell = 1 if ema_trend == "SELL" else 0
+    new_buy = sum(1 for s in [ut_trend, ema_stack, pivot_signal] if s in ("BUY", "STRONG_BUY"))
+    new_sell = sum(1 for s in [ut_trend, ema_stack, pivot_signal] if s in ("SELL", "STRONG_SELL"))
 
-    # ============================================
-    # STEP 2: Determine momentum direction
-    # Momentum tells us where price is GOING
-    # ============================================
-    momentum_score = 0  # positive = bullish, negative = bearish
+    total_buy = bot2_buy + new_buy
+    total_sell = bot2_sell + new_sell
 
-    # RSI contribution
-    if rsi is not None:
-        if rsi > 60:
-            momentum_score += 1  # bullish
-        elif rsi > 55:
-            momentum_score += 0.5
-        elif rsi < 40:
-            momentum_score -= 1  # bearish
-        elif rsi < 45:
-            momentum_score -= 0.5
-
-    # BB position contribution
-    if bb_pos is not None:
-        if bb_pos > 0.65:
-            momentum_score += 1  # price in upper zone, bullish
-        elif bb_pos > 0.55:
-            momentum_score += 0.5
-        elif bb_pos < 0.35:
-            momentum_score -= 1  # price in lower zone, bearish
-        elif bb_pos < 0.45:
-            momentum_score -= 0.5
-
-    # ROC contribution (strongest momentum signal)
-    if roc is not None:
-        if roc > 0.1:
-            momentum_score += 1.5  # strong upward acceleration
-        elif roc > 0.03:
-            momentum_score += 0.75
-        elif roc < -0.1:
-            momentum_score -= 1.5  # strong downward acceleration
-        elif roc < -0.03:
-            momentum_score -= 0.75
-
-    # EMA contribution
-    momentum_score += ema_buy * 0.5
-    momentum_score -= ema_sell * 0.5
-
-    # ============================================
-    # STEP 3: Detect danger signals
-    # These override everything — Bot 3's edge over Bot 2
-    # ============================================
-    danger_signals = 0
-
-    # RSI exhaustion (trend about to reverse)
-    if rsi is not None:
-        if rsi > 75:
-            danger_signals += 2  # very overbought
-        elif rsi > 70:
-            danger_signals += 1  # overbought
-        elif rsi < 25:
-            danger_signals += 2  # very oversold (if we're betting NO)
-        elif rsi < 30:
-            danger_signals += 1
-
-    # BB at extremes (price hitting walls)
-    if bb_pos is not None:
-        if bb_pos > 0.9 or bb_pos < 0.1:
-            danger_signals += 1
-
-    # ROC reversal (momentum changing direction vs trend)
-    if roc is not None and sma_trend:
-        if sma_trend == "BUY" and roc < -0.05:
-            danger_signals += 1  # trend says up but momentum fading
-        elif sma_trend == "SELL" and roc > 0.05:
-            danger_signals += 1  # trend says down but momentum rising
-
-    # ============================================
-    # STEP 4: Make the decision
-    # ============================================
+    # ── Decision ──
     bet_side = None
-    effective_odds = None
     confidence = "LOW"
-    decision_reason = ""
+    reason = ""
 
-    # --- CASE 1: STRONG TREND (Bot 2 signals + momentum aligned) ---
-    if bot2_buy >= 2 and momentum_score > 0:
-        if price_above:
-            # Perfect setup: trend + momentum + price all agree UP
-            bet_side = "YES" if p["direction"] == "above" else "NO"
-            confidence = "HIGH" if momentum_score >= 2 and bot2_buy >= 2 else "MEDIUM"
-            decision_reason = "TREND_CONFIRMED"
-        else:
-            # Price below but trend + momentum say coming back up
-            if momentum_score >= 1.5:
-                bet_side = "YES" if p["direction"] == "above" else "NO"
-                confidence = "MEDIUM" if momentum_score >= 2.5 else "LOW"
-                decision_reason = "MOMENTUM_REVERSAL_UP"
-            elif margin_pct < 0.15:
-                # Price barely below, momentum pushing up — good odds
-                bet_side = "YES" if p["direction"] == "above" else "NO"
-                confidence = "LOW"
-                decision_reason = "CLOSE_TO_BASELINE_UP"
+    # CASE 1: Everything agrees bullish + price confirms
+    if total_buy >= 5 and price_above:
+        bet_side = "YES" if p["direction"] == "above" else "NO"
+        confidence = "HIGH" if total_buy >= 6 else "MEDIUM"
+        reason = "FULL_BULL"
 
-    elif bot2_sell >= 2 and momentum_score < 0:
-        if not price_above:
-            # Perfect: trend + momentum + price all agree DOWN
-            bet_side = "NO" if p["direction"] == "above" else "YES"
-            confidence = "HIGH" if momentum_score <= -2 and bot2_sell >= 2 else "MEDIUM"
-            decision_reason = "TREND_CONFIRMED_DOWN"
-        else:
-            # Price above but everything says it's coming down
-            if momentum_score <= -1.5:
-                bet_side = "NO" if p["direction"] == "above" else "YES"
-                confidence = "MEDIUM" if momentum_score <= -2.5 else "LOW"
-                decision_reason = "MOMENTUM_REVERSAL_DOWN"
-            elif margin_pct < 0.15:
-                bet_side = "NO" if p["direction"] == "above" else "YES"
-                confidence = "LOW"
-                decision_reason = "CLOSE_TO_BASELINE_DOWN"
+    # CASE 2: Everything agrees bearish + price confirms
+    elif total_sell >= 5 and not price_above:
+        bet_side = "NO" if p["direction"] == "above" else "YES"
+        confidence = "HIGH" if total_sell >= 6 else "MEDIUM"
+        reason = "FULL_BEAR"
 
-    # --- CASE 2: BOT 2 SIGNALS MIXED but momentum is clear ---
-    elif bot2_total >= 2 and abs(momentum_score) >= 2:
-        if momentum_score >= 2:
-            if price_above or margin_pct < 0.2:
-                bet_side = "YES" if p["direction"] == "above" else "NO"
-                confidence = "MEDIUM" if price_above else "LOW"
-                decision_reason = "MOMENTUM_OVERRIDE_UP"
-        elif momentum_score <= -2:
-            if not price_above or margin_pct < 0.2:
-                bet_side = "NO" if p["direction"] == "above" else "YES"
-                confidence = "MEDIUM" if not price_above else "LOW"
-                decision_reason = "MOMENTUM_OVERRIDE_DOWN"
+    # CASE 3: Bot 2 agrees (>=1) + New agrees (>=2) + price confirms
+    elif bot2_buy >= 1 and new_buy >= 2 and price_above:
+        bet_side = "YES" if p["direction"] == "above" else "NO"
+        confidence = "MEDIUM" if bot2_buy >= 2 and new_buy >= 3 else "LOW"
+        reason = "CONFIRMED_BULL"
 
-    # --- CASE 3: RANGING MARKET ---
-    elif is_ranging and not bb_squeeze:
-        # Trade the edges of the range
-        if bb_val < 0.25 and rsi_val < 42:
-            # Near bottom of range — expect bounce up
-            bet_side = "YES" if p["direction"] == "above" else "NO"
-            confidence = "LOW"
-            decision_reason = "RANGE_BOTTOM_BOUNCE"
-        elif bb_val > 0.75 and rsi_val > 58:
-            # Near top of range — expect drop
-            bet_side = "NO" if p["direction"] == "above" else "YES"
-            confidence = "LOW"
-            decision_reason = "RANGE_TOP_REJECT"
+    elif bot2_sell >= 1 and new_sell >= 2 and not price_above:
+        bet_side = "NO" if p["direction"] == "above" else "YES"
+        confidence = "MEDIUM" if bot2_sell >= 2 and new_sell >= 3 else "LOW"
+        reason = "CONFIRMED_BEAR"
 
-    # --- CASE 4: BB SQUEEZE (breakout coming) ---
-    elif bb_squeeze:
-        # Tight range about to break — follow momentum direction
-        if momentum_score >= 1 and (bot2_buy >= 1 or ema_buy):
-            bet_side = "YES" if p["direction"] == "above" else "NO"
-            confidence = "MEDIUM" if momentum_score >= 2 else "LOW"
-            decision_reason = "SQUEEZE_BREAKOUT_UP"
-        elif momentum_score <= -1 and (bot2_sell >= 1 or ema_sell):
-            bet_side = "NO" if p["direction"] == "above" else "YES"
-            confidence = "MEDIUM" if momentum_score <= -2 else "LOW"
-            decision_reason = "SQUEEZE_BREAKOUT_DOWN"
-
-    # --- CASE 5: Bot 2 has clear signal, momentum neutral ---
-    elif bot2_buy >= 2 and momentum_score >= 0 and price_above:
+    # CASE 4: Bot 2 strong (>=2) + at least 1 new + price confirms
+    elif bot2_buy >= 2 and new_buy >= 1 and price_above:
         bet_side = "YES" if p["direction"] == "above" else "NO"
         confidence = "LOW"
-        decision_reason = "BOT2_SIGNAL_NEUTRAL_MOM"
+        reason = "BOT2_STRONG_BULL"
 
-    elif bot2_sell >= 2 and momentum_score <= 0 and not price_above:
+    elif bot2_sell >= 2 and new_sell >= 1 and not price_above:
         bet_side = "NO" if p["direction"] == "above" else "YES"
         confidence = "LOW"
-        decision_reason = "BOT2_SIGNAL_NEUTRAL_MOM_DOWN"
+        reason = "BOT2_STRONG_BEAR"
 
     if bet_side is None:
         return None
 
-    # ============================================
-    # STEP 5: Apply danger signal veto
-    # This is where Bot 3 SAVES money vs Bot 2
-    # ============================================
-    if danger_signals >= 2:
-        # Strong danger — only trade if HIGH confidence
-        if confidence != "HIGH":
-            return None
-        confidence = "MEDIUM"  # downgrade
-        decision_reason += "_DANGER_OVERRIDE"
-
-    elif danger_signals >= 1:
-        # Mild danger — downgrade confidence
-        if confidence == "HIGH":
-            confidence = "MEDIUM"
-        elif confidence == "MEDIUM":
-            confidence = "LOW"
-        elif confidence == "LOW":
-            # Check if momentum is strong enough to overcome danger
-            if abs(momentum_score) < 1.5:
-                return None
-        decision_reason += "_DANGER_CAUTION"
-
-    # ============================================
-    # STEP 6: Apply data-driven rules
-    # ============================================
+    # ── Data rules ──
     effective_odds = yes_odds if bet_side == "YES" else no_odds
-
-    # Must be in 30-70% range
     if effective_odds < 30 or effective_odds > 70:
         return None
 
-    # Market type
     mtype = "15M" if p["is_short"] and p.get("mins_left", 0) <= 20 else "1H" if p["is_short"] else "Daily"
 
-    # Data rule: ETH/XRP need MEDIUM+ on 1H
+    # ETH/XRP on 1H need MEDIUM+
     if asset in ("ETH", "XRP") and mtype == "1H" and confidence == "LOW":
         return None
 
-    # Data rule: 1H markets need at least MEDIUM confidence
-    if mtype == "1H" and confidence == "LOW" and abs(momentum_score) < 2:
+    # 1H needs at least some confirmation
+    if mtype == "1H" and confidence == "LOW" and total_buy < 4 and total_sell < 4:
         return None
 
-    # Data rule: Daily markets need HIGH confidence
+    # Daily needs HIGH
     if mtype == "Daily" and confidence != "HIGH":
-        if confidence == "MEDIUM" and abs(momentum_score) >= 2.5:
-            pass  # strong momentum override
-        else:
-            return None
+        return None
 
-    # Build indicator string
+    # ── Build output ──
     indicator_details = []
-    for name, signal in [("TV", tv_dir), ("SMA", sma_trend), ("EMA", ema_trend),
-                          ("RSI", "BUY" if rsi_val > 55 else "SELL" if rsi_val < 45 else None),
-                          ("BB", "BUY" if bb_val > 0.55 else "SELL" if bb_val < 0.45 else None),
-                          ("ROC", "BUY" if roc_val > 0.03 else "SELL" if roc_val < -0.03 else None),
-                          ("BTC", btc_trend)]:
-        if signal == "BUY":
+    for name, signal in [("TV", tv_dir), ("SMA", sma_trend), ("BTC", btc_trend),
+                          ("UT", ut_trend), ("EMA4", ema_stack), ("PIV", pivot_signal)]:
+        if signal in ("BUY", "STRONG_BUY"):
             indicator_details.append("{}=BUY".format(name))
-        elif signal == "SELL":
+        elif signal in ("SELL", "STRONG_SELL"):
             indicator_details.append("{}=SELL".format(name))
         else:
-            indicator_details.append("{}=—".format(name))
+            indicator_details.append("{}=\u2014".format(name))
 
-    # Score for display (total agreeing indicators)
-    if bet_side == "YES" and p["direction"] == "above" or bet_side == "NO" and p["direction"] != "above":
-        # Betting on UP
-        score = bot2_buy + (1 if momentum_score > 0.5 else 0) + (1 if momentum_score > 1.5 else 0) + ema_buy
-    else:
-        # Betting on DOWN
-        score = bot2_sell + (1 if momentum_score < -0.5 else 0) + (1 if momentum_score < -1.5 else 0) + ema_sell
-
-    total_signals = bot2_total + sum(1 for s in [
-        "BUY" if rsi_val > 55 else "SELL" if rsi_val < 45 else None,
-        "BUY" if bb_val > 0.55 else "SELL" if bb_val < 0.45 else None,
-        "BUY" if roc_val > 0.03 else "SELL" if roc_val < -0.03 else None,
-        ema_trend] if s is not None)
+    score = max(total_buy, total_sell)
+    total_signals = bot2_buy + bot2_sell + new_buy + new_sell
 
     share_price = effective_odds / 100.0
     if bet_side == "NO":
@@ -2522,19 +2449,15 @@ def _score_paper3_trade(p, price, indicators):
     return {
         "bet_side": bet_side,
         "bet_odds": effective_odds,
-        "score": max(score, 3),
-        "total_signals": max(total_signals, 3),
+        "score": max(int(score), 3),
+        "total_signals": max(int(total_signals), 3),
         "confidence": confidence,
         "indicators": " | ".join(indicator_details),
-        "rsi": rsi,
-        "bb_pos": bb_pos,
+        "rsi": indicators.get("rsi"),
+        "bb_pos": indicators.get("bb_position"),
         "market_type": mtype,
         "sim_payout": sim_payout,
-        "momentum_score": round(momentum_score, 2),
-        "danger_signals": danger_signals,
-        "decision_reason": decision_reason,
     }
-
 
 # ═══════════════════════════════════════════════════════════
 # PAPER 4: Reversal Hunter — contrarian bets on exhausted trends
