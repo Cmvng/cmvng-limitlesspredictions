@@ -358,6 +358,33 @@ def init_db():
             slug          TEXT
         )
     """)
+
+    # Paper 5.1: Squeeze + SMC + BTC tiebreaker + 15M + 4H pullback
+    conn.run("""
+        CREATE TABLE IF NOT EXISTS paper51_trades (
+            id            SERIAL PRIMARY KEY,
+            market_id     TEXT,
+            title         TEXT,
+            asset         TEXT,
+            direction     TEXT,
+            baseline      REAL,
+            bet_odds      REAL,
+            bet_side      TEXT,
+            current_price REAL,
+            hours_left    REAL,
+            market_type   TEXT,
+            indicators    TEXT,
+            score         INTEGER,
+            total_signals INTEGER,
+            simulated_stake REAL DEFAULT 1.0,
+            simulated_payout REAL,
+            status        TEXT DEFAULT 'Pending',
+            outcome       TEXT,
+            fired_at      TEXT,
+            resolved_at   TEXT,
+            slug          TEXT
+        )
+    """)
     conn.close()
     print("DB initialized OK")
 
@@ -3432,6 +3459,199 @@ def _score_paper21_trade(p, price, indicators=None, expiry_minute=None):
         "market_type": mtype, "sim_payout": sim_payout,
     }
 
+
+# ═══════════════════════════════════════════════════════════
+# PAPER 5.1: Squeeze + SMC + BTC tiebreaker + FULL dual timeframe
+# ═══════════════════════════════════════════════════════════
+
+def _score_paper51_trade(p, price, indicators, ind_macro=None, expiry_minute=None, expiry_hour=None):
+    """Paper 5.1: Squeeze + SMC with BTC as tiebreaker + FULL pullback detection.
+    15M: UT Bot gatekeeper for :30/:00. 1H: UT Bot gatekeeper for hours 3-4 of 4H.
+    BTC confirms when Squeeze+SMC agree, ignored when they disagree.
+    """
+    if not indicators or price is None:
+        return None
+
+    asset = p["asset"]
+    yes_odds = p["yes_odds"]
+    no_odds = 100 - yes_odds
+
+    if not (30 <= yes_odds <= 70 or 30 <= no_odds <= 70):
+        return None
+
+    if p["direction"] == "above":
+        price_above = price > p["baseline"]
+    else:
+        price_above = price < p["baseline"]
+
+    # ── Signal 1: Squeeze Momentum (micro) ──
+    sqz_val = indicators.get("squeeze_val")
+    sqz_prev = indicators.get("squeeze_prev_val")
+    sqz_on = indicators.get("squeeze_on", False)
+    sqz_dir = None; sqz_strong = False
+    if sqz_val is not None and sqz_prev is not None:
+        if sqz_val > 0: sqz_dir = "BUY"; sqz_strong = sqz_val > sqz_prev
+        elif sqz_val < 0: sqz_dir = "SELL"; sqz_strong = sqz_val < sqz_prev
+
+    # ── Signal 2: SMC Structure (micro) ──
+    smc_internal = indicators.get("smc_internal_trend")
+    smc_swing = indicators.get("smc_swing_trend")
+    smc_event = indicators.get("smc_last_event")
+    near_bull_ob = indicators.get("smc_near_bull_ob", False)
+    near_bear_ob = indicators.get("smc_near_bear_ob", False)
+    smc_dir = None; smc_strong = False
+    if smc_internal == "BULLISH": smc_dir = "BUY"; smc_strong = smc_swing == "BULLISH"
+    elif smc_internal == "BEARISH": smc_dir = "SELL"; smc_strong = smc_swing == "BEARISH"
+
+    # ── Signal 3: BTC trend ──
+    btc_trend = _btc_trend_cache.get("trend")
+
+    # ── UT Bot (micro — gatekeeper) ──
+    ut_trend = indicators.get("ut_trend")
+
+    # ── PAIR direction (Squeeze + SMC without BTC) ──
+    pair_agree = (sqz_dir == smc_dir) and sqz_dir is not None
+    pair_dir = sqz_dir if pair_agree else None
+
+    # ── BTC role ──
+    btc_agrees = (btc_trend == pair_dir) if pair_dir and btc_trend else False
+    if pair_dir and btc_agrees:
+        btc_role = "CONFIRM"
+    elif pair_dir and btc_trend and not btc_agrees:
+        btc_role = "IGNORED"
+    elif not pair_agree and btc_trend:
+        btc_role = "TIEBREAK"
+    else:
+        btc_role = "NONE"
+
+    # ── Macro direction (1H for 15M, 4H for 1H) ──
+    macro_dir = None
+    if ind_macro:
+        m_sqz = ind_macro.get("squeeze_val")
+        m_sqz_dir = "BUY" if m_sqz and m_sqz > 0 else "SELL" if m_sqz and m_sqz < 0 else None
+        m_smc = ind_macro.get("smc_internal_trend")
+        m_smc_dir = "BUY" if m_smc == "BULLISH" else "SELL" if m_smc == "BEARISH" else None
+        m_buy = sum(1 for s in [m_sqz_dir, m_smc_dir, btc_trend] if s == "BUY")
+        m_sell = sum(1 for s in [m_sqz_dir, m_smc_dir, btc_trend] if s == "SELL")
+        if m_buy >= 2: macro_dir = "BUY"
+        elif m_sell >= 2: macro_dir = "SELL"
+
+    # ── Timing ──
+    mtype = "15M" if p["is_short"] and p.get("mins_left", 0) <= 20 else "1H" if p["is_short"] else "Daily"
+    is_weak_period = False
+    if mtype == "15M" and expiry_minute is not None:
+        is_weak_period = expiry_minute in (0, 30)
+    elif mtype == "1H" and expiry_hour is not None:
+        hour_in_4h = expiry_hour % 4
+        is_weak_period = hour_in_4h in (2, 3)
+
+    # ── Decision ──
+    bet_side = None; confidence = "LOW"; reason = ""
+
+    if is_weak_period and macro_dir:
+        # ═══ WEAK PERIOD: UT Bot gatekeeper (both 15M and 1H) ═══
+        ut_opposes = (ut_trend == "SELL" and macro_dir == "BUY") or (ut_trend == "BUY" and macro_dir == "SELL")
+        sqz_opposes = (sqz_dir == "SELL" and macro_dir == "BUY") or (sqz_dir == "BUY" and macro_dir == "SELL")
+
+        if ut_opposes and sqz_opposes:
+            if macro_dir == "BUY":
+                bet_side = "NO" if p["direction"] == "above" else "YES"
+                confidence = "HIGH"; reason = "PULLBACK_S4_BEAR"
+            else:
+                bet_side = "YES" if p["direction"] == "above" else "NO"
+                confidence = "HIGH"; reason = "PULLBACK_S4_BULL"
+        elif ut_opposes and not sqz_opposes:
+            if macro_dir == "BUY":
+                bet_side = "NO" if p["direction"] == "above" else "YES"
+                confidence = "MEDIUM"; reason = "PULLBACK_S3_BEAR"
+            else:
+                bet_side = "YES" if p["direction"] == "above" else "NO"
+                confidence = "MEDIUM"; reason = "PULLBACK_S3_BULL"
+        elif not ut_opposes and sqz_opposes:
+            return None  # Squeeze only → SKIP
+        else:
+            # Neither opposes → pair must agree
+            if pair_agree and pair_dir == "BUY" and price_above:
+                bet_side = "YES" if p["direction"] == "above" else "NO"
+                confidence = "HIGH" if sqz_strong and smc_strong else "MEDIUM"
+                reason = "WEAK_TREND_HOLDS"
+            elif pair_agree and pair_dir == "SELL" and not price_above:
+                bet_side = "NO" if p["direction"] == "above" else "YES"
+                confidence = "HIGH" if sqz_strong and smc_strong else "MEDIUM"
+                reason = "WEAK_TREND_HOLDS_BEAR"
+            else:
+                return None
+    else:
+        # ═══ STRONG PERIOD ═══
+        if pair_agree and btc_agrees:
+            if pair_dir == "BUY":
+                bet_side = "YES" if p["direction"] == "above" else "NO"
+                confidence = "HIGH" if sqz_strong and smc_strong else "MEDIUM"
+                reason = "STRONG_ALL_AGREE_BUY"
+            else:
+                bet_side = "NO" if p["direction"] == "above" else "YES"
+                confidence = "HIGH" if sqz_strong and smc_strong else "MEDIUM"
+                reason = "STRONG_ALL_AGREE_SELL"
+        elif pair_agree and not btc_agrees:
+            if pair_dir == "BUY" and price_above:
+                bet_side = "YES" if p["direction"] == "above" else "NO"
+                confidence = "MEDIUM" if sqz_strong or smc_strong else "LOW"
+                reason = "STRONG_PAIR_BUY_BTC_IGN"
+            elif pair_dir == "SELL" and not price_above:
+                bet_side = "NO" if p["direction"] == "above" else "YES"
+                confidence = "MEDIUM" if sqz_strong or smc_strong else "LOW"
+                reason = "STRONG_PAIR_SELL_BTC_IGN"
+        elif not pair_agree and btc_trend:
+            if btc_trend == "BUY" and sqz_dir == "BUY" and price_above:
+                bet_side = "YES" if p["direction"] == "above" else "NO"
+                confidence = "LOW"; reason = "STRONG_BTC_TIEBREAK_BUY"
+            elif btc_trend == "SELL" and sqz_dir == "SELL" and not price_above:
+                bet_side = "NO" if p["direction"] == "above" else "YES"
+                confidence = "LOW"; reason = "STRONG_BTC_TIEBREAK_SELL"
+
+    if bet_side is None: return None
+
+    effective_odds = yes_odds if bet_side == "YES" else no_odds
+    if effective_odds > 60: return None
+
+    # Danger checks (skip for pullbacks)
+    if "PULLBACK" not in reason:
+        if smc_event == "CHOCH_BEAR" and bet_side == ("YES" if p["direction"] == "above" else "NO"):
+            return None
+        if smc_event == "CHOCH_BULL" and bet_side == ("NO" if p["direction"] == "above" else "YES"):
+            return None
+        if sqz_on and not smc_strong: return None
+
+    if confidence == "LOW": return None
+    if asset == "ETH" and mtype == "1H" and confidence != "HIGH": return None
+    if mtype == "Daily" and confidence != "HIGH": return None
+
+    # ── Output ──
+    indicator_details = []
+    for name, signal in [("SQZ", sqz_dir), ("SMC", smc_dir), ("BTC", btc_trend)]:
+        if signal == "BUY": indicator_details.append("{}=BUY".format(name))
+        elif signal == "SELL": indicator_details.append("{}=SELL".format(name))
+        else: indicator_details.append("{}=\u2014".format(name))
+
+    if ut_trend: indicator_details.append("UT={}".format(ut_trend))
+    if sqz_strong: indicator_details.append("MOM:ACCEL")
+    if smc_strong: indicator_details.append("STR:STRONG")
+    indicator_details.append("BTC:{}".format(btc_role))
+    if is_weak_period and macro_dir:
+        indicator_details.append("MACRO={}".format(macro_dir))
+    if "PULLBACK" in reason: indicator_details.append("FLIP")
+
+    share_price = effective_odds / 100.0
+    if bet_side == "NO": share_price = 1.0 - (yes_odds / 100.0)
+    sim_payout = round(1.0 / share_price, 4) if share_price > 0 else 0
+
+    return {
+        "bet_side": bet_side, "bet_odds": effective_odds,
+        "score": 3, "total_signals": 3,
+        "confidence": confidence, "indicators": " | ".join(indicator_details),
+        "market_type": mtype, "sim_payout": sim_payout,
+    }
+
 def run_paper34_scan():
     """Scan markets for Paper 3 (momentum) and Paper 4 (reversal) signals."""
     import requests as req
@@ -3468,6 +3688,11 @@ def run_paper34_scan():
             p21_ids = set(str(row[0]) for row in p21_rows)
         except:
             p21_ids = set()
+        try:
+            p51_rows = conn.run("SELECT market_id FROM paper51_trades WHERE fired_at::timestamptz > NOW() - INTERVAL '30 hours'")
+            p51_ids = set(str(row[0]) for row in p51_rows)
+        except:
+            p51_ids = set()
         # Get Bot 1 and Bot 2 market IDs to avoid overlap
         try:
             bot12_rows = conn.run("""SELECT market_id FROM limitless_predictions WHERE created_at > NOW() - INTERVAL '30 hours'
@@ -3484,6 +3709,7 @@ def run_paper34_scan():
         p5_count = 0
         p31_count = 0
         p21_count = 0
+        p51_count = 0
 
         for market in markets:
             try:
@@ -3712,11 +3938,40 @@ def run_paper34_scan():
                         except Exception as e:
                             print("Paper21 save error: {}".format(e))
 
+                # Paper 5.1: Squeeze + SMC + BTC tiebreaker + full pullback
+                if parsed["market_id"] not in p51_ids:
+                    scored51 = _score_paper51_trade(parsed, price, ind, ind_macro=ind_macro, expiry_minute=expiry_minute, expiry_hour=expiry_hour)
+                    if scored51:
+                        try:
+                            conn51 = get_db()
+                            conn51.run(
+                                """INSERT INTO paper51_trades
+                                (market_id, title, asset, direction, baseline, bet_odds, bet_side,
+                                 current_price, hours_left, market_type, indicators, score,
+                                 total_signals, simulated_stake, simulated_payout, status, fired_at, slug)
+                                VALUES (:mid, :ttl, :ast, :dir, :base, :odds, :bs,
+                                        :pr, :hrs, :mt, :ind, :sc, :ts, 1.0, :sp, 'Pending', :now, :slg)""",
+                                mid=parsed["market_id"], ttl=parsed["title"], ast=asset,
+                                dir=parsed["direction"], base=parsed["baseline"],
+                                odds=scored51["bet_odds"], bs=scored51["bet_side"],
+                                pr=price, hrs=round(parsed["hours_left"], 2),
+                                mt=scored51["market_type"],
+                                ind="[{}] {}".format(scored51["confidence"], scored51["indicators"]),
+                                sc=scored51["score"], ts=scored51["total_signals"],
+                                sp=scored51["sim_payout"],
+                                now=now, slg=parsed["slug"]
+                            )
+                            conn51.close()
+                            p51_ids.add(parsed["market_id"])
+                            p51_count += 1
+                        except Exception as e:
+                            print("Paper51 save error: {}".format(e))
+
             except Exception as e:
                 print("Paper345 market error: {}".format(e))
 
         if p3_count > 0 or p4_count > 0 or p5_count > 0:
-            print("P3:{} P4:{} P5:{} P3.1:{} P2.1:{}".format(p3_count, p4_count, p5_count, p31_count, p21_count))
+            print("P3:{} P4:{} P5:{} P3.1:{} P2.1:{} P5.1:{}".format(p3_count, p4_count, p5_count, p31_count, p21_count, p51_count))
         else:
             # Count how many assets we got indicators for
             ind_ok = sum(1 for v in indicator_cache_local.values() if v is not None)
@@ -3853,8 +4108,9 @@ def resolve_paper34_trades():
     r5 = _resolve_paper_table("paper5_trades")
     r31 = _resolve_paper_table("paper31_trades")
     r21 = _resolve_paper_table("paper21_trades")
+    r51 = _resolve_paper_table("paper51_trades")
     if r3 or r4 or r5:
-        print("Resolved: P3={} P4={} P5={} P3.1={} P2.1={}".format(r3, r4, r5, r31, r21))
+        print("Resolved: P3={} P4={} P5={} P3.1={} P2.1={} P5.1={}".format(r3, r4, r5, r31, r21, r51))
 
 def _score_paper_trade(p, price):
     """Score a market for paper trading. Accepts 40-72% odds when ALL trends agree.
@@ -7962,6 +8218,7 @@ td{padding:8px 12px;border-bottom:1px solid #f4f3ed;color:var(--ink-2)}tr:last-c
     <a href="/app/paper4" class="nav-tab""" + (" active" if nav_active == "paper4" else "") + """">Paper 4</a>
     <a href="/app/paper21" class="nav-tab""" + (" active" if nav_active == "paper21" else "") + """">Paper 2.1</a>
     <a href="/app/paper31" class="nav-tab""" + (" active" if nav_active == "paper31" else "") + """">Paper 3.1</a>
+    <a href="/app/paper51" class="nav-tab""" + (" active" if nav_active == "paper51" else "") + """">Paper 5.1</a>
     <a href="/app/paper5" class="nav-tab""" + (" active" if nav_active == "paper5" else "") + """">Paper 5</a>
     <a href="/app/football" class="nav-tab">Football</a>
   </nav>
@@ -8104,6 +8361,17 @@ def paper31_page():
         "Same indicators as Paper 3 but BTC confirms when pair agrees, ignored when pair disagrees. Dual-timeframe pullback detection: UT Bot + Squeeze as gatekeeper during weak periods. 4H macro for 1H markets.",
         ["Score", "Indicators"],
         "paper31"
+    )
+
+@app.route("/app/paper51")
+def paper51_page():
+    return _build_paper_page(
+        "paper51_trades",
+        "Paper 5.1 — Full Dual Timeframe",
+        "Squeeze + SMC + BTC Tiebreaker + 15M & 4H Pullback",
+        "Squeeze Momentum + SMC Structure with BTC as tiebreaker. Full pullback detection: UT Bot gatekeeper for 15M weak periods AND 1H hours 3-4 of 4H blocks. Pair leads, BTC confirms or ignored.",
+        ["Score", "Indicators"],
+        "paper51"
     )
 
 @app.route("/app/paper5")
