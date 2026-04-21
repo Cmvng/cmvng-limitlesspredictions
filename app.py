@@ -1624,142 +1624,101 @@ def execute_trade(parsed_market, score, prediction_id, override_stake=None, bot_
             "{:.4f}".format(best_bid) if best_bid else "?",
             "{:.4f}".format(best_ask) if best_ask else "?"))
 
-        # 3. Place GTC limit order at starting price
-        current_price = start_price
-        order_id = _place_gtc_order(slug, bet_side, token_id, stake, current_price,
-                                     exchange_addr, profile_id, fee_bps)
+        # 3. SMART ORDER ROUTING: GTC only when orderbook has liquidity, else FOK directly
+        orderbook_live = orderbook is not None and best_bid is not None and best_ask is not None
 
-        if not order_id:
-            # GTC failed — try FOK as fallback
-            print("GTC failed — trying FOK fallback")
-            success = _place_fok_order(slug, bet_side, token_id, stake, exchange_addr, profile_id, fee_bps)
-            if success:
-                if override_stake is None:
-                    _trading_state["trades_today"] += 1
-                    _trading_state["last_balance"] = round((balance or 0) - stake, 2)
-                    lbl2 = "BOT 1"
-                    bal_after2 = _trading_state["last_balance"]
-                else:
-                    lbl2 = bot_name or "BOT"
-                    bal_after2 = bot_balance_after or 0
-                try:
-                    conn = get_db()
-                    conn.run("UPDATE limitless_predictions SET size_rec=:s WHERE id=:i",
-                             s="AUTO ${:.2f} | {} | FOK-fallback".format(stake, bet_side), i=prediction_id)
-                    conn.close()
-                except:
-                    pass
-                send_telegram(
-                    "🤖 <b>{} TRADE PLACED</b>\n"
-                    "──────────────────────────\n"
-                    "📌 {}\n"
-                    "<b>Side:</b> BUY {} shares\n"
-                    "<b>Stake:</b> ${:.2f}\n"
-                    "<b>Balance:</b> ${:.2f}\n"
-                    "──────────────────────────".format(
-                        lbl2, parsed_market["title"][:50], bet_side, stake, bal_after2))
-            return success
-
-        # 4. Aggressive bidding loop — check every 5 seconds for 60 seconds
         filled = False
-        fill_price = current_price
-        max_checks = 12  # 12 × 5s = 60 seconds
-        for check_num in range(max_checks):
-            time.sleep(5)
+        fill_price = displayed_price
+        cancel_result = None
 
-            # Check if filled
-            status = _check_order_filled(order_id)
-            if status == "FILLED":
-                filled = True
-                fill_price = current_price
-                print("GTC filled at ${:.4f} after {}s".format(fill_price, (check_num + 1) * 5))
-                break
+        if orderbook_live:
+            # ── PATH A: Orderbook has liquidity → GTC for better price ──
+            current_price = start_price
+            order_id = _place_gtc_order(slug, bet_side, token_id, stake, current_price,
+                                         exchange_addr, profile_id, fee_bps)
 
-            if status == "CANCELLED":
-                print("GTC was cancelled externally")
-                break
-
-            # Check if we've been topped — re-fetch orderbook
-            ob = _fetch_orderbook(slug)
-            new_bid, new_ask, new_mid = _get_best_prices(ob, bet_side)
-
-            if new_bid and new_bid >= current_price:
-                # Someone topped us — outbid by $0.01
-                new_price = round(new_bid + 0.01, 3)
-                if new_price > ceiling:
-                    print("Bid war hit ceiling ${:.4f} — stopping".format(ceiling))
-                    break
-
-                # Cancel old order and place new one
-                _cancel_order(order_id)
-                time.sleep(0.5)
-                order_id = _place_gtc_order(slug, bet_side, token_id, stake, new_price,
-                                             exchange_addr, profile_id, fee_bps)
-                if order_id:
-                    current_price = new_price
-                    print("Outbid → ${:.4f} (check {}/{})".format(new_price, check_num + 1, max_checks))
-                else:
-                    print("Outbid order failed — breaking")
-                    break
-
-        # 5. If not filled after 30 seconds — FOK at the ask (if under ceiling)
-        if not filled:
-            # First check if the GTC actually filled during the wait
-            if order_id:
-                final_status = _check_order_filled(order_id)
-                if final_status == "FILLED":
-                    print("GTC filled during 60s wait!")
+            if not order_id:
+                # GTC failed — FOK fallback
+                print("GTC failed — trying FOK fallback")
+                success = _place_fok_order(slug, bet_side, token_id, stake, exchange_addr, profile_id, fee_bps)
+                if success:
                     filled = True
-                    fill_price = current_price
-                else:
-                    # Not filled — cancel and FOK
-                    cancel_result = _cancel_order(order_id)
-                    time.sleep(0.5)
-
-                    # If cancel returned "FILLED" (order was already filled/canceled),
-                    # check if it actually FILLED before placing FOK
-                    if cancel_result == "FILLED":
-                        recheck = _check_order_filled(order_id)
-                        if recheck == "FILLED":
-                            print("GTC was filled (cancel confirmed)! Skipping FOK.")
-                            filled = True
-                            fill_price = current_price
-
-            if not filled:
-                # Only FOK if we're sure the GTC didn't fill
-                # cancel_result True = cancelled OK, safe to FOK
-                # cancel_result False = unknown, check one more time
-                if cancel_result == False:
-                    final_check = _check_order_filled(order_id)
-                    if final_check == "FILLED":
-                        print("GTC filled on final check! Skipping FOK.")
+                    fill_price = displayed_price
+            else:
+                # Wait 30 seconds (6 checks × 5s) — shorter than before
+                max_checks = 6
+                for check_num in range(max_checks):
+                    time.sleep(5)
+                    status = _check_order_filled(order_id)
+                    if status == "FILLED":
                         filled = True
                         fill_price = current_price
+                        print("GTC filled at ${:.4f} after {}s".format(fill_price, (check_num + 1) * 5))
+                        break
+                    if status == "CANCELLED":
+                        print("GTC was cancelled externally")
+                        break
 
-            if not filled:
-                # Place FOK regardless of cancel result
-                # If cancel succeeded → safe, no double
-                # If cancel returned 400 → order already gone (filled or expired)
-                # If cancel failed → order might still be live but it's a GTC at LOW price,
-                #   unlikely to fill at the same time as our FOK at MARKET price
-                ob = _fetch_orderbook(slug)
-                _, final_ask, _ = _get_best_prices(ob, bet_side)
+                    # Check if we've been topped
+                    ob = _fetch_orderbook(slug)
+                    new_bid, new_ask, new_mid = _get_best_prices(ob, bet_side)
+                    if new_bid and new_bid >= current_price:
+                        new_price = round(new_bid + 0.01, 3)
+                        if new_price > ceiling:
+                            print("Bid war hit ceiling ${:.4f} — stopping".format(ceiling))
+                            break
+                        _cancel_order(order_id)
+                        time.sleep(0.5)
+                        order_id = _place_gtc_order(slug, bet_side, token_id, stake, new_price,
+                                                     exchange_addr, profile_id, fee_bps)
+                        if order_id:
+                            current_price = new_price
+                            print("Outbid → ${:.4f} (check {}/{})".format(new_price, check_num + 1, max_checks))
+                        else:
+                            print("Outbid order failed — breaking")
+                            break
 
-                if final_ask and final_ask <= ceiling:
-                    print("Not filled after 60s — FOK at ask ${:.4f}".format(final_ask))
-                    success = _place_fok_order(slug, bet_side, token_id, stake, exchange_addr, profile_id, fee_bps)
-                    if success:
+                # After wait — check status and cancel
+                if not filled and order_id:
+                    final_status = _check_order_filled(order_id)
+                    if final_status == "FILLED":
+                        print("GTC filled during wait!")
                         filled = True
-                        fill_price = final_ask
-                elif final_ask and final_ask > ceiling:
-                    print("Not filled and ask ${:.4f} > ceiling ${:.4f} — walking away".format(final_ask, ceiling))
-                    return False
-                else:
-                    print("Not filled after 60s, orderbook unavailable — FOK fallback")
-                    success = _place_fok_order(slug, bet_side, token_id, stake, exchange_addr, profile_id, fee_bps)
-                    if success:
-                        filled = True
-                        fill_price = displayed_price
+                        fill_price = current_price
+                    else:
+                        cancel_result = _cancel_order(order_id)
+                        time.sleep(0.5)
+
+                        if cancel_result == "FILLED":
+                            # Cancel says "already filled/canceled" — assume filled, skip FOK
+                            print("GTC already filled/canceled — skipping FOK to prevent double-spend.")
+                            filled = True
+                            fill_price = current_price
+                        elif cancel_result == True:
+                            # Cancel succeeded — safe to FOK
+                            print("GTC cancelled OK — FOK at market price")
+                            success = _place_fok_order(slug, bet_side, token_id, stake, exchange_addr, profile_id, fee_bps)
+                            if success:
+                                filled = True
+                                fill_price = displayed_price
+                        else:
+                            # Cancel failed/unknown — check order one more time
+                            recheck = _check_order_filled(order_id)
+                            if recheck == "FILLED":
+                                print("GTC filled on recheck — skipping FOK.")
+                                filled = True
+                                fill_price = current_price
+                            else:
+                                print("Cancel unclear ({}), skipping FOK to be safe.".format(cancel_result))
+
+        else:
+            # ── PATH B: No orderbook (404/empty) → FOK immediately ──
+            # No GTC, no cancel, no double-spend risk
+            print("No orderbook liquidity — FOK only (no GTC)")
+            success = _place_fok_order(slug, bet_side, token_id, stake, exchange_addr, profile_id, fee_bps)
+            if success:
+                filled = True
+                fill_price = displayed_price
 
         if filled:
             if override_stake is None:
