@@ -3914,7 +3914,7 @@ def run_paper34_scan():
                             print("Paper5 save error: {}".format(e))
 
                 # Paper 3.1: BTC Tiebreaker + Dual Timeframe
-                if parsed["market_id"] not in p31_ids:
+                if parsed["market_id"] not in p31_ids and parsed["market_id"] not in bot12_ids:
                     scored31 = _score_paper31_trade(parsed, price, ind, ind_macro=ind_macro, expiry_minute=expiry_minute, expiry_hour=expiry_hour)
                     if scored31:
                         try:
@@ -3963,7 +3963,7 @@ def run_paper34_scan():
                                     print("P3.1 trade error: {}".format(te))
 
                 # Paper 2.1: Bot 2 strategy + BTC Tiebreaker + 15M Pullback
-                if parsed["market_id"] not in p21_ids:
+                if parsed["market_id"] not in p21_ids and parsed["market_id"] not in bot12_ids:
                     scored21 = _score_paper21_trade(parsed, price, indicators=ind, expiry_minute=expiry_minute)
                     if scored21:
                         try:
