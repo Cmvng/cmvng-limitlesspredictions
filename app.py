@@ -1716,6 +1716,26 @@ def execute_trade(parsed_market, score, prediction_id, override_stake=None, bot_
                     cancel_result = _cancel_order(order_id)
                     time.sleep(0.5)
 
+                    # If cancel returned "FILLED" (order was already filled/canceled),
+                    # check if it actually FILLED before placing FOK
+                    if cancel_result == "FILLED":
+                        recheck = _check_order_filled(order_id)
+                        if recheck == "FILLED":
+                            print("GTC was filled (cancel confirmed)! Skipping FOK.")
+                            filled = True
+                            fill_price = current_price
+
+            if not filled:
+                # Only FOK if we're sure the GTC didn't fill
+                # cancel_result True = cancelled OK, safe to FOK
+                # cancel_result False = unknown, check one more time
+                if cancel_result == False:
+                    final_check = _check_order_filled(order_id)
+                    if final_check == "FILLED":
+                        print("GTC filled on final check! Skipping FOK.")
+                        filled = True
+                        fill_price = current_price
+
             if not filled:
                 # Place FOK regardless of cancel result
                 # If cancel succeeded → safe, no double
