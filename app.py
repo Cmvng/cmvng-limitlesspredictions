@@ -1210,20 +1210,20 @@ def _is_safe_trading_window():
 
 def _is_volatile_window():
     """Check if current time is in a volatile period where ALL bots should pause.
-    Volatile periods (UTC):
-      00:00-01:00 — daily candle close, funding rates, low liquidity
-      13:00-15:00 — US market open, Fed news, economic data
-      21:00-22:00 — NY close → Asia transition, 0% win rate historically
+    Volatile periods (UTC → Lagos):
+      23:00-01:00 UTC (12am-2am Lagos) — daily candle close, funding rates
+      13:00-15:00 UTC (2pm-4pm Lagos) — US market open, Fed news
+      20:00-21:00 UTC (9pm-10pm Lagos) — US market close, trend reversal
     Also checks next hour to catch trades that EXPIRE during volatile periods.
     """
     utc_hour = datetime.now(timezone.utc).hour
     next_hour = (utc_hour + 1) % 24
     for h in [utc_hour, next_hour]:
-        if 0 <= h < 1:
+        if h >= 23 or h < 1:
             return True
         if 13 <= h < 15:
             return True
-        if 21 <= h < 22:
+        if 20 <= h < 21:
             return True
     return False
 
