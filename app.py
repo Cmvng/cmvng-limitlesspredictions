@@ -2465,12 +2465,13 @@ def _calculate_indicators(asset, timeframe="1h"):
 # ═══════════════════════════════════════════════════════════
 
 def _score_paper3_trade(p, price, indicators, ind_macro=None, expiry_minute=None):
-    """Bot 3 v3: UT Bot + EMA Stack + Pivots with dual-timeframe pullback detection.
-    KEEP: TV signal, SMA trend, BTC trend (proven in Bot 2)
-    NEW: UT Bot, EMA 20/50/100/200 stack, Pivot Reversal
-    DUAL TIMEFRAME: For 15M markets, checks micro (15M) vs macro (1H) for pullbacks.
-    Strong periods (:15, :45 expiry) → follow macro trend
-    Weak periods (:30, :00 expiry) → check micro, flip if pullback detected
+    """Bot 3 v4: Dual-timeframe with UT Bot pullback gatekeeper.
+    Strong periods (:15/:45 expiry) → follow macro trend (75%+ win rate)
+    Weak periods (:30/:00 expiry) → UT Bot gatekeeper:
+      Scenario 4: UT + Squeeze both oppose macro → FLIP HIGH confidence
+      Scenario 3: UT only opposes macro → FLIP MEDIUM confidence
+      Squeeze only opposes → SKIP
+      Neither opposes → follow trend
     """
     if not indicators or price is None:
         return None
@@ -2488,7 +2489,7 @@ def _score_paper3_trade(p, price, indicators, ind_macro=None, expiry_minute=None
     else:
         price_above = price < p["baseline"]
 
-    # ── Group 1: Bot 2 signals (proven foundation) ──
+    # ── Bot 2 signals (proven) ──
     tv = _tv_trends.get(asset.upper())
     tv_dir = tv["dir"] if tv else None
     sma_trend = indicators.get("sma_trend")
@@ -2497,7 +2498,7 @@ def _score_paper3_trade(p, price, indicators, ind_macro=None, expiry_minute=None
     bot2_buy = sum(1 for s in [tv_dir, sma_trend, btc_trend] if s == "BUY")
     bot2_sell = sum(1 for s in [tv_dir, sma_trend, btc_trend] if s == "SELL")
 
-    # ── Group 2: New indicators (micro — 15M candles) ──
+    # ── New indicators (micro — 15M candles) ──
     ut_trend = indicators.get("ut_trend")
     ema_stack = indicators.get("ema_stack")
     pivot_signal = indicators.get("pivot_signal")
@@ -2505,7 +2506,20 @@ def _score_paper3_trade(p, price, indicators, ind_macro=None, expiry_minute=None
     new_buy = sum(1 for s in [ut_trend, ema_stack, pivot_signal] if s in ("BUY", "STRONG_BUY"))
     new_sell = sum(1 for s in [ut_trend, ema_stack, pivot_signal] if s in ("SELL", "STRONG_SELL"))
 
-    # ── Macro direction (1H candles — for dual timeframe) ──
+    # ── Squeeze Momentum (micro) ──
+    sqz_val = indicators.get("squeeze_val")
+    sqz_prev = indicators.get("squeeze_prev_val")
+    sqz_dir = None
+    sqz_strong = False
+    if sqz_val is not None and sqz_prev is not None:
+        if sqz_val > 0:
+            sqz_dir = "BUY"
+            sqz_strong = sqz_val > sqz_prev
+        elif sqz_val < 0:
+            sqz_dir = "SELL"
+            sqz_strong = sqz_val < sqz_prev
+
+    # ── Macro direction (1H candles) ──
     macro_dir = None
     if ind_macro:
         macro_sma = ind_macro.get("sma_trend")
@@ -2518,50 +2532,73 @@ def _score_paper3_trade(p, price, indicators, ind_macro=None, expiry_minute=None
         elif macro_sell >= 3:
             macro_dir = "SELL"
 
-    # ── Determine if this is a weak period (pullback prone) ──
+    # ── Market timing ──
     mtype = "15M" if p["is_short"] and p.get("mins_left", 0) <= 20 else "1H" if p["is_short"] else "Daily"
     is_weak_period = False
     if mtype == "15M" and expiry_minute is not None:
-        is_weak_period = expiry_minute in (0, 30)  # :00 and :30 expiry = weak
+        is_weak_period = expiry_minute in (0, 30)
 
-    # ── Micro momentum direction (15M candles) ──
-    micro_buy = bot2_buy + new_buy
-    micro_sell = bot2_sell + new_sell
-    micro_dir = "BUY" if micro_buy > micro_sell else "SELL" if micro_sell > micro_buy else None
+    # ── Total micro direction ──
+    total_buy = bot2_buy + new_buy
+    total_sell = bot2_sell + new_sell
 
-    # ── Decision logic ──
+    # ── Decision ──
     bet_side = None
     confidence = "LOW"
     reason = ""
 
-    if mtype == "15M" and is_weak_period and macro_dir and micro_dir:
-        # DUAL TIMEFRAME: Weak period — check for pullback
-        if macro_dir != micro_dir:
-            # PULLBACK DETECTED: micro opposes macro
-            # Follow the MICRO direction (pullback) for 15M market
-            if micro_dir == "BUY" and (price_above or micro_buy >= 4):
-                bet_side = "YES" if p["direction"] == "above" else "NO"
-                confidence = "MEDIUM" if micro_buy >= 5 else "LOW"
-                reason = "PULLBACK_MICRO_BUY"
-            elif micro_dir == "SELL" and (not price_above or micro_sell >= 4):
+    if mtype == "15M" and is_weak_period and macro_dir:
+        # ═══ WEAK PERIOD: UT Bot gatekeeper for pullback detection ═══
+        
+        # Determine if UT Bot opposes macro
+        ut_opposes = (ut_trend == "SELL" and macro_dir == "BUY") or (ut_trend == "BUY" and macro_dir == "SELL")
+        # Determine if Squeeze opposes macro
+        sqz_opposes = (sqz_dir == "SELL" and macro_dir == "BUY") or (sqz_dir == "BUY" and macro_dir == "SELL")
+        
+        if ut_opposes and sqz_opposes:
+            # SCENARIO 4: Both UT + Squeeze oppose macro → FLIP HIGH confidence
+            if macro_dir == "BUY":
+                # Macro is BUY but micro says pullback DOWN → bet NO
                 bet_side = "NO" if p["direction"] == "above" else "YES"
-                confidence = "MEDIUM" if micro_sell >= 5 else "LOW"
-                reason = "PULLBACK_MICRO_SELL"
+                confidence = "HIGH"
+                reason = "PULLBACK_S4_BEAR"
+            else:
+                # Macro is SELL but micro says bounce UP → bet YES
+                bet_side = "YES" if p["direction"] == "above" else "NO"
+                confidence = "HIGH"
+                reason = "PULLBACK_S4_BULL"
+        
+        elif ut_opposes and not sqz_opposes:
+            # SCENARIO 3: Only UT opposes → FLIP MEDIUM confidence
+            if macro_dir == "BUY":
+                bet_side = "NO" if p["direction"] == "above" else "YES"
+                confidence = "MEDIUM"
+                reason = "PULLBACK_S3_BEAR"
+            else:
+                bet_side = "YES" if p["direction"] == "above" else "NO"
+                confidence = "MEDIUM"
+                reason = "PULLBACK_S3_BULL"
+        
+        elif not ut_opposes and sqz_opposes:
+            # Squeeze only opposes → SKIP (not enough evidence)
+            return None
+        
         else:
-            # NO PULLBACK: macro and micro agree even in weak period
-            if micro_dir == "BUY" and price_above and micro_buy >= 3:
+            # Neither opposes → trend is strong, follow it cautiously
+            if macro_dir == "BUY" and total_buy >= 3 and price_above:
                 bet_side = "YES" if p["direction"] == "above" else "NO"
-                confidence = "MEDIUM" if micro_buy >= 5 else "LOW"
-                reason = "WEAK_TREND_CONTINUES"
-            elif micro_dir == "SELL" and not price_above and micro_sell >= 3:
+                confidence = "MEDIUM" if total_buy >= 5 else "LOW"
+                reason = "WEAK_TREND_HOLDS"
+            elif macro_dir == "SELL" and total_sell >= 3 and not price_above:
                 bet_side = "NO" if p["direction"] == "above" else "YES"
-                confidence = "MEDIUM" if micro_sell >= 5 else "LOW"
-                reason = "WEAK_TREND_CONTINUES_BEAR"
-    else:
-        # STRONG PERIOD or 1H/Daily — use original logic
-        total_buy = bot2_buy + new_buy
-        total_sell = bot2_sell + new_sell
+                confidence = "MEDIUM" if total_sell >= 5 else "LOW"
+                reason = "WEAK_TREND_HOLDS_BEAR"
+            else:
+                # Weak agreement → SKIP
+                return None
 
+    else:
+        # ═══ STRONG PERIOD (:15/:45) or 1H/Daily — original logic ═══
         if total_buy >= 5 and price_above:
             bet_side = "YES" if p["direction"] == "above" else "NO"
             confidence = "HIGH" if total_buy >= 6 else "MEDIUM"
@@ -2597,7 +2634,7 @@ def _score_paper3_trade(p, price, indicators, ind_macro=None, expiry_minute=None
 
     if asset in ("ETH", "XRP") and mtype == "1H" and confidence == "LOW":
         return None
-    if mtype == "1H" and confidence == "LOW" and (micro_buy < 4 and micro_sell < 4):
+    if mtype == "1H" and confidence == "LOW" and total_buy < 4 and total_sell < 4:
         return None
     if mtype == "Daily" and confidence != "HIGH":
         return None
@@ -2613,10 +2650,14 @@ def _score_paper3_trade(p, price, indicators, ind_macro=None, expiry_minute=None
         else:
             indicator_details.append("{}=\u2014".format(name))
 
+    if sqz_dir:
+        indicator_details.append("SQZ={}".format(sqz_dir))
     if is_weak_period and macro_dir:
         indicator_details.append("MACRO={}".format(macro_dir))
+    if "PULLBACK" in reason:
+        indicator_details.append("FLIP")
 
-    score = max(micro_buy, micro_sell)
+    score = max(total_buy, total_sell)
     total_signals = bot2_buy + bot2_sell + new_buy + new_sell
 
     share_price = effective_odds / 100.0
@@ -2781,9 +2822,13 @@ def _score_paper4_trade(p, price, indicators):
 # ═══════════════════════════════════════════════════════════
 
 def _score_paper5_trade(p, price, indicators, ind_macro=None, expiry_minute=None):
-    """Paper 5: Squeeze Momentum + SMC Structure + BTC + Dual Timeframe.
-    ALL 3 signals must agree. Only 30-60% odds. Skip danger signals.
-    DUAL TIMEFRAME: For 15M weak periods, uses micro squeeze/SMC to detect pullbacks.
+    """Paper 5: Squeeze + SMC + BTC + Dual Timeframe with UT Bot gatekeeper.
+    Strong periods (:15/:45) → ALL 3 must agree, 30-60% odds
+    Weak periods (:30/:00) → UT Bot gatekeeper:
+      Scenario 4: UT + Squeeze both oppose macro → FLIP HIGH confidence
+      Scenario 3: UT only opposes macro → FLIP MEDIUM confidence
+      Squeeze only → SKIP
+      Neither → follow trend if all agree
     """
     if not indicators or price is None:
         return None
@@ -2800,7 +2845,7 @@ def _score_paper5_trade(p, price, indicators, ind_macro=None, expiry_minute=None
     else:
         price_above = price < p["baseline"]
 
-    # ── Signal 1: Squeeze Momentum (micro — from current timeframe candles) ──
+    # ── Signal 1: Squeeze Momentum (micro) ──
     sqz_val = indicators.get("squeeze_val")
     sqz_prev = indicators.get("squeeze_prev_val")
     sqz_on = indicators.get("squeeze_on", False)
@@ -2835,13 +2880,15 @@ def _score_paper5_trade(p, price, indicators, ind_macro=None, expiry_minute=None
     # ── Signal 3: BTC trend ──
     btc_trend = _btc_trend_cache.get("trend")
 
-    # ── Macro direction (1H candles for dual-timeframe) ──
+    # ── UT Bot (micro — for pullback gatekeeper) ──
+    ut_trend = indicators.get("ut_trend")
+
+    # ── Macro direction (1H candles) ──
     macro_dir = None
     macro_sqz_dir = None
     macro_smc_dir = None
     if ind_macro:
         m_sqz = ind_macro.get("squeeze_val")
-        m_sqz_prev = ind_macro.get("squeeze_prev_val")
         if m_sqz is not None:
             macro_sqz_dir = "BUY" if m_sqz > 0 else "SELL" if m_sqz < 0 else None
         m_smc = ind_macro.get("smc_internal_trend")
@@ -2859,53 +2906,59 @@ def _score_paper5_trade(p, price, indicators, ind_macro=None, expiry_minute=None
     if mtype == "15M" and expiry_minute is not None:
         is_weak_period = expiry_minute in (0, 30)
 
-    # ── Micro direction (current timeframe signals) ──
-    micro_buy = sum(1 for s in [sqz_dir, smc_dir, btc_trend] if s == "BUY")
-    micro_sell = sum(1 for s in [sqz_dir, smc_dir, btc_trend] if s == "SELL")
-    micro_dir = "BUY" if micro_buy > micro_sell else "SELL" if micro_sell > micro_buy else None
-
     # ── Decision ──
     bet_side = None
     confidence = "LOW"
     reason = ""
 
-    if mtype == "15M" and is_weak_period and macro_dir and micro_dir:
-        # DUAL TIMEFRAME: Weak period
-        if macro_dir != micro_dir:
-            # PULLBACK: micro opposes macro → trade the pullback
-            all_micro_buy = sqz_dir == "BUY" and smc_dir == "BUY" and btc_trend == "BUY"
-            all_micro_sell = sqz_dir == "SELL" and smc_dir == "SELL" and btc_trend == "SELL"
+    if mtype == "15M" and is_weak_period and macro_dir:
+        # ═══ WEAK PERIOD: UT Bot gatekeeper + Squeeze confirmation ═══
+        ut_opposes = (ut_trend == "SELL" and macro_dir == "BUY") or (ut_trend == "BUY" and macro_dir == "SELL")
+        sqz_opposes = (sqz_dir == "SELL" and macro_dir == "BUY") or (sqz_dir == "BUY" and macro_dir == "SELL")
 
-            if all_micro_sell:
+        if ut_opposes and sqz_opposes:
+            # SCENARIO 4: Both oppose macro → FLIP HIGH confidence
+            if macro_dir == "BUY":
                 bet_side = "NO" if p["direction"] == "above" else "YES"
-                confidence = "HIGH" if sqz_strong and smc_strong else "MEDIUM"
-                reason = "PULLBACK_ALL_SELL"
-            elif all_micro_buy:
+                confidence = "HIGH"
+                reason = "PULLBACK_S4_BEAR"
+            else:
                 bet_side = "YES" if p["direction"] == "above" else "NO"
-                confidence = "HIGH" if sqz_strong and smc_strong else "MEDIUM"
-                reason = "PULLBACK_ALL_BUY"
-            elif micro_sell >= 2 and sqz_strong:
+                confidence = "HIGH"
+                reason = "PULLBACK_S4_BULL"
+
+        elif ut_opposes and not sqz_opposes:
+            # SCENARIO 3: UT only opposes → FLIP MEDIUM confidence
+            if macro_dir == "BUY":
                 bet_side = "NO" if p["direction"] == "above" else "YES"
                 confidence = "MEDIUM"
-                reason = "PULLBACK_STRONG_SELL"
-            elif micro_buy >= 2 and sqz_strong:
+                reason = "PULLBACK_S3_BEAR"
+            else:
                 bet_side = "YES" if p["direction"] == "above" else "NO"
                 confidence = "MEDIUM"
-                reason = "PULLBACK_STRONG_BUY"
+                reason = "PULLBACK_S3_BULL"
+
+        elif not ut_opposes and sqz_opposes:
+            # Squeeze only opposes → SKIP (not enough evidence)
+            return None
+
         else:
-            # NO PULLBACK: macro and micro agree in weak period
+            # Neither opposes → trend strong, follow if all 3 agree
             all_buy = sqz_dir == "BUY" and smc_dir == "BUY" and btc_trend == "BUY"
             all_sell = sqz_dir == "SELL" and smc_dir == "SELL" and btc_trend == "SELL"
             if all_buy and price_above:
                 bet_side = "YES" if p["direction"] == "above" else "NO"
                 confidence = "HIGH" if sqz_strong and smc_strong else "MEDIUM"
-                reason = "WEAK_ALL_AGREE_BUY"
+                reason = "WEAK_TREND_HOLDS"
             elif all_sell and not price_above:
                 bet_side = "NO" if p["direction"] == "above" else "YES"
                 confidence = "HIGH" if sqz_strong and smc_strong else "MEDIUM"
-                reason = "WEAK_ALL_AGREE_SELL"
+                reason = "WEAK_TREND_HOLDS_BEAR"
+            else:
+                return None
+
     else:
-        # STRONG PERIOD or 1H/Daily — original strict logic
+        # ═══ STRONG PERIOD (:15/:45) or 1H/Daily — strict ALL 3 agree ═══
         all_buy = sqz_dir == "BUY" and smc_dir == "BUY" and btc_trend == "BUY"
         all_sell = sqz_dir == "SELL" and smc_dir == "SELL" and btc_trend == "SELL"
 
@@ -2914,8 +2967,10 @@ def _score_paper5_trade(p, price, indicators, ind_macro=None, expiry_minute=None
 
         if all_buy:
             bet_side = "YES" if p["direction"] == "above" else "NO"
+            reason = "STRONG_ALL_BUY"
         else:
             bet_side = "NO" if p["direction"] == "above" else "YES"
+            reason = "STRONG_ALL_SELL"
 
         if sqz_strong and smc_strong:
             confidence = "HIGH"
@@ -2923,8 +2978,6 @@ def _score_paper5_trade(p, price, indicators, ind_macro=None, expiry_minute=None
             confidence = "MEDIUM"
         else:
             confidence = "LOW"
-
-        reason = "STRONG_ALL_BUY" if all_buy else "STRONG_ALL_SELL"
 
     if bet_side is None:
         return None
@@ -2935,16 +2988,20 @@ def _score_paper5_trade(p, price, indicators, ind_macro=None, expiry_minute=None
     if effective_odds > 60:
         return None
 
-    # ── Danger checks (apply to all periods) ──
-    if all_buy if micro_dir == "BUY" else False:
-        if smc_event == "CHOCH_BEAR":
-            return None
-        if near_bear_ob and confidence != "HIGH":
-            return None
-    if all_sell if micro_dir == "SELL" else False:
-        if smc_event == "CHOCH_BULL":
-            return None
-        if near_bull_ob and confidence != "HIGH":
+    # ── Danger checks (only for non-pullback trades) ──
+    if "PULLBACK" not in reason:
+        if bet_side == ("YES" if p["direction"] == "above" else "NO"):
+            if smc_event == "CHOCH_BEAR":
+                return None
+            if near_bear_ob and confidence != "HIGH":
+                return None
+        else:
+            if smc_event == "CHOCH_BULL":
+                return None
+            if near_bull_ob and confidence != "HIGH":
+                return None
+
+        if sqz_on and not smc_strong:
             return None
 
     # Skip LOW confidence
@@ -2967,12 +3024,16 @@ def _score_paper5_trade(p, price, indicators, ind_macro=None, expiry_minute=None
         else:
             indicator_details.append("{}=\u2014".format(name))
 
+    if ut_trend:
+        indicator_details.append("UT={}".format(ut_trend))
     if sqz_on: indicator_details.append("SQZ:ON")
     elif sqz_off: indicator_details.append("SQZ:OFF")
     if sqz_strong: indicator_details.append("MOM:ACCEL")
     if smc_strong: indicator_details.append("STR:STRONG")
-    if is_weak_period: indicator_details.append("WEAK")
-    if macro_dir: indicator_details.append("MACRO={}".format(macro_dir))
+    if is_weak_period and macro_dir:
+        indicator_details.append("MACRO={}".format(macro_dir))
+    if "PULLBACK" in reason:
+        indicator_details.append("FLIP")
 
     share_price = effective_odds / 100.0
     if bet_side == "NO":
