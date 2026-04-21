@@ -37,7 +37,7 @@ _last_scan_log = {"time": None, "total": 0, "qualified": 0, "filtered": []}
 # AUTO-TRADING STATE
 # ═══════════════════════════════════════════════════════════
 _trading_state = {
-    "enabled": True,             # Kill switch — set False to stop all trades
+    "enabled": False,            # Kill switch — DISABLED by default, manually start
     "daily_loss": 0.0,           # Accumulated losses today (USDC)
     "daily_profit": 0.0,         # Accumulated profits today
     "trades_today": 0,           # Number of trades placed today
@@ -56,22 +56,22 @@ _trading_state = {
 # Bot 2: Low odds strategy (20-72%, trends aligned)
 _bot2_state = {
     "enabled": True,
-    "balance": 50.0,
+    "balance": 30.0,
     "daily_loss": 0.0,
     "daily_profit": 0.0,
     "trades_today": 0,
     "last_reset": None,
     "stake_pct": 0.025,          # 2.5% when compounding
     "min_stake": 1.0,
-    "max_loss_pct": 0.60,        # floor at $20 = 60% loss on $50
-    "starting_balance": 50.0,
-    "floor_balance": 20.0,
-    "compound_threshold": 1.10,  # 10% profit = $55 (best performer)
+    "max_loss_pct": 0.60,
+    "starting_balance": 30.0,
+    "floor_balance": 10.0,
+    "compound_threshold": 1.10,  # 10% profit (best performer)
 }
 
 # Bot 3: Smart Momentum (multi-indicator, 30-70% odds)
 _bot3_state = {
-    "enabled": True,
+    "enabled": False,
     "balance": 20.0,
     "daily_loss": 0.0,
     "daily_profit": 0.0,
@@ -79,10 +79,10 @@ _bot3_state = {
     "last_reset": None,
     "stake_pct": 0.025,          # 2.5% when compounding
     "min_stake": 1.0,
-    "max_loss_pct": 0.60,        # floor at $8 = 60% loss on $20
+    "max_loss_pct": 0.60,
     "starting_balance": 20.0,
-    "floor_balance": 8.0,
-    "compound_threshold": 1.20,  # 20% profit = $24
+    "floor_balance": 999.0,      # Paper only — set lower to activate
+    "compound_threshold": 1.20,  # 20% profit
 }
 
 FAVOURITE_HOURLY = ["ADA", "BNB", "DOGE"]
