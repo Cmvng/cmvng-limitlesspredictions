@@ -85,6 +85,39 @@ _bot3_state = {
     "compound_threshold": 1.20,  # 20% profit
 }
 
+
+# Paper 2.1: Bot 2 + BTC Tiebreaker + 15M Pullback (LIVE trading)
+_bot21_state = {
+    "enabled": True,
+    "balance": 15.0,
+    "daily_loss": 0.0,
+    "daily_profit": 0.0,
+    "trades_today": 0,
+    "last_reset": None,
+    "stake_pct": 0.025,
+    "min_stake": 1.0,
+    "max_loss_pct": 0.60,
+    "starting_balance": 15.0,
+    "floor_balance": 5.0,
+    "compound_threshold": 1.20,  # 20% profit
+}
+
+# Paper 3.1: Paper 3 + BTC Tiebreaker + Dual Timeframe (LIVE trading)
+_bot31_state = {
+    "enabled": True,
+    "balance": 15.0,
+    "daily_loss": 0.0,
+    "daily_profit": 0.0,
+    "trades_today": 0,
+    "last_reset": None,
+    "stake_pct": 0.025,
+    "min_stake": 1.0,
+    "max_loss_pct": 0.60,
+    "starting_balance": 15.0,
+    "floor_balance": 5.0,
+    "compound_threshold": 1.20,  # 20% profit
+}
+
 FAVOURITE_HOURLY = ["ADA", "BNB", "DOGE"]
 
 def _calc_bot_stake(state):
@@ -3909,6 +3942,26 @@ def run_paper34_scan():
                         except Exception as e:
                             print("Paper31 save error: {}".format(e))
 
+                        # Place REAL trade via Paper 3.1 bot
+                        floor31 = _bot31_state.get("floor_balance", 0)
+                        if _bot31_state["enabled"] and _bot31_state["balance"] > floor31 and not _is_volatile_window():
+                            real_stake31 = _calc_bot_stake(_bot31_state)
+                            if real_stake31 <= 0:
+                                _bot31_state["enabled"] = False
+                                send_telegram("⚠️ <b>Paper 3.1 stopped — floor reached</b>\nBalance: ${:.2f}".format(_bot31_state["balance"]))
+                            elif real_stake31 <= _bot31_state["balance"]:
+                                try:
+                                    bal_after31 = round(_bot31_state["balance"] - real_stake31, 2)
+                                    success = execute_trade(parsed, scored31, None, override_stake=real_stake31,
+                                                           bot_name="P3.1", bot_balance_after=bal_after31)
+                                    if success:
+                                        _bot31_state["balance"] = bal_after31
+                                        _bot31_state["trades_today"] += 1
+                                        print("P3.1 TRADE: {} {} ${:.2f} on {} | bal=${:.2f}".format(
+                                            scored31["bet_side"], asset, real_stake31, parsed["title"][:30], _bot31_state["balance"]))
+                                except Exception as te:
+                                    print("P3.1 trade error: {}".format(te))
+
                 # Paper 2.1: Bot 2 strategy + BTC Tiebreaker + 15M Pullback
                 if parsed["market_id"] not in p21_ids:
                     scored21 = _score_paper21_trade(parsed, price, indicators=ind, expiry_minute=expiry_minute)
@@ -3937,6 +3990,26 @@ def run_paper34_scan():
                             p21_count += 1
                         except Exception as e:
                             print("Paper21 save error: {}".format(e))
+
+                        # Place REAL trade via Paper 2.1 bot
+                        floor21 = _bot21_state.get("floor_balance", 0)
+                        if _bot21_state["enabled"] and _bot21_state["balance"] > floor21 and not _is_volatile_window():
+                            real_stake21 = _calc_bot_stake(_bot21_state)
+                            if real_stake21 <= 0:
+                                _bot21_state["enabled"] = False
+                                send_telegram("⚠️ <b>Paper 2.1 stopped — floor reached</b>\nBalance: ${:.2f}".format(_bot21_state["balance"]))
+                            elif real_stake21 <= _bot21_state["balance"]:
+                                try:
+                                    bal_after21 = round(_bot21_state["balance"] - real_stake21, 2)
+                                    success = execute_trade(parsed, scored21, None, override_stake=real_stake21,
+                                                           bot_name="P2.1", bot_balance_after=bal_after21)
+                                    if success:
+                                        _bot21_state["balance"] = bal_after21
+                                        _bot21_state["trades_today"] += 1
+                                        print("P2.1 TRADE: {} {} ${:.2f} on {} | bal=${:.2f}".format(
+                                            scored21["bet_side"], asset, real_stake21, parsed["title"][:30], _bot21_state["balance"]))
+                                except Exception as te:
+                                    print("P2.1 trade error: {}".format(te))
 
                 # Paper 5.1: Squeeze + SMC + BTC tiebreaker + full pullback
                 if parsed["market_id"] not in p51_ids:
@@ -4065,6 +4138,44 @@ def _resolve_paper_table(table_name):
 
                 # Update Bot 3 balance for paper3_trades
                 if table_name == "paper3_trades":
+                    if won:
+                        _bot3_state["balance"] = round(_bot3_state["balance"] + payout, 2)
+                        _bot3_state["daily_profit"] = round(_bot3_state["daily_profit"] + (payout - stake), 2)
+                    else:
+                        _bot3_state["daily_loss"] = round(_bot3_state["daily_loss"] + stake, 2)
+
+                # Update Paper 2.1 balance
+                if table_name == "paper21_trades":
+                    if won:
+                        _bot21_state["balance"] = round(_bot21_state["balance"] + payout, 2)
+                        _bot21_state["daily_profit"] = round(_bot21_state["daily_profit"] + (payout - stake), 2)
+                    else:
+                        _bot21_state["daily_loss"] = round(_bot21_state["daily_loss"] + stake, 2)
+                    floor21 = _bot21_state.get("floor_balance", 0)
+                    if _bot21_state["balance"] <= floor21:
+                        _bot21_state["enabled"] = False
+                        send_telegram("⚠️ <b>Paper 2.1 stopped — floor reached</b>\nBalance: ${:.2f}".format(_bot21_state["balance"]))
+                    emoji = "✅" if won else "❌"
+                    print("P2.1 #{} {}: stake=${:.2f} payout=${:.2f} bal=${:.2f}".format(
+                        p["id"], "WIN" if won else "LOSS", stake, payout, _bot21_state["balance"]))
+
+                # Update Paper 3.1 balance
+                if table_name == "paper31_trades":
+                    if won:
+                        _bot31_state["balance"] = round(_bot31_state["balance"] + payout, 2)
+                        _bot31_state["daily_profit"] = round(_bot31_state["daily_profit"] + (payout - stake), 2)
+                    else:
+                        _bot31_state["daily_loss"] = round(_bot31_state["daily_loss"] + stake, 2)
+                    floor31 = _bot31_state.get("floor_balance", 0)
+                    if _bot31_state["balance"] <= floor31:
+                        _bot31_state["enabled"] = False
+                        send_telegram("⚠️ <b>Paper 3.1 stopped — floor reached</b>\nBalance: ${:.2f}".format(_bot31_state["balance"]))
+                    emoji = "✅" if won else "❌"
+                    print("P3.1 #{} {}: stake=${:.2f} payout=${:.2f} bal=${:.2f}".format(
+                        p["id"], "WIN" if won else "LOSS", stake, payout, _bot31_state["balance"]))
+
+                # SKIP duplicate Bot 3 balance update below
+                if False and table_name == "paper3_trades":
                     if won:
                         _bot3_state["balance"] = round(_bot3_state["balance"] + payout, 2)
                         _bot3_state["daily_profit"] = round(_bot3_state["daily_profit"] + (payout - stake), 2)
@@ -8343,10 +8454,12 @@ def paper4_page():
 
 @app.route("/app/paper21")
 def paper21_page():
+    bal21 = "${:.2f}".format(_bot21_state["balance"])
+    status21 = "LIVE" if _bot21_state["enabled"] else "STOPPED"
     return _build_paper_page(
         "paper21_trades",
         "Paper 2.1 — BTC Tiebreaker",
-        "Bot 2 Strategy + BTC Tiebreaker + 15M Pullback Detection",
+        "Bot 2 Strategy + BTC Tiebreaker + 15M Pullback · Balance: {} · {}".format(bal21, status21),
         "Bot 2 signals (TV + SMA + BTC) but BTC confirms when pair agrees, ignored when pair disagrees. UT Bot gatekeeper flips trades during 15M weak periods (:30/:00 expiry). No 4H pullback yet.",
         ["Score", "Indicators"],
         "paper21"
@@ -8354,10 +8467,12 @@ def paper21_page():
 
 @app.route("/app/paper31")
 def paper31_page():
+    bal31 = "${:.2f}".format(_bot31_state["balance"])
+    status31 = "LIVE" if _bot31_state["enabled"] else "STOPPED"
     return _build_paper_page(
         "paper31_trades",
         "Paper 3.1 — BTC Tiebreaker",
-        "Dual Timeframe + UT Bot Gatekeeper + BTC as Tiebreaker",
+        "Dual Timeframe + UT Bot Gatekeeper + BTC Tiebreaker · Balance: {} · {}".format(bal31, status31),
         "Same indicators as Paper 3 but BTC confirms when pair agrees, ignored when pair disagrees. Dual-timeframe pullback detection: UT Bot + Squeeze as gatekeeper during weak periods. 4H macro for 1H markets.",
         ["Score", "Indicators"],
         "paper31"
