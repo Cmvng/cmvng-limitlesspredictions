@@ -1209,15 +1209,18 @@ def _is_safe_trading_window():
     return True
 
 def _is_volatile_window():
-    """Check if current time is in a volatile period where Bot 2/3 should pause.
+    """Check if current time is in a volatile period where ALL bots should pause.
     Volatile periods (UTC):
       00:00-01:00 — daily candle close, funding rates, low liquidity
       13:00-15:00 — US market open, Fed news, economic data
+      21:00-22:00 — NY close → Asia transition, 0% win rate historically
     """
     utc_hour = datetime.now(timezone.utc).hour
     if 0 <= utc_hour < 1:
         return True
     if 13 <= utc_hour < 15:
+        return True
+    if 21 <= utc_hour < 22:
         return True
     return False
 
