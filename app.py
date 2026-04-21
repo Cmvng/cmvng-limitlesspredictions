@@ -277,6 +277,33 @@ def init_db():
             slug          TEXT
         )
     """)
+
+    # Paper 5: Squeeze + SMC + BTC (structure-based momentum)
+    conn.run("""
+        CREATE TABLE IF NOT EXISTS paper5_trades (
+            id            SERIAL PRIMARY KEY,
+            market_id     TEXT,
+            title         TEXT,
+            asset         TEXT,
+            direction     TEXT,
+            baseline      REAL,
+            bet_odds      REAL,
+            bet_side      TEXT,
+            current_price REAL,
+            hours_left    REAL,
+            market_type   TEXT,
+            indicators    TEXT,
+            score         INTEGER,
+            total_signals INTEGER,
+            simulated_stake REAL DEFAULT 1.0,
+            simulated_payout REAL,
+            status        TEXT DEFAULT 'Pending',
+            outcome       TEXT,
+            fired_at      TEXT,
+            resolved_at   TEXT,
+            slug          TEXT
+        )
+    """)
     conn.close()
     print("DB initialized OK")
 
@@ -2290,6 +2317,114 @@ def _calculate_indicators(asset, timeframe="1h"):
                 elif last_ph and last_pl:
                     pivot_signal = "BUY" if abs(current - last_ph) < abs(current - last_pl) else "SELL"
 
+
+        # === Squeeze Momentum [LazyBear] ===
+        squeeze_val = None
+        squeeze_prev_val = None
+        squeeze_on_flag = False
+        squeeze_off_flag = False
+        if n >= 22:
+            sq_len = 20
+            sq_mult = 2.0
+            kc_mult_sq = 1.5
+            # BB
+            sq_data = [float(x) for x in closes[-sq_len:]]
+            sq_basis = sum(sq_data) / sq_len
+            sq_dev = sq_mult * (sum((x - sq_basis)**2 for x in sq_data) / sq_len) ** 0.5
+            sq_upper_bb = sq_basis + sq_dev
+            sq_lower_bb = sq_basis - sq_dev
+            # KC
+            sq_ma = sum([float(x) for x in closes[-sq_len:]]) / sq_len
+            sq_trs = []
+            for si in range(n - sq_len, n):
+                if si > 0:
+                    sq_tr = max(float(highs[si]) - float(lows[si]), abs(float(highs[si]) - float(closes[si-1])), abs(float(lows[si]) - float(closes[si-1])))
+                else:
+                    sq_tr = float(highs[si]) - float(lows[si])
+                sq_trs.append(sq_tr)
+            sq_rangema = sum(sq_trs) / sq_len
+            sq_upper_kc = sq_ma + kc_mult_sq * sq_rangema
+            sq_lower_kc = sq_ma - kc_mult_sq * sq_rangema
+            squeeze_on_flag = (sq_lower_bb > sq_lower_kc) and (sq_upper_bb < sq_upper_kc)
+            squeeze_off_flag = (sq_lower_bb < sq_lower_kc) and (sq_upper_bb > sq_upper_kc)
+            # Momentum value (linreg of close - midline)
+            def sq_calc_val(end_i):
+                sq_vals = []
+                for sj in range(end_i - sq_len, end_i):
+                    if sj < 0 or sj >= n: continue
+                    sstart = max(0, sj - sq_len + 1)
+                    shh = max([float(x) for x in highs[sstart:sj+1]])
+                    sll = min([float(x) for x in lows[sstart:sj+1]])
+                    ss = sum([float(x) for x in closes[sstart:sj+1]]) / len(closes[sstart:sj+1])
+                    smid = ((shh + sll) / 2 + ss) / 2
+                    sq_vals.append(float(closes[sj]) - smid)
+                if len(sq_vals) < 3: return 0
+                sx = list(range(len(sq_vals)))
+                sxm = sum(sx) / len(sx)
+                sym = sum(sq_vals) / len(sq_vals)
+                snum = sum((xi - sxm) * (yi - sym) for xi, yi in zip(sx, sq_vals))
+                sden = sum((xi - sxm)**2 for xi in sx)
+                if sden == 0: return sym
+                sb = snum / sden
+                sa = sym - sb * sxm
+                return sa + sb * (len(sq_vals) - 1)
+            squeeze_val = round(sq_calc_val(n), 4)
+            squeeze_prev_val = round(sq_calc_val(n - 1), 4)
+
+        # === SMC Structure (internal + swing) ===
+        smc_internal_trend = None
+        smc_swing_trend = None
+        smc_last_event = None
+        smc_near_bull_ob = False
+        smc_near_bear_ob = False
+        if n >= 55:
+            def smc_detect(plen):
+                s_leg = 0; s_ph = None; s_pl = None
+                s_ph_x = False; s_pl_x = False; s_trend = 0
+                s_event = None; s_bull_obs = []; s_bear_obs = []
+                for si in range(plen + 1, n):
+                    s_wh = max([float(x) for x in highs[si-plen:si]])
+                    s_wl = min([float(x) for x in lows[si-plen:si]])
+                    old_leg = s_leg
+                    if float(highs[si]) > s_wh: s_leg = 0
+                    elif float(lows[si]) < s_wl: s_leg = 1
+                    if s_leg != old_leg:
+                        if s_leg == 1:
+                            s_pl = min([float(x) for x in lows[max(0,si-plen):si+1]])
+                            s_pl_x = False
+                        elif s_leg == 0:
+                            s_ph = max([float(x) for x in highs[max(0,si-plen):si+1]])
+                            s_ph_x = False
+                    if s_ph is not None and not s_ph_x and float(closes[si]) > s_ph:
+                        s_ph_x = True
+                        s_event = "CHOCH_BULL" if s_trend == -1 else "BOS_BULL"
+                        s_trend = 1
+                        st = max(0, si - plen * 2)
+                        ml = min([float(x) for x in lows[st:si]])
+                        mi = st + [float(x) for x in lows[st:si]].index(ml)
+                        s_bull_obs.append((float(highs[mi]), float(lows[mi])))
+                    if s_pl is not None and not s_pl_x and float(closes[si]) < s_pl:
+                        s_pl_x = True
+                        s_event = "CHOCH_BEAR" if s_trend == 1 else "BOS_BEAR"
+                        s_trend = -1
+                        st = max(0, si - plen * 2)
+                        mh = max([float(x) for x in highs[st:si]])
+                        mi = st + [float(x) for x in highs[st:si]].index(mh)
+                        s_bear_obs.append((float(highs[mi]), float(lows[mi])))
+                return s_trend, s_event, s_bull_obs[-5:], s_bear_obs[-5:]
+            s_int_t, s_int_e, s_int_bo, s_int_beo = smc_detect(5)
+            smc_internal_trend = "BULLISH" if s_int_t == 1 else "BEARISH" if s_int_t == -1 else None
+            smc_last_event = s_int_e
+            s_sw_len = min(50, n // 4)
+            if s_sw_len > 5:
+                s_sw_t, _, s_sw_bo, s_sw_beo = smc_detect(s_sw_len)
+                smc_swing_trend = "BULLISH" if s_sw_t == 1 else "BEARISH" if s_sw_t == -1 else None
+                s_int_bo += s_sw_bo
+                s_int_beo += s_sw_beo
+            smc_atr = sum(max(float(highs[i]) - float(lows[i]), abs(float(highs[i]) - float(closes[i-1])), abs(float(lows[i]) - float(closes[i-1]))) for i in range(n-14, n)) / 14
+            smc_near_bull_ob = any(current >= ol - smc_atr*0.5 and current <= oh + smc_atr*0.5 for oh, ol in s_int_bo)
+            smc_near_bear_ob = any(current >= ol - smc_atr*0.5 and current <= oh + smc_atr*0.5 for oh, ol in s_int_beo)
+
         result = {
             "current": current,
             "sma10": sma10, "sma20": sma20, "sma_trend": sma_trend,
@@ -2304,6 +2439,15 @@ def _calculate_indicators(asset, timeframe="1h"):
             "vol_trend": vol_trend, "vol_spike": vol_spike,
             "is_ranging": is_ranging, "bb_squeeze": bb_squeeze,
             "timeframe": timeframe,
+            "squeeze_val": squeeze_val,
+            "squeeze_prev_val": squeeze_prev_val,
+            "squeeze_on": squeeze_on_flag,
+            "squeeze_off": squeeze_off_flag,
+            "smc_internal_trend": smc_internal_trend,
+            "smc_swing_trend": smc_swing_trend,
+            "smc_last_event": smc_last_event,
+            "smc_near_bull_ob": smc_near_bull_ob,
+            "smc_near_bear_ob": smc_near_bear_ob,
             "ut_trend": ut_trend,
             "ema_stack": ema_stack,
             "pivot_signal": pivot_signal,
@@ -2600,6 +2744,166 @@ def _score_paper4_trade(p, price, indicators):
 # PAPER 3 & 4 SCANNER AND RESOLVER
 # ═══════════════════════════════════════════════════════════
 
+
+# ═══════════════════════════════════════════════════════════
+# PAPER 5: Squeeze Momentum + Smart Money Concepts + BTC
+# Structure-based momentum — quality over quantity
+# ═══════════════════════════════════════════════════════════
+
+def _score_paper5_trade(p, price, indicators):
+    """Paper 5: Squeeze Momentum + SMC Structure + BTC trend.
+    ALL 3 must agree. Only 30-60% odds entries. Skip danger signals.
+    Uses: squeeze momentum (direction + state), SMC internal/swing trend, BTC trend.
+    """
+    if not indicators or price is None:
+        return None
+
+    asset = p["asset"]
+    yes_odds = p["yes_odds"]
+    no_odds = 100 - yes_odds
+
+    # Only 30-70% odds range
+    if not (30 <= yes_odds <= 70 or 30 <= no_odds <= 70):
+        return None
+
+    # Price position
+    if p["direction"] == "above":
+        price_above = price > p["baseline"]
+    else:
+        price_above = price < p["baseline"]
+
+    # ── Signal 1: Squeeze Momentum ──
+    sqz_val = indicators.get("squeeze_val")
+    sqz_prev = indicators.get("squeeze_prev_val")
+    sqz_on = indicators.get("squeeze_on", False)
+    sqz_off = indicators.get("squeeze_off", False)
+
+    sqz_dir = None
+    sqz_strong = False
+    if sqz_val is not None and sqz_prev is not None:
+        if sqz_val > 0:
+            sqz_dir = "BUY"
+            sqz_strong = sqz_val > sqz_prev  # accelerating
+        elif sqz_val < 0:
+            sqz_dir = "SELL"
+            sqz_strong = sqz_val < sqz_prev  # accelerating
+
+    # ── Signal 2: SMC Structure ──
+    smc_internal = indicators.get("smc_internal_trend")
+    smc_swing = indicators.get("smc_swing_trend")
+    smc_event = indicators.get("smc_last_event")
+    near_bull_ob = indicators.get("smc_near_bull_ob", False)
+    near_bear_ob = indicators.get("smc_near_bear_ob", False)
+
+    smc_dir = None
+    smc_strong = False
+    if smc_internal == "BULLISH":
+        smc_dir = "BUY"
+        smc_strong = smc_swing == "BULLISH"
+    elif smc_internal == "BEARISH":
+        smc_dir = "SELL"
+        smc_strong = smc_swing == "BEARISH"
+
+    # ── Signal 3: BTC trend ──
+    btc_trend = _btc_trend_cache.get("trend")
+
+    # ── ALL 3 must agree ──
+    all_buy = sqz_dir == "BUY" and smc_dir == "BUY" and btc_trend == "BUY"
+    all_sell = sqz_dir == "SELL" and smc_dir == "SELL" and btc_trend == "SELL"
+
+    if not all_buy and not all_sell:
+        return None
+
+    # Determine bet side
+    if all_buy:
+        bet_side = "YES" if p["direction"] == "above" else "NO"
+    else:
+        bet_side = "NO" if p["direction"] == "above" else "YES"
+
+    effective_odds = yes_odds if bet_side == "YES" else no_odds
+
+    # Only 30-60% odds (skip 60-70% — poor value)
+    if effective_odds > 60:
+        return None
+
+    # ── Danger checks ──
+    # 1. CHoCH against our direction = structure just reversed
+    if all_buy and smc_event == "CHOCH_BEAR":
+        return None
+    if all_sell and smc_event == "CHOCH_BULL":
+        return None
+
+    # 2. Near opposing order block
+    if all_buy and near_bear_ob:
+        return None
+    if all_sell and near_bull_ob:
+        return None
+
+    # 3. Squeeze building with no strong structure = skip
+    if sqz_on and not smc_strong:
+        return None
+
+    # ── Confidence ──
+    if sqz_strong and smc_strong:
+        confidence = "HIGH"
+    elif sqz_strong or smc_strong:
+        confidence = "MEDIUM"
+    else:
+        confidence = "LOW"
+
+    # Skip LOW confidence
+    if confidence == "LOW":
+        return None
+
+    # ── Market type rules ──
+    mtype = "15M" if p["is_short"] and p.get("mins_left", 0) <= 20 else "1H" if p["is_short"] else "Daily"
+
+    # ETH needs MEDIUM+ on 1H
+    if asset == "ETH" and mtype == "1H" and confidence != "HIGH":
+        return None
+
+    # Daily needs HIGH
+    if mtype == "Daily" and confidence != "HIGH":
+        return None
+
+    # ── Build output ──
+    indicator_details = []
+    for name, signal in [("SQZ", sqz_dir), ("SMC", smc_dir), ("BTC", btc_trend)]:
+        if signal == "BUY":
+            indicator_details.append("{}=BUY".format(name))
+        elif signal == "SELL":
+            indicator_details.append("{}=SELL".format(name))
+        else:
+            indicator_details.append("{}=\u2014".format(name))
+
+    # Add squeeze state
+    if sqz_on:
+        indicator_details.append("SQZ:ON")
+    elif sqz_off:
+        indicator_details.append("SQZ:OFF")
+
+    # Add strength
+    if sqz_strong:
+        indicator_details.append("MOM:ACCEL")
+    if smc_strong:
+        indicator_details.append("STR:STRONG")
+
+    share_price = effective_odds / 100.0
+    if bet_side == "NO":
+        share_price = 1.0 - (yes_odds / 100.0)
+    sim_payout = round(1.0 / share_price, 4) if share_price > 0 else 0
+
+    return {
+        "bet_side": bet_side,
+        "bet_odds": effective_odds,
+        "score": 3,
+        "total_signals": 3,
+        "confidence": confidence,
+        "indicators": " | ".join(indicator_details),
+        "market_type": mtype,
+        "sim_payout": sim_payout,
+    }
+
 def run_paper34_scan():
     """Scan markets for Paper 3 (momentum) and Paper 4 (reversal) signals."""
     import requests as req
@@ -2621,6 +2925,11 @@ def run_paper34_scan():
             p4_ids = set(str(row[0]) for row in p4_rows)
         except:
             p4_ids = set()
+        try:
+            p5_rows = conn.run("SELECT market_id FROM paper5_trades WHERE fired_at::timestamptz > NOW() - INTERVAL '30 hours'")
+            p5_ids = set(str(row[0]) for row in p5_rows)
+        except:
+            p5_ids = set()
         # Get Bot 1 and Bot 2 market IDs to avoid overlap
         try:
             bot12_rows = conn.run("""SELECT market_id FROM limitless_predictions WHERE created_at > NOW() - INTERVAL '30 hours'
@@ -2634,6 +2943,7 @@ def run_paper34_scan():
         indicator_cache_local = {}
         p3_count = 0
         p4_count = 0
+        p5_count = 0
 
         for market in markets:
             try:
@@ -2757,11 +3067,40 @@ def run_paper34_scan():
                         except Exception as e:
                             print("Paper4 save error: {}".format(e))
 
-            except Exception as e:
-                print("Paper34 market error: {}".format(e))
+                # Paper 5: Squeeze + SMC + BTC
+                if parsed["market_id"] not in p5_ids:
+                    scored5 = _score_paper5_trade(parsed, price, ind)
+                    if scored5:
+                        try:
+                            conn5 = get_db()
+                            conn5.run(
+                                """INSERT INTO paper5_trades
+                                (market_id, title, asset, direction, baseline, bet_odds, bet_side,
+                                 current_price, hours_left, market_type, indicators, score,
+                                 total_signals, simulated_stake, simulated_payout, status, fired_at, slug)
+                                VALUES (:mid, :ttl, :ast, :dir, :base, :odds, :bs,
+                                        :pr, :hrs, :mt, :ind, :sc, :ts, 1.0, :sp, 'Pending', :now, :slg)""",
+                                mid=parsed["market_id"], ttl=parsed["title"], ast=asset,
+                                dir=parsed["direction"], base=parsed["baseline"],
+                                odds=scored5["bet_odds"], bs=scored5["bet_side"],
+                                pr=price, hrs=round(parsed["hours_left"], 2),
+                                mt=scored5["market_type"],
+                                ind="[{}] {}".format(scored5["confidence"], scored5["indicators"]),
+                                sc=scored5["score"], ts=scored5["total_signals"],
+                                sp=scored5["sim_payout"],
+                                now=now, slg=parsed["slug"]
+                            )
+                            conn5.close()
+                            p5_ids.add(parsed["market_id"])
+                            p5_count += 1
+                        except Exception as e:
+                            print("Paper5 save error: {}".format(e))
 
-        if p3_count > 0 or p4_count > 0:
-            print("Paper3: {} signals | Paper4: {} signals".format(p3_count, p4_count))
+            except Exception as e:
+                print("Paper345 market error: {}".format(e))
+
+        if p3_count > 0 or p4_count > 0 or p5_count > 0:
+            print("Paper3: {} | Paper4: {} | Paper5: {}".format(p3_count, p4_count, p5_count))
         else:
             # Count how many assets we got indicators for
             ind_ok = sum(1 for v in indicator_cache_local.values() if v is not None)
@@ -2895,6 +3234,7 @@ def resolve_paper34_trades():
     """Resolve both Paper 3 and Paper 4 trades."""
     r3 = _resolve_paper_table("paper3_trades")
     r4 = _resolve_paper_table("paper4_trades")
+    r5 = _resolve_paper_table("paper5_trades")
     if r3 or r4:
         print("Resolved: Paper3={} Paper4={}".format(r3, r4))
 
@@ -6999,6 +7339,7 @@ td{padding:8px 12px;border-bottom:1px solid #f4f3ed;color:var(--ink-2)}tr:last-c
     <a href="/app/paper" class="nav-tab">Bot 2</a>
     <a href="/app/paper3" class="nav-tab""" + (" active" if nav_active == "paper3" else "") + """">Paper 3</a>
     <a href="/app/paper4" class="nav-tab""" + (" active" if nav_active == "paper4" else "") + """">Paper 4</a>
+    <a href="/app/paper5" class="nav-tab""" + (" active" if nav_active == "paper5" else "") + """">Paper 5</a>
     <a href="/app/football" class="nav-tab">Football</a>
   </nav>
 </header>
@@ -7116,6 +7457,17 @@ def paper4_page():
         "Hunts exhausted trends at 5-55% odds. Enters when RSI is extreme (<30 or >70) AND price is at Bollinger bands, with additional confirmation from momentum, volume, or EMA direction. Also catches Bollinger squeeze breakouts. Higher risk, much higher payout per win.",
         ["Reversal", "RSI", "BB"],
         "paper4"
+    )
+
+@app.route("/app/paper5")
+def paper5_page():
+    return _build_paper_page(
+        "paper5_trades",
+        "Paper 5 — Squeeze + SMC",
+        "Squeeze Momentum + Smart Money Concepts + BTC Trend",
+        "Structure-based momentum at 30-60% odds. ALL 3 signals must agree: Squeeze Momentum (direction + acceleration), SMC Structure (internal + swing trend), BTC trend. Skips opposing order blocks, CHoCH reversals, and low confidence setups. Quality over quantity.",
+        ["Score", "Indicators"],
+        "paper5"
     )
 
 try:
