@@ -331,6 +331,33 @@ def init_db():
             slug          TEXT
         )
     """)
+
+    # Paper 2.1: Bot 2 strategy + BTC Tiebreaker + 15M Pullback Detection
+    conn.run("""
+        CREATE TABLE IF NOT EXISTS paper21_trades (
+            id            SERIAL PRIMARY KEY,
+            market_id     TEXT,
+            title         TEXT,
+            asset         TEXT,
+            direction     TEXT,
+            baseline      REAL,
+            bet_odds      REAL,
+            bet_side      TEXT DEFAULT 'YES',
+            current_price REAL,
+            hours_left    REAL,
+            market_type   TEXT,
+            indicators    TEXT,
+            score         INTEGER,
+            total_signals INTEGER,
+            simulated_stake REAL DEFAULT 1.0,
+            simulated_payout REAL,
+            status        TEXT DEFAULT 'Pending',
+            outcome       TEXT,
+            fired_at      TEXT,
+            resolved_at   TEXT,
+            slug          TEXT
+        )
+    """)
     conn.close()
     print("DB initialized OK")
 
@@ -1845,13 +1872,11 @@ def record_trade_outcome(prediction_id, won, stake_amount):
             "──────────────────────────".format(
                 prediction_id, stake_amount, payout, profit, _trading_state["last_balance"]))
 
-        # Auto-resume if wins bring balance back above floor
-        floor1 = _trading_state.get("floor_balance", 0)
-        bal1 = _trading_state.get("last_balance", 0)
-        if not _trading_state["enabled"] and bal1 > floor1 + _trading_state["min_stake"]:
-            _trading_state["enabled"] = True
-            print("Bot1 AUTO-RESUMED: balance ${:.2f} above floor ${:.2f}".format(bal1, floor1))
-            send_telegram("🟢 <b>Bot 1 auto-resumed</b>\nBalance: ${:.2f} (floor: ${:.2f})".format(bal1, floor1))
+        # Bot 1 auto-resume DISABLED — must be manually started
+        # floor1 = _trading_state.get("floor_balance", 0)
+        # bal1 = _trading_state.get("last_balance", 0)
+        # if not _trading_state["enabled"] and bal1 > floor1 + _trading_state["min_stake"]:
+        #     _trading_state["enabled"] = True
     else:
         _trading_state["daily_loss"] += stake_amount
         print("Trade #{} LOST: stake ${:.2f}, balance ${:.2f}".format(
@@ -1988,12 +2013,11 @@ def _auto_redeem_positions():
 
                     # Auto-resume Bot 1 only if its TRACKED balance is above floor
                     # (wins from record_trade_outcome update last_balance correctly)
-                    floor1 = _trading_state.get("floor_balance", 0)
-                    bot1_bal = _trading_state.get("last_balance") or _trading_state.get("starting_balance", 0)
-                    if not _trading_state["enabled"] and bot1_bal > floor1 + _trading_state["min_stake"]:
-                        _trading_state["enabled"] = True
-                        print("Bot1 AUTO-RESUMED: tracked balance ${:.2f} above floor ${:.2f}".format(bot1_bal, floor1))
-                        send_telegram("🟢 <b>Bot 1 auto-resumed</b>\nBalance: ${:.2f} (floor: ${:.2f})".format(bot1_bal, floor1))
+                    # Bot 1 auto-resume DISABLED — must be manually started
+                    # floor1 = _trading_state.get("floor_balance", 0)
+                    # bot1_bal = _trading_state.get("last_balance") or _trading_state.get("starting_balance", 0)
+                    # if not _trading_state["enabled"] and bot1_bal > floor1 + _trading_state["min_stake"]:
+                    #     _trading_state["enabled"] = True
             except Exception as be:
                 print("Balance update after redeem failed: {}".format(be))
     except Exception as e:
@@ -3239,6 +3263,175 @@ def _score_paper31_trade(p, price, indicators, ind_macro=None, expiry_minute=Non
         "market_type": mtype, "sim_payout": sim_payout,
     }
 
+
+# ═══════════════════════════════════════════════════════════
+# PAPER 2.1: Bot 2 strategy + BTC Tiebreaker + 15M Pullback
+# ═══════════════════════════════════════════════════════════
+
+def _score_paper21_trade(p, price, indicators=None, expiry_minute=None):
+    """Paper 2.1: Bot 2's TV + SMA + BTC signals with:
+    1. BTC as tiebreaker (pair's TV + SMA lead, BTC confirms/ignored)
+    2. 15M pullback detection using UT Bot gatekeeper during weak periods
+    Does NOT include 4H pullback for 1H (waiting for Paper 3.1 data).
+    """
+    if price is None:
+        return None
+
+    asset = p["asset"]
+    yes_odds = p["yes_odds"]
+    no_odds = 100 - yes_odds
+
+    if not (20 <= yes_odds <= 72 or 20 <= no_odds <= 72):
+        return None
+
+    # Minimum margin
+    margin_pct = abs(price - p["baseline"]) / p["baseline"] * 100 if p["baseline"] > 0 else 0
+    min_margin = 0.05 if p["is_short"] else 0.3
+    if margin_pct < min_margin:
+        return None
+
+    if p["direction"] == "above":
+        price_above = price > p["baseline"]
+    else:
+        price_above = price < p["baseline"]
+
+    # ── Bot 2's original signals ──
+    tv = _tv_trends.get(asset.upper())
+    tv_dir = tv["dir"] if tv else None
+    sma_dir = _pair_sma_cache.get(asset.upper(), {}).get("trend")
+    btc_trend = _btc_trend_cache.get("trend")
+
+    # ── PAIR's direction (TV + SMA without BTC) ──
+    pair_signals = [s for s in [tv_dir, sma_dir] if s is not None]
+    pair_buy = sum(1 for s in pair_signals if s == "BUY")
+    pair_sell = sum(1 for s in pair_signals if s == "SELL")
+
+    if pair_buy > pair_sell:
+        pair_dir = "BUY"
+    elif pair_sell > pair_buy:
+        pair_dir = "SELL"
+    elif len(pair_signals) == 0:
+        pair_dir = btc_trend  # no pair data, use BTC
+    else:
+        pair_dir = None  # split
+
+    # ── BTC role ──
+    btc_agrees = (btc_trend == pair_dir) if pair_dir and btc_trend else False
+    if pair_dir and btc_agrees:
+        btc_role = "CONFIRM"
+    elif pair_dir and btc_trend and not btc_agrees:
+        btc_role = "IGNORED"
+    elif not pair_dir and btc_trend:
+        btc_role = "TIEBREAK"
+        pair_dir = btc_trend
+    else:
+        btc_role = "NONE"
+
+    if not pair_dir:
+        return None
+
+    # ── UT Bot + Squeeze for pullback (from indicators if available) ──
+    ut_trend = indicators.get("ut_trend") if indicators else None
+    sqz_val = indicators.get("squeeze_val") if indicators else None
+    sqz_prev = indicators.get("squeeze_prev_val") if indicators else None
+    sqz_dir = None
+    if sqz_val is not None and sqz_prev is not None:
+        sqz_dir = "BUY" if sqz_val > 0 else "SELL" if sqz_val < 0 else None
+
+    # ── Market timing ──
+    mtype = "15M" if p["is_short"] and p.get("mins_left", 0) <= 20 else "1H" if p["is_short"] else "Daily"
+    is_weak_period = False
+    if mtype == "15M" and expiry_minute is not None:
+        is_weak_period = expiry_minute in (0, 30)
+
+    # ── Decision ──
+    bet_side = None
+    confidence = "LOW"
+    reason = ""
+
+    if mtype == "15M" and is_weak_period and ut_trend:
+        # ═══ WEAK PERIOD: UT Bot gatekeeper ═══
+        # Macro = pair_dir (what TV+SMA say on the broader trend)
+        macro_for_pullback = pair_dir
+        ut_opposes = (ut_trend == "SELL" and macro_for_pullback == "BUY") or (ut_trend == "BUY" and macro_for_pullback == "SELL")
+        sqz_opposes = (sqz_dir == "SELL" and macro_for_pullback == "BUY") or (sqz_dir == "BUY" and macro_for_pullback == "SELL") if sqz_dir else False
+
+        if ut_opposes and sqz_opposes:
+            # S4: both oppose → FLIP HIGH
+            if macro_for_pullback == "BUY":
+                bet_side = "NO" if p["direction"] == "above" else "YES"
+                confidence = "HIGH"; reason = "PULLBACK_S4_BEAR"
+            else:
+                bet_side = "YES" if p["direction"] == "above" else "NO"
+                confidence = "HIGH"; reason = "PULLBACK_S4_BULL"
+        elif ut_opposes and not sqz_opposes:
+            # S3: UT only → FLIP MEDIUM
+            if macro_for_pullback == "BUY":
+                bet_side = "NO" if p["direction"] == "above" else "YES"
+                confidence = "MEDIUM"; reason = "PULLBACK_S3_BEAR"
+            else:
+                bet_side = "YES" if p["direction"] == "above" else "NO"
+                confidence = "MEDIUM"; reason = "PULLBACK_S3_BULL"
+        elif not ut_opposes and sqz_opposes:
+            return None  # Squeeze only → SKIP
+        else:
+            # Neither opposes → follow pair direction
+            if pair_dir == "BUY" and price_above:
+                bet_side = "YES" if p["direction"] == "above" else "NO"
+                confidence = "HIGH" if btc_agrees else "MEDIUM"
+                reason = "WEAK_TREND_HOLDS"
+            elif pair_dir == "SELL" and not price_above:
+                bet_side = "NO" if p["direction"] == "above" else "YES"
+                confidence = "HIGH" if btc_agrees else "MEDIUM"
+                reason = "WEAK_TREND_HOLDS_BEAR"
+    else:
+        # ═══ STRONG PERIOD or 1H/Daily ═══
+        if pair_dir == "BUY" and price_above:
+            bet_side = "YES" if p["direction"] == "above" else "NO"
+            confidence = "HIGH" if btc_agrees else "MEDIUM"
+            reason = "TREND_BUY"
+        elif pair_dir == "SELL" and not price_above:
+            bet_side = "NO" if p["direction"] == "above" else "YES"
+            confidence = "HIGH" if btc_agrees else "MEDIUM"
+            reason = "TREND_SELL"
+
+    if bet_side is None:
+        return None
+
+    effective_odds = yes_odds if bet_side == "YES" else no_odds
+    if effective_odds < 20 or effective_odds > 72:
+        return None
+
+    # Need at least TV or SMA present
+    if not tv_dir and not sma_dir:
+        return None
+
+    # ── Output ──
+    indicator_details = []
+    for name, signal in [("TV", tv_dir), ("SMA", sma_dir), ("BTC", btc_trend)]:
+        if signal == "BUY": indicator_details.append("{}=BUY".format(name))
+        elif signal == "SELL": indicator_details.append("{}=SELL".format(name))
+        else: indicator_details.append("{}=\u2014".format(name))
+    if ut_trend: indicator_details.append("UT={}".format(ut_trend))
+    if sqz_dir: indicator_details.append("SQZ={}".format(sqz_dir))
+    indicator_details.append("BTC:{}".format(btc_role))
+    if is_weak_period: indicator_details.append("WEAK")
+    if "PULLBACK" in reason: indicator_details.append("FLIP")
+
+    total_signals = sum(1 for s in [tv_dir, sma_dir, btc_trend] if s)
+    signals_agree = sum(1 for s in [tv_dir, sma_dir, btc_trend] if s == pair_dir)
+
+    share_price = effective_odds / 100.0
+    if bet_side == "NO": share_price = 1.0 - (yes_odds / 100.0)
+    sim_payout = round(1.0 / share_price, 4) if share_price > 0 else 0
+
+    return {
+        "bet_side": bet_side, "bet_odds": effective_odds,
+        "score": signals_agree, "total_signals": total_signals,
+        "confidence": confidence, "indicators": " | ".join(indicator_details),
+        "market_type": mtype, "sim_payout": sim_payout,
+    }
+
 def run_paper34_scan():
     """Scan markets for Paper 3 (momentum) and Paper 4 (reversal) signals."""
     import requests as req
@@ -3270,6 +3463,11 @@ def run_paper34_scan():
             p31_ids = set(str(row[0]) for row in p31_rows)
         except:
             p31_ids = set()
+        try:
+            p21_rows = conn.run("SELECT market_id FROM paper21_trades WHERE fired_at::timestamptz > NOW() - INTERVAL '30 hours'")
+            p21_ids = set(str(row[0]) for row in p21_rows)
+        except:
+            p21_ids = set()
         # Get Bot 1 and Bot 2 market IDs to avoid overlap
         try:
             bot12_rows = conn.run("""SELECT market_id FROM limitless_predictions WHERE created_at > NOW() - INTERVAL '30 hours'
@@ -3285,6 +3483,7 @@ def run_paper34_scan():
         p4_count = 0
         p5_count = 0
         p31_count = 0
+        p21_count = 0
 
         for market in markets:
             try:
@@ -3484,11 +3683,40 @@ def run_paper34_scan():
                         except Exception as e:
                             print("Paper31 save error: {}".format(e))
 
+                # Paper 2.1: Bot 2 strategy + BTC Tiebreaker + 15M Pullback
+                if parsed["market_id"] not in p21_ids:
+                    scored21 = _score_paper21_trade(parsed, price, indicators=ind, expiry_minute=expiry_minute)
+                    if scored21:
+                        try:
+                            conn21 = get_db()
+                            conn21.run(
+                                """INSERT INTO paper21_trades
+                                (market_id, title, asset, direction, baseline, bet_odds, bet_side,
+                                 current_price, hours_left, market_type, indicators, score,
+                                 total_signals, simulated_stake, simulated_payout, status, fired_at, slug)
+                                VALUES (:mid, :ttl, :ast, :dir, :base, :odds, :bs,
+                                        :pr, :hrs, :mt, :ind, :sc, :ts, 1.0, :sp, 'Pending', :now, :slg)""",
+                                mid=parsed["market_id"], ttl=parsed["title"], ast=asset,
+                                dir=parsed["direction"], base=parsed["baseline"],
+                                odds=scored21["bet_odds"], bs=scored21["bet_side"],
+                                pr=price, hrs=round(parsed["hours_left"], 2),
+                                mt=scored21["market_type"],
+                                ind="[{}] {}".format(scored21["confidence"], scored21["indicators"]),
+                                sc=scored21["score"], ts=scored21["total_signals"],
+                                sp=scored21["sim_payout"],
+                                now=now, slg=parsed["slug"]
+                            )
+                            conn21.close()
+                            p21_ids.add(parsed["market_id"])
+                            p21_count += 1
+                        except Exception as e:
+                            print("Paper21 save error: {}".format(e))
+
             except Exception as e:
                 print("Paper345 market error: {}".format(e))
 
         if p3_count > 0 or p4_count > 0 or p5_count > 0:
-            print("Paper3: {} | Paper4: {} | Paper5: {} | Paper3.1: {}".format(p3_count, p4_count, p5_count, p31_count))
+            print("P3:{} P4:{} P5:{} P3.1:{} P2.1:{}".format(p3_count, p4_count, p5_count, p31_count, p21_count))
         else:
             # Count how many assets we got indicators for
             ind_ok = sum(1 for v in indicator_cache_local.values() if v is not None)
@@ -3624,8 +3852,9 @@ def resolve_paper34_trades():
     r4 = _resolve_paper_table("paper4_trades")
     r5 = _resolve_paper_table("paper5_trades")
     r31 = _resolve_paper_table("paper31_trades")
+    r21 = _resolve_paper_table("paper21_trades")
     if r3 or r4 or r5:
-        print("Resolved: Paper3={} Paper4={} Paper5={} Paper3.1={}".format(r3, r4, r5, r31))
+        print("Resolved: P3={} P4={} P5={} P3.1={} P2.1={}".format(r3, r4, r5, r31, r21))
 
 def _score_paper_trade(p, price):
     """Score a market for paper trading. Accepts 40-72% odds when ALL trends agree.
@@ -7731,6 +7960,7 @@ td{padding:8px 12px;border-bottom:1px solid #f4f3ed;color:var(--ink-2)}tr:last-c
     <a href="/app/paper" class="nav-tab">Bot 2</a>
     <a href="/app/paper3" class="nav-tab""" + (" active" if nav_active == "paper3" else "") + """">Paper 3</a>
     <a href="/app/paper4" class="nav-tab""" + (" active" if nav_active == "paper4" else "") + """">Paper 4</a>
+    <a href="/app/paper21" class="nav-tab""" + (" active" if nav_active == "paper21" else "") + """">Paper 2.1</a>
     <a href="/app/paper31" class="nav-tab""" + (" active" if nav_active == "paper31" else "") + """">Paper 3.1</a>
     <a href="/app/paper5" class="nav-tab""" + (" active" if nav_active == "paper5" else "") + """">Paper 5</a>
     <a href="/app/football" class="nav-tab">Football</a>
@@ -7852,6 +8082,17 @@ def paper4_page():
         "Hunts exhausted trends at 5-55% odds. Enters when RSI is extreme (<30 or >70) AND price is at Bollinger bands, with additional confirmation from momentum, volume, or EMA direction. Also catches Bollinger squeeze breakouts. Higher risk, much higher payout per win.",
         ["Reversal", "RSI", "BB"],
         "paper4"
+    )
+
+@app.route("/app/paper21")
+def paper21_page():
+    return _build_paper_page(
+        "paper21_trades",
+        "Paper 2.1 — BTC Tiebreaker",
+        "Bot 2 Strategy + BTC Tiebreaker + 15M Pullback Detection",
+        "Bot 2 signals (TV + SMA + BTC) but BTC confirms when pair agrees, ignored when pair disagrees. UT Bot gatekeeper flips trades during 15M weak periods (:30/:00 expiry). No 4H pullback yet.",
+        ["Score", "Indicators"],
+        "paper21"
     )
 
 @app.route("/app/paper31")
