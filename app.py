@@ -1214,14 +1214,17 @@ def _is_volatile_window():
       00:00-01:00 — daily candle close, funding rates, low liquidity
       13:00-15:00 — US market open, Fed news, economic data
       21:00-22:00 — NY close → Asia transition, 0% win rate historically
+    Also checks next hour to catch trades that EXPIRE during volatile periods.
     """
     utc_hour = datetime.now(timezone.utc).hour
-    if 0 <= utc_hour < 1:
-        return True
-    if 13 <= utc_hour < 15:
-        return True
-    if 21 <= utc_hour < 22:
-        return True
+    next_hour = (utc_hour + 1) % 24
+    for h in [utc_hour, next_hour]:
+        if 0 <= h < 1:
+            return True
+        if 13 <= h < 15:
+            return True
+        if 21 <= h < 22:
+            return True
     return False
 
 def _fetch_orderbook(slug):
