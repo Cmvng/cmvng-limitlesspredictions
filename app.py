@@ -3235,8 +3235,8 @@ def resolve_paper34_trades():
     r3 = _resolve_paper_table("paper3_trades")
     r4 = _resolve_paper_table("paper4_trades")
     r5 = _resolve_paper_table("paper5_trades")
-    if r3 or r4:
-        print("Resolved: Paper3={} Paper4={}".format(r3, r4))
+    if r3 or r4 or r5:
+        print("Resolved: Paper3={} Paper4={} Paper5={}".format(r3, r4, r5))
 
 def _score_paper_trade(p, price):
     """Score a market for paper trading. Accepts 40-72% odds when ALL trends agree.
