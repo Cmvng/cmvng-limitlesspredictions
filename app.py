@@ -6565,6 +6565,80 @@ def bot3_stop():
     _bot3_state["enabled"] = False
     return {"status": "Bot 3 stopped", "balance": _bot3_state["balance"]}, 200
 
+# ── Paper 2.1 controls ──
+@app.route("/p21/status", methods=["GET"])
+def p21_status():
+    compound_target = _bot21_state["starting_balance"] * _bot21_state.get("compound_threshold", 1.20)
+    return {
+        "enabled": _bot21_state["enabled"],
+        "balance": _bot21_state["balance"],
+        "starting_balance": _bot21_state["starting_balance"],
+        "floor_balance": _bot21_state.get("floor_balance", 0),
+        "compound_after": round(compound_target, 2),
+        "is_compounding": _bot21_state["balance"] >= compound_target,
+        "current_stake": _calc_bot_stake(_bot21_state),
+        "daily_profit": _bot21_state["daily_profit"],
+        "daily_loss": _bot21_state["daily_loss"],
+        "trades_today": _bot21_state["trades_today"],
+        "mode": "Paper 2.1: Bot 2 + BTC Tiebreaker + 15M Pullback",
+    }, 200
+
+@app.route("/p21/set", methods=["GET"])
+def p21_set():
+    if request.args.get("balance"):
+        _bot21_state["balance"] = float(request.args["balance"])
+        _bot21_state["starting_balance"] = float(request.args["balance"])
+    if request.args.get("floor"):
+        _bot21_state["floor_balance"] = float(request.args["floor"])
+    return {"balance": _bot21_state["balance"], "floor": _bot21_state.get("floor_balance", 0), "stake": _calc_bot_stake(_bot21_state)}, 200
+
+@app.route("/p21/start", methods=["GET"])
+def p21_start():
+    _bot21_state["enabled"] = True
+    return {"status": "Paper 2.1 started", "balance": _bot21_state["balance"]}, 200
+
+@app.route("/p21/stop", methods=["GET"])
+def p21_stop():
+    _bot21_state["enabled"] = False
+    return {"status": "Paper 2.1 stopped", "balance": _bot21_state["balance"]}, 200
+
+# ── Paper 3.1 controls ──
+@app.route("/p31/status", methods=["GET"])
+def p31_status():
+    compound_target = _bot31_state["starting_balance"] * _bot31_state.get("compound_threshold", 1.20)
+    return {
+        "enabled": _bot31_state["enabled"],
+        "balance": _bot31_state["balance"],
+        "starting_balance": _bot31_state["starting_balance"],
+        "floor_balance": _bot31_state.get("floor_balance", 0),
+        "compound_after": round(compound_target, 2),
+        "is_compounding": _bot31_state["balance"] >= compound_target,
+        "current_stake": _calc_bot_stake(_bot31_state),
+        "daily_profit": _bot31_state["daily_profit"],
+        "daily_loss": _bot31_state["daily_loss"],
+        "trades_today": _bot31_state["trades_today"],
+        "mode": "Paper 3.1: Paper 3 + BTC Tiebreaker + Dual Timeframe",
+    }, 200
+
+@app.route("/p31/set", methods=["GET"])
+def p31_set():
+    if request.args.get("balance"):
+        _bot31_state["balance"] = float(request.args["balance"])
+        _bot31_state["starting_balance"] = float(request.args["balance"])
+    if request.args.get("floor"):
+        _bot31_state["floor_balance"] = float(request.args["floor"])
+    return {"balance": _bot31_state["balance"], "floor": _bot31_state.get("floor_balance", 0), "stake": _calc_bot_stake(_bot31_state)}, 200
+
+@app.route("/p31/start", methods=["GET"])
+def p31_start():
+    _bot31_state["enabled"] = True
+    return {"status": "Paper 3.1 started", "balance": _bot31_state["balance"]}, 200
+
+@app.route("/p31/stop", methods=["GET"])
+def p31_stop():
+    _bot31_state["enabled"] = False
+    return {"status": "Paper 3.1 stopped", "balance": _bot31_state["balance"]}, 200
+
 @app.route("/football/clear", methods=["GET"])
 def clear_football_picks():
     """Wipe old accumulator picks with broken formatting. Run once, then /football/scan."""
