@@ -3679,7 +3679,8 @@ def _score_paper21_trade(p, price, indicators=None, ind_macro=None, expiry_minut
     # Minimum margin
     margin_pct = abs(price - p["baseline"]) / p["baseline"] * 100 if p["baseline"] > 0 else 0
     min_margin = 0.05 if p["is_short"] else 0.3
-    if margin_pct < min_margin:
+    # Skip margin check for Up/Down markets where baseline ≈ current price (Polymarket style)
+    if margin_pct < min_margin and "up or down" not in p.get("title", "").lower():
         return None
 
     if p["direction"] == "above":
