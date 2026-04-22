@@ -4774,12 +4774,10 @@ def resolve_paper_trades():
                 else:
                     _bot2_state["daily_loss"] = round(_bot2_state["daily_loss"] + stake, 2)
 
-                # Auto-resume if wins bring balance back above floor
-                floor2 = _bot2_state.get("floor_balance", 0)
-                if not _bot2_state["enabled"] and _bot2_state["balance"] > floor2 + _bot2_state["min_stake"]:
-                    _bot2_state["enabled"] = True
-                    print("Bot2 AUTO-RESUMED: balance ${:.2f} above floor ${:.2f}".format(_bot2_state["balance"], floor2))
-                    send_telegram("🟢 <b>Bot 2 auto-resumed</b>\nBalance: ${:.2f} (floor: ${:.2f})".format(_bot2_state["balance"], floor2))
+                # Bot 2 auto-resume DISABLED — must be manually started via /bot2/start
+                # floor2 = _bot2_state.get("floor_balance", 0)
+                # if not _bot2_state["enabled"] and _bot2_state["balance"] > floor2 + _bot2_state["min_stake"]:
+                #     _bot2_state["enabled"] = True
 
                 # Telegram notification for Bot 2 trades
                 emoji = "✅" if won else "❌"
