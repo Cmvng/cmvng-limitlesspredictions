@@ -86,10 +86,10 @@ _bot3_state = {
 }
 
 
-# Paper 2.1: Bot 2 + BTC Tiebreaker + 15M Pullback (LIVE trading)
+# Paper 2.1: Bot 2 + BTC Tiebreaker + 15M + 4H Pullback (LIVE trading)
 _bot21_state = {
     "enabled": True,
-    "balance": 15.0,
+    "balance": 20.0,
     "daily_loss": 0.0,
     "daily_profit": 0.0,
     "trades_today": 0,
@@ -97,15 +97,15 @@ _bot21_state = {
     "stake_pct": 0.025,
     "min_stake": 1.0,
     "max_loss_pct": 0.60,
-    "starting_balance": 15.0,
+    "starting_balance": 20.0,
     "floor_balance": 5.0,
-    "compound_threshold": 1.20,  # 20% profit
+    "compound_threshold": 9999.0,  # Never compound — fixed $1 stakes
 }
 
 # Paper 3.1: Paper 3 + BTC Tiebreaker + Dual Timeframe (LIVE trading)
 _bot31_state = {
     "enabled": True,
-    "balance": 15.0,
+    "balance": 20.0,
     "daily_loss": 0.0,
     "daily_profit": 0.0,
     "trades_today": 0,
@@ -113,9 +113,9 @@ _bot31_state = {
     "stake_pct": 0.025,
     "min_stake": 1.0,
     "max_loss_pct": 0.60,
-    "starting_balance": 15.0,
+    "starting_balance": 20.0,
     "floor_balance": 5.0,
-    "compound_threshold": 1.20,  # 20% profit
+    "compound_threshold": 9999.0,  # Never compound — fixed $1 stakes
 }
 
 FAVOURITE_HOURLY = ["ADA", "BNB", "DOGE"]
@@ -4184,7 +4184,7 @@ def _resolve_paper_table(table_name):
                 # P2.1 went live ~18:00 UTC Apr 21, 2026
                 if table_name == "paper21_trades":
                     fired = p.get("fired_at") or ""
-                    is_live_trade = fired >= "2026-04-22T05:30"
+                    is_live_trade = fired >= "2026-04-22T06:00"
                     if is_live_trade:
                         if won:
                             _bot21_state["balance"] = round(_bot21_state["balance"] + payout, 2)
@@ -4203,7 +4203,7 @@ def _resolve_paper_table(table_name):
                 # P3.1 went live ~18:00 UTC Apr 21, 2026
                 if table_name == "paper31_trades":
                     fired = p.get("fired_at") or ""
-                    is_live_trade = fired >= "2026-04-22T05:30"
+                    is_live_trade = fired >= "2026-04-22T06:00"
                     if is_live_trade:
                         if won:
                             _bot31_state["balance"] = round(_bot31_state["balance"] + payout, 2)
@@ -4412,14 +4412,11 @@ def run_paper_scan():
     Records to paper_trades table AND places real trades with separate $20 balance."""
     import requests as req
     try:
-        # Check if Bot 2 is enabled and has balance
-        if not _bot2_state["enabled"]:
-            return
-        if not _has_trading_keys():
+        # Skip volatile periods
+        if _is_volatile_window():
             return
 
-        # Skip volatile periods (US open 13-15 UTC, daily close 00-01 UTC)
-        if _is_volatile_window():
+        if not _has_trading_keys():
             return
 
         # Check floor balance
@@ -4531,18 +4528,19 @@ def run_paper_scan():
                 conn2.close()
                 recorded_ids.add(parsed["market_id"])
 
-                # Place REAL trade via Bot 2
-                try:
-                    bal_after = round(_bot2_state["balance"] - stake, 2)
-                    success = execute_trade(parsed, scored, None, override_stake=stake,
-                                           bot_name="BOT 2", bot_balance_after=bal_after)
-                    if success:
-                        _bot2_state["balance"] = bal_after
-                        _bot2_state["trades_today"] += 1
-                        print("Bot2 TRADE: {} {} ${:.2f} on {} | bal=${:.2f}".format(
-                            scored["bet_side"], parsed["asset"], stake, parsed["title"][:30], _bot2_state["balance"]))
-                except Exception as te:
-                    print("Bot2 trade error: {}".format(te))
+                # Place REAL trade via Bot 2 (only if enabled)
+                if _bot2_state["enabled"]:
+                    try:
+                        bal_after = round(_bot2_state["balance"] - stake, 2)
+                        success = execute_trade(parsed, scored, None, override_stake=stake,
+                                               bot_name="BOT 2", bot_balance_after=bal_after)
+                        if success:
+                            _bot2_state["balance"] = bal_after
+                            _bot2_state["trades_today"] += 1
+                            print("Bot2 TRADE: {} {} ${:.2f} on {} | bal=${:.2f}".format(
+                                scored["bet_side"], parsed["asset"], stake, parsed["title"][:30], _bot2_state["balance"]))
+                    except Exception as te:
+                        print("Bot2 trade error: {}".format(te))
 
                 count += 1
                 time.sleep(1)
