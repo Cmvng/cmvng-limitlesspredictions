@@ -9509,30 +9509,27 @@ _chainlink_connected = False
 
 def _rtds_price_to_beat(asset, timeframe, end_ts):
     """Get the Price to Beat for a specific window from Chainlink cache.
-    Tries the exact end_ts, then nearby windows in case of timing offset."""
-    # Try exact match
-    key = "{}_{}_{}".format(asset, timeframe, end_ts)
-    ptb = _chainlink_ptb.get(key)
-    if ptb:
-        return ptb
-    
-    # Try nearby windows (±1 second rounding issues)
-    for offset in [-1, 1, -2, 2]:
-        key2 = "{}_{}_{}".format(asset, timeframe, end_ts + offset)
-        ptb = _chainlink_ptb.get(key2)
-        if ptb:
-            return ptb
-    
-    # Try the window that contains current time
-    # (scanner might query for next window but PTB is from current)
+    The PTB key uses window_end timestamps. The market's expiry might be 
+    the same window or a neighboring one, so we check multiple."""
     tf_seconds = {"5M": 300, "15M": 900, "1H": 3600}.get(timeframe, 300)
-    now_ts = int(time.time())
-    current_window_end = ((now_ts // tf_seconds) + 1) * tf_seconds
-    if current_window_end != end_ts:
-        key3 = "{}_{}_{}".format(asset, timeframe, current_window_end)
-        ptb = _chainlink_ptb.get(key3)
+    
+    # Try exact match and nearby windows (±1 window in each direction)
+    for offset in [0, -tf_seconds, tf_seconds, -2*tf_seconds, 2*tf_seconds, -1, 1]:
+        key = "{}_{}_{}".format(asset, timeframe, end_ts + offset)
+        ptb = _chainlink_ptb.get(key)
         if ptb:
             return ptb
+    
+    # Try all stored keys for this asset+timeframe, find closest to end_ts
+    prefix = "{}_{}_".format(asset, timeframe)
+    matching = {k: v for k, v in _chainlink_ptb.items() if k.startswith(prefix)}
+    if matching:
+        # Find the key with timestamp closest to end_ts
+        closest_key = min(matching.keys(), key=lambda k: abs(int(k.rsplit("_", 1)[1]) - end_ts))
+        closest_ts = int(closest_key.rsplit("_", 1)[1])
+        # Only use if within 2 windows
+        if abs(closest_ts - end_ts) <= tf_seconds * 2:
+            return matching[closest_key]
     
     return None
 
