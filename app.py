@@ -9526,16 +9526,77 @@ def _rtds_loop():
         "sol/usd": "SOL", "xrp/usd": "XRP",
     }
     
+    _rtds_msg_count = [0]  # mutable counter
+    
+    def _store_ptb(asset, price, ts_sec):
+        """Store Price to Beat at window boundaries."""
+        for tf_label, tf_sec in [("5M", 300), ("15M", 900), ("1H", 3600)]:
+            window_start = (ts_sec // tf_sec) * tf_sec
+            window_end = window_start + tf_sec
+            ptb_key = "{}_{}_{}".format(asset, tf_label, window_end)
+            if ts_sec - window_start <= 5 and ptb_key not in _chainlink_ptb:
+                _chainlink_ptb[ptb_key] = price
+                print("PTB {} {} = ${:,.2f}".format(asset, tf_label, price))
+        # Clean old entries
+        cutoff = ts_sec - 7200
+        old_keys = [k for k in list(_chainlink_ptb.keys()) if int(k.rsplit("_", 1)[1]) < cutoff]
+        for k in old_keys:
+            del _chainlink_ptb[k]
+    
     def on_message(ws, message):
         global _chainlink_connected
         _chainlink_connected = True
         try:
             if message == "PONG":
                 return
-            # Parse: "timestamp,datetime,pair,price" or JSON
-            if message.startswith("{"):
-                return  # subscription confirmation
             
+            _rtds_msg_count[0] += 1
+            
+            # Debug first 3 messages to see format
+            if _rtds_msg_count[0] <= 3:
+                print("RTDS msg #{}: {}".format(_rtds_msg_count[0], str(message)[:200]))
+            
+            # Try JSON format first
+            if message.startswith("{") or message.startswith("["):
+                data = json.loads(message)
+                # Could be array of updates or single object
+                updates = data if isinstance(data, list) else [data]
+                for item in updates:
+                    if isinstance(item, dict):
+                        pair = item.get("pair") or item.get("symbol") or item.get("asset_id") or ""
+                        price_val = item.get("price") or item.get("value") or item.get("px")
+                        ts = item.get("timestamp") or item.get("ts") or 0
+                        
+                        if not pair or not price_val:
+                            continue
+                        
+                        pair = pair.lower().strip()
+                        price = float(price_val)
+                        asset = pair_map.get(pair)
+                        if not asset:
+                            # Try without /usd suffix
+                            for k, v in pair_map.items():
+                                if k.split("/")[0] in pair:
+                                    asset = v
+                                    break
+                        if not asset:
+                            continue
+                        
+                        _chainlink_prices[asset] = price
+                        
+                        if isinstance(ts, str):
+                            ts_sec = int(float(ts)) // 1000 if float(ts) > 1e12 else int(float(ts))
+                        else:
+                            ts_sec = int(ts) // 1000 if ts > 1e12 else int(ts)
+                        
+                        if ts_sec > 0:
+                            _store_ptb(asset, price, ts_sec)
+                        
+                        if _rtds_msg_count[0] <= 5:
+                            print("RTDS price: {} = ${:,.2f}".format(asset, price))
+                return
+            
+            # Try CSV format: timestamp,datetime,pair,price
             parts = message.split(",")
             if len(parts) >= 4:
                 ts_ms = int(parts[0])
@@ -9548,30 +9609,14 @@ def _rtds_loop():
                 
                 _chainlink_prices[asset] = price
                 ts_sec = ts_ms // 1000
+                _store_ptb(asset, price, ts_sec)
                 
-                # Check if this is the first price at a window boundary
-                # 5M windows: every 300 seconds
-                # 15M windows: every 900 seconds
-                # 1H windows: every 3600 seconds
-                for tf_label, tf_sec in [("5M", 300), ("15M", 900), ("1H", 3600)]:
-                    window_start = (ts_sec // tf_sec) * tf_sec
-                    window_end = window_start + tf_sec
-                    ptb_key = "{}_{}_{}".format(asset, tf_label, window_end)
-                    
-                    # Only store the FIRST price at/after window boundary
-                    # (within first 5 seconds of the window)
-                    if ts_sec - window_start <= 5 and ptb_key not in _chainlink_ptb:
-                        _chainlink_ptb[ptb_key] = price
-                        print("PTB {} {} = ${:,.2f}".format(asset, tf_label, price))
-                
-                # Clean old entries (keep last 2 hours)
-                cutoff = ts_sec - 7200
-                old_keys = [k for k in _chainlink_ptb if int(k.rsplit("_", 1)[1]) < cutoff]
-                for k in old_keys:
-                    del _chainlink_ptb[k]
+                if _rtds_msg_count[0] <= 5:
+                    print("RTDS price: {} = ${:,.2f}".format(asset, price))
                     
         except Exception as e:
-            pass
+            if _rtds_msg_count[0] <= 5:
+                print("RTDS parse error: {} — msg: {}".format(e, str(message)[:100]))
     
     def on_error(ws, error):
         global _chainlink_connected
