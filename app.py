@@ -9502,16 +9502,21 @@ POLY_CLOB_API = "https://clob.polymarket.com"
 POLY_RTDS_URL = "wss://ws-live-data.polymarket.com"
 
 # ── Chainlink RTDS Price Cache ──
-# Stores latest Chainlink price per asset AND the Price to Beat per window
 _chainlink_prices = {}  # {"BTC": 78900.50, "ETH": 2400.10, ...}
-_chainlink_ptb = {}     # {"BTC_5M_1776888000": 78684.13, "BTC_15M_1776888900": 78690.20, ...}
+_chainlink_ptb = {}     # {"BTC_5M": (end_ts, price), "BTC_15M": (end_ts, price), ...}
 _chainlink_connected = False
 
 def _rtds_price_to_beat(asset, timeframe, end_ts):
-    """Get the exact Price to Beat for a specific window.
-    Only returns if we have the EXACT window match. No fuzzy matching."""
-    key = "{}_{}_{}".format(asset, timeframe, end_ts)
-    return _chainlink_ptb.get(key)
+    """Get the Price to Beat. Returns price if stored for current or recent window."""
+    key = "{}_{}".format(asset, timeframe)
+    entry = _chainlink_ptb.get(key)
+    if entry:
+        stored_ts, stored_price = entry
+        # Accept if within 2 windows of the requested end_ts
+        tf_sec = {"5M": 300, "15M": 900, "1H": 3600}.get(timeframe, 300)
+        if abs(stored_ts - end_ts) <= tf_sec * 2:
+            return stored_price
+    return None
 
 def _rtds_current_price(asset):
     """Get latest Chainlink price for an asset."""
@@ -9530,19 +9535,19 @@ def _rtds_loop():
     _rtds_msg_count = [0]  # mutable counter
     
     def _store_ptb(asset, price, ts_sec):
-        """Store Price to Beat at window boundaries."""
+        """Store Price to Beat at window boundaries.
+        Simple: just store the latest PTB per asset per timeframe."""
         for tf_label, tf_sec in [("5M", 300), ("15M", 900), ("1H", 3600)]:
             window_start = (ts_sec // tf_sec) * tf_sec
             window_end = window_start + tf_sec
-            ptb_key = "{}_{}_{}".format(asset, tf_label, window_end)
-            if ts_sec - window_start <= 15 and ptb_key not in _chainlink_ptb:
-                _chainlink_ptb[ptb_key] = price
-                print("PTB {} {} = ${:,.2f}".format(asset, tf_label, price))
-        # Clean old entries
-        cutoff = ts_sec - 7200
-        old_keys = [k for k in list(_chainlink_ptb.keys()) if int(k.rsplit("_", 1)[1]) < cutoff]
-        for k in old_keys:
-            del _chainlink_ptb[k]
+            key = "{}_{}".format(asset, tf_label)
+            existing = _chainlink_ptb.get(key)
+            
+            # Store if this is a new window boundary (within first 15 seconds)
+            if ts_sec - window_start <= 15:
+                if not existing or existing[0] != window_end:
+                    _chainlink_ptb[key] = (window_end, price)
+                    print("PTB {} {} = ${:,.2f}".format(asset, tf_label, price))
     
     def on_message(ws, message):
         global _chainlink_connected
@@ -9995,39 +10000,49 @@ def _poly_fetch_markets():
 
 
 def _poly_get_baseline(parsed, price, indicators):
-    """Get the exact Price to Beat from Polymarket's dedicated API endpoint.
-    GET https://polymarket.com/api/equity/price-to-beat/{slug}
-    Falls back to Chainlink RTDS, then candle open."""
+    """Get the exact Price to Beat for a Polymarket market.
+    Priority: 1. Polymarket price-to-beat API
+              2. Chainlink RTDS cached PTB
+              3. Latest Chainlink price
+              4. yfinance candle open"""
     import requests as req
     asset = parsed.get("asset", "")
     slug = parsed.get("slug", "")
-    
-    # Source 1: Polymarket's dedicated Price to Beat API (EXACT)
-    if slug:
-        try:
-            r = req.get(
-                "https://polymarket.com/api/equity/price-to-beat/{}".format(slug),
-                timeout=5
-            )
-            if r.status_code == 200:
-                data = r.json()
-                # Response might be {"price_to_beat": 78724.98} or just a number
-                if isinstance(data, dict):
-                    ptb = data.get("price_to_beat") or data.get("priceToBeat") or data.get("price") or data.get("value")
-                    if ptb:
-                        return float(ptb)
-                elif isinstance(data, (int, float)):
-                    return float(data)
-                elif isinstance(data, str):
-                    try:
-                        return float(data)
-                    except:
-                        pass
-        except:
-            pass
-    
-    # Source 2: Exact Chainlink PTB from RTDS cache
     tf = parsed.get("timeframe", "")
+    
+    # Source 1: Polymarket price-to-beat API endpoint
+    if slug:
+        for url_pattern in [
+            "https://polymarket.com/api/equity/price-to-beat/{}",
+            "https://polymarket.com/api/crypto/price-to-beat/{}",
+            "https://gamma-api.polymarket.com/markets/{}",
+        ]:
+            try:
+                r = req.get(url_pattern.format(slug), timeout=5)
+                if r.status_code == 200:
+                    data = r.json()
+                    if isinstance(data, dict):
+                        # Try various field names
+                        for field in ["price_to_beat", "priceToBeat", "price", "value", "strikePrice"]:
+                            ptb = data.get(field)
+                            if ptb and float(ptb) > 0:
+                                return float(ptb)
+                        # For gamma-api market response, check description for dollar amount
+                        desc = data.get("description") or ""
+                        price_match = re.search(r'\$([0-9,]+\.?\d*)', desc)
+                        if price_match:
+                            try:
+                                val = float(price_match.group(1).replace(",", ""))
+                                if val > 0:
+                                    return val
+                            except:
+                                pass
+                    elif isinstance(data, (int, float)) and data > 0:
+                        return float(data)
+            except:
+                pass
+    
+    # Source 2: Chainlink RTDS cached PTB
     expiry_dt = parsed.get("expiry_dt")
     if expiry_dt and asset and tf:
         end_ts = int(expiry_dt.timestamp())
