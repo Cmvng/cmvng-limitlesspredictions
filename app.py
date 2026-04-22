@@ -681,6 +681,35 @@ def init_db():
             fired_at TEXT, resolved_at TEXT, slug TEXT
         )
     """)
+    # Polymarket paper trades — single table for all sections/strategies
+    conn.run("""
+        CREATE TABLE IF NOT EXISTS poly_trades (
+            id SERIAL PRIMARY KEY,
+            section TEXT,
+            strategy TEXT,
+            market_id TEXT,
+            title TEXT,
+            asset TEXT,
+            direction TEXT DEFAULT 'above',
+            baseline REAL,
+            bet_odds REAL,
+            bet_side TEXT,
+            current_price REAL,
+            hours_left REAL,
+            market_type TEXT,
+            indicators TEXT,
+            score INTEGER,
+            total_signals INTEGER,
+            simulated_stake REAL DEFAULT 1.0,
+            simulated_payout REAL,
+            status TEXT DEFAULT 'Pending',
+            outcome TEXT,
+            fired_at TEXT,
+            resolved_at TEXT,
+            slug TEXT,
+            condition_id TEXT
+        )
+    """)
     conn.close()
     print("DB initialized OK")
 
@@ -9435,11 +9464,722 @@ threading.Thread(target=scan_loop, daemon=True).start()
 threading.Thread(target=outcome_loop, daemon=True).start()
 threading.Thread(target=football_loop, daemon=True).start()
 threading.Thread(target=otp_loop, daemon=True).start()
+threading.Thread(target=_poly_scan_loop, daemon=True).start()
 if SIGNALS_DB_URL:
     threading.Thread(target=_signals_poll_loop, daemon=True).start()
-    print("Limitless Bot v4 — 5 threads running (signals DB connected)")
+    print("Limitless Bot v4 — 6 threads running (signals DB + Polymarket)")
 else:
-    print("Limitless Bot v4 — 4 threads running (no signals DB — set SIGNALS_DB_URL to connect)")
+    print("Limitless Bot v4 — 5 threads running (Polymarket enabled, no signals DB)")
+
+# ═══════════════════════════════════════════════════════════
+# POLYMARKET MODULE — Paper trading on crypto Up/Down markets
+# ═══════════════════════════════════════════════════════════
+
+POLY_GAMMA_API = "https://gamma-api.polymarket.com"
+POLY_CLOB_API = "https://clob.polymarket.com"
+
+# Polymarket balance tracking: {section}_{strategy} → balance
+_poly_balances = {}
+
+def _poly_bal_key(section, strategy):
+    return "{}_{}".format(section, strategy)
+
+def _poly_get_balance(section, strategy):
+    return _poly_balances.get(_poly_bal_key(section, strategy), 20.0)
+
+def _poly_set_balance(section, strategy, bal):
+    _poly_balances[_poly_bal_key(section, strategy)] = round(bal, 2)
+
+# Initialize all 16 balances
+for _ps in ["btc5m", "all5m", "all15m", "all1h"]:
+    for _pst in ["p21", "p23", "p31", "p33"]:
+        _poly_set_balance(_ps, _pst, 20.0)
+
+
+def _poly_parse_market(market):
+    """Parse a Polymarket crypto Up/Down market from Gamma API data."""
+    try:
+        question = market.get("question") or market.get("title") or ""
+        slug = market.get("slug") or ""
+        condition_id = market.get("conditionId") or market.get("condition_id") or ""
+
+        # Match "Bitcoin Up or Down" / "Ethereum Up or Down" etc
+        asset_map = {
+            "bitcoin": "BTC", "btc": "BTC",
+            "ethereum": "ETH", "eth": "ETH",
+            "solana": "SOL", "sol": "SOL",
+            "xrp": "XRP",
+            "hyperliquid": "HYPE", "hype": "HYPE",
+            "dogecoin": "DOGE", "doge": "DOGE",
+            "bnb": "BNB", "binance": "BNB",
+        }
+
+        asset = None
+        q_lower = question.lower()
+        for key, val in asset_map.items():
+            if key in q_lower:
+                asset = val
+                break
+
+        if not asset:
+            return None
+
+        # Must be an Up or Down market
+        if "up or down" not in q_lower and "updown" not in slug.lower():
+            return None
+
+        # Determine timeframe from slug pattern
+        timeframe = None
+        if "-5m-" in slug or "5m" in slug:
+            timeframe = "5M"
+        elif "-15m-" in slug or "15m" in slug:
+            timeframe = "15M"
+        elif "-1h-" in slug or "1h" in slug or "hourly" in slug.lower():
+            timeframe = "1H"
+
+        # Also try from tags/categories
+        if not timeframe:
+            tags = market.get("tags", [])
+            if isinstance(tags, list):
+                tag_str = " ".join(str(t) for t in tags).lower()
+            else:
+                tag_str = str(tags).lower()
+            if "5 min" in tag_str or "5m" in tag_str:
+                timeframe = "5M"
+            elif "15 min" in tag_str or "15m" in tag_str:
+                timeframe = "15M"
+            elif "1 hour" in tag_str or "hourly" in tag_str or "1h" in tag_str:
+                timeframe = "1H"
+
+        if not timeframe:
+            return None
+
+        # Get expiry
+        end_date = market.get("endDate") or market.get("end_date_iso") or ""
+        exp_ts = market.get("expirationTimestamp") or market.get("expiration_timestamp")
+        if exp_ts:
+            if isinstance(exp_ts, str):
+                exp_ts = int(exp_ts)
+            if exp_ts > 1e12:
+                exp_ts = exp_ts / 1000
+            expiry_dt = datetime.fromtimestamp(exp_ts, tz=timezone.utc)
+        elif end_date:
+            try:
+                expiry_dt = datetime.fromisoformat(end_date.replace("Z", "+00:00"))
+            except:
+                return None
+        else:
+            return None
+
+        now = datetime.now(timezone.utc)
+        mins_left = (expiry_dt - now).total_seconds() / 60
+        if mins_left <= 0:
+            return None
+
+        # Get odds — outcomePrices is usually "[\"0.52\",\"0.48\"]"
+        outcome_prices = market.get("outcomePrices") or market.get("outcome_prices")
+        up_odds = 50.0
+        if outcome_prices:
+            if isinstance(outcome_prices, str):
+                try:
+                    outcome_prices = json.loads(outcome_prices)
+                except:
+                    outcome_prices = None
+            if isinstance(outcome_prices, list) and len(outcome_prices) >= 2:
+                up_raw = float(outcome_prices[0])
+                if up_raw <= 1.0:
+                    up_odds = up_raw * 100
+                else:
+                    up_odds = up_raw
+
+        # Get token IDs for resolution
+        clob_tokens = market.get("clobTokenIds")
+        if isinstance(clob_tokens, str):
+            try:
+                clob_tokens = json.loads(clob_tokens)
+            except:
+                clob_tokens = []
+
+        # Market ID for dedup
+        market_id = str(market.get("id") or condition_id or slug)
+
+        # Get the "Price to Beat" — this is the baseline
+        # Polymarket includes it in the description or as metadata
+        # For up/down markets, baseline is implied (open price of window)
+        # We'll extract from description if possible, else use current yfinance price
+        description = market.get("description") or ""
+        baseline = None
+        # Try to find price in description like "$78,050" or "Price to Beat" 
+        price_match = re.search(r'\$([0-9,]+\.?\d*)', description)
+        if price_match:
+            try:
+                baseline = float(price_match.group(1).replace(",", ""))
+            except:
+                pass
+
+        # Determine expiry minute for weak/strong period detection
+        expiry_minute = expiry_dt.minute
+        expiry_hour = expiry_dt.hour
+
+        return {
+            "market_id": market_id,
+            "title": question,
+            "asset": asset,
+            "direction": "above",  # Up = above baseline
+            "baseline": baseline,
+            "expiry_dt": expiry_dt,
+            "mins_left": mins_left,
+            "hours_left": mins_left / 60,
+            "yes_odds": up_odds,  # UP odds = YES odds
+            "is_short": timeframe in ("5M", "15M"),
+            "is_daily": False,
+            "slug": slug,
+            "condition_id": condition_id,
+            "timeframe": timeframe,
+            "clob_tokens": clob_tokens or [],
+            "expiry_minute": expiry_minute,
+            "expiry_hour": expiry_hour,
+        }
+    except Exception as e:
+        return None
+
+
+def _poly_fetch_markets():
+    """Fetch active crypto Up/Down markets from Polymarket Gamma API."""
+    import requests as req
+    all_markets = []
+    try:
+        # Fetch crypto markets — tag_id 21 = crypto
+        for offset in [0, 100]:
+            r = req.get(
+                "{}/markets".format(POLY_GAMMA_API),
+                params={"active": "true", "tag_id": 21, "closed": "false",
+                        "limit": 100, "offset": offset},
+                timeout=15
+            )
+            if r.status_code != 200:
+                break
+            batch = r.json()
+            if not batch:
+                break
+            if isinstance(batch, list):
+                all_markets.extend(batch)
+            elif isinstance(batch, dict) and "data" in batch:
+                all_markets.extend(batch["data"])
+            else:
+                all_markets.extend([batch])
+            if len(batch) < 100:
+                break
+    except Exception as e:
+        print("Poly fetch error: {}".format(e))
+
+    parsed = []
+    for m in all_markets:
+        p = _poly_parse_market(m)
+        if p:
+            parsed.append(p)
+    return parsed
+
+
+def _poly_get_baseline(parsed, price):
+    """Get baseline for a Polymarket market. If not parsed from description, use current price."""
+    if parsed.get("baseline") and parsed["baseline"] > 0:
+        return parsed["baseline"]
+    # For Up/Down markets, baseline ≈ current price at window open
+    # Since we can't get the exact Chainlink price, use yfinance current
+    return price
+
+
+def run_poly_scan():
+    """Scan Polymarket crypto markets and record paper predictions."""
+    import requests as req
+    try:
+        markets = _poly_fetch_markets()
+        if not markets:
+            return
+
+        now = datetime.now(timezone.utc).isoformat()
+
+        # Load existing IDs to avoid duplicates
+        conn = get_db()
+        try:
+            existing = conn.run("SELECT section, strategy, market_id FROM poly_trades WHERE fired_at::timestamptz > NOW() - INTERVAL '6 hours'")
+            existing_keys = set("{}_{}_{}" .format(r[0], r[1], r[2]) for r in existing)
+        except:
+            existing_keys = set()
+        conn.close()
+
+        poly_counts = {"btc5m": 0, "all5m": 0, "all15m": 0, "all1h": 0}
+        strategies = ["p21", "p23", "p31", "p33"]
+
+        for parsed in markets:
+            asset = parsed["asset"]
+            tf = parsed["timeframe"]
+            mins_left = parsed["mins_left"]
+
+            # Skip if too little or too much time left
+            if tf == "5M" and (mins_left < 1 or mins_left > 6):
+                continue
+            if tf == "15M" and (mins_left < 2 or mins_left > 18):
+                continue
+            if tf == "1H" and (mins_left < 5 or mins_left > 65):
+                continue
+
+            # Determine which sections this market belongs to
+            sections = []
+            if tf == "5M":
+                sections.append("all5m")
+                if asset == "BTC":
+                    sections.append("btc5m")
+            elif tf == "15M":
+                sections.append("all15m")
+            elif tf == "1H":
+                sections.append("all1h")
+
+            if not sections:
+                continue
+
+            # Get yfinance candle data for this asset at the appropriate timeframe
+            yf_tf = "5m" if tf == "5M" else "15m" if tf == "15M" else "1h"
+            ind = _calculate_indicators(asset, yf_tf)
+            if not ind:
+                continue
+
+            price = ind.get("current")
+            if not price:
+                continue
+
+            baseline = _poly_get_baseline(parsed, price)
+            parsed["baseline"] = baseline
+
+            # Get BTC indicators for tiebreaker (if not BTC itself)
+            btc_ind = _calculate_indicators("BTC", yf_tf) if asset != "BTC" else ind
+
+            # 4H macro for 1H markets
+            ind_macro = None
+            if tf == "1H":
+                ind_macro = _calculate_indicators(asset, "4h")
+
+            expiry_minute = parsed.get("expiry_minute")
+            expiry_hour = parsed.get("expiry_hour")
+
+            for section in sections:
+                for strat in strategies:
+                    key = "{}_{}_{}" .format(section, strat, parsed["market_id"])
+                    if key in existing_keys:
+                        continue
+
+                    # Score using the appropriate strategy
+                    scored = None
+                    try:
+                        if strat == "p21":
+                            scored = _score_paper21_trade(parsed, price, indicators=ind,
+                                                          ind_macro=ind_macro,
+                                                          expiry_minute=expiry_minute,
+                                                          expiry_hour=expiry_hour)
+                        elif strat == "p23":
+                            scored = _score_paper23_trade(parsed, price, indicators=ind,
+                                                          ind_macro=ind_macro,
+                                                          expiry_minute=expiry_minute,
+                                                          expiry_hour=expiry_hour)
+                        elif strat == "p31":
+                            scored = _score_paper31_trade(parsed, price, ind,
+                                                          ind_macro=ind_macro,
+                                                          expiry_minute=expiry_minute,
+                                                          expiry_hour=expiry_hour)
+                        elif strat == "p33":
+                            scored = _score_paper33_trade(parsed, price, indicators=ind,
+                                                          ind_macro=ind_macro,
+                                                          expiry_minute=expiry_minute,
+                                                          expiry_hour=expiry_hour)
+                    except Exception as e:
+                        continue
+
+                    if not scored:
+                        continue
+
+                    # For Polymarket: YES→UP, NO→DOWN
+                    bet_side = scored["bet_side"]
+                    poly_side = "UP" if bet_side == "YES" else "DOWN"
+
+                    # Calculate sim payout
+                    up_odds = parsed["yes_odds"]
+                    if poly_side == "UP":
+                        effective_odds = up_odds
+                    else:
+                        effective_odds = 100 - up_odds
+                    share_price = effective_odds / 100.0
+                    sim_payout = round(1.0 / share_price, 4) if share_price > 0 else 0
+
+                    try:
+                        conn2 = get_db()
+                        conn2.run(
+                            """INSERT INTO poly_trades
+                            (section, strategy, market_id, title, asset, direction, baseline,
+                             bet_odds, bet_side, current_price, hours_left, market_type,
+                             indicators, score, total_signals, simulated_stake, simulated_payout,
+                             status, fired_at, slug, condition_id)
+                            VALUES (:sec, :strat, :mid, :ttl, :ast, :dir, :base,
+                                    :odds, :bs, :pr, :hrs, :mt,
+                                    :ind, :sc, :ts, 1.0, :sp,
+                                    'Pending', :now, :slg, :cid)""",
+                            sec=section, strat=strat, mid=parsed["market_id"],
+                            ttl=parsed["title"], ast=asset,
+                            dir="above", base=baseline,
+                            odds=effective_odds, bs=poly_side,
+                            pr=price, hrs=round(parsed["hours_left"], 2),
+                            mt=tf,
+                            ind="[{}] {}".format(scored.get("confidence", "?"), scored.get("indicators", "")),
+                            sc=scored.get("score", 0), ts=scored.get("total_signals", 0),
+                            sp=sim_payout,
+                            now=now, slg=parsed.get("slug", ""),
+                            cid=parsed.get("condition_id", "")
+                        )
+                        conn2.close()
+                        existing_keys.add(key)
+                        poly_counts[section] = poly_counts.get(section, 0) + 1
+                    except Exception as e:
+                        print("Poly save error: {}".format(e))
+
+        total = sum(poly_counts.values())
+        if total > 0:
+            print("Poly: {} trades | btc5m={} all5m={} all15m={} all1h={}".format(
+                total, poly_counts["btc5m"], poly_counts["all5m"],
+                poly_counts["all15m"], poly_counts["all1h"]))
+
+    except Exception as e:
+        print("Poly scan error: {}".format(e))
+
+
+def _resolve_poly_trades():
+    """Resolve Polymarket paper trades. Uses price comparison fallback."""
+    try:
+        conn = get_db()
+        rows = conn.run("SELECT * FROM poly_trades WHERE status='Pending'")
+        cols = [c['name'] for c in conn.columns]
+        items = [dict(zip(cols, r)) for r in rows]
+        conn.close()
+
+        if not items:
+            return 0
+
+        now = datetime.now(timezone.utc)
+        resolved = 0
+
+        for p in items:
+            try:
+                if not p.get("fired_at") or not p.get("asset") or p.get("baseline") is None:
+                    continue
+
+                fired = datetime.fromisoformat(p["fired_at"])
+                if fired.tzinfo is None:
+                    fired = fired.replace(tzinfo=timezone.utc)
+                hours_left = float(p.get("hours_left") or 0)
+                if hours_left <= 0:
+                    hours_left = 0.05
+                expiry = fired + timedelta(hours=hours_left)
+
+                if now < expiry + timedelta(minutes=2):
+                    continue
+
+                # Try Polymarket Gamma API for resolution
+                won = None
+                condition_id = p.get("condition_id")
+                slug = p.get("slug")
+                if condition_id or slug:
+                    try:
+                        import requests as req
+                        lookup = slug or condition_id
+                        mr = req.get("{}/markets/{}".format(POLY_GAMMA_API, lookup), timeout=10)
+                        if mr.status_code == 200:
+                            mdata = mr.json()
+                            # Check if resolved
+                            is_closed = mdata.get("closed") or mdata.get("active") == False
+                            wi = mdata.get("winningOutcomeIndex")
+                            if is_closed and wi is not None:
+                                # winningOutcomeIndex: 0 = first outcome (UP), 1 = second (DOWN)
+                                market_went_up = (wi == 0)
+                                bet_side = p.get("bet_side") or "UP"
+                                if bet_side == "UP":
+                                    won = market_went_up
+                                else:
+                                    won = not market_went_up
+                    except:
+                        pass
+
+                # Fallback: use current price vs baseline
+                if won is None:
+                    # Only use fallback if enough time has passed
+                    if now < expiry + timedelta(minutes=5):
+                        continue
+                    current_price = get_price(p["asset"])
+                    if current_price is None:
+                        continue
+                    baseline = float(p["baseline"])
+                    market_went_up = current_price > baseline
+                    bet_side = p.get("bet_side") or "UP"
+                    if bet_side == "UP":
+                        won = market_went_up
+                    else:
+                        won = not market_went_up
+
+                outcome = "WIN" if won else "LOSS"
+                status = "✅ Won" if won else "❌ Lost"
+
+                stake = float(p.get("simulated_stake") or 1.0)
+                odds = float(p.get("bet_odds") or 50)
+                share_price = odds / 100.0
+                payout = round((stake / share_price) if won else 0, 4)
+
+                conn2 = get_db()
+                conn2.run(
+                    "UPDATE poly_trades SET status=:s, outcome=:o, resolved_at=:r, simulated_payout=:p WHERE id=:i",
+                    s=status, o=outcome, r=now.isoformat(), p=payout, i=p["id"]
+                )
+                conn2.close()
+                resolved += 1
+
+                # Update balance
+                section = p.get("section", "")
+                strat = p.get("strategy", "")
+                bal = _poly_get_balance(section, strat)
+                if won:
+                    bal += (payout - stake)
+                else:
+                    bal -= stake
+                _poly_set_balance(section, strat, bal)
+
+            except Exception as e:
+                continue
+
+        if resolved > 0:
+            print("Poly resolved: {}".format(resolved))
+        return resolved
+
+    except Exception as e:
+        print("Poly resolve error: {}".format(e))
+        return 0
+
+
+def _poly_scan_loop():
+    """Background thread for Polymarket scanning and resolving."""
+    time.sleep(60)  # Wait for init
+    while True:
+        try:
+            run_poly_scan()
+        except Exception as e:
+            print("Poly scan loop error: {}".format(e))
+        try:
+            _resolve_poly_trades()
+        except Exception as e:
+            print("Poly resolve loop error: {}".format(e))
+        time.sleep(180)  # Every 3 minutes
+
+
+# ═══════════════════════════════════════════════════════════
+# POLYMARKET PAGES
+# ═══════════════════════════════════════════════════════════
+
+def _build_poly_page(section, page_title, subtitle, description):
+    """Build a Polymarket paper trading dashboard page."""
+    strategies = [
+        ("p21", "Paper 2.1", "TV + SMA + BTC Tiebreaker"),
+        ("p23", "Paper 2.3", "P2.1 + Distance Math (Full)"),
+        ("p31", "Paper 3.1", "7 Indicators + BTC Tiebreaker"),
+        ("p33", "Paper 3.3", "P3.1 + Distance Math (Mixed)"),
+    ]
+
+    try:
+        conn = get_db()
+        all_rows = conn.run(
+            "SELECT * FROM poly_trades WHERE section=:sec ORDER BY id DESC",
+            sec=section
+        )
+        cols = [c['name'] for c in conn.columns]
+        all_trades = [dict(zip(cols, r)) for r in all_rows]
+        conn.close()
+    except Exception as e:
+        print("Poly page error {}: {}".format(section, e))
+        all_trades = []
+
+    # Build stats per strategy
+    strat_html_parts = []
+    for strat_id, strat_name, strat_desc in strategies:
+        trades = [t for t in all_trades if t.get("strategy") == strat_id]
+        total = len(trades)
+        wins = sum(1 for t in trades if t.get("outcome") == "WIN")
+        losses = sum(1 for t in trades if t.get("outcome") == "LOSS")
+        pending = sum(1 for t in trades if t.get("status") == "Pending")
+        resolved = wins + losses
+        wr = round(wins / resolved * 100, 1) if resolved > 0 else 0
+
+        pnl = 0
+        for t in trades:
+            if t.get("outcome") == "WIN":
+                pnl += float(t.get("simulated_payout") or 0) - float(t.get("simulated_stake") or 1)
+            elif t.get("outcome") == "LOSS":
+                pnl -= float(t.get("simulated_stake") or 1)
+        pnl = round(pnl, 2)
+
+        bal = _poly_get_balance(section, strat_id)
+
+        # By asset
+        asset_stats = {}
+        for t in trades:
+            a = t.get("asset") or "?"
+            if a not in asset_stats:
+                asset_stats[a] = {"w": 0, "l": 0, "profit": 0.0}
+            if t.get("outcome") == "WIN":
+                asset_stats[a]["w"] += 1
+                asset_stats[a]["profit"] += float(t.get("simulated_payout") or 0) - 1.0
+            elif t.get("outcome") == "LOSS":
+                asset_stats[a]["l"] += 1
+                asset_stats[a]["profit"] -= 1.0
+
+        asset_html = ""
+        for a in sorted(asset_stats.keys()):
+            s = asset_stats[a]
+            at = s["w"] + s["l"]
+            awr = round(s["w"] / at * 100, 1) if at > 0 else 0
+            asset_html += '<span style="margin-right:15px;"><b>{}</b>: {}% ({}W/{}L) ${:.2f}</span>'.format(
+                a, awr, s["w"], s["l"], s["profit"])
+
+        # Recent trades
+        trade_rows = ""
+        for t in trades[:30]:
+            status = t.get("status", "Pending")
+            pnl_cell = ""
+            if t.get("outcome") == "WIN":
+                pnl_val = float(t.get("simulated_payout") or 0) - float(t.get("simulated_stake") or 1)
+                pnl_cell = '<span style="color:#4ade80">+${:.2f}</span>'.format(pnl_val)
+            elif t.get("outcome") == "LOSS":
+                pnl_cell = '<span style="color:#f87171">-${:.2f}</span>'.format(float(t.get("simulated_stake") or 1))
+            else:
+                pnl_cell = "—"
+
+            trade_rows += """<tr>
+                <td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}%</td>
+                <td>{}</td><td>{}</td><td>{}</td><td>{}</td>
+            </tr>""".format(
+                t.get("id", ""),
+                (t.get("title") or "")[:50],
+                t.get("asset", ""),
+                t.get("bet_side", ""),
+                t.get("bet_odds", ""),
+                t.get("market_type", ""),
+                pnl_cell,
+                status,
+                (t.get("fired_at") or "")[:16]
+            )
+
+        strat_html_parts.append("""
+        <div style="background:#1e1e2e; border:1px solid #333; border-radius:10px; padding:20px; margin-bottom:20px;">
+            <h3 style="color:#a78bfa; margin-top:0;">{name} — {desc}</h3>
+            <div style="display:flex; gap:30px; flex-wrap:wrap; margin-bottom:15px;">
+                <div><b>Balance:</b> ${bal:.2f}</div>
+                <div><b>Trades:</b> {total}</div>
+                <div><b>Win Rate:</b> <span style="color:{'#4ade80' if wr >= 60 else '#fbbf24' if wr >= 50 else '#f87171'}">{wr}%</span></div>
+                <div><b>W/L:</b> {wins}W/{losses}L</div>
+                <div><b>Pending:</b> {pending}</div>
+                <div><b>P&L:</b> <span style="color:{'#4ade80' if pnl >= 0 else '#f87171'}">${pnl:.2f}</span></div>
+            </div>
+            <div style="margin-bottom:15px; font-size:0.85em;">{assets}</div>
+            <details>
+                <summary style="cursor:pointer; color:#a78bfa;">Show Trades ({total})</summary>
+                <div style="overflow-x:auto; margin-top:10px;">
+                    <table style="width:100%; border-collapse:collapse; font-size:0.8em;">
+                        <tr style="background:#252540;">
+                            <th>#</th><th>Market</th><th>Asset</th><th>Side</th><th>Odds</th>
+                            <th>Type</th><th>P&L</th><th>Status</th><th>Time</th>
+                        </tr>
+                        {rows}
+                    </table>
+                </div>
+            </details>
+        </div>
+        """.format(
+            name=strat_name, desc=strat_desc, bal=bal,
+            total=total, wr=wr, wins=wins, losses=losses, pending=pending,
+            pnl=pnl, assets=asset_html, rows=trade_rows
+        ))
+
+    # Build nav
+    poly_nav = """
+    <div style="display:flex; gap:10px; margin-bottom:20px; flex-wrap:wrap;">
+        <a href="/app/poly/btc5m" style="padding:8px 16px; background:{}; color:white; text-decoration:none; border-radius:6px;">BTC 5M</a>
+        <a href="/app/poly/all5m" style="padding:8px 16px; background:{}; color:white; text-decoration:none; border-radius:6px;">All 5M</a>
+        <a href="/app/poly/all15m" style="padding:8px 16px; background:{}; color:white; text-decoration:none; border-radius:6px;">All 15M</a>
+        <a href="/app/poly/all1h" style="padding:8px 16px; background:{}; color:white; text-decoration:none; border-radius:6px;">All 1H</a>
+        <a href="/app" style="padding:8px 16px; background:#333; color:white; text-decoration:none; border-radius:6px;">← Limitless</a>
+    </div>
+    """.format(
+        "#7c3aed" if section == "btc5m" else "#444",
+        "#7c3aed" if section == "all5m" else "#444",
+        "#7c3aed" if section == "all15m" else "#444",
+        "#7c3aed" if section == "all1h" else "#444",
+    )
+
+    body = """<!DOCTYPE html>
+<html><head><title>{title}</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="refresh" content="60">
+<style>
+body {{ background:#0d0d1a; color:#e0e0e0; font-family:system-ui; padding:20px; margin:0; }}
+h1 {{ color:#a78bfa; }} h2 {{ color:#7c3aed; }}
+table th, table td {{ padding:6px 8px; text-align:left; border-bottom:1px solid #333; }}
+details summary {{ font-weight:bold; }}
+</style></head><body>
+{nav}
+<h1>{title}</h1>
+<p style="color:#999;">{subtitle}</p>
+<p style="color:#666; font-size:0.85em;">{desc}</p>
+{strats}
+<p style="color:#555; font-size:0.75em; margin-top:30px;">
+Polymarket paper trading · $1 simulated stakes · Auto-resolves · Auto-refresh 60s</p>
+</body></html>""".format(
+        title=page_title, subtitle=subtitle, desc=description,
+        nav=poly_nav, strats="\n".join(strat_html_parts)
+    )
+
+    return body
+
+
+@app.route("/app/poly/btc5m")
+def poly_btc5m_page():
+    return _build_poly_page(
+        "btc5m",
+        "Polymarket — BTC 5M Only",
+        "4 strategies paper trading on Bitcoin 5-minute Up/Down markets",
+        "Tests P2.1, P2.3, P3.1, P3.3 strategies on Polymarket BTC 5M markets using 5-minute candle data from yfinance."
+    )
+
+@app.route("/app/poly/all5m")
+def poly_all5m_page():
+    return _build_poly_page(
+        "all5m",
+        "Polymarket — All Pairs 5M",
+        "4 strategies on all 5-minute crypto Up/Down markets (BTC, ETH, SOL, XRP)",
+        "Tests all strategies across all available 5M Polymarket crypto pairs."
+    )
+
+@app.route("/app/poly/all15m")
+def poly_all15m_page():
+    return _build_poly_page(
+        "all15m",
+        "Polymarket — All Pairs 15M",
+        "4 strategies on all 15-minute crypto Up/Down markets",
+        "Tests all strategies across all available 15M Polymarket crypto pairs."
+    )
+
+@app.route("/app/poly/all1h")
+def poly_all1h_page():
+    return _build_poly_page(
+        "all1h",
+        "Polymarket — All Pairs 1H",
+        "4 strategies on all 1-hour crypto Up/Down markets",
+        "Tests all strategies across all available 1H Polymarket crypto pairs."
+    )
+
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
