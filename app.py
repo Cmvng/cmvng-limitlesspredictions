@@ -9475,14 +9475,11 @@ try:
                           ("p22", _bot22_state), ("p32", _bot32_state)]:
             _save_bot_balance(_bn, _bs)
         print("No saved balances — starting fresh at $15.00 each")
-    # Clear old Polymarket trades (bad baseline data) and reset poly balances
+    # Clear old Polymarket trades (bad baseline data)
     try:
         _pc = get_db()
         _pc.run("DELETE FROM poly_trades")
         _pc.close()
-        for _ps in ["btc5m", "all5m", "all15m", "all1h"]:
-            for _pst in ["p21", "p23", "p31", "p33"]:
-                _poly_set_balance(_ps, _pst, 20.0)
         print("Cleared old Polymarket trades — fresh start with correct baseline")
     except Exception as e:
         print("Poly cleanup note: {}".format(e))
@@ -9502,6 +9499,132 @@ if SIGNALS_DB_URL:
 
 POLY_GAMMA_API = "https://gamma-api.polymarket.com"
 POLY_CLOB_API = "https://clob.polymarket.com"
+POLY_RTDS_URL = "wss://ws-live-data.polymarket.com"
+
+# ── Chainlink RTDS Price Cache ──
+# Stores latest Chainlink price per asset AND the Price to Beat per window
+_chainlink_prices = {}  # {"BTC": 78900.50, "ETH": 2400.10, ...}
+_chainlink_ptb = {}     # {"BTC_5M_1776888000": 78684.13, "BTC_15M_1776888900": 78690.20, ...}
+_chainlink_connected = False
+
+def _rtds_price_to_beat(asset, timeframe, end_ts):
+    """Get the Price to Beat for a specific window from Chainlink cache."""
+    key = "{}_{}_{}".format(asset, timeframe, end_ts)
+    return _chainlink_ptb.get(key)
+
+def _rtds_current_price(asset):
+    """Get latest Chainlink price for an asset."""
+    return _chainlink_prices.get(asset)
+
+def _rtds_loop():
+    """Background thread: connect to Polymarket RTDS WebSocket for Chainlink prices."""
+    global _chainlink_connected
+    import websocket
+    
+    pair_map = {
+        "btc/usd": "BTC", "eth/usd": "ETH",
+        "sol/usd": "SOL", "xrp/usd": "XRP",
+    }
+    
+    def on_message(ws, message):
+        global _chainlink_connected
+        _chainlink_connected = True
+        try:
+            if message == "PONG":
+                return
+            # Parse: "timestamp,datetime,pair,price" or JSON
+            if message.startswith("{"):
+                return  # subscription confirmation
+            
+            parts = message.split(",")
+            if len(parts) >= 4:
+                ts_ms = int(parts[0])
+                pair = parts[2].strip()
+                price = float(parts[3].strip())
+                
+                asset = pair_map.get(pair)
+                if not asset:
+                    return
+                
+                _chainlink_prices[asset] = price
+                ts_sec = ts_ms // 1000
+                
+                # Check if this is the first price at a window boundary
+                # 5M windows: every 300 seconds
+                # 15M windows: every 900 seconds
+                # 1H windows: every 3600 seconds
+                for tf_label, tf_sec in [("5M", 300), ("15M", 900), ("1H", 3600)]:
+                    window_start = (ts_sec // tf_sec) * tf_sec
+                    window_end = window_start + tf_sec
+                    ptb_key = "{}_{}_{}".format(asset, tf_label, window_end)
+                    
+                    # Only store the FIRST price at/after window boundary
+                    # (within first 5 seconds of the window)
+                    if ts_sec - window_start <= 5 and ptb_key not in _chainlink_ptb:
+                        _chainlink_ptb[ptb_key] = price
+                        print("PTB {} {} = ${:,.2f}".format(asset, tf_label, price))
+                
+                # Clean old entries (keep last 2 hours)
+                cutoff = ts_sec - 7200
+                old_keys = [k for k in _chainlink_ptb if int(k.rsplit("_", 1)[1]) < cutoff]
+                for k in old_keys:
+                    del _chainlink_ptb[k]
+                    
+        except Exception as e:
+            pass
+    
+    def on_error(ws, error):
+        global _chainlink_connected
+        _chainlink_connected = False
+        print("RTDS error: {}".format(error))
+    
+    def on_close(ws, close_status, close_msg):
+        global _chainlink_connected
+        _chainlink_connected = False
+        print("RTDS disconnected — will reconnect")
+    
+    def on_open(ws):
+        global _chainlink_connected
+        _chainlink_connected = True
+        # Subscribe to Chainlink prices
+        sub = json.dumps({
+            "action": "subscribe",
+            "subscriptions": [{
+                "topic": "crypto_prices_chainlink",
+                "type": "update",
+                "filters": "btc/usd,eth/usd,sol/usd,xrp/usd"
+            }]
+        })
+        ws.send(sub)
+        print("RTDS connected — subscribed to Chainlink prices")
+        
+        # Start ping thread
+        def ping():
+            while ws.sock and ws.sock.connected:
+                try:
+                    ws.send("PING")
+                except:
+                    break
+                time.sleep(5)
+        threading.Thread(target=ping, daemon=True).start()
+    
+    # Reconnect loop
+    while True:
+        try:
+            ws = websocket.WebSocketApp(
+                POLY_RTDS_URL,
+                on_message=on_message,
+                on_error=on_error,
+                on_close=on_close,
+                on_open=on_open
+            )
+            ws.run_forever(ping_interval=0)  # We handle pings manually
+        except Exception as e:
+            print("RTDS connection error: {}".format(e))
+        
+        _chainlink_connected = False
+        time.sleep(10)  # Wait before reconnect
+
 
 # Polymarket balance tracking: {section}_{strategy} → balance
 _poly_balances = {}
@@ -9844,16 +9967,32 @@ def _poly_fetch_markets():
 
 def _poly_get_baseline(parsed, price, indicators):
     """Get baseline (Price to Beat) for a Polymarket market.
-    Price to Beat = Chainlink price at window open ≈ yfinance candle open.
-    This is the price the market resolves against."""
-    # First check if parsed from API description
+    Priority: 1. Exact Chainlink price from RTDS WebSocket
+              2. Price from API description
+              3. yfinance candle open (fallback)"""
+    # Source 1: Exact Chainlink Price to Beat from RTDS
+    asset = parsed.get("asset", "")
+    tf = parsed.get("timeframe", "")
+    expiry_dt = parsed.get("expiry_dt")
+    if expiry_dt and asset and tf:
+        end_ts = int(expiry_dt.timestamp())
+        ptb = _rtds_price_to_beat(asset, tf, end_ts)
+        if ptb:
+            return ptb
+    
+    # Source 2: From API description (if regex found a price)
     if parsed.get("baseline") and parsed["baseline"] > 0:
         return parsed["baseline"]
-    # Use yfinance candle open price — this matches the window open
-    # which is what Polymarket uses as the Price to Beat
+    
+    # Source 3: Latest Chainlink price (close but not exact PTB)
+    chainlink = _rtds_current_price(asset)
+    if chainlink:
+        return chainlink
+    
+    # Source 4: yfinance candle open (last resort)
     if indicators and indicators.get("candle_open"):
         return indicators["candle_open"]
-    # Last resort fallback
+    
     return price
 
 
@@ -10404,10 +10543,11 @@ def poly_all1h_page():
     )
 
 
-# Start Polymarket thread (defined above)
+# Start Polymarket threads (defined above)
+threading.Thread(target=_rtds_loop, daemon=True).start()
 threading.Thread(target=_poly_scan_loop, daemon=True).start()
-print("Limitless Bot v4 — {} threads running (Polymarket enabled{})".format(
-    6 if SIGNALS_DB_URL else 5,
+print("Limitless Bot v4 — {} threads running (Polymarket + Chainlink RTDS{})".format(
+    7 if SIGNALS_DB_URL else 6,
     " + signals DB" if SIGNALS_DB_URL else ""))
 
 if __name__ == "__main__":
