@@ -117,7 +117,35 @@ _bot31_state = {
     "max_loss_pct": 0.60,
     "starting_balance": 20.0,
     "floor_balance": 5.0,
-    "compound_threshold": 9999.0,  # Never compound — fixed $1 stakes
+    "compound_threshold": 9999.0,
+}
+
+# Paper 2.2: Bot 2.1 strategy, 15M ONLY (LIVE trading)
+_bot22_state = {
+    "enabled": True,
+    "balance": 20.0,
+    "peak_balance": 20.0,
+    "daily_loss": 0.0,
+    "daily_profit": 0.0,
+    "trades_today": 0,
+    "last_reset": None,
+    "min_stake": 1.0,
+    "starting_balance": 20.0,
+    "floor_balance": 5.0,
+}
+
+# Paper 3.2: Bot 3.1 strategy, 15M ONLY (LIVE trading)
+_bot32_state = {
+    "enabled": True,
+    "balance": 20.0,
+    "peak_balance": 20.0,
+    "daily_loss": 0.0,
+    "daily_profit": 0.0,
+    "trades_today": 0,
+    "last_reset": None,
+    "min_stake": 1.0,
+    "starting_balance": 20.0,
+    "floor_balance": 5.0,
 }
 
 FAVOURITE_HOURLY = ["ADA", "BNB", "DOGE"]
@@ -4213,7 +4241,7 @@ def run_paper34_scan():
                         except Exception as e:
                             print("Paper51 save error: {}".format(e))
 
-                # Paper 2.2: Same as P2.1 but 15M ONLY
+                # Paper 2.2: Same as P2.1 but 15M ONLY (LIVE trading)
                 if parsed["market_id"] not in p22_ids:
                     scored22 = _score_paper21_trade(parsed, price, indicators=ind, ind_macro=ind_macro, expiry_minute=expiry_minute, expiry_hour=expiry_hour)
                     if scored22 and scored22["market_type"] == "15M":
@@ -4242,7 +4270,28 @@ def run_paper34_scan():
                         except Exception as e:
                             print("Paper22 save error: {}".format(e))
 
-                # Paper 3.2: Same as P3.1 but 15M ONLY
+                        # P2.2 LIVE trade
+                        floor22 = _bot22_state.get("floor_balance", 5)
+                        if _bot22_state["enabled"] and _bot22_state["balance"] > floor22 and not _is_volatile_window():
+                            real_stake22 = _calc_autoscale_stake(_bot22_state)
+                            if real_stake22 <= 0:
+                                if _bot22_state["balance"] <= floor22:
+                                    _bot22_state["enabled"] = False
+                                    send_telegram("⚠️ <b>Paper 2.2 stopped — floor reached</b>\nBalance: ${:.2f}".format(_bot22_state["balance"]))
+                            elif real_stake22 <= _bot22_state["balance"]:
+                                try:
+                                    bal_after22 = round(_bot22_state["balance"] - real_stake22, 2)
+                                    success = execute_trade(parsed, scored22, None, override_stake=real_stake22,
+                                                           bot_name="P2.2", bot_balance_after=bal_after22)
+                                    if success:
+                                        _bot22_state["balance"] = bal_after22
+                                        _bot22_state["trades_today"] += 1
+                                        print("P2.2 TRADE: {} {} ${:.2f} on {} | bal=${:.2f}".format(
+                                            scored22["bet_side"], asset, real_stake22, parsed["title"][:30], _bot22_state["balance"]))
+                                except Exception as te:
+                                    print("P2.2 trade error: {}".format(te))
+
+                # Paper 3.2: Same as P3.1 but 15M ONLY (LIVE trading)
                 if parsed["market_id"] not in p32_ids:
                     scored32 = _score_paper31_trade(parsed, price, ind, ind_macro=ind_macro, expiry_minute=expiry_minute, expiry_hour=expiry_hour)
                     if scored32 and scored32["market_type"] == "15M":
@@ -4270,6 +4319,27 @@ def run_paper34_scan():
                             p32_count += 1
                         except Exception as e:
                             print("Paper32 save error: {}".format(e))
+
+                        # P3.2 LIVE trade
+                        floor32 = _bot32_state.get("floor_balance", 5)
+                        if _bot32_state["enabled"] and _bot32_state["balance"] > floor32 and not _is_volatile_window():
+                            real_stake32 = _calc_autoscale_stake(_bot32_state)
+                            if real_stake32 <= 0:
+                                if _bot32_state["balance"] <= floor32:
+                                    _bot32_state["enabled"] = False
+                                    send_telegram("⚠️ <b>Paper 3.2 stopped — floor reached</b>\nBalance: ${:.2f}".format(_bot32_state["balance"]))
+                            elif real_stake32 <= _bot32_state["balance"]:
+                                try:
+                                    bal_after32 = round(_bot32_state["balance"] - real_stake32, 2)
+                                    success = execute_trade(parsed, scored32, None, override_stake=real_stake32,
+                                                           bot_name="P3.2", bot_balance_after=bal_after32)
+                                    if success:
+                                        _bot32_state["balance"] = bal_after32
+                                        _bot32_state["trades_today"] += 1
+                                        print("P3.2 TRADE: {} {} ${:.2f} on {} | bal=${:.2f}".format(
+                                            scored32["bet_side"], asset, real_stake32, parsed["title"][:30], _bot32_state["balance"]))
+                                except Exception as te:
+                                    print("P3.2 trade error: {}".format(te))
 
             except Exception as e:
                 print("Paper345 market error: {}".format(e))
@@ -4412,6 +4482,40 @@ def _resolve_paper_table(table_name):
                         emoji = "✅" if won else "❌"
                         print("P3.1 #{} {}: stake=${:.2f} payout=${:.2f} bal=${:.2f}".format(
                             p["id"], "WIN" if won else "LOSS", stake, payout, _bot31_state["balance"]))
+
+                # Update Paper 2.2 balance
+                if table_name == "paper22_trades":
+                    fired = p.get("fired_at") or ""
+                    is_live_trade = fired >= "2026-04-22T09:00"
+                    if is_live_trade:
+                        if won:
+                            _bot22_state["balance"] = round(_bot22_state["balance"] + payout, 2)
+                            _bot22_state["daily_profit"] = round(_bot22_state["daily_profit"] + (payout - stake), 2)
+                        else:
+                            _bot22_state["daily_loss"] = round(_bot22_state["daily_loss"] + stake, 2)
+                        floor22 = _bot22_state.get("floor_balance", 0)
+                        if _bot22_state["balance"] <= floor22:
+                            _bot22_state["enabled"] = False
+                            send_telegram("⚠️ <b>Paper 2.2 stopped — floor reached</b>\nBalance: ${:.2f}".format(_bot22_state["balance"]))
+                        print("P2.2 #{} {}: stake=${:.2f} payout=${:.2f} bal=${:.2f}".format(
+                            p["id"], "WIN" if won else "LOSS", stake, payout, _bot22_state["balance"]))
+
+                # Update Paper 3.2 balance
+                if table_name == "paper32_trades":
+                    fired = p.get("fired_at") or ""
+                    is_live_trade = fired >= "2026-04-22T09:00"
+                    if is_live_trade:
+                        if won:
+                            _bot32_state["balance"] = round(_bot32_state["balance"] + payout, 2)
+                            _bot32_state["daily_profit"] = round(_bot32_state["daily_profit"] + (payout - stake), 2)
+                        else:
+                            _bot32_state["daily_loss"] = round(_bot32_state["daily_loss"] + stake, 2)
+                        floor32 = _bot32_state.get("floor_balance", 0)
+                        if _bot32_state["balance"] <= floor32:
+                            _bot32_state["enabled"] = False
+                            send_telegram("⚠️ <b>Paper 3.2 stopped — floor reached</b>\nBalance: ${:.2f}".format(_bot32_state["balance"]))
+                        print("P3.2 #{} {}: stake=${:.2f} payout=${:.2f} bal=${:.2f}".format(
+                            p["id"], "WIN" if won else "LOSS", stake, payout, _bot32_state["balance"]))
 
                 # SKIP duplicate Bot 3 balance update below
                 if False and table_name == "paper3_trades":
@@ -6876,6 +6980,70 @@ def p31_stop():
     _bot31_state["enabled"] = False
     return {"status": "Paper 3.1 stopped", "balance": _bot31_state["balance"]}, 200
 
+@app.route("/p22/status", methods=["GET"])
+def p22_status():
+    return {
+        "enabled": _bot22_state["enabled"],
+        "balance": _bot22_state["balance"],
+        "peak_balance": _bot22_state.get("peak_balance", _bot22_state["balance"]),
+        "floor_balance": _bot22_state.get("floor_balance", 5),
+        "current_stake": _calc_autoscale_stake(_bot22_state),
+        "trades_today": _bot22_state["trades_today"],
+        "mode": "Paper 2.2: Bot 2.1 strategy, 15M ONLY",
+    }, 200
+
+@app.route("/p22/start", methods=["GET"])
+def p22_start():
+    _bot22_state["enabled"] = True
+    return {"status": "Paper 2.2 started", "balance": _bot22_state["balance"]}, 200
+
+@app.route("/p22/stop", methods=["GET"])
+def p22_stop():
+    _bot22_state["enabled"] = False
+    return {"status": "Paper 2.2 stopped", "balance": _bot22_state["balance"]}, 200
+
+@app.route("/p22/set", methods=["GET"])
+def p22_set():
+    if request.args.get("balance"):
+        _bot22_state["balance"] = float(request.args["balance"])
+        _bot22_state["starting_balance"] = float(request.args["balance"])
+        _bot22_state["peak_balance"] = float(request.args["balance"])
+    if request.args.get("floor"):
+        _bot22_state["floor_balance"] = float(request.args["floor"])
+    return {"balance": _bot22_state["balance"], "floor": _bot22_state.get("floor_balance", 0), "stake": _calc_autoscale_stake(_bot22_state)}, 200
+
+@app.route("/p32/status", methods=["GET"])
+def p32_status():
+    return {
+        "enabled": _bot32_state["enabled"],
+        "balance": _bot32_state["balance"],
+        "peak_balance": _bot32_state.get("peak_balance", _bot32_state["balance"]),
+        "floor_balance": _bot32_state.get("floor_balance", 5),
+        "current_stake": _calc_autoscale_stake(_bot32_state),
+        "trades_today": _bot32_state["trades_today"],
+        "mode": "Paper 3.2: Bot 3.1 strategy, 15M ONLY",
+    }, 200
+
+@app.route("/p32/start", methods=["GET"])
+def p32_start():
+    _bot32_state["enabled"] = True
+    return {"status": "Paper 3.2 started", "balance": _bot32_state["balance"]}, 200
+
+@app.route("/p32/stop", methods=["GET"])
+def p32_stop():
+    _bot32_state["enabled"] = False
+    return {"status": "Paper 3.2 stopped", "balance": _bot32_state["balance"]}, 200
+
+@app.route("/p32/set", methods=["GET"])
+def p32_set():
+    if request.args.get("balance"):
+        _bot32_state["balance"] = float(request.args["balance"])
+        _bot32_state["starting_balance"] = float(request.args["balance"])
+        _bot32_state["peak_balance"] = float(request.args["balance"])
+    if request.args.get("floor"):
+        _bot32_state["floor_balance"] = float(request.args["floor"])
+    return {"balance": _bot32_state["balance"], "floor": _bot32_state.get("floor_balance", 0), "stake": _calc_autoscale_stake(_bot32_state)}, 200
+
 @app.route("/football/clear", methods=["GET"])
 def clear_football_picks():
     """Wipe old accumulator picks with broken formatting. Run once, then /football/scan."""
@@ -8767,22 +8935,26 @@ def paper4_page():
 
 @app.route("/app/paper22")
 def paper22_page():
+    bal22 = "${:.2f}".format(_bot22_state["balance"])
+    stake22 = "${:.2f}".format(_calc_autoscale_stake(_bot22_state))
     return _build_paper_page(
         "paper22_trades",
         "Paper 2.2 — 15M Only",
-        "Bot 2 Strategy + BTC Tiebreaker + Pullback · 15M Markets Only",
-        "Same as Paper 2.1 but only trades 15-minute markets. No 1H or Daily. Data shows 15M has 71.2% win rate vs 52.8% on 1H.",
+        "Bot 2.1 Strategy + BTC Tiebreaker + Pullback · 15M Only · Balance: {} · Stake: {} · LIVE".format(bal22, stake22),
+        "Same as Paper 2.1 but only trades 15-minute markets. Fixed-step auto-scaling: $1→$2→$5→$10→$20.",
         ["Score", "Indicators"],
         "paper22"
     )
 
 @app.route("/app/paper32")
 def paper32_page():
+    bal32 = "${:.2f}".format(_bot32_state["balance"])
+    stake32 = "${:.2f}".format(_calc_autoscale_stake(_bot32_state))
     return _build_paper_page(
         "paper32_trades",
         "Paper 3.2 — 15M Only",
-        "Paper 3.1 Strategy + Dual Timeframe · 15M Markets Only",
-        "Same as Paper 3.1 but only trades 15-minute markets. No 1H or Daily. Data shows 15M has 70.5% win rate vs 43.3% on 1H.",
+        "Paper 3.1 Strategy + Dual Timeframe · 15M Only · Balance: {} · Stake: {} · LIVE".format(bal32, stake32),
+        "Same as Paper 3.1 but only trades 15-minute markets. Fixed-step auto-scaling: $1→$2→$5→$10→$20.",
         ["Score", "Indicators"],
         "paper32"
     )
