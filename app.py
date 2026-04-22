@@ -55,18 +55,18 @@ _trading_state = {
 
 # Bot 2: Low odds strategy (20-72%, trends aligned)
 _bot2_state = {
-    "enabled": True,
-    "balance": 30.0,
+    "enabled": False,             # PAUSED — P2.1 and P3.1 running instead
+    "balance": 19.16,
     "daily_loss": 0.0,
     "daily_profit": 0.0,
     "trades_today": 0,
     "last_reset": None,
-    "stake_pct": 0.025,          # 2.5% when compounding
+    "stake_pct": 0.025,
     "min_stake": 1.0,
     "max_loss_pct": 0.60,
     "starting_balance": 30.0,
     "floor_balance": 10.0,
-    "compound_threshold": 1.10,  # 10% profit (best performer)
+    "compound_threshold": 1.10,
 }
 
 # Bot 3: Smart Momentum (multi-indicator, 30-70% odds)
@@ -3212,10 +3212,13 @@ def _score_paper31_trade(p, price, indicators, ind_macro=None, expiry_minute=Non
         m_sma = ind_macro.get("sma_trend")
         m_ut = ind_macro.get("ut_trend")
         m_ema = ind_macro.get("ema_stack")
-        m_buy = sum(1 for s in [m_sma, m_ut, m_ema, btc_trend] if s in ("BUY", "STRONG_BUY"))
-        m_sell = sum(1 for s in [m_sma, m_ut, m_ema, btc_trend] if s in ("SELL", "STRONG_SELL"))
-        if m_buy >= 3: macro_dir = "BUY"
-        elif m_sell >= 3: macro_dir = "SELL"
+        m_signals = [s for s in [m_sma, m_ut, m_ema, btc_trend] if s is not None]
+        m_buy = sum(1 for s in m_signals if s in ("BUY", "STRONG_BUY"))
+        m_sell = sum(1 for s in m_signals if s in ("SELL", "STRONG_SELL"))
+        m_total = len(m_signals)
+        # Need majority: 2/3 or 3/4 or 2/2
+        if m_total >= 2 and m_buy > m_sell and m_buy >= 2: macro_dir = "BUY"
+        elif m_total >= 2 and m_sell > m_buy and m_sell >= 2: macro_dir = "SELL"
 
     # ── Timing ──
     mtype = "15M" if p["is_short"] and p.get("mins_left", 0) <= 20 else "1H" if p["is_short"] else "Daily"
@@ -3334,11 +3337,11 @@ def _score_paper31_trade(p, price, indicators, ind_macro=None, expiry_minute=Non
 # PAPER 2.1: Bot 2 strategy + BTC Tiebreaker + 15M Pullback
 # ═══════════════════════════════════════════════════════════
 
-def _score_paper21_trade(p, price, indicators=None, expiry_minute=None):
+def _score_paper21_trade(p, price, indicators=None, ind_macro=None, expiry_minute=None, expiry_hour=None):
     """Paper 2.1: Bot 2's TV + SMA + BTC signals with:
     1. BTC as tiebreaker (pair's TV + SMA lead, BTC confirms/ignored)
     2. 15M pullback detection using UT Bot gatekeeper during weak periods
-    Does NOT include 4H pullback for 1H (waiting for Paper 3.1 data).
+    3. 4H pullback for 1H markets (hours 3-4 of 4H block)
     """
     if price is None:
         return None
@@ -3404,26 +3407,40 @@ def _score_paper21_trade(p, price, indicators=None, expiry_minute=None):
     if sqz_val is not None and sqz_prev is not None:
         sqz_dir = "BUY" if sqz_val > 0 else "SELL" if sqz_val < 0 else None
 
+    # ── Macro direction (4H for 1H markets) ──
+    macro_dir = None
+    if ind_macro:
+        m_sma = ind_macro.get("sma_trend")
+        m_ut = ind_macro.get("ut_trend")
+        m_ema = ind_macro.get("ema_stack")
+        m_signals = [s for s in [m_sma, m_ut, m_ema, btc_trend] if s is not None]
+        m_buy = sum(1 for s in m_signals if s in ("BUY", "STRONG_BUY"))
+        m_sell = sum(1 for s in m_signals if s in ("SELL", "STRONG_SELL"))
+        m_total = len(m_signals)
+        if m_total >= 2 and m_buy > m_sell and m_buy >= 2: macro_dir = "BUY"
+        elif m_total >= 2 and m_sell > m_buy and m_sell >= 2: macro_dir = "SELL"
+
     # ── Market timing ──
     mtype = "15M" if p["is_short"] and p.get("mins_left", 0) <= 20 else "1H" if p["is_short"] else "Daily"
     is_weak_period = False
     if mtype == "15M" and expiry_minute is not None:
         is_weak_period = expiry_minute in (0, 30)
+    elif mtype == "1H" and expiry_hour is not None:
+        hour_in_4h = expiry_hour % 4
+        is_weak_period = hour_in_4h in (2, 3)
 
     # ── Decision ──
     bet_side = None
     confidence = "LOW"
     reason = ""
 
-    if mtype == "15M" and is_weak_period and ut_trend:
-        # ═══ WEAK PERIOD: UT Bot gatekeeper ═══
-        # Macro = pair_dir (what TV+SMA say on the broader trend)
-        macro_for_pullback = pair_dir
-        ut_opposes = (ut_trend == "SELL" and macro_for_pullback == "BUY") or (ut_trend == "BUY" and macro_for_pullback == "SELL")
+    if is_weak_period and (ut_trend or macro_dir):
+        # ═══ WEAK PERIOD: UT Bot gatekeeper (15M and 1H) ═══
+        macro_for_pullback = macro_dir if mtype == "1H" and macro_dir else pair_dir
+        ut_opposes = (ut_trend == "SELL" and macro_for_pullback == "BUY") or (ut_trend == "BUY" and macro_for_pullback == "SELL") if ut_trend else False
         sqz_opposes = (sqz_dir == "SELL" and macro_for_pullback == "BUY") or (sqz_dir == "BUY" and macro_for_pullback == "SELL") if sqz_dir else False
 
         if ut_opposes and sqz_opposes:
-            # S4: both oppose → FLIP HIGH
             if macro_for_pullback == "BUY":
                 bet_side = "NO" if p["direction"] == "above" else "YES"
                 confidence = "HIGH"; reason = "PULLBACK_S4_BEAR"
@@ -3431,7 +3448,6 @@ def _score_paper21_trade(p, price, indicators=None, expiry_minute=None):
                 bet_side = "YES" if p["direction"] == "above" else "NO"
                 confidence = "HIGH"; reason = "PULLBACK_S4_BULL"
         elif ut_opposes and not sqz_opposes:
-            # S3: UT only → FLIP MEDIUM
             if macro_for_pullback == "BUY":
                 bet_side = "NO" if p["direction"] == "above" else "YES"
                 confidence = "MEDIUM"; reason = "PULLBACK_S3_BEAR"
@@ -3451,7 +3467,7 @@ def _score_paper21_trade(p, price, indicators=None, expiry_minute=None):
                 confidence = "HIGH" if btc_agrees else "MEDIUM"
                 reason = "WEAK_TREND_HOLDS_BEAR"
     else:
-        # ═══ STRONG PERIOD or 1H/Daily ═══
+        # ═══ STRONG PERIOD ═══
         if pair_dir == "BUY" and price_above:
             bet_side = "YES" if p["direction"] == "above" else "NO"
             confidence = "HIGH" if btc_agrees else "MEDIUM"
@@ -3481,7 +3497,9 @@ def _score_paper21_trade(p, price, indicators=None, expiry_minute=None):
     if ut_trend: indicator_details.append("UT={}".format(ut_trend))
     if sqz_dir: indicator_details.append("SQZ={}".format(sqz_dir))
     indicator_details.append("BTC:{}".format(btc_role))
-    if is_weak_period: indicator_details.append("WEAK")
+    if is_weak_period:
+        indicator_details.append("WEAK")
+        if macro_dir: indicator_details.append("MACRO={}".format(macro_dir))
     if "PULLBACK" in reason: indicator_details.append("FLIP")
 
     total_signals = sum(1 for s in [tv_dir, sma_dir, btc_trend] if s)
@@ -3921,6 +3939,18 @@ def run_paper34_scan():
 
                 # Paper 3.1: BTC Tiebreaker + Dual Timeframe
                 if parsed["market_id"] not in p31_ids and parsed["market_id"] not in bot12_ids:
+                    # Debug: log 1H macro data
+                    if ind_tf == "1h" and ind_macro:
+                        m_sma_d = ind_macro.get("sma_trend")
+                        m_ut_d = ind_macro.get("ut_trend")
+                        m_ema_d = ind_macro.get("ema_stack")
+                        btc_d = _btc_trend_cache.get("trend")
+                        exp_h = parsed["expiry_dt"].hour if parsed.get("expiry_dt") else None
+                        h_in_4h = exp_h % 4 if exp_h is not None else None
+                        print("4H_DEBUG {}: macro_sma={} ut={} ema={} btc={} | hour={} h_in_4h={} weak={}".format(
+                            asset, m_sma_d, m_ut_d, m_ema_d, btc_d, exp_h, h_in_4h, h_in_4h in (2,3) if h_in_4h is not None else "?"))
+                    elif ind_tf == "1h" and not ind_macro:
+                        print("4H_DEBUG {}: NO MACRO DATA (ind_macro is None)".format(asset))
                     scored31 = _score_paper31_trade(parsed, price, ind, ind_macro=ind_macro, expiry_minute=expiry_minute, expiry_hour=expiry_hour)
                     if scored31:
                         try:
@@ -3970,7 +4000,7 @@ def run_paper34_scan():
 
                 # Paper 2.1: Bot 2 strategy + BTC Tiebreaker + 15M Pullback
                 if parsed["market_id"] not in p21_ids and parsed["market_id"] not in bot12_ids:
-                    scored21 = _score_paper21_trade(parsed, price, indicators=ind, expiry_minute=expiry_minute)
+                    scored21 = _score_paper21_trade(parsed, price, indicators=ind, ind_macro=ind_macro, expiry_minute=expiry_minute, expiry_hour=expiry_hour)
                     if scored21:
                         try:
                             conn21 = get_db()
@@ -4154,7 +4184,7 @@ def _resolve_paper_table(table_name):
                 # P2.1 went live ~18:00 UTC Apr 21, 2026
                 if table_name == "paper21_trades":
                     fired = p.get("fired_at") or ""
-                    is_live_trade = fired >= "2026-04-21T18:00"
+                    is_live_trade = fired >= "2026-04-22T05:30"
                     if is_live_trade:
                         if won:
                             _bot21_state["balance"] = round(_bot21_state["balance"] + payout, 2)
@@ -4173,7 +4203,7 @@ def _resolve_paper_table(table_name):
                 # P3.1 went live ~18:00 UTC Apr 21, 2026
                 if table_name == "paper31_trades":
                     fired = p.get("fired_at") or ""
-                    is_live_trade = fired >= "2026-04-21T18:00"
+                    is_live_trade = fired >= "2026-04-22T05:30"
                     if is_live_trade:
                         if won:
                             _bot31_state["balance"] = round(_bot31_state["balance"] + payout, 2)
