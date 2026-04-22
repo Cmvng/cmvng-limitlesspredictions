@@ -10059,17 +10059,27 @@ def _poly_fetch_markets():
 
 def _poly_get_baseline(parsed, price, indicators):
     """Get the Price to Beat from Chainlink RTDS cache.
-    Returns the latest cached PTB for this asset+timeframe."""
+    ONLY returns if the cached PTB is from the CURRENT window.
+    If stale (from previous window), returns None → market skipped."""
     asset = parsed.get("asset", "")
     tf = parsed.get("timeframe", "")
     key = "{}_{}".format(asset, tf)
     entry = _chainlink_ptb.get(key)
     if entry:
-        return entry[1]  # (end_ts, price) → return price
-    # Fallback: latest Chainlink price
-    chainlink = _chainlink_prices.get(asset)
-    if chainlink:
-        return chainlink
+        stored_end_ts, stored_price = entry
+        # Check if this PTB is from the current time window
+        # Current window end = next boundary from NOW
+        tf_sec = {"5M": 300, "15M": 900, "1H": 3600}.get(tf, 300)
+        now_ts = int(time.time())
+        current_window_start = (now_ts // tf_sec) * tf_sec
+        current_window_end = current_window_start + tf_sec
+        # The stored PTB should be for the current window
+        # (stored_end_ts == current_window_end means PTB was captured at current_window_start)
+        if stored_end_ts == current_window_end:
+            return stored_price
+        # Also accept if we're in the first 30 seconds of a new window
+        # and the PTB hasn't been captured yet for the new window
+        # In this case, return None and let the scanner skip
     return None
 
 
