@@ -4150,35 +4150,43 @@ def _resolve_paper_table(table_name):
                     else:
                         _bot3_state["daily_loss"] = round(_bot3_state["daily_loss"] + stake, 2)
 
-                # Update Paper 2.1 balance
+                # Update Paper 2.1 balance — only for trades placed after live trading enabled
+                # P2.1 went live ~18:00 UTC Apr 21, 2026
                 if table_name == "paper21_trades":
-                    if won:
-                        _bot21_state["balance"] = round(_bot21_state["balance"] + payout, 2)
-                        _bot21_state["daily_profit"] = round(_bot21_state["daily_profit"] + (payout - stake), 2)
-                    else:
-                        _bot21_state["daily_loss"] = round(_bot21_state["daily_loss"] + stake, 2)
-                    floor21 = _bot21_state.get("floor_balance", 0)
-                    if _bot21_state["balance"] <= floor21:
-                        _bot21_state["enabled"] = False
-                        send_telegram("⚠️ <b>Paper 2.1 stopped — floor reached</b>\nBalance: ${:.2f}".format(_bot21_state["balance"]))
-                    emoji = "✅" if won else "❌"
-                    print("P2.1 #{} {}: stake=${:.2f} payout=${:.2f} bal=${:.2f}".format(
-                        p["id"], "WIN" if won else "LOSS", stake, payout, _bot21_state["balance"]))
+                    fired = p.get("fired_at") or ""
+                    is_live_trade = fired >= "2026-04-21T18:00"
+                    if is_live_trade:
+                        if won:
+                            _bot21_state["balance"] = round(_bot21_state["balance"] + payout, 2)
+                            _bot21_state["daily_profit"] = round(_bot21_state["daily_profit"] + (payout - stake), 2)
+                        else:
+                            _bot21_state["daily_loss"] = round(_bot21_state["daily_loss"] + stake, 2)
+                        floor21 = _bot21_state.get("floor_balance", 0)
+                        if _bot21_state["balance"] <= floor21:
+                            _bot21_state["enabled"] = False
+                            send_telegram("⚠️ <b>Paper 2.1 stopped — floor reached</b>\nBalance: ${:.2f}".format(_bot21_state["balance"]))
+                        emoji = "✅" if won else "❌"
+                        print("P2.1 #{} {}: stake=${:.2f} payout=${:.2f} bal=${:.2f}".format(
+                            p["id"], "WIN" if won else "LOSS", stake, payout, _bot21_state["balance"]))
 
-                # Update Paper 3.1 balance
+                # Update Paper 3.1 balance — only for trades placed after live trading enabled
+                # P3.1 went live ~18:00 UTC Apr 21, 2026
                 if table_name == "paper31_trades":
-                    if won:
-                        _bot31_state["balance"] = round(_bot31_state["balance"] + payout, 2)
-                        _bot31_state["daily_profit"] = round(_bot31_state["daily_profit"] + (payout - stake), 2)
-                    else:
-                        _bot31_state["daily_loss"] = round(_bot31_state["daily_loss"] + stake, 2)
-                    floor31 = _bot31_state.get("floor_balance", 0)
-                    if _bot31_state["balance"] <= floor31:
-                        _bot31_state["enabled"] = False
-                        send_telegram("⚠️ <b>Paper 3.1 stopped — floor reached</b>\nBalance: ${:.2f}".format(_bot31_state["balance"]))
-                    emoji = "✅" if won else "❌"
-                    print("P3.1 #{} {}: stake=${:.2f} payout=${:.2f} bal=${:.2f}".format(
-                        p["id"], "WIN" if won else "LOSS", stake, payout, _bot31_state["balance"]))
+                    fired = p.get("fired_at") or ""
+                    is_live_trade = fired >= "2026-04-21T18:00"
+                    if is_live_trade:
+                        if won:
+                            _bot31_state["balance"] = round(_bot31_state["balance"] + payout, 2)
+                            _bot31_state["daily_profit"] = round(_bot31_state["daily_profit"] + (payout - stake), 2)
+                        else:
+                            _bot31_state["daily_loss"] = round(_bot31_state["daily_loss"] + stake, 2)
+                        floor31 = _bot31_state.get("floor_balance", 0)
+                        if _bot31_state["balance"] <= floor31:
+                            _bot31_state["enabled"] = False
+                            send_telegram("⚠️ <b>Paper 3.1 stopped — floor reached</b>\nBalance: ${:.2f}".format(_bot31_state["balance"]))
+                        emoji = "✅" if won else "❌"
+                        print("P3.1 #{} {}: stake=${:.2f} payout=${:.2f} bal=${:.2f}".format(
+                            p["id"], "WIN" if won else "LOSS", stake, payout, _bot31_state["balance"]))
 
                 # SKIP duplicate Bot 3 balance update below
                 if False and table_name == "paper3_trades":
