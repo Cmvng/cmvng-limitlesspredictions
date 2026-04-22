@@ -9656,40 +9656,96 @@ def _poly_parse_market(market):
 
 
 def _poly_fetch_markets():
-    """Fetch active crypto Up/Down markets from Polymarket Gamma API."""
+    """Fetch active crypto Up/Down markets from Polymarket.
+    Uses deterministic slug construction + Gamma API lookup.
+    Slug pattern: {asset}-updown-{tf}-{unix_end_ts}
+    """
     import requests as req
-    all_markets = []
-    try:
-        # Fetch crypto markets — tag_id 21 = crypto
-        for offset in [0, 100]:
+    now = datetime.now(timezone.utc)
+    markets = []
+
+    # Assets and timeframes to scan
+    assets = [
+        ("btc", "BTC"), ("eth", "ETH"), ("sol", "SOL"), ("xrp", "XRP")
+    ]
+    timeframes = [
+        ("5m", 300, "5M"),   # 5 minutes = 300 seconds
+        ("15m", 900, "15M"), # 15 minutes = 900 seconds
+        ("1h", 3600, "1H"),  # 1 hour = 3600 seconds
+    ]
+
+    current_ts = int(now.timestamp())
+
+    for asset_slug, asset_name in assets:
+        for tf_slug, tf_seconds, tf_label in timeframes:
+            # Calculate current and next window end timestamps
+            # Windows are aligned: 5m at :00,:05,:10... 15m at :00,:15,:30,:45... 1h at :00
+            window_start = (current_ts // tf_seconds) * tf_seconds
+            window_end = window_start + tf_seconds
+            next_window_end = window_end + tf_seconds
+
+            # Try current window and next window
+            for end_ts in [window_end, next_window_end]:
+                mins_left = (end_ts - current_ts) / 60.0
+                if mins_left <= 0 or mins_left > (tf_seconds / 60.0) + 2:
+                    continue
+
+                slug = "{}-updown-{}-{}".format(asset_slug, tf_slug, end_ts)
+
+                # Look up this specific market on Gamma API
+                try:
+                    r = req.get(
+                        "{}/markets".format(POLY_GAMMA_API),
+                        params={"slug": slug},
+                        timeout=10
+                    )
+                    if r.status_code == 200:
+                        data = r.json()
+                        # Response could be a list or single market
+                        if isinstance(data, list) and data:
+                            market = data[0]
+                        elif isinstance(data, dict) and data.get("id"):
+                            market = data
+                        else:
+                            continue
+
+                        parsed = _poly_parse_market(market)
+                        if parsed:
+                            markets.append(parsed)
+                except Exception as e:
+                    pass  # Individual market lookup failure — skip silently
+
+    if not markets:
+        # Fallback: try broad search
+        try:
             r = req.get(
                 "{}/markets".format(POLY_GAMMA_API),
-                params={"active": "true", "tag_id": 21, "closed": "false",
-                        "limit": 100, "offset": offset},
+                params={"active": "true", "closed": "false", "limit": 100,
+                        "order": "volume24hr", "ascending": "false"},
                 timeout=15
             )
-            if r.status_code != 200:
-                break
-            batch = r.json()
-            if not batch:
-                break
-            if isinstance(batch, list):
-                all_markets.extend(batch)
-            elif isinstance(batch, dict) and "data" in batch:
-                all_markets.extend(batch["data"])
+            if r.status_code == 200:
+                batch = r.json()
+                if isinstance(batch, list):
+                    for m in batch:
+                        q = (m.get("question") or m.get("title") or "").lower()
+                        if "up or down" in q:
+                            parsed = _poly_parse_market(m)
+                            if parsed:
+                                markets.append(parsed)
+                print("Poly fallback: {} raw, {} parsed".format(
+                    len(batch) if isinstance(batch, list) else 0, len(markets)))
             else:
-                all_markets.extend([batch])
-            if len(batch) < 100:
-                break
-    except Exception as e:
-        print("Poly fetch error: {}".format(e))
+                print("Poly API status: {}".format(r.status_code))
+        except Exception as e:
+            print("Poly fetch error: {}".format(e))
 
-    parsed = []
-    for m in all_markets:
-        p = _poly_parse_market(m)
-        if p:
-            parsed.append(p)
-    return parsed
+    if markets:
+        print("Poly scan: {} markets found".format(len(markets)))
+    else:
+        print("Poly scan: 0 markets from API")
+
+    return markets
 
 
 def _poly_get_baseline(parsed, price, indicators):
@@ -10000,12 +10056,12 @@ def _poly_scan_loop():
 # ═══════════════════════════════════════════════════════════
 
 def _build_poly_page(section, page_title, subtitle, description):
-    """Build a Polymarket paper trading dashboard page."""
+    """Build a Polymarket paper trading dashboard — uses same design as Limitless pages."""
     strategies = [
         ("p21", "Paper 2.1", "TV + SMA + BTC Tiebreaker"),
-        ("p23", "Paper 2.3", "P2.1 + Distance Math (Full)"),
+        ("p23", "Paper 2.3", "P2.1 + Distance Math (Full Confidence)"),
         ("p31", "Paper 3.1", "7 Indicators + BTC Tiebreaker"),
-        ("p33", "Paper 3.3", "P3.1 + Distance Math (Mixed)"),
+        ("p33", "Paper 3.3", "P3.1 + Distance Math (Mixed Mode)"),
     ]
 
     try:
@@ -10021,8 +10077,8 @@ def _build_poly_page(section, page_title, subtitle, description):
         print("Poly page error {}: {}".format(section, e))
         all_trades = []
 
-    # Build stats per strategy
-    strat_html_parts = []
+    # Build strategy sections
+    strat_sections = []
     for strat_id, strat_name, strat_desc in strategies:
         trades = [t for t in all_trades if t.get("strategy") == strat_id]
         total = len(trades)
@@ -10043,6 +10099,7 @@ def _build_poly_page(section, page_title, subtitle, description):
         bal = _poly_get_balance(section, strat_id)
 
         # By asset
+        asset_parts = []
         asset_stats = {}
         for t in trades:
             a = t.get("asset") or "?"
@@ -10054,117 +10111,152 @@ def _build_poly_page(section, page_title, subtitle, description):
             elif t.get("outcome") == "LOSS":
                 asset_stats[a]["l"] += 1
                 asset_stats[a]["profit"] -= 1.0
-
-        asset_html = ""
         for a in sorted(asset_stats.keys()):
             s = asset_stats[a]
             at = s["w"] + s["l"]
             awr = round(s["w"] / at * 100, 1) if at > 0 else 0
-            asset_html += '<span style="margin-right:15px;"><b>{}</b>: {}% ({}W/{}L) ${:.2f}</span>'.format(
-                a, awr, s["w"], s["l"], s["profit"])
+            asset_parts.append("{}: {}% ({}W/{}L) ${:.2f}".format(a, awr, s["w"], s["l"], s["profit"]))
 
-        # Recent trades
-        trade_rows = ""
-        for t in trades[:30]:
-            status = t.get("status", "Pending")
-            pnl_cell = ""
+        # Trade rows
+        trade_rows = []
+        for t in trades[:50]:
             if t.get("outcome") == "WIN":
                 pnl_val = float(t.get("simulated_payout") or 0) - float(t.get("simulated_stake") or 1)
-                pnl_cell = '<span style="color:#4ade80">+${:.2f}</span>'.format(pnl_val)
+                pnl_cell = "+${:.2f}".format(pnl_val)
+                status_cell = "✅ Won"
             elif t.get("outcome") == "LOSS":
-                pnl_cell = '<span style="color:#f87171">-${:.2f}</span>'.format(float(t.get("simulated_stake") or 1))
+                pnl_cell = "-${:.2f}".format(float(t.get("simulated_stake") or 1))
+                status_cell = "❌ Lost"
             else:
                 pnl_cell = "—"
+                status_cell = "Pending"
 
-            trade_rows += """<tr>
-                <td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}%</td>
-                <td>{}</td><td>{}</td><td>{}</td><td>{}</td>
-            </tr>""".format(
-                t.get("id", ""),
-                (t.get("title") or "")[:50],
-                t.get("asset", ""),
-                t.get("bet_side", ""),
-                t.get("bet_odds", ""),
-                t.get("market_type", ""),
-                pnl_cell,
-                status,
-                (t.get("fired_at") or "")[:16]
-            )
+            trade_rows.append({
+                "id": t.get("id", ""),
+                "title": (t.get("title") or "")[:55],
+                "asset": t.get("asset", ""),
+                "side": t.get("bet_side", ""),
+                "odds": "{}%".format(t.get("bet_odds", "")),
+                "type": t.get("market_type", ""),
+                "pnl": pnl_cell,
+                "status": status_cell,
+                "time": (t.get("fired_at") or "")[:16],
+            })
 
-        wr_color = "#4ade80" if wr >= 60 else "#fbbf24" if wr >= 50 else "#f87171"
-        pnl_color = "#4ade80" if pnl >= 0 else "#f87171"
+        strat_sections.append({
+            "name": strat_name, "desc": strat_desc,
+            "bal": bal, "total": total, "wr": wr,
+            "wins": wins, "losses": losses, "pending": pending,
+            "pnl": pnl, "assets": " · ".join(asset_parts) if asset_parts else "No trades yet",
+            "trades": trade_rows,
+        })
 
-        strat_html_parts.append("""
-        <div style="background:#1e1e2e; border:1px solid #333; border-radius:10px; padding:20px; margin-bottom:20px;">
-            <h3 style="color:#a78bfa; margin-top:0;">{name} — {desc}</h3>
-            <div style="display:flex; gap:30px; flex-wrap:wrap; margin-bottom:15px;">
-                <div><b>Balance:</b> ${bal:.2f}</div>
-                <div><b>Trades:</b> {total}</div>
-                <div><b>Win Rate:</b> <span style="color:{wr_color}">{wr}%</span></div>
-                <div><b>W/L:</b> {wins}W/{losses}L</div>
-                <div><b>Pending:</b> {pending}</div>
-                <div><b>P&L:</b> <span style="color:{pnl_color}">${pnl:.2f}</span></div>
-            </div>
-            <div style="margin-bottom:15px; font-size:0.85em;">{assets}</div>
-            <details>
-                <summary style="cursor:pointer; color:#a78bfa;">Show Trades ({total})</summary>
-                <div style="overflow-x:auto; margin-top:10px;">
-                    <table style="width:100%; border-collapse:collapse; font-size:0.8em;">
-                        <tr style="background:#252540;">
-                            <th>#</th><th>Market</th><th>Asset</th><th>Side</th><th>Odds</th>
-                            <th>Type</th><th>P&L</th><th>Status</th><th>Time</th>
-                        </tr>
-                        {rows}
-                    </table>
-                </div>
-            </details>
+    # Use same HTML structure as Limitless pages
+    nav_tabs = [
+        ("/app/poly/btc5m", "BTC 5M", section == "btc5m"),
+        ("/app/poly/all5m", "All 5M", section == "all5m"),
+        ("/app/poly/all15m", "All 15M", section == "all15m"),
+        ("/app/poly/all1h", "All 1H", section == "all1h"),
+        ("/app", "← Limitless", False),
+    ]
+
+    nav_html = ""
+    for href, label, active in nav_tabs:
+        cls = "nav-tab active" if active else "nav-tab"
+        nav_html += '    <a href="{}" class="{}">{}</a>\n'.format(href, cls, label)
+
+    strats_html = ""
+    for s in strat_sections:
+        wr_class = "stat-value" if s["wr"] == 0 else "stat-value"
+        rows_html = ""
+        for tr in s["trades"]:
+            rows_html += """<tr>
+              <td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td>
+              <td>{}</td><td>{}</td><td>{}</td><td>{}</td>
+            </tr>""".format(tr["id"], tr["title"], tr["asset"], tr["side"],
+                            tr["odds"], tr["type"], tr["pnl"], tr["status"], tr["time"])
+
+        strats_html += """
+    <div class="card" style="margin-bottom:20px;">
+      <h3 style="color:#2d6a4f; margin-top:0;">{name} — {desc}</h3>
+      <div class="stats-grid">
+        <div class="stat-box"><div class="stat-label">Balance</div><div class="stat-value">${bal:.2f}</div></div>
+        <div class="stat-box"><div class="stat-label">Trades</div><div class="stat-value">{total}</div></div>
+        <div class="stat-box"><div class="stat-label">Win Rate</div><div class="stat-value">{wr}%</div></div>
+        <div class="stat-box"><div class="stat-label">W / L</div><div class="stat-value">{wins}W / {losses}L</div></div>
+        <div class="stat-box"><div class="stat-label">Pending</div><div class="stat-value">{pending}</div></div>
+        <div class="stat-box"><div class="stat-label">Sim P&amp;L</div><div class="stat-value">${pnl:.2f}</div></div>
+      </div>
+      <p style="font-size:0.85em; color:#666; margin:10px 0;">{assets}</p>
+      <details>
+        <summary style="cursor:pointer; color:#2d6a4f; font-weight:bold;">Show Trade Log ({total})</summary>
+        <div style="overflow-x:auto; margin-top:10px;">
+          <table style="width:100%; border-collapse:collapse; font-size:0.82em;">
+            <tr style="background:#f0f0f0;">
+              <th>#</th><th>Market</th><th>Asset</th><th>Side</th><th>Odds</th>
+              <th>Type</th><th>Sim P&amp;L</th><th>Status</th><th>Time</th>
+            </tr>
+            {rows}
+          </table>
         </div>
-        """.format(
-            name=strat_name, desc=strat_desc, bal=bal,
-            total=total, wr=wr, wins=wins, losses=losses, pending=pending,
-            pnl=pnl, assets=asset_html, rows=trade_rows,
-            wr_color=wr_color, pnl_color=pnl_color
-        ))
+      </details>
+    </div>""".format(
+            name=s["name"], desc=s["desc"], bal=s["bal"],
+            total=s["total"], wr=s["wr"], wins=s["wins"], losses=s["losses"],
+            pending=s["pending"], pnl=s["pnl"], assets=s["assets"], rows=rows_html
+        )
 
-    # Build nav
-    poly_nav = """
-    <div style="display:flex; gap:10px; margin-bottom:20px; flex-wrap:wrap;">
-        <a href="/app/poly/btc5m" style="padding:8px 16px; background:{}; color:white; text-decoration:none; border-radius:6px;">BTC 5M</a>
-        <a href="/app/poly/all5m" style="padding:8px 16px; background:{}; color:white; text-decoration:none; border-radius:6px;">All 5M</a>
-        <a href="/app/poly/all15m" style="padding:8px 16px; background:{}; color:white; text-decoration:none; border-radius:6px;">All 15M</a>
-        <a href="/app/poly/all1h" style="padding:8px 16px; background:{}; color:white; text-decoration:none; border-radius:6px;">All 1H</a>
-        <a href="/app" style="padding:8px 16px; background:#333; color:white; text-decoration:none; border-radius:6px;">← Limitless</a>
-    </div>
-    """.format(
-        "#7c3aed" if section == "btc5m" else "#444",
-        "#7c3aed" if section == "all5m" else "#444",
-        "#7c3aed" if section == "all15m" else "#444",
-        "#7c3aed" if section == "all1h" else "#444",
-    )
-
-    body = """<!DOCTYPE html>
-<html><head><title>{title}</title>
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<meta http-equiv="refresh" content="60">
+    page_html = """<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{title}</title>
 <style>
-body {{ background:#0d0d1a; color:#e0e0e0; font-family:system-ui; padding:20px; margin:0; }}
-h1 {{ color:#a78bfa; }} h2 {{ color:#7c3aed; }}
-table th, table td {{ padding:6px 8px; text-align:left; border-bottom:1px solid #333; }}
-details summary {{ font-weight:bold; }}
-</style></head><body>
+  body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f5f5f0; color: #333; margin: 0; padding: 0; }}
+  .container {{ max-width: 1200px; margin: 0 auto; padding: 20px; }}
+  .header {{ display: flex; align-items: center; gap: 15px; margin-bottom: 5px; }}
+  .header img {{ width: 48px; height: 48px; border-radius: 10px; }}
+  .header h1 {{ margin: 0; font-size: 1.5em; color: #1a1a2e; }}
+  .header .subtitle {{ color: #888; font-size: 0.8em; text-transform: uppercase; letter-spacing: 1px; }}
+  .nav {{ display: flex; gap: 5px; margin: 15px 0; flex-wrap: wrap; }}
+  .nav-tab {{ padding: 8px 16px; background: #e8e8e3; color: #555; text-decoration: none; border-radius: 6px; font-size: 0.85em; }}
+  .nav-tab:hover {{ background: #ddd; }}
+  .nav-tab.active {{ background: #2d6a4f; color: white; }}
+  .card {{ background: white; border-radius: 12px; padding: 20px; margin-bottom: 15px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); }}
+  .stats-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(100px, 1fr)); gap: 10px; margin: 10px 0; }}
+  .stat-box {{ text-align: center; padding: 8px; }}
+  .stat-label {{ font-size: 0.75em; color: #888; text-transform: uppercase; }}
+  .stat-value {{ font-size: 1.1em; font-weight: 600; }}
+  table th, table td {{ padding: 6px 10px; text-align: left; border-bottom: 1px solid #eee; }}
+  table tr:hover {{ background: #fafaf5; }}
+  .footer {{ text-align: center; color: #999; font-size: 0.8em; margin-top: 30px; padding: 20px; }}
+</style>
+</head><body>
+<div class="container">
+  <div class="header">
+    <div>
+      <h1>Polymarket</h1>
+      <div class="subtitle">CMVNG · {subtitle_short}</div>
+    </div>
+  </div>
+  <div class="nav">
 {nav}
-<h1>{title}</h1>
-<p style="color:#999;">{subtitle}</p>
-<p style="color:#666; font-size:0.85em;">{desc}</p>
+  </div>
+  <div class="card">
+    <p style="margin:0; color:#666; font-size:0.9em;">{desc}</p>
+  </div>
 {strats}
-<p style="color:#555; font-size:0.75em; margin-top:30px;">
-Polymarket paper trading · $1 simulated stakes · Auto-resolves · Auto-refresh 60s</p>
+  <footer class="footer">Polymarket paper trading · $1 simulated stakes · Auto-resolves · Auto-refresh 60s</footer>
+</div>
+<script>setTimeout(()=>location.reload(),60000);</script>
 </body></html>""".format(
-        title=page_title, subtitle=subtitle, desc=description,
-        nav=poly_nav, strats="\n".join(strat_html_parts)
+        title=page_title,
+        subtitle_short=subtitle,
+        nav=nav_html,
+        desc=description,
+        strats=strats_html
     )
 
-    return body
+    return page_html
 
 
 @app.route("/app/poly/btc5m")
