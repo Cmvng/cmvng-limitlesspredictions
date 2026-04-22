@@ -10058,27 +10058,18 @@ def _poly_fetch_markets():
 
 
 def _poly_get_baseline(parsed, price, indicators):
-    """Get the Price to Beat directly from Chainlink RTDS cache.
-    Only returns the PTB if it matches the current market's window."""
+    """Get the Price to Beat from Chainlink RTDS cache.
+    Returns the latest cached PTB for this asset+timeframe."""
     asset = parsed.get("asset", "")
     tf = parsed.get("timeframe", "")
     key = "{}_{}".format(asset, tf)
     entry = _chainlink_ptb.get(key)
     if entry:
-        stored_end_ts, stored_price = entry
-        # Verify this PTB is for the correct window
-        # The market's expiry should match the stored window end
-        expiry_dt = parsed.get("expiry_dt")
-        if expiry_dt:
-            market_end_ts = int(expiry_dt.timestamp())
-            tf_sec = {"5M": 300, "15M": 900, "1H": 3600}.get(tf, 300)
-            # PTB must be from the same window (end_ts matches)
-            # or the immediately previous window (within 1 window)
-            if abs(stored_end_ts - market_end_ts) <= tf_sec:
-                return stored_price
-            else:
-                return None  # Stale PTB from wrong window
-        return stored_price
+        return entry[1]  # (end_ts, price) → return price
+    # Fallback: latest Chainlink price
+    chainlink = _chainlink_prices.get(asset)
+    if chainlink:
+        return chainlink
     return None
 
 
