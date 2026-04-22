@@ -418,6 +418,60 @@ def init_db():
             slug          TEXT
         )
     """)
+
+    # Paper 2.2: Paper 2.1 strategy but 15M only
+    conn.run("""
+        CREATE TABLE IF NOT EXISTS paper22_trades (
+            id            SERIAL PRIMARY KEY,
+            market_id     TEXT,
+            title         TEXT,
+            asset         TEXT,
+            direction     TEXT,
+            baseline      REAL,
+            bet_odds      REAL,
+            bet_side      TEXT,
+            current_price REAL,
+            hours_left    REAL,
+            market_type   TEXT,
+            indicators    TEXT,
+            score         INTEGER,
+            total_signals INTEGER,
+            simulated_stake REAL DEFAULT 1.0,
+            simulated_payout REAL,
+            status        TEXT DEFAULT 'Pending',
+            outcome       TEXT,
+            fired_at      TEXT,
+            resolved_at   TEXT,
+            slug          TEXT
+        )
+    """)
+
+    # Paper 3.2: Paper 3.1 strategy but 15M only
+    conn.run("""
+        CREATE TABLE IF NOT EXISTS paper32_trades (
+            id            SERIAL PRIMARY KEY,
+            market_id     TEXT,
+            title         TEXT,
+            asset         TEXT,
+            direction     TEXT,
+            baseline      REAL,
+            bet_odds      REAL,
+            bet_side      TEXT,
+            current_price REAL,
+            hours_left    REAL,
+            market_type   TEXT,
+            indicators    TEXT,
+            score         INTEGER,
+            total_signals INTEGER,
+            simulated_stake REAL DEFAULT 1.0,
+            simulated_payout REAL,
+            status        TEXT DEFAULT 'Pending',
+            outcome       TEXT,
+            fired_at      TEXT,
+            resolved_at   TEXT,
+            slug          TEXT
+        )
+    """)
     conn.close()
     print("DB initialized OK")
 
@@ -3750,6 +3804,16 @@ def run_paper34_scan():
             p51_ids = set(str(row[0]) for row in p51_rows)
         except:
             p51_ids = set()
+        try:
+            p22_rows = conn.run("SELECT market_id FROM paper22_trades WHERE fired_at::timestamptz > NOW() - INTERVAL '30 hours'")
+            p22_ids = set(str(row[0]) for row in p22_rows)
+        except:
+            p22_ids = set()
+        try:
+            p32_rows = conn.run("SELECT market_id FROM paper32_trades WHERE fired_at::timestamptz > NOW() - INTERVAL '30 hours'")
+            p32_ids = set(str(row[0]) for row in p32_rows)
+        except:
+            p32_ids = set()
         # Get Bot 1 and Bot 2 market IDs to avoid overlap
         try:
             bot12_rows = conn.run("""SELECT market_id FROM limitless_predictions WHERE created_at > NOW() - INTERVAL '30 hours'
@@ -3767,6 +3831,8 @@ def run_paper34_scan():
         p31_count = 0
         p21_count = 0
         p51_count = 0
+        p22_count = 0
+        p32_count = 0
 
         for market in markets:
             try:
@@ -4076,11 +4142,69 @@ def run_paper34_scan():
                         except Exception as e:
                             print("Paper51 save error: {}".format(e))
 
+                # Paper 2.2: Same as P2.1 but 15M ONLY
+                if parsed["market_id"] not in p22_ids:
+                    scored22 = _score_paper21_trade(parsed, price, indicators=ind, ind_macro=ind_macro, expiry_minute=expiry_minute, expiry_hour=expiry_hour)
+                    if scored22 and scored22["market_type"] == "15M":
+                        try:
+                            conn22 = get_db()
+                            conn22.run(
+                                """INSERT INTO paper22_trades
+                                (market_id, title, asset, direction, baseline, bet_odds, bet_side,
+                                 current_price, hours_left, market_type, indicators, score,
+                                 total_signals, simulated_stake, simulated_payout, status, fired_at, slug)
+                                VALUES (:mid, :ttl, :ast, :dir, :base, :odds, :bs,
+                                        :pr, :hrs, :mt, :ind, :sc, :ts, 1.0, :sp, 'Pending', :now, :slg)""",
+                                mid=parsed["market_id"], ttl=parsed["title"], ast=asset,
+                                dir=parsed["direction"], base=parsed["baseline"],
+                                odds=scored22["bet_odds"], bs=scored22["bet_side"],
+                                pr=price, hrs=round(parsed["hours_left"], 2),
+                                mt=scored22["market_type"],
+                                ind="[{}] {}".format(scored22["confidence"], scored22["indicators"]),
+                                sc=scored22["score"], ts=scored22["total_signals"],
+                                sp=scored22["sim_payout"],
+                                now=now, slg=parsed["slug"]
+                            )
+                            conn22.close()
+                            p22_ids.add(parsed["market_id"])
+                            p22_count += 1
+                        except Exception as e:
+                            print("Paper22 save error: {}".format(e))
+
+                # Paper 3.2: Same as P3.1 but 15M ONLY
+                if parsed["market_id"] not in p32_ids:
+                    scored32 = _score_paper31_trade(parsed, price, ind, ind_macro=ind_macro, expiry_minute=expiry_minute, expiry_hour=expiry_hour)
+                    if scored32 and scored32["market_type"] == "15M":
+                        try:
+                            conn32 = get_db()
+                            conn32.run(
+                                """INSERT INTO paper32_trades
+                                (market_id, title, asset, direction, baseline, bet_odds, bet_side,
+                                 current_price, hours_left, market_type, indicators, score,
+                                 total_signals, simulated_stake, simulated_payout, status, fired_at, slug)
+                                VALUES (:mid, :ttl, :ast, :dir, :base, :odds, :bs,
+                                        :pr, :hrs, :mt, :ind, :sc, :ts, 1.0, :sp, 'Pending', :now, :slg)""",
+                                mid=parsed["market_id"], ttl=parsed["title"], ast=asset,
+                                dir=parsed["direction"], base=parsed["baseline"],
+                                odds=scored32["bet_odds"], bs=scored32["bet_side"],
+                                pr=price, hrs=round(parsed["hours_left"], 2),
+                                mt=scored32["market_type"],
+                                ind="[{}] {}".format(scored32["confidence"], scored32["indicators"]),
+                                sc=scored32["score"], ts=scored32["total_signals"],
+                                sp=scored32["sim_payout"],
+                                now=now, slg=parsed["slug"]
+                            )
+                            conn32.close()
+                            p32_ids.add(parsed["market_id"])
+                            p32_count += 1
+                        except Exception as e:
+                            print("Paper32 save error: {}".format(e))
+
             except Exception as e:
                 print("Paper345 market error: {}".format(e))
 
         if p3_count > 0 or p4_count > 0 or p5_count > 0:
-            print("P3:{} P4:{} P5:{} P3.1:{} P2.1:{} P5.1:{}".format(p3_count, p4_count, p5_count, p31_count, p21_count, p51_count))
+            print("P3:{} P4:{} P5:{} P3.1:{} P2.1:{} P5.1:{} P2.2:{} P3.2:{}".format(p3_count, p4_count, p5_count, p31_count, p21_count, p51_count, p22_count, p32_count))
         else:
             # Count how many assets we got indicators for
             ind_ok = sum(1 for v in indicator_cache_local.values() if v is not None)
@@ -4264,8 +4388,10 @@ def resolve_paper34_trades():
     r31 = _resolve_paper_table("paper31_trades")
     r21 = _resolve_paper_table("paper21_trades")
     r51 = _resolve_paper_table("paper51_trades")
+    r22 = _resolve_paper_table("paper22_trades")
+    r32 = _resolve_paper_table("paper32_trades")
     if r3 or r4 or r5:
-        print("Resolved: P3={} P4={} P5={} P3.1={} P2.1={} P5.1={}".format(r3, r4, r5, r31, r21, r51))
+        print("Resolved: P3={} P4={} P5={} P3.1={} P2.1={} P5.1={} P2.2={} P3.2={}".format(r3, r4, r5, r31, r21, r51, r22, r32))
 
 def _score_paper_trade(p, price):
     """Score a market for paper trading. Accepts 40-72% odds when ALL trends agree.
@@ -8443,6 +8569,8 @@ td{padding:8px 12px;border-bottom:1px solid #f4f3ed;color:var(--ink-2)}tr:last-c
     <a href="/app/paper" class="nav-tab">Bot 2</a>
     <a href="/app/paper3" class="nav-tab""" + (" active" if nav_active == "paper3" else "") + """">Paper 3</a>
     <a href="/app/paper4" class="nav-tab""" + (" active" if nav_active == "paper4" else "") + """">Paper 4</a>
+    <a href="/app/paper22" class="nav-tab""" + (" active" if nav_active == "paper22" else "") + """">Paper 2.2</a>
+    <a href="/app/paper32" class="nav-tab""" + (" active" if nav_active == "paper32" else "") + """">Paper 3.2</a>
     <a href="/app/paper21" class="nav-tab""" + (" active" if nav_active == "paper21" else "") + """">Paper 2.1</a>
     <a href="/app/paper31" class="nav-tab""" + (" active" if nav_active == "paper31" else "") + """">Paper 3.1</a>
     <a href="/app/paper51" class="nav-tab""" + (" active" if nav_active == "paper51" else "") + """">Paper 5.1</a>
@@ -8566,6 +8694,28 @@ def paper4_page():
         "Hunts exhausted trends at 5-55% odds. Enters when RSI is extreme (<30 or >70) AND price is at Bollinger bands, with additional confirmation from momentum, volume, or EMA direction. Also catches Bollinger squeeze breakouts. Higher risk, much higher payout per win.",
         ["Reversal", "RSI", "BB"],
         "paper4"
+    )
+
+@app.route("/app/paper22")
+def paper22_page():
+    return _build_paper_page(
+        "paper22_trades",
+        "Paper 2.2 — 15M Only",
+        "Bot 2 Strategy + BTC Tiebreaker + Pullback · 15M Markets Only",
+        "Same as Paper 2.1 but only trades 15-minute markets. No 1H or Daily. Data shows 15M has 71.2% win rate vs 52.8% on 1H.",
+        ["Score", "Indicators"],
+        "paper22"
+    )
+
+@app.route("/app/paper32")
+def paper32_page():
+    return _build_paper_page(
+        "paper32_trades",
+        "Paper 3.2 — 15M Only",
+        "Paper 3.1 Strategy + Dual Timeframe · 15M Markets Only",
+        "Same as Paper 3.1 but only trades 15-minute markets. No 1H or Daily. Data shows 15M has 70.5% win rate vs 43.3% on 1H.",
+        ["Score", "Indicators"],
+        "paper32"
     )
 
 @app.route("/app/paper21")
