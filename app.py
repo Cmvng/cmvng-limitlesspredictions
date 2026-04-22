@@ -150,6 +150,45 @@ _bot32_state = {
 
 FAVOURITE_HOURLY = ["ADA", "BNB", "DOGE"]
 
+import math as _math
+
+def _calc_dist_score(price, baseline, sigma, momentum, time_remaining=0.67):
+    """Calculate distance probability and return a score.
+    
+    Uses normal distribution: P(close above) = Φ((expected - baseline) / (sigma × √T))
+    
+    Thresholds tuned for Limitless markets where baseline is always close to price.
+    Momentum from last 3 candles determines direction at tight distances.
+    
+    Returns: (probability, score_label)
+      STRONG_BUY:  >58% above (momentum clearly pushing above baseline)
+      BUY:         53-58% above (slight edge above)
+      NEUTRAL:     47-53% (truly on the line, could go either way)
+      SELL:        42-47% (slight edge below)
+      STRONG_SELL: <42% (momentum clearly pushing below baseline)
+    """
+    if sigma is None or sigma <= 0 or price is None or baseline is None:
+        return 0.5, "NEUTRAL"
+    
+    if momentum is None:
+        momentum = 0
+    
+    expected_close = price + (momentum * time_remaining)
+    z = (expected_close - baseline) / (sigma * _math.sqrt(max(0.01, time_remaining)))
+    prob_above = 0.5 * (1 + _math.erf(z / _math.sqrt(2)))
+    
+    if prob_above > 0.58:
+        return prob_above, "STRONG_BUY"
+    elif prob_above > 0.53:
+        return prob_above, "BUY"
+    elif prob_above > 0.47:
+        return prob_above, "NEUTRAL"
+    elif prob_above > 0.42:
+        return prob_above, "SELL"
+    else:
+        return prob_above, "STRONG_SELL"
+
+
 def _calc_bot_stake(state):
     """Calculate stake for any bot. $1 fixed until 20% profit, then 2.5% compounding."""
     balance = state.get("balance", state.get("last_balance", 0)) or 0
@@ -275,8 +314,55 @@ def get_db():
         ssl_context=True
     )
 
+
+def _save_bot_balance(bot_name, state):
+    """Save bot balance to database so it persists across deploys."""
+    try:
+        conn = get_db()
+        conn.run(
+            """INSERT INTO bot_balances (bot_name, balance, peak_balance, enabled, updated_at)
+               VALUES (:name, :bal, :peak, :enabled, :now)
+               ON CONFLICT (bot_name) DO UPDATE SET
+               balance = :bal, peak_balance = :peak, enabled = :enabled, updated_at = :now""",
+            name=bot_name,
+            bal=state.get("balance", 20.0),
+            peak=state.get("peak_balance", state.get("balance", 20.0)),
+            enabled=state.get("enabled", True),
+            now=datetime.now(timezone.utc).isoformat()
+        )
+        conn.close()
+    except Exception as e:
+        print("Save balance error {}: {}".format(bot_name, e))
+
+
+def _load_bot_balances():
+    """Load saved balances from database on startup."""
+    saved = {}
+    try:
+        conn = get_db()
+        rows = conn.run("SELECT bot_name, balance, peak_balance, enabled FROM bot_balances")
+        for row in rows:
+            saved[row[0]] = {"balance": row[1], "peak_balance": row[2], "enabled": row[3]}
+        conn.close()
+        if saved:
+            print("Loaded balances: {}".format(
+                ", ".join("{}=${:.2f}".format(k, v["balance"]) for k, v in saved.items())))
+    except Exception as e:
+        print("Load balances error: {}".format(e))
+    return saved
+
 def init_db():
     conn = get_db()
+    # Bot balance persistence table
+    conn.run("""
+        CREATE TABLE IF NOT EXISTS bot_balances (
+            bot_name TEXT PRIMARY KEY,
+            balance REAL DEFAULT 20.0,
+            peak_balance REAL DEFAULT 20.0,
+            enabled BOOLEAN DEFAULT TRUE,
+            updated_at TEXT
+        )
+    """)
     conn.run("""
         CREATE TABLE IF NOT EXISTS limitless_predictions (
             id            SERIAL PRIMARY KEY,
@@ -569,6 +655,30 @@ def init_db():
             fired_at      TEXT,
             resolved_at   TEXT,
             slug          TEXT
+        )
+    """)
+    # Paper 2.3: P2.1 + Distance Math (full confidence only)
+    conn.run("""
+        CREATE TABLE IF NOT EXISTS paper23_trades (
+            id SERIAL PRIMARY KEY, market_id TEXT, title TEXT, asset TEXT,
+            direction TEXT, baseline REAL, bet_odds REAL, bet_side TEXT,
+            current_price REAL, hours_left REAL, market_type TEXT,
+            indicators TEXT, score INTEGER, total_signals INTEGER,
+            simulated_stake REAL DEFAULT 1.0, simulated_payout REAL,
+            status TEXT DEFAULT 'Pending', outcome TEXT,
+            fired_at TEXT, resolved_at TEXT, slug TEXT
+        )
+    """)
+    # Paper 3.3: P3.1 + Distance Math (mixed mode)
+    conn.run("""
+        CREATE TABLE IF NOT EXISTS paper33_trades (
+            id SERIAL PRIMARY KEY, market_id TEXT, title TEXT, asset TEXT,
+            direction TEXT, baseline REAL, bet_odds REAL, bet_side TEXT,
+            current_price REAL, hours_left REAL, market_type TEXT,
+            indicators TEXT, score INTEGER, total_signals INTEGER,
+            simulated_stake REAL DEFAULT 1.0, simulated_payout REAL,
+            status TEXT DEFAULT 'Pending', outcome TEXT,
+            fired_at TEXT, resolved_at TEXT, slug TEXT
         )
     """)
     conn.close()
@@ -2328,6 +2438,13 @@ def scan_loop():
             run_paper34_scan()
         except Exception as e:
             print("Paper34 scan error: {}".format(e))
+        # Save bot balances to DB (persists across deploys)
+        try:
+            for _bn, _bs in [("p21", _bot21_state), ("p31", _bot31_state),
+                              ("p22", _bot22_state), ("p32", _bot32_state)]:
+                _save_bot_balance(_bn, _bs)
+        except Exception as e:
+            print("Balance save error: {}".format(e))
         time.sleep(300)
 
 # ═══════════════════════════════════════════════════════════
@@ -2708,6 +2825,26 @@ def _calculate_indicators(asset, timeframe="1h"):
             smc_near_bull_ob = any(current >= ol - smc_atr*0.5 and current <= oh + smc_atr*0.5 for oh, ol in s_int_bo)
             smc_near_bear_ob = any(current >= ol - smc_atr*0.5 and current <= oh + smc_atr*0.5 for oh, ol in s_int_beo)
 
+        # === Distance Math: sigma + momentum for close probability ===
+        dist_sigma = None
+        dist_momentum = None
+        if n >= 12:
+            # Sigma: std dev of last 10 close-to-close changes
+            cc_changes = [float(closes[j]) - float(closes[j-1]) for j in range(max(1, n-10), n)]
+            if cc_changes:
+                cc_mean = sum(cc_changes) / len(cc_changes)
+                dist_sigma = max(0.0001, (sum((x - cc_mean)**2 for x in cc_changes) / len(cc_changes)) ** 0.5)
+            # Momentum: weighted average of last 3 close-to-close changes (recent = heavier)
+            if n >= 4:
+                c1 = float(closes[-2]) - float(closes[-3])  # oldest
+                c2 = float(closes[-1]) - float(closes[-2])  # most recent
+                # If we have 4 candles for 3 changes
+                if n >= 5:
+                    c0 = float(closes[-3]) - float(closes[-4])
+                    dist_momentum = c0 * 0.2 + c1 * 0.3 + c2 * 0.5
+                else:
+                    dist_momentum = c1 * 0.4 + c2 * 0.6
+
         result = {
             "current": current,
             "sma10": sma10, "sma20": sma20, "sma_trend": sma_trend,
@@ -2734,6 +2871,8 @@ def _calculate_indicators(asset, timeframe="1h"):
             "ut_trend": ut_trend,
             "ema_stack": ema_stack,
             "pivot_signal": pivot_signal,
+            "dist_sigma": dist_sigma,
+            "dist_momentum": dist_momentum,
         }
 
         _indicator_cache[cache_key] = {"data": result, "updated": datetime.now(timezone.utc)}
@@ -3862,6 +4001,180 @@ def _score_paper51_trade(p, price, indicators, ind_macro=None, expiry_minute=Non
         "market_type": mtype, "sim_payout": sim_payout,
     }
 
+
+# ═══════════════════════════════════════════════════════════
+# PAPER 2.3: Bot 2.1 + Distance Calculator — FULL CONFIDENCE ONLY
+# Only takes trades where BOTH indicators AND distance math agree
+# ═══════════════════════════════════════════════════════════
+
+def _score_paper23_trade(p, price, indicators=None, ind_macro=None, expiry_minute=None, expiry_hour=None):
+    """Paper 2.3: Paper 2.1 strategy + distance probability.
+    FULL CONFIDENCE: only takes trades where DIST confirms direction.
+    If DIST=NEUTRAL or DIST opposes indicators → SKIP.
+    """
+    # First get Paper 2.1's decision
+    scored = _score_paper21_trade(p, price, indicators=indicators, ind_macro=ind_macro,
+                                  expiry_minute=expiry_minute, expiry_hour=expiry_hour)
+    if scored is None:
+        return None
+
+    # Only 15M trades
+    if scored["market_type"] != "15M":
+        return None
+
+    # Get distance data from indicators
+    sigma = indicators.get("dist_sigma") if indicators else None
+    momentum = indicators.get("dist_momentum") if indicators else None
+    baseline = p.get("baseline", 0)
+
+    # Calculate distance probability
+    prob, dist_label = _calc_dist_score(price, baseline, sigma, momentum)
+
+    bet_side = scored["bet_side"]
+
+    # FULL CONFIDENCE: DIST must agree with bet direction
+    # YES bet needs DIST=BUY or STRONG_BUY (prob > 53%)
+    # NO bet needs DIST=SELL or STRONG_SELL (prob < 47%)
+    # NEUTRAL (47-53%) = true coin flip → skip
+    if bet_side == "YES" and dist_label in ("SELL", "STRONG_SELL", "NEUTRAL"):
+        return None  # distance doesn't confirm YES
+    if bet_side == "NO" and dist_label in ("BUY", "STRONG_BUY", "NEUTRAL"):
+        return None  # distance doesn't confirm NO
+
+    # Distance confirms — upgrade confidence
+    if dist_label in ("STRONG_BUY", "STRONG_SELL"):
+        confidence = "HIGH"
+    else:
+        confidence = scored["confidence"]
+
+    # Add DIST to indicator display
+    ind_str = scored["indicators"]
+    ind_str += " | DIST={}({:.0f}%)".format(dist_label, prob * 100)
+
+    return {
+        "bet_side": bet_side, "bet_odds": scored["bet_odds"],
+        "score": scored["score"] + 1, "total_signals": scored["total_signals"] + 1,
+        "confidence": confidence, "indicators": ind_str,
+        "market_type": scored["market_type"], "sim_payout": scored["sim_payout"],
+    }
+
+
+# ═══════════════════════════════════════════════════════════
+# PAPER 3.3: Bot 3.1 + Distance Calculator — MIXED MODE
+# Uses distance to adjust confidence and can override weak-period pullbacks
+# ═══════════════════════════════════════════════════════════
+
+def _score_paper33_trade(p, price, indicators=None, ind_macro=None, expiry_minute=None, expiry_hour=None):
+    """Paper 3.3: Paper 3.1 strategy + distance probability.
+    MIXED MODE:
+    - DIST=STRONG_BUY/SELL overrides weak-period pullbacks
+    - DIST=NEUTRAL during weak period → SKIP
+    - DIST=BUY/SELL during strong period → adjusts confidence
+    - DIST opposes indicators during strong period → SKIP
+    """
+    if not indicators or price is None:
+        return None
+
+    # Get Paper 3.1's base decision
+    scored = _score_paper31_trade(p, price, indicators, ind_macro=ind_macro,
+                                  expiry_minute=expiry_minute, expiry_hour=expiry_hour)
+
+    # Get distance data
+    sigma = indicators.get("dist_sigma") if indicators else None
+    momentum = indicators.get("dist_momentum") if indicators else None
+    baseline = p.get("baseline", 0)
+    prob, dist_label = _calc_dist_score(price, baseline, sigma, momentum)
+
+    # Determine timing
+    mtype = "15M" if p["is_short"] and p.get("mins_left", 0) <= 20 else "1H" if p["is_short"] else "Daily"
+    if mtype != "15M":
+        return None  # 15M only
+
+    is_weak = False
+    if expiry_minute is not None:
+        is_weak = expiry_minute in (0, 30)
+
+    # Case 1: Paper 3.1 scored the trade
+    if scored is not None:
+        bet_side = scored["bet_side"]
+
+        if is_weak:
+            # WEAK PERIOD rules
+            if dist_label in ("STRONG_BUY", "STRONG_SELL"):
+                # Distance is overwhelming → override pullback, keep P3.1 direction
+                # But check if DIST agrees with bet
+                dist_agrees = (bet_side == "YES" and dist_label == "STRONG_BUY") or \
+                              (bet_side == "NO" and dist_label == "STRONG_SELL")
+                if dist_agrees:
+                    confidence = "HIGH"
+                else:
+                    # DIST strongly opposes bet → flip
+                    bet_side = "NO" if bet_side == "YES" else "YES"
+                    confidence = "HIGH"
+                    # Recalculate odds
+                    yes_odds = p["yes_odds"]
+                    effective_odds = yes_odds if bet_side == "YES" else (100 - yes_odds)
+                    if effective_odds < 20 or effective_odds > 72:
+                        return None
+                    scored["bet_odds"] = effective_odds
+            elif dist_label == "NEUTRAL":
+                return None  # coin flip + weak timing = no edge
+            else:
+                # DIST=BUY or SELL (moderate)
+                dist_agrees = (bet_side == "YES" and dist_label == "BUY") or \
+                              (bet_side == "NO" and dist_label == "SELL")
+                if dist_agrees:
+                    confidence = scored["confidence"]
+                else:
+                    return None  # moderate disagreement + weak = skip
+        else:
+            # STRONG PERIOD rules
+            dist_agrees = (bet_side == "YES" and dist_label in ("BUY", "STRONG_BUY")) or \
+                          (bet_side == "NO" and dist_label in ("SELL", "STRONG_SELL"))
+            if dist_agrees:
+                confidence = "HIGH" if dist_label.startswith("STRONG") else scored["confidence"]
+            elif dist_label == "NEUTRAL":
+                confidence = scored["confidence"]  # indicators lead during strong
+            else:
+                return None  # DIST opposes during strong → skip
+
+        ind_str = scored["indicators"] + " | DIST={}({:.0f}%)".format(dist_label, prob * 100)
+
+        return {
+            "bet_side": bet_side, "bet_odds": scored["bet_odds"],
+            "score": scored["score"] + 1, "total_signals": scored["total_signals"] + 1,
+            "confidence": confidence, "indicators": ind_str,
+            "market_type": scored["market_type"], "sim_payout": scored["sim_payout"],
+        }
+
+    # Case 2: Paper 3.1 didn't score (returned None) but DIST is strong
+    # Maybe P3.1 skipped because indicators were mixed, but distance is overwhelming
+    if dist_label in ("STRONG_BUY", "STRONG_SELL") and not is_weak:
+        yes_odds = p["yes_odds"]
+        if dist_label == "STRONG_BUY":
+            bet_side = "YES" if p["direction"] == "above" else "NO"
+        else:
+            bet_side = "NO" if p["direction"] == "above" else "YES"
+
+        effective_odds = yes_odds if bet_side == "YES" else (100 - yes_odds)
+        if effective_odds < 20 or effective_odds > 72:
+            return None
+
+        share_price = effective_odds / 100.0
+        if bet_side == "NO": share_price = 1.0 - (yes_odds / 100.0)
+        sim_payout = round(1.0 / share_price, 4) if share_price > 0 else 0
+
+        return {
+            "bet_side": bet_side, "bet_odds": effective_odds,
+            "score": 1, "total_signals": 1,
+            "confidence": "MEDIUM",
+            "indicators": "DIST={}({:.0f}%) | DIST_ONLY".format(dist_label, prob * 100),
+            "market_type": "15M", "sim_payout": sim_payout,
+        }
+
+    return None
+
+
 def run_paper34_scan():
     """Scan markets for Paper 3 (momentum) and Paper 4 (reversal) signals."""
     import requests as req
@@ -3913,6 +4226,16 @@ def run_paper34_scan():
             p32_ids = set(str(row[0]) for row in p32_rows)
         except:
             p32_ids = set()
+        try:
+            p23_rows = conn.run("SELECT market_id FROM paper23_trades WHERE fired_at::timestamptz > NOW() - INTERVAL '30 hours'")
+            p23_ids = set(str(row[0]) for row in p23_rows)
+        except:
+            p23_ids = set()
+        try:
+            p33_rows = conn.run("SELECT market_id FROM paper33_trades WHERE fired_at::timestamptz > NOW() - INTERVAL '30 hours'")
+            p33_ids = set(str(row[0]) for row in p33_rows)
+        except:
+            p33_ids = set()
         # Get Bot 1 and Bot 2 market IDs to avoid overlap
         try:
             bot12_rows = conn.run("""SELECT market_id FROM limitless_predictions WHERE created_at > NOW() - INTERVAL '30 hours'
@@ -3932,6 +4255,8 @@ def run_paper34_scan():
         p51_count = 0
         p22_count = 0
         p32_count = 0
+        p23_count = 0
+        p33_count = 0
 
         for market in markets:
             try:
@@ -4341,11 +4666,69 @@ def run_paper34_scan():
                                 except Exception as te:
                                     print("P3.2 trade error: {}".format(te))
 
+                # Paper 2.3: P2.1 + Distance Math (full confidence, 15M only)
+                if parsed["market_id"] not in p23_ids:
+                    scored23 = _score_paper23_trade(parsed, price, indicators=ind, ind_macro=ind_macro, expiry_minute=expiry_minute, expiry_hour=expiry_hour)
+                    if scored23:
+                        try:
+                            conn23 = get_db()
+                            conn23.run(
+                                """INSERT INTO paper23_trades
+                                (market_id, title, asset, direction, baseline, bet_odds, bet_side,
+                                 current_price, hours_left, market_type, indicators, score,
+                                 total_signals, simulated_stake, simulated_payout, status, fired_at, slug)
+                                VALUES (:mid, :ttl, :ast, :dir, :base, :odds, :bs,
+                                        :pr, :hrs, :mt, :ind, :sc, :ts, 1.0, :sp, 'Pending', :now, :slg)""",
+                                mid=parsed["market_id"], ttl=parsed["title"], ast=asset,
+                                dir=parsed["direction"], base=parsed["baseline"],
+                                odds=scored23["bet_odds"], bs=scored23["bet_side"],
+                                pr=price, hrs=round(parsed["hours_left"], 2),
+                                mt=scored23["market_type"],
+                                ind="[{}] {}".format(scored23["confidence"], scored23["indicators"]),
+                                sc=scored23["score"], ts=scored23["total_signals"],
+                                sp=scored23["sim_payout"],
+                                now=now, slg=parsed["slug"]
+                            )
+                            conn23.close()
+                            p23_ids.add(parsed["market_id"])
+                            p23_count += 1
+                        except Exception as e:
+                            print("Paper23 save error: {}".format(e))
+
+                # Paper 3.3: P3.1 + Distance Math (mixed mode, 15M only)
+                if parsed["market_id"] not in p33_ids:
+                    scored33 = _score_paper33_trade(parsed, price, indicators=ind, ind_macro=ind_macro, expiry_minute=expiry_minute, expiry_hour=expiry_hour)
+                    if scored33:
+                        try:
+                            conn33 = get_db()
+                            conn33.run(
+                                """INSERT INTO paper33_trades
+                                (market_id, title, asset, direction, baseline, bet_odds, bet_side,
+                                 current_price, hours_left, market_type, indicators, score,
+                                 total_signals, simulated_stake, simulated_payout, status, fired_at, slug)
+                                VALUES (:mid, :ttl, :ast, :dir, :base, :odds, :bs,
+                                        :pr, :hrs, :mt, :ind, :sc, :ts, 1.0, :sp, 'Pending', :now, :slg)""",
+                                mid=parsed["market_id"], ttl=parsed["title"], ast=asset,
+                                dir=parsed["direction"], base=parsed["baseline"],
+                                odds=scored33["bet_odds"], bs=scored33["bet_side"],
+                                pr=price, hrs=round(parsed["hours_left"], 2),
+                                mt=scored33["market_type"],
+                                ind="[{}] {}".format(scored33["confidence"], scored33["indicators"]),
+                                sc=scored33["score"], ts=scored33["total_signals"],
+                                sp=scored33["sim_payout"],
+                                now=now, slg=parsed["slug"]
+                            )
+                            conn33.close()
+                            p33_ids.add(parsed["market_id"])
+                            p33_count += 1
+                        except Exception as e:
+                            print("Paper33 save error: {}".format(e))
+
             except Exception as e:
                 print("Paper345 market error: {}".format(e))
 
         if p3_count > 0 or p4_count > 0 or p5_count > 0:
-            print("P3:{} P4:{} P5:{} P3.1:{} P2.1:{} P5.1:{} P2.2:{} P3.2:{}".format(p3_count, p4_count, p5_count, p31_count, p21_count, p51_count, p22_count, p32_count))
+            print("P3:{} P4:{} P5:{} P3.1:{} P2.1:{} P5.1:{} P2.2:{} P3.2:{} P2.3:{} P3.3:{}".format(p3_count, p4_count, p5_count, p31_count, p21_count, p51_count, p22_count, p32_count, p23_count, p33_count))
         else:
             # Count how many assets we got indicators for
             ind_ok = sum(1 for v in indicator_cache_local.values() if v is not None)
@@ -4565,8 +4948,10 @@ def resolve_paper34_trades():
     r51 = _resolve_paper_table("paper51_trades")
     r22 = _resolve_paper_table("paper22_trades")
     r32 = _resolve_paper_table("paper32_trades")
+    r23 = _resolve_paper_table("paper23_trades")
+    r33 = _resolve_paper_table("paper33_trades")
     if r3 or r4 or r5:
-        print("Resolved: P3={} P4={} P5={} P3.1={} P2.1={} P5.1={} P2.2={} P3.2={}".format(r3, r4, r5, r31, r21, r51, r22, r32))
+        print("Resolved: P3={} P4={} P5={} P3.1={} P2.1={} P5.1={} P2.2={} P3.2={} P2.3={} P3.3={}".format(r3, r4, r5, r31, r21, r51, r22, r32, r23, r33))
 
 def _score_paper_trade(p, price):
     """Score a market for paper trading. Accepts 40-72% odds when ALL trends agree.
@@ -8806,6 +9191,8 @@ td{padding:8px 12px;border-bottom:1px solid #f4f3ed;color:var(--ink-2)}tr:last-c
     <a href="/app/paper" class="nav-tab">Bot 2</a>
     <a href="/app/paper3" class="nav-tab""" + (" active" if nav_active == "paper3" else "") + """">Paper 3</a>
     <a href="/app/paper4" class="nav-tab""" + (" active" if nav_active == "paper4" else "") + """">Paper 4</a>
+    <a href="/app/paper23" class="nav-tab""" + (" active" if nav_active == "paper23" else "") + """">Paper 2.3</a>
+    <a href="/app/paper33" class="nav-tab""" + (" active" if nav_active == "paper33" else "") + """">Paper 3.3</a>
     <a href="/app/paper22" class="nav-tab""" + (" active" if nav_active == "paper22" else "") + """">Paper 2.2</a>
     <a href="/app/paper32" class="nav-tab""" + (" active" if nav_active == "paper32" else "") + """">Paper 3.2</a>
     <a href="/app/paper21" class="nav-tab""" + (" active" if nav_active == "paper21" else "") + """">Paper 2.1</a>
@@ -8933,6 +9320,28 @@ def paper4_page():
         "paper4"
     )
 
+@app.route("/app/paper23")
+def paper23_page():
+    return _build_paper_page(
+        "paper23_trades",
+        "Paper 2.3 — Distance Math (Full Confidence)",
+        "P2.1 Strategy + Distance Calculator · 15M Only · FULL CONFIDENCE",
+        "Same as Paper 2.1 but adds distance probability from candle momentum. Only takes trades where distance math CONFIRMS indicator direction (>65% or <35%).",
+        ["Score", "Indicators"],
+        "paper23"
+    )
+
+@app.route("/app/paper33")
+def paper33_page():
+    return _build_paper_page(
+        "paper33_trades",
+        "Paper 3.3 — Distance Math (Mixed Mode)",
+        "P3.1 Strategy + Distance Calculator · 15M Only · MIXED MODE",
+        "Same as Paper 3.1 but adds distance probability. DIST overrides weak-period pullbacks when strong. DIST=NEUTRAL during weak periods = skip.",
+        ["Score", "Indicators"],
+        "paper33"
+    )
+
 @app.route("/app/paper22")
 def paper22_page():
     bal22 = "${:.2f}".format(_bot22_state["balance"])
@@ -9009,6 +9418,16 @@ def paper5_page():
 
 try:
     init_db()
+    # Load saved balances from database
+    _saved_bals = _load_bot_balances()
+    for _bot_name, _bot_state_ref in [
+        ("p21", _bot21_state), ("p31", _bot31_state),
+        ("p22", _bot22_state), ("p32", _bot32_state),
+    ]:
+        if _bot_name in _saved_bals:
+            _bot_state_ref["balance"] = _saved_bals[_bot_name]["balance"]
+            _bot_state_ref["peak_balance"] = _saved_bals[_bot_name].get("peak_balance", _bot_state_ref["balance"])
+            _bot_state_ref["enabled"] = _saved_bals[_bot_name].get("enabled", True)
 except Exception as e:
     print("DB init error: {}".format(e))
 
