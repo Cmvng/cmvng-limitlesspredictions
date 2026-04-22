@@ -9700,6 +9700,7 @@ def _poly_parse_market(market):
 
         # BUG 6 FIX: Use slug pattern first (more reliable than question text)
         slug_lower = slug.lower()
+        q_lower = question.lower()
         asset = None
         for prefix in ["btc-", "bitcoin-"]:
             if prefix in slug_lower: asset = "BTC"; break
@@ -9720,7 +9721,6 @@ def _poly_parse_market(market):
 
         # Fallback to question text if slug didn't match
         if not asset:
-            q_lower = question.lower()
             for word, sym in [("bitcoin", "BTC"), ("ethereum", "ETH"), ("solana", "SOL"),
                               ("xrp", "XRP"), ("hyperliquid", "HYPE"), ("dogecoin", "DOGE")]:
                 if word in q_lower:
@@ -9736,7 +9736,6 @@ def _poly_parse_market(market):
 
         # Determine timeframe from slug pattern
         timeframe = None
-        slug_lower = slug.lower() if slug else ""
         if "-15m-" in slug_lower or "-15m" in slug_lower or "15min" in slug_lower:
             timeframe = "15M"
         elif "-5m-" in slug_lower or "-5m" in slug_lower or "5min" in slug_lower:
