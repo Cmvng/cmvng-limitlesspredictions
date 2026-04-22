@@ -9632,16 +9632,58 @@ def _poly_parse_market(market):
 
         market_id = str(market.get("id") or condition_id or slug)
 
-        # BUG 1 FIX: Extract baseline from description, or compute from expiry time
-        # The "Price to Beat" is the Chainlink price at window open
-        description = market.get("description") or ""
+        # Extract the "Price to Beat" (baseline) from the API data
+        # Try multiple sources in order of reliability
         baseline = None
-        price_match = re.search(r'\$([0-9,]+\.?\d*)', description)
-        if price_match:
-            try:
-                baseline = float(price_match.group(1).replace(",", ""))
-            except:
-                pass
+        
+        # Source 1: Check all text fields for dollar amounts
+        description = market.get("description") or ""
+        
+        # Source 2: Check for specific price-related metadata
+        # Some markets have customData, metadata, or resolution details
+        for field in ["description", "resolutionSource", "rules", "customData"]:
+            text = str(market.get(field) or "")
+            if text and "$" in text:
+                # Find all dollar amounts
+                all_prices = re.findall(r'\$([0-9,]+\.?\d*)', text)
+                for p in all_prices:
+                    try:
+                        val = float(p.replace(",", ""))
+                        # Sanity check: must be a reasonable crypto price
+                        if asset == "BTC" and 10000 < val < 200000:
+                            baseline = val
+                            break
+                        elif asset == "ETH" and 500 < val < 10000:
+                            baseline = val
+                            break
+                        elif asset == "SOL" and 5 < val < 500:
+                            baseline = val
+                            break
+                        elif asset == "XRP" and 0.1 < val < 10:
+                            baseline = val
+                            break
+                    except:
+                        pass
+                if baseline:
+                    break
+
+        # Source 3: Check the title/question itself for a price
+        if not baseline:
+            for text in [question, market.get("title") or ""]:
+                price_in_title = re.search(r'\$([0-9,]+\.?\d*)', text)
+                if price_in_title:
+                    try:
+                        baseline = float(price_in_title.group(1).replace(",", ""))
+                    except:
+                        pass
+
+        # Log what we found for debugging
+        if baseline:
+            pass  # Got exact price from API
+        else:
+            # Log first 100 chars of description to debug
+            desc_preview = description[:100] if description else "empty"
+            print("Poly baseline NOT found for {} — desc: {}".format(asset, desc_preview))
 
         expiry_minute = expiry_dt.minute
         expiry_hour = expiry_dt.hour
@@ -9722,6 +9764,17 @@ def _poly_fetch_markets():
                             market = data
                         else:
                             continue
+
+                        # Debug: log first BTC market's fields to find Price to Beat
+                        if asset_slug == "btc" and tf_slug == "5m" and not markets:
+                            desc = (market.get("description") or "")[:200]
+                            print("POLY_DEBUG BTC 5m keys: {}".format(list(market.keys())[:20]))
+                            print("POLY_DEBUG desc: {}".format(desc))
+                            # Check for any price-like fields
+                            for k, v in market.items():
+                                vs = str(v)
+                                if "$" in vs or "price" in k.lower() or "strike" in k.lower() or "beat" in k.lower():
+                                    print("POLY_DEBUG field {}={}" .format(k, vs[:150]))
 
                         parsed = _poly_parse_market(market)
                         if parsed:
