@@ -5,3 +5,4 @@ yfinance
 eth-account
 eth-abi
 web3
+websocket-client
