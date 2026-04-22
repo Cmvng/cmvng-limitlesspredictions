@@ -10111,12 +10111,21 @@ def run_poly_scan():
             baseline = _poly_get_baseline(parsed, price, ind)
             parsed["baseline"] = baseline
             
-            # Debug: log PTB lookup for first few trades
-            if asset == "BTC" and tf == "5M":
-                end_ts = int(parsed["expiry_dt"].timestamp()) if parsed.get("expiry_dt") else 0
-                stored_keys = [k for k in _chainlink_ptb.keys() if k.startswith("BTC_5M")]
-                print("PTB_LOOKUP BTC 5M: end_ts={} stored_keys={} baseline={:.2f} chainlink={}".format(
-                    end_ts, stored_keys, baseline, _chainlink_prices.get("BTC", "none")))
+            # CRITICAL: Only trade if we have the exact Chainlink PTB
+            # If we only have the fallback (current price), skip this market
+            # — it will be caught on the next scan when PTB is available
+            has_exact_ptb = False
+            if parsed.get("expiry_dt") and asset and tf:
+                end_ts_check = int(parsed["expiry_dt"].timestamp())
+                ptb_check = _rtds_price_to_beat(asset, tf, end_ts_check)
+                if ptb_check:
+                    has_exact_ptb = True
+                    baseline = ptb_check
+                    parsed["baseline"] = baseline
+            
+            if not has_exact_ptb:
+                # No exact PTB yet — skip and wait for next scan
+                continue
 
             # 4H macro for 1H markets
             ind_macro = None
