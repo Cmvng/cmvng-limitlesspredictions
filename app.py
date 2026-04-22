@@ -9730,17 +9730,18 @@ def _poly_parse_market(market):
         if not asset:
             return None
 
-        # Must be an Up or Down market
-        if "up or down" not in question.lower() and "updown" not in slug_lower:
+        # Must be an Up or Down market OR an above/below market
+        if "up or down" not in q_lower and "updown" not in slug_lower and "above" not in q_lower and "below" not in q_lower:
             return None
 
-        # BUG 8 FIX: Check longer patterns first to avoid false matches
+        # Determine timeframe from slug pattern
         timeframe = None
-        if "-15m-" in slug_lower or "-15m" in slug_lower:
+        slug_lower = slug.lower() if slug else ""
+        if "-15m-" in slug_lower or "-15m" in slug_lower or "15min" in slug_lower:
             timeframe = "15M"
-        elif "-5m-" in slug_lower or "-5m" in slug_lower:
+        elif "-5m-" in slug_lower or "-5m" in slug_lower or "5min" in slug_lower:
             timeframe = "5M"
-        elif "-1h-" in slug_lower or "-1h" in slug_lower:
+        elif "-1h-" in slug_lower or "-1h" in slug_lower or "hourly" in slug_lower:
             timeframe = "1H"
 
         # Fallback to tags
@@ -9753,6 +9754,22 @@ def _poly_parse_market(market):
                 timeframe = "5M"
             elif "1 hour" in tag_str or "hourly" in tag_str or "1h" in tag_str:
                 timeframe = "1H"
+
+        if not timeframe:
+            # Detect from market duration (createdAt to expirationTimestamp)
+            created = market.get("createdAt") or ""
+            if created and exp_ts:
+                try:
+                    created_dt = datetime.fromisoformat(created.replace("Z", "+00:00"))
+                    duration_mins = (expiry_dt - created_dt).total_seconds() / 60
+                    if 55 <= duration_mins <= 65:
+                        timeframe = "1H"
+                    elif 13 <= duration_mins <= 17:
+                        timeframe = "15M"
+                    elif 4 <= duration_mins <= 6:
+                        timeframe = "5M"
+                except:
+                    pass
 
         if not timeframe:
             return None
@@ -9964,32 +9981,74 @@ def _poly_fetch_markets():
         except Exception as e:
             print("Poly fetch error: {}".format(e))
 
-    # Also fetch 1H markets via tag_id 102175 (hourly crypto tag)
-    # These use a different indexing system than 5M/15M
+    # Also fetch 1H markets — these use event slugs like "bitcoin-up-or-down-april-22-2026-2pm-et"
+    # and resolve via Binance BTC/USDT, NOT Chainlink
     hourly_found = sum(1 for m in markets if m.get("timeframe") == "1H")
     if hourly_found == 0:
         try:
-            r = req.get(
-                "{}/markets".format(POLY_GAMMA_API),
-                params={"active": "true", "closed": "false", "tag_id": 102175,
-                        "limit": 50},
-                timeout=15
-            )
-            if r.status_code == 200:
-                batch = r.json()
-                if isinstance(batch, list):
-                    existing_ids = set(m.get("market_id") for m in markets)
-                    for m in batch:
-                        q = (m.get("question") or m.get("title") or "").lower()
-                        if "up or down" in q:
-                            parsed = _poly_parse_market(m)
-                            if parsed and parsed["market_id"] not in existing_ids:
-                                # Force timeframe to 1H if tag says hourly
-                                if not parsed.get("timeframe"):
+            now_et = now - timedelta(hours=4)  # UTC to ET
+            month_names = ["", "january", "february", "march", "april", "may", "june",
+                          "july", "august", "september", "october", "november", "december"]
+            month = month_names[now_et.month]
+            day = now_et.day
+            year = now_et.year
+
+            for asset_name, asset_code in [("bitcoin", "BTC"), ("ethereum", "ETH"), ("solana", "SOL"), ("xrp", "XRP")]:
+                for hour_offset in [0, 1]:
+                    target = now_et + timedelta(hours=hour_offset)
+                    target_hour = target.hour
+                    am_pm = "am" if target_hour < 12 else "pm"
+                    display_hour = target_hour if target_hour <= 12 else target_hour - 12
+                    if display_hour == 0:
+                        display_hour = 12
+
+                    event_slug = "{}-up-or-down-{}-{}-{}-{}{}-et".format(
+                        asset_name, month, target.day, year, display_hour, am_pm)
+
+                    try:
+                        r = req.get("{}/events".format(POLY_GAMMA_API),
+                                    params={"slug": event_slug}, timeout=5)
+                        if r.status_code == 200:
+                            data = r.json()
+                            event_markets = []
+                            if isinstance(data, list) and data:
+                                event_markets = data[0].get("markets", []) if isinstance(data[0], dict) else []
+                            elif isinstance(data, dict):
+                                event_markets = data.get("markets", [])
+                            for m in event_markets:
+                                parsed = _poly_parse_market(m)
+                                if parsed:
                                     parsed["timeframe"] = "1H"
-                                markets.append(parsed)
+                                    markets.append(parsed)
+                    except:
+                        pass
+
+            # Fallback: tag search
+            if sum(1 for m in markets if m.get("timeframe") == "1H") == 0:
+                try:
+                    r = req.get("{}/markets".format(POLY_GAMMA_API),
+                                params={"active": "true", "closed": "false", "tag_id": 102175, "limit": 50},
+                                timeout=15)
+                    if r.status_code == 200:
+                        batch = r.json()
+                        if isinstance(batch, list):
+                            existing_ids = set(m.get("market_id") for m in markets)
+                            for m in batch:
+                                q = (m.get("question") or m.get("title") or "").lower()
+                                if "up or down" in q or "above" in q:
+                                    parsed = _poly_parse_market(m)
+                                    if parsed and parsed["market_id"] not in existing_ids:
+                                        if not parsed.get("timeframe"):
+                                            parsed["timeframe"] = "1H"
+                                        markets.append(parsed)
+                except:
+                    pass
+
+            hourly_total = sum(1 for m in markets if m.get("timeframe") == "1H")
+            if hourly_total > 0:
+                print("Poly 1H: {} hourly markets found".format(hourly_total))
         except Exception as e:
-            print("Poly 1H tag fetch error: {}".format(e))
+            print("Poly 1H error: {}".format(e))
 
     if markets:
         print("Poly scan: {} markets found".format(len(markets)))
@@ -10001,13 +10060,26 @@ def _poly_fetch_markets():
 
 def _poly_get_baseline(parsed, price, indicators):
     """Get the Price to Beat directly from Chainlink RTDS cache.
-    Simple: read _chainlink_ptb[ASSET_TF] which stores the exact price."""
+    Only returns the PTB if it matches the current market's window."""
     asset = parsed.get("asset", "")
     tf = parsed.get("timeframe", "")
     key = "{}_{}".format(asset, tf)
     entry = _chainlink_ptb.get(key)
     if entry:
-        return entry[1]  # (end_ts, price) → return price
+        stored_end_ts, stored_price = entry
+        # Verify this PTB is for the correct window
+        # The market's expiry should match the stored window end
+        expiry_dt = parsed.get("expiry_dt")
+        if expiry_dt:
+            market_end_ts = int(expiry_dt.timestamp())
+            tf_sec = {"5M": 300, "15M": 900, "1H": 3600}.get(tf, 300)
+            # PTB must be from the same window (end_ts matches)
+            # or the immediately previous window (within 1 window)
+            if abs(stored_end_ts - market_end_ts) <= tf_sec:
+                return stored_price
+            else:
+                return None  # Stale PTB from wrong window
+        return stored_price
     return None
 
 
@@ -10043,11 +10115,13 @@ def run_poly_scan():
             mins_left = parsed["mins_left"]
 
             # Skip if too little or too much time left
-            if tf == "5M" and (mins_left < 1 or mins_left > 6):
+            # For 5M: only trade after window has opened (PTB captured at boundary)
+            # Max 4.5 min ensures we're inside the window, not before it
+            if tf == "5M" and (mins_left < 1 or mins_left > 4.5):
                 continue
-            if tf == "15M" and (mins_left < 2 or mins_left > 18):
+            if tf == "15M" and (mins_left < 2 or mins_left > 14):
                 continue
-            if tf == "1H" and (mins_left < 5 or mins_left > 65):
+            if tf == "1H" and (mins_left < 5 or mins_left > 58):
                 continue
 
             # Determine which sections this market belongs to
