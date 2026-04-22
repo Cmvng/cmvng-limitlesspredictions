@@ -9508,9 +9508,33 @@ _chainlink_ptb = {}     # {"BTC_5M_1776888000": 78684.13, "BTC_15M_1776888900": 
 _chainlink_connected = False
 
 def _rtds_price_to_beat(asset, timeframe, end_ts):
-    """Get the Price to Beat for a specific window from Chainlink cache."""
+    """Get the Price to Beat for a specific window from Chainlink cache.
+    Tries the exact end_ts, then nearby windows in case of timing offset."""
+    # Try exact match
     key = "{}_{}_{}".format(asset, timeframe, end_ts)
-    return _chainlink_ptb.get(key)
+    ptb = _chainlink_ptb.get(key)
+    if ptb:
+        return ptb
+    
+    # Try nearby windows (±1 second rounding issues)
+    for offset in [-1, 1, -2, 2]:
+        key2 = "{}_{}_{}".format(asset, timeframe, end_ts + offset)
+        ptb = _chainlink_ptb.get(key2)
+        if ptb:
+            return ptb
+    
+    # Try the window that contains current time
+    # (scanner might query for next window but PTB is from current)
+    tf_seconds = {"5M": 300, "15M": 900, "1H": 3600}.get(timeframe, 300)
+    now_ts = int(time.time())
+    current_window_end = ((now_ts // tf_seconds) + 1) * tf_seconds
+    if current_window_end != end_ts:
+        key3 = "{}_{}_{}".format(asset, timeframe, current_window_end)
+        ptb = _chainlink_ptb.get(key3)
+        if ptb:
+            return ptb
+    
+    return None
 
 def _rtds_current_price(asset):
     """Get latest Chainlink price for an asset."""
@@ -9534,7 +9558,7 @@ def _rtds_loop():
             window_start = (ts_sec // tf_sec) * tf_sec
             window_end = window_start + tf_sec
             ptb_key = "{}_{}_{}".format(asset, tf_label, window_end)
-            if ts_sec - window_start <= 5 and ptb_key not in _chainlink_ptb:
+            if ts_sec - window_start <= 15 and ptb_key not in _chainlink_ptb:
                 _chainlink_ptb[ptb_key] = price
                 print("PTB {} {} = ${:,.2f}".format(asset, tf_label, price))
         # Clean old entries
@@ -9844,10 +9868,8 @@ def _poly_parse_market(market):
         # Log what we found for debugging
         if baseline:
             pass  # Got exact price from API
-        else:
-            # Log first 100 chars of description to debug
-            desc_preview = description[:100] if description else "empty"
-            print("Poly baseline NOT found for {} — desc: {}".format(asset, desc_preview))
+        # Only log missing baseline once per scan, not per market
+        # (the baseline will be found by _poly_get_baseline from Chainlink)
 
         expiry_minute = expiry_dt.minute
         expiry_hour = expiry_dt.hour
@@ -9928,17 +9950,6 @@ def _poly_fetch_markets():
                             market = data
                         else:
                             continue
-
-                        # Debug: log first BTC market's fields to find Price to Beat
-                        if asset_slug == "btc" and tf_slug == "5m" and not markets:
-                            desc = (market.get("description") or "")[:200]
-                            print("POLY_DEBUG BTC 5m keys: {}".format(list(market.keys())[:20]))
-                            print("POLY_DEBUG desc: {}".format(desc))
-                            # Check for any price-like fields
-                            for k, v in market.items():
-                                vs = str(v)
-                                if "$" in vs or "price" in k.lower() or "strike" in k.lower() or "beat" in k.lower():
-                                    print("POLY_DEBUG field {}={}" .format(k, vs[:150]))
 
                         parsed = _poly_parse_market(market)
                         if parsed:
