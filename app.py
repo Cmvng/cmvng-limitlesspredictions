@@ -90,6 +90,7 @@ _bot3_state = {
 _bot21_state = {
     "enabled": True,
     "balance": 20.0,
+    "peak_balance": 20.0,
     "daily_loss": 0.0,
     "daily_profit": 0.0,
     "trades_today": 0,
@@ -106,6 +107,7 @@ _bot21_state = {
 _bot31_state = {
     "enabled": True,
     "balance": 20.0,
+    "peak_balance": 20.0,
     "daily_loss": 0.0,
     "daily_profit": 0.0,
     "trades_today": 0,
@@ -148,6 +150,71 @@ def _calc_bot_stake(state):
     if stake > balance or stake < min_stake:
         return 0
 
+    return stake
+
+
+def _calc_autoscale_stake(state):
+    """Auto-scaling stake calculator for P2.1 and P3.1.
+    
+    Tiers:
+      $5-$50:   $1 fixed
+      $50-$100: 3% of balance
+      $100-$300: 4% of balance
+      $300+:    5% of balance
+    
+    Safety: 30% drawdown from peak → drop one tier
+    Floor: $5 → stops trading
+    """
+    balance = state.get("balance", 0)
+    peak = state.get("peak_balance", balance)
+    floor = state.get("floor_balance", 5.0)
+    min_stake = 1.0
+    
+    # Check floor
+    if balance <= floor:
+        return 0
+    
+    # Track peak
+    if balance > peak:
+        state["peak_balance"] = balance
+        peak = balance
+    
+    # Check 30% drawdown from peak
+    in_drawdown = (peak > 0 and balance < peak * 0.70)
+    
+    # Determine current tier based on balance
+    if balance >= 300:
+        normal_pct = 0.05   # Tier 4: 5%
+        safety_pct = 0.04   # Drop to Tier 3: 4%
+    elif balance >= 100:
+        normal_pct = 0.04   # Tier 3: 4%
+        safety_pct = 0.03   # Drop to Tier 2: 3%
+    elif balance >= 50:
+        normal_pct = 0.03   # Tier 2: 3%
+        safety_pct = None    # Drop to Tier 1: $1 fixed
+    else:
+        normal_pct = None    # Tier 1: $1 fixed
+        safety_pct = None
+    
+    # Calculate stake
+    if in_drawdown and safety_pct is not None:
+        stake = max(min_stake, round(balance * safety_pct, 2))
+    elif in_drawdown and safety_pct is None:
+        stake = min_stake
+    elif normal_pct is not None:
+        stake = max(min_stake, round(balance * normal_pct, 2))
+    else:
+        stake = min_stake
+    
+    # Never bet more than would take us below floor
+    max_allowed = balance - floor
+    if max_allowed < min_stake:
+        return 0  # Not enough above floor for minimum stake
+    if stake > max_allowed:
+        stake = round(max_allowed, 2)
+    if stake > balance or stake < min_stake:
+        return 0
+    
     return stake
 
 YAHOO_MAP = {
@@ -4047,7 +4114,7 @@ def run_paper34_scan():
                         # Place REAL trade via Paper 3.1 bot
                         floor31 = _bot31_state.get("floor_balance", 0)
                         if _bot31_state["enabled"] and _bot31_state["balance"] > floor31 and not _is_volatile_window():
-                            real_stake31 = _calc_bot_stake(_bot31_state)
+                            real_stake31 = _calc_autoscale_stake(_bot31_state)
                             if real_stake31 <= 0:
                                 _bot31_state["enabled"] = False
                                 send_telegram("⚠️ <b>Paper 3.1 stopped — floor reached</b>\nBalance: ${:.2f}".format(_bot31_state["balance"]))
@@ -4096,7 +4163,7 @@ def run_paper34_scan():
                         # Place REAL trade via Paper 2.1 bot
                         floor21 = _bot21_state.get("floor_balance", 0)
                         if _bot21_state["enabled"] and _bot21_state["balance"] > floor21 and not _is_volatile_window():
-                            real_stake21 = _calc_bot_stake(_bot21_state)
+                            real_stake21 = _calc_autoscale_stake(_bot21_state)
                             if real_stake21 <= 0:
                                 _bot21_state["enabled"] = False
                                 send_telegram("⚠️ <b>Paper 2.1 stopped — floor reached</b>\nBalance: ${:.2f}".format(_bot21_state["balance"]))
@@ -4308,7 +4375,7 @@ def _resolve_paper_table(table_name):
                 # P2.1 went live ~18:00 UTC Apr 21, 2026
                 if table_name == "paper21_trades":
                     fired = p.get("fired_at") or ""
-                    is_live_trade = fired >= "2026-04-22T06:00"
+                    is_live_trade = fired >= "2026-04-22T08:30"
                     if is_live_trade:
                         if won:
                             _bot21_state["balance"] = round(_bot21_state["balance"] + payout, 2)
@@ -4327,7 +4394,7 @@ def _resolve_paper_table(table_name):
                 # P3.1 went live ~18:00 UTC Apr 21, 2026
                 if table_name == "paper31_trades":
                     fired = p.get("fired_at") or ""
-                    is_live_trade = fired >= "2026-04-22T06:00"
+                    is_live_trade = fired >= "2026-04-22T08:30"
                     if is_live_trade:
                         if won:
                             _bot31_state["balance"] = round(_bot31_state["balance"] + payout, 2)
@@ -6742,7 +6809,7 @@ def p21_status():
         "floor_balance": _bot21_state.get("floor_balance", 0),
         "compound_after": round(compound_target, 2),
         "is_compounding": _bot21_state["balance"] >= compound_target,
-        "current_stake": _calc_bot_stake(_bot21_state),
+        "current_stake": _calc_autoscale_stake(_bot21_state),
         "daily_profit": _bot21_state["daily_profit"],
         "daily_loss": _bot21_state["daily_loss"],
         "trades_today": _bot21_state["trades_today"],
@@ -6756,7 +6823,7 @@ def p21_set():
         _bot21_state["starting_balance"] = float(request.args["balance"])
     if request.args.get("floor"):
         _bot21_state["floor_balance"] = float(request.args["floor"])
-    return {"balance": _bot21_state["balance"], "floor": _bot21_state.get("floor_balance", 0), "stake": _calc_bot_stake(_bot21_state)}, 200
+    return {"balance": _bot21_state["balance"], "floor": _bot21_state.get("floor_balance", 0), "stake": _calc_autoscale_stake(_bot21_state)}, 200
 
 @app.route("/p21/start", methods=["GET"])
 def p21_start():
@@ -6779,7 +6846,7 @@ def p31_status():
         "floor_balance": _bot31_state.get("floor_balance", 0),
         "compound_after": round(compound_target, 2),
         "is_compounding": _bot31_state["balance"] >= compound_target,
-        "current_stake": _calc_bot_stake(_bot31_state),
+        "current_stake": _calc_autoscale_stake(_bot31_state),
         "daily_profit": _bot31_state["daily_profit"],
         "daily_loss": _bot31_state["daily_loss"],
         "trades_today": _bot31_state["trades_today"],
@@ -6793,7 +6860,7 @@ def p31_set():
         _bot31_state["starting_balance"] = float(request.args["balance"])
     if request.args.get("floor"):
         _bot31_state["floor_balance"] = float(request.args["floor"])
-    return {"balance": _bot31_state["balance"], "floor": _bot31_state.get("floor_balance", 0), "stake": _calc_bot_stake(_bot31_state)}, 200
+    return {"balance": _bot31_state["balance"], "floor": _bot31_state.get("floor_balance", 0), "stake": _calc_autoscale_stake(_bot31_state)}, 200
 
 @app.route("/p31/start", methods=["GET"])
 def p31_start():
