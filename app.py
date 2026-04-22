@@ -7880,6 +7880,7 @@ tbody tr:hover{background:var(--bg)}
       <a href="/" class="nav-tab">Home</a>
       <a href="/app" class="nav-tab active">Crypto</a>
       <a href="/app/football" class="nav-tab">Football</a>
+      <a href="/app/poly/btc5m" class="nav-tab">Polymarket</a>
       <a href="/app/paper" class="nav-tab">Bot 2</a>
       <a href="/app/paper3" class="nav-tab">Paper 3</a>
       <a href="/app/paper4" class="nav-tab">Paper 4</a>
@@ -8083,6 +8084,7 @@ tbody tr:hover{background:var(--bg)}
       <a href="/" class="nav-tab">Home</a>
       <a href="/app" class="nav-tab">Crypto</a>
       <a href="/app/football" class="nav-tab active">Football</a>
+      <a href="/app/poly/btc5m" class="nav-tab">Polymarket</a>
     </nav>
   </div>
 </header>
@@ -8985,6 +8987,7 @@ tr:hover td{background:#fafaf7}
     <a href="/" class="nav-tab">Home</a>
     <a href="/app" class="nav-tab">Crypto</a>
     <a href="/app/football" class="nav-tab">Football</a>
+      <a href="/app/poly/btc5m" class="nav-tab">Polymarket</a>
       <a href="/app/paper" class="nav-tab">Bot 2</a>
       <a href="/app/paper3" class="nav-tab">Paper 3</a>
       <a href="/app/paper4" class="nav-tab">Paper 4</a>
@@ -9229,6 +9232,7 @@ td{padding:8px 12px;border-bottom:1px solid #f4f3ed;color:var(--ink-2)}tr:last-c
     <a href="/app/paper51" class="nav-tab""" + (" active" if nav_active == "paper51" else "") + """">Paper 5.1</a>
     <a href="/app/paper5" class="nav-tab""" + (" active" if nav_active == "paper5" else "") + """">Paper 5</a>
     <a href="/app/football" class="nav-tab">Football</a>
+      <a href="/app/poly/btc5m" class="nav-tab">Polymarket</a>
   </nav>
 </header>
 <section class="hero">
@@ -9447,18 +9451,25 @@ def paper5_page():
 
 try:
     init_db()
-    # Reset all balances to $20 (fresh start)
-    try:
-        _reset_conn = get_db()
-        _reset_conn.run("DELETE FROM bot_balances")
-        _reset_conn.close()
-        print("Reset all Limitless balances to $20.00")
-    except Exception as e:
-        print("Balance reset note: {}".format(e))
-    # Force $20 on all bot states
-    for _bot_state_ref in [_bot21_state, _bot31_state, _bot22_state, _bot32_state]:
-        _bot_state_ref["balance"] = 20.0
-        _bot_state_ref["peak_balance"] = 20.0
+    # Load saved balances from database (persists across deploys)
+    _saved_bals = _load_bot_balances()
+    if _saved_bals:
+        for _bot_name, _bot_state_ref in [
+            ("p21", _bot21_state), ("p31", _bot31_state),
+            ("p22", _bot22_state), ("p32", _bot32_state),
+        ]:
+            if _bot_name in _saved_bals:
+                _bot_state_ref["balance"] = _saved_bals[_bot_name]["balance"]
+                _bot_state_ref["peak_balance"] = _saved_bals[_bot_name].get("peak_balance", _bot_state_ref["balance"])
+                _bot_state_ref["enabled"] = _saved_bals[_bot_name].get("enabled", True)
+        print("Loaded balances: {}".format(
+            ", ".join("{}=${:.2f}".format(k, v["balance"]) for k, v in _saved_bals.items())))
+    else:
+        # First run after reset — save $20 defaults
+        for _bn, _bs in [("p21", _bot21_state), ("p31", _bot31_state),
+                          ("p22", _bot22_state), ("p32", _bot32_state)]:
+            _save_bot_balance(_bn, _bs)
+        print("No saved balances — starting fresh at $20.00 each")
 except Exception as e:
     print("DB init error: {}".format(e))
 
