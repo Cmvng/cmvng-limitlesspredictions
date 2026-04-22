@@ -2539,10 +2539,12 @@ def _calculate_indicators(asset, timeframe="1h"):
         closes = df["Close"].values.flatten()
         highs = df["High"].values.flatten()
         lows = df["Low"].values.flatten()
+        opens = df["Open"].values.flatten()
         volumes = df["Volume"].values.flatten() if "Volume" in df.columns else None
 
         n = len(closes)
         current = float(closes[-1])
+        candle_open = float(opens[-1]) if len(opens) > 0 else current
 
         sma10 = float(sum(closes[-10:]) / 10) if n >= 10 else None
         sma20 = float(sum(closes[-20:]) / 20) if n >= 20 else None
@@ -2904,6 +2906,7 @@ def _calculate_indicators(asset, timeframe="1h"):
             "pivot_signal": pivot_signal,
             "dist_sigma": dist_sigma,
             "dist_momentum": dist_momentum,
+            "candle_open": candle_open,
         }
 
         _indicator_cache[cache_key] = {"data": result, "updated": datetime.now(timezone.utc)}
@@ -9454,21 +9457,35 @@ def paper5_page():
 
 try:
     init_db()
-    # Reset all balances to $15 (user requested)
+    # Load Limitless balances from DB (persistence mode)
+    _saved_bals = _load_bot_balances()
+    if _saved_bals:
+        for _bot_name, _bot_state_ref in [
+            ("p21", _bot21_state), ("p31", _bot31_state),
+            ("p22", _bot22_state), ("p32", _bot32_state),
+        ]:
+            if _bot_name in _saved_bals:
+                _bot_state_ref["balance"] = _saved_bals[_bot_name]["balance"]
+                _bot_state_ref["peak_balance"] = _saved_bals[_bot_name].get("peak_balance", _bot_state_ref["balance"])
+                _bot_state_ref["enabled"] = _saved_bals[_bot_name].get("enabled", True)
+        print("Loaded balances: {}".format(
+            ", ".join("{}=${:.2f}".format(k, v["balance"]) for k, v in _saved_bals.items())))
+    else:
+        for _bn, _bs in [("p21", _bot21_state), ("p31", _bot31_state),
+                          ("p22", _bot22_state), ("p32", _bot32_state)]:
+            _save_bot_balance(_bn, _bs)
+        print("No saved balances — starting fresh at $15.00 each")
+    # Clear old Polymarket trades (bad baseline data) and reset poly balances
     try:
-        _reset_conn = get_db()
-        _reset_conn.run("DELETE FROM bot_balances")
-        _reset_conn.close()
-    except:
-        pass
-    for _bot_state_ref in [_bot21_state, _bot31_state, _bot22_state, _bot32_state]:
-        _bot_state_ref["balance"] = 15.0
-        _bot_state_ref["peak_balance"] = 15.0
-    # Save the $15 balances immediately
-    for _bn, _bs in [("p21", _bot21_state), ("p31", _bot31_state),
-                      ("p22", _bot22_state), ("p32", _bot32_state)]:
-        _save_bot_balance(_bn, _bs)
-    print("Reset all Limitless balances to $15.00 each")
+        _pc = get_db()
+        _pc.run("DELETE FROM poly_trades")
+        _pc.close()
+        for _ps in ["btc5m", "all5m", "all15m", "all1h"]:
+            for _pst in ["p21", "p23", "p31", "p33"]:
+                _poly_set_balance(_ps, _pst, 20.0)
+        print("Cleared old Polymarket trades — fresh start with correct baseline")
+    except Exception as e:
+        print("Poly cleanup note: {}".format(e))
 except Exception as e:
     print("DB init error: {}".format(e))
 
@@ -9773,16 +9790,17 @@ def _poly_fetch_markets():
 
 
 def _poly_get_baseline(parsed, price, indicators):
-    """Get baseline for a Polymarket market.
-    BUG 1 FIX: Use candle open price as baseline instead of current price.
-    For Up/Down markets, the Price to Beat = opening price of the window."""
+    """Get baseline (Price to Beat) for a Polymarket market.
+    Price to Beat = Chainlink price at window open ≈ yfinance candle open.
+    This is the price the market resolves against."""
+    # First check if parsed from API description
     if parsed.get("baseline") and parsed["baseline"] > 0:
         return parsed["baseline"]
-    # Use the open of the current candle from yfinance as the window open price
-    # This is more accurate than current price because baseline = price at window start
-    # The indicators dict doesn't have open, so we approximate:
-    # For a candle that just started, sma10 is a decent proxy, but current is too late.
-    # Best approximation: use current price (it's close enough for paper trading)
+    # Use yfinance candle open price — this matches the window open
+    # which is what Polymarket uses as the Price to Beat
+    if indicators and indicators.get("candle_open"):
+        return indicators["candle_open"]
+    # Last resort fallback
     return price
 
 
@@ -10155,6 +10173,16 @@ def _build_poly_page(section, page_title, subtitle, description):
                 pnl_cell = "—"
                 status_cell = "Pending"
 
+            # Format baseline for display
+            baseline_val = t.get("baseline")
+            price_val = t.get("current_price")
+            if baseline_val and price_val:
+                baseline_str = "${:,.2f}".format(float(baseline_val))
+                price_str = "${:,.2f}".format(float(price_val))
+            else:
+                baseline_str = "—"
+                price_str = "—"
+
             trade_rows.append({
                 "id": t.get("id", ""),
                 "title": (t.get("title") or "")[:55],
@@ -10162,6 +10190,8 @@ def _build_poly_page(section, page_title, subtitle, description):
                 "side": t.get("bet_side", ""),
                 "odds": "{}%".format(t.get("bet_odds", "")),
                 "type": t.get("market_type", ""),
+                "baseline": baseline_str,
+                "price": price_str,
                 "pnl": pnl_cell,
                 "status": status_cell,
                 "time": (t.get("fired_at") or "")[:16],
@@ -10196,9 +10226,10 @@ def _build_poly_page(section, page_title, subtitle, description):
         for tr in s["trades"]:
             rows_html += """<tr>
               <td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td>
-              <td>{}</td><td>{}</td><td>{}</td><td>{}</td>
+              <td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td>
             </tr>""".format(tr["id"], tr["title"], tr["asset"], tr["side"],
-                            tr["odds"], tr["type"], tr["pnl"], tr["status"], tr["time"])
+                            tr["odds"], tr["type"], tr["baseline"], tr["price"],
+                            tr["pnl"], tr["status"], tr["time"])
 
         strats_html += """
     <div class="card" style="margin-bottom:20px;">
@@ -10218,7 +10249,7 @@ def _build_poly_page(section, page_title, subtitle, description):
           <table style="width:100%; border-collapse:collapse; font-size:0.82em;">
             <tr style="background:#f0f0f0;">
               <th>#</th><th>Market</th><th>Asset</th><th>Side</th><th>Odds</th>
-              <th>Type</th><th>Sim P&amp;L</th><th>Status</th><th>Time</th>
+              <th>Type</th><th>Price to Beat</th><th>Price</th><th>Sim P&amp;L</th><th>Status</th><th>Time</th>
             </tr>
             {rows}
           </table>
