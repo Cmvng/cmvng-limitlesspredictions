@@ -9508,30 +9508,10 @@ _chainlink_ptb = {}     # {"BTC_5M_1776888000": 78684.13, "BTC_15M_1776888900": 
 _chainlink_connected = False
 
 def _rtds_price_to_beat(asset, timeframe, end_ts):
-    """Get the Price to Beat for a specific window from Chainlink cache.
-    The PTB key uses window_end timestamps. The market's expiry might be 
-    the same window or a neighboring one, so we check multiple."""
-    tf_seconds = {"5M": 300, "15M": 900, "1H": 3600}.get(timeframe, 300)
-    
-    # Try exact match and nearby windows (±1 window in each direction)
-    for offset in [0, -tf_seconds, tf_seconds, -2*tf_seconds, 2*tf_seconds, -1, 1]:
-        key = "{}_{}_{}".format(asset, timeframe, end_ts + offset)
-        ptb = _chainlink_ptb.get(key)
-        if ptb:
-            return ptb
-    
-    # Try all stored keys for this asset+timeframe, find closest to end_ts
-    prefix = "{}_{}_".format(asset, timeframe)
-    matching = {k: v for k, v in _chainlink_ptb.items() if k.startswith(prefix)}
-    if matching:
-        # Find the key with timestamp closest to end_ts
-        closest_key = min(matching.keys(), key=lambda k: abs(int(k.rsplit("_", 1)[1]) - end_ts))
-        closest_ts = int(closest_key.rsplit("_", 1)[1])
-        # Only use if within 2 windows
-        if abs(closest_ts - end_ts) <= tf_seconds * 2:
-            return matching[closest_key]
-    
-    return None
+    """Get the exact Price to Beat for a specific window.
+    Only returns if we have the EXACT window match. No fuzzy matching."""
+    key = "{}_{}_{}".format(asset, timeframe, end_ts)
+    return _chainlink_ptb.get(key)
 
 def _rtds_current_price(asset):
     """Get latest Chainlink price for an asset."""
@@ -10015,12 +9995,38 @@ def _poly_fetch_markets():
 
 
 def _poly_get_baseline(parsed, price, indicators):
-    """Get baseline (Price to Beat) for a Polymarket market.
-    Priority: 1. Exact Chainlink price from RTDS WebSocket
-              2. Price from API description
-              3. yfinance candle open (fallback)"""
-    # Source 1: Exact Chainlink Price to Beat from RTDS
+    """Get the exact Price to Beat from Polymarket's dedicated API endpoint.
+    GET https://polymarket.com/api/equity/price-to-beat/{slug}
+    Falls back to Chainlink RTDS, then candle open."""
+    import requests as req
     asset = parsed.get("asset", "")
+    slug = parsed.get("slug", "")
+    
+    # Source 1: Polymarket's dedicated Price to Beat API (EXACT)
+    if slug:
+        try:
+            r = req.get(
+                "https://polymarket.com/api/equity/price-to-beat/{}".format(slug),
+                timeout=5
+            )
+            if r.status_code == 200:
+                data = r.json()
+                # Response might be {"price_to_beat": 78724.98} or just a number
+                if isinstance(data, dict):
+                    ptb = data.get("price_to_beat") or data.get("priceToBeat") or data.get("price") or data.get("value")
+                    if ptb:
+                        return float(ptb)
+                elif isinstance(data, (int, float)):
+                    return float(data)
+                elif isinstance(data, str):
+                    try:
+                        return float(data)
+                    except:
+                        pass
+        except:
+            pass
+    
+    # Source 2: Exact Chainlink PTB from RTDS cache
     tf = parsed.get("timeframe", "")
     expiry_dt = parsed.get("expiry_dt")
     if expiry_dt and asset and tf:
@@ -10029,16 +10035,12 @@ def _poly_get_baseline(parsed, price, indicators):
         if ptb:
             return ptb
     
-    # Source 2: From API description (if regex found a price)
-    if parsed.get("baseline") and parsed["baseline"] > 0:
-        return parsed["baseline"]
-    
-    # Source 3: Latest Chainlink price (close but not exact PTB)
+    # Source 3: Latest Chainlink price
     chainlink = _rtds_current_price(asset)
     if chainlink:
         return chainlink
     
-    # Source 4: yfinance candle open (last resort)
+    # Source 4: yfinance candle open
     if indicators and indicators.get("candle_open"):
         return indicators["candle_open"]
     
@@ -10110,22 +10112,6 @@ def run_poly_scan():
 
             baseline = _poly_get_baseline(parsed, price, ind)
             parsed["baseline"] = baseline
-            
-            # CRITICAL: Only trade if we have the exact Chainlink PTB
-            # If we only have the fallback (current price), skip this market
-            # — it will be caught on the next scan when PTB is available
-            has_exact_ptb = False
-            if parsed.get("expiry_dt") and asset and tf:
-                end_ts_check = int(parsed["expiry_dt"].timestamp())
-                ptb_check = _rtds_price_to_beat(asset, tf, end_ts_check)
-                if ptb_check:
-                    has_exact_ptb = True
-                    baseline = ptb_check
-                    parsed["baseline"] = baseline
-            
-            if not has_exact_ptb:
-                # No exact PTB yet — skip and wait for next scan
-                continue
 
             # 4H macro for 1H markets
             ind_macro = None
