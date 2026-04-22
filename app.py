@@ -4861,7 +4861,7 @@ def _resolve_paper_table(table_name):
                 # P2.1 went live ~18:00 UTC Apr 21, 2026
                 if table_name == "paper21_trades":
                     fired = p.get("fired_at") or ""
-                    is_live_trade = fired >= "2026-04-22T08:30"
+                    is_live_trade = fired >= "2026-04-22T15:00"
                     if is_live_trade:
                         if won:
                             _bot21_state["balance"] = round(_bot21_state["balance"] + payout, 2)
@@ -4880,7 +4880,7 @@ def _resolve_paper_table(table_name):
                 # P3.1 went live ~18:00 UTC Apr 21, 2026
                 if table_name == "paper31_trades":
                     fired = p.get("fired_at") or ""
-                    is_live_trade = fired >= "2026-04-22T08:30"
+                    is_live_trade = fired >= "2026-04-22T15:00"
                     if is_live_trade:
                         if won:
                             _bot31_state["balance"] = round(_bot31_state["balance"] + payout, 2)
@@ -4898,7 +4898,7 @@ def _resolve_paper_table(table_name):
                 # Update Paper 2.2 balance
                 if table_name == "paper22_trades":
                     fired = p.get("fired_at") or ""
-                    is_live_trade = fired >= "2026-04-22T09:00"
+                    is_live_trade = fired >= "2026-04-22T15:00"
                     if is_live_trade:
                         if won:
                             _bot22_state["balance"] = round(_bot22_state["balance"] + payout, 2)
@@ -4915,7 +4915,7 @@ def _resolve_paper_table(table_name):
                 # Update Paper 3.2 balance
                 if table_name == "paper32_trades":
                     fired = p.get("fired_at") or ""
-                    is_live_trade = fired >= "2026-04-22T09:00"
+                    is_live_trade = fired >= "2026-04-22T15:00"
                     if is_live_trade:
                         if won:
                             _bot32_state["balance"] = round(_bot32_state["balance"] + payout, 2)
@@ -9447,16 +9447,18 @@ def paper5_page():
 
 try:
     init_db()
-    # Load saved balances from database
-    _saved_bals = _load_bot_balances()
-    for _bot_name, _bot_state_ref in [
-        ("p21", _bot21_state), ("p31", _bot31_state),
-        ("p22", _bot22_state), ("p32", _bot32_state),
-    ]:
-        if _bot_name in _saved_bals:
-            _bot_state_ref["balance"] = _saved_bals[_bot_name]["balance"]
-            _bot_state_ref["peak_balance"] = _saved_bals[_bot_name].get("peak_balance", _bot_state_ref["balance"])
-            _bot_state_ref["enabled"] = _saved_bals[_bot_name].get("enabled", True)
+    # Reset all balances to $20 (fresh start)
+    try:
+        _reset_conn = get_db()
+        _reset_conn.run("DELETE FROM bot_balances")
+        _reset_conn.close()
+        print("Reset all Limitless balances to $20.00")
+    except Exception as e:
+        print("Balance reset note: {}".format(e))
+    # Force $20 on all bot states
+    for _bot_state_ref in [_bot21_state, _bot31_state, _bot22_state, _bot32_state]:
+        _bot_state_ref["balance"] = 20.0
+        _bot_state_ref["peak_balance"] = 20.0
 except Exception as e:
     print("DB init error: {}".format(e))
 
@@ -9464,12 +9466,8 @@ threading.Thread(target=scan_loop, daemon=True).start()
 threading.Thread(target=outcome_loop, daemon=True).start()
 threading.Thread(target=football_loop, daemon=True).start()
 threading.Thread(target=otp_loop, daemon=True).start()
-threading.Thread(target=_poly_scan_loop, daemon=True).start()
 if SIGNALS_DB_URL:
     threading.Thread(target=_signals_poll_loop, daemon=True).start()
-    print("Limitless Bot v4 — 6 threads running (signals DB + Polymarket)")
-else:
-    print("Limitless Bot v4 — 5 threads running (Polymarket enabled, no signals DB)")
 
 # ═══════════════════════════════════════════════════════════
 # POLYMARKET MODULE — Paper trading on crypto Up/Down markets
@@ -10180,6 +10178,12 @@ def poly_all1h_page():
         "Tests all strategies across all available 1H Polymarket crypto pairs."
     )
 
+
+# Start Polymarket thread (defined above)
+threading.Thread(target=_poly_scan_loop, daemon=True).start()
+print("Limitless Bot v4 — {} threads running (Polymarket enabled{})".format(
+    6 if SIGNALS_DB_URL else 5,
+    " + signals DB" if SIGNALS_DB_URL else ""))
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
