@@ -9559,41 +9559,37 @@ def _rtds_loop():
             # Try JSON format first
             if message.startswith("{") or message.startswith("["):
                 data = json.loads(message)
-                # Could be array of updates or single object
-                updates = data if isinstance(data, list) else [data]
-                for item in updates:
-                    if isinstance(item, dict):
-                        pair = item.get("pair") or item.get("symbol") or item.get("asset_id") or ""
-                        price_val = item.get("price") or item.get("value") or item.get("px")
-                        ts = item.get("timestamp") or item.get("ts") or 0
+                
+                # RTDS format: {"topic":"crypto_prices_chainlink","type":"update",
+                #   "timestamp":1753314064237,
+                #   "payload":{"symbol":"eth/usd","timestamp":1753314064213,"value":3456.78}}
+                if isinstance(data, dict):
+                    payload = data.get("payload")
+                    topic = data.get("topic", "")
+                    
+                    if payload and isinstance(payload, dict):
+                        symbol = (payload.get("symbol") or "").lower()
+                        value = payload.get("value") or payload.get("price")
+                        ts = payload.get("timestamp") or data.get("timestamp") or 0
                         
-                        if not pair or not price_val:
-                            continue
-                        
-                        pair = pair.lower().strip()
-                        price = float(price_val)
-                        asset = pair_map.get(pair)
-                        if not asset:
-                            # Try without /usd suffix
-                            for k, v in pair_map.items():
-                                if k.split("/")[0] in pair:
-                                    asset = v
-                                    break
-                        if not asset:
-                            continue
-                        
-                        _chainlink_prices[asset] = price
-                        
-                        if isinstance(ts, str):
-                            ts_sec = int(float(ts)) // 1000 if float(ts) > 1e12 else int(float(ts))
-                        else:
-                            ts_sec = int(ts) // 1000 if ts > 1e12 else int(ts)
-                        
-                        if ts_sec > 0:
-                            _store_ptb(asset, price, ts_sec)
-                        
-                        if _rtds_msg_count[0] <= 5:
-                            print("RTDS price: {} = ${:,.2f}".format(asset, price))
+                        if symbol and value:
+                            price = float(value)
+                            asset = pair_map.get(symbol)
+                            if asset:
+                                _chainlink_prices[asset] = price
+                                
+                                if isinstance(ts, (int, float)):
+                                    ts_sec = int(ts) // 1000 if ts > 1e12 else int(ts)
+                                else:
+                                    ts_sec = int(time.time())
+                                
+                                _store_ptb(asset, price, ts_sec)
+                                
+                                if _rtds_msg_count[0] <= 5:
+                                    print("RTDS price: {} = ${:,.2f}".format(asset, price))
+                    elif _rtds_msg_count[0] <= 3:
+                        # Log non-payload messages for debugging
+                        pass
                 return
             
             # Try CSV format: timestamp,datetime,pair,price
@@ -9631,13 +9627,13 @@ def _rtds_loop():
     def on_open(ws):
         global _chainlink_connected
         _chainlink_connected = True
-        # Subscribe to Chainlink prices
+        # Subscribe to ALL Chainlink prices — empty filters = all symbols
         sub = json.dumps({
             "action": "subscribe",
             "subscriptions": [{
                 "topic": "crypto_prices_chainlink",
-                "type": "update",
-                "filters": "btc/usd,eth/usd,sol/usd,xrp/usd"
+                "type": "*",
+                "filters": ""
             }]
         })
         ws.send(sub)
