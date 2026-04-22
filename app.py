@@ -4864,7 +4864,7 @@ def _resolve_paper_table(table_name):
                 # P2.1 went live ~18:00 UTC Apr 21, 2026
                 if table_name == "paper21_trades":
                     fired = p.get("fired_at") or ""
-                    is_live_trade = fired >= "2026-04-22T15:00"
+                    is_live_trade = fired >= "2026-04-22T20:30"
                     if is_live_trade:
                         if won:
                             _bot21_state["balance"] = round(_bot21_state["balance"] + payout, 2)
@@ -4883,7 +4883,7 @@ def _resolve_paper_table(table_name):
                 # P3.1 went live ~18:00 UTC Apr 21, 2026
                 if table_name == "paper31_trades":
                     fired = p.get("fired_at") or ""
-                    is_live_trade = fired >= "2026-04-22T15:00"
+                    is_live_trade = fired >= "2026-04-22T20:30"
                     if is_live_trade:
                         if won:
                             _bot31_state["balance"] = round(_bot31_state["balance"] + payout, 2)
@@ -4901,7 +4901,7 @@ def _resolve_paper_table(table_name):
                 # Update Paper 2.2 balance
                 if table_name == "paper22_trades":
                     fired = p.get("fired_at") or ""
-                    is_live_trade = fired >= "2026-04-22T15:00"
+                    is_live_trade = fired >= "2026-04-22T20:30"
                     if is_live_trade:
                         if won:
                             _bot22_state["balance"] = round(_bot22_state["balance"] + payout, 2)
@@ -4918,7 +4918,7 @@ def _resolve_paper_table(table_name):
                 # Update Paper 3.2 balance
                 if table_name == "paper32_trades":
                     fired = p.get("fired_at") or ""
-                    is_live_trade = fired >= "2026-04-22T15:00"
+                    is_live_trade = fired >= "2026-04-22T20:30"
                     if is_live_trade:
                         if won:
                             _bot32_state["balance"] = round(_bot32_state["balance"] + payout, 2)
@@ -9454,25 +9454,21 @@ def paper5_page():
 
 try:
     init_db()
-    # Load saved balances from database (persists across deploys)
-    _saved_bals = _load_bot_balances()
-    if _saved_bals:
-        for _bot_name, _bot_state_ref in [
-            ("p21", _bot21_state), ("p31", _bot31_state),
-            ("p22", _bot22_state), ("p32", _bot32_state),
-        ]:
-            if _bot_name in _saved_bals:
-                _bot_state_ref["balance"] = _saved_bals[_bot_name]["balance"]
-                _bot_state_ref["peak_balance"] = _saved_bals[_bot_name].get("peak_balance", _bot_state_ref["balance"])
-                _bot_state_ref["enabled"] = _saved_bals[_bot_name].get("enabled", True)
-        print("Loaded balances: {}".format(
-            ", ".join("{}=${:.2f}".format(k, v["balance"]) for k, v in _saved_bals.items())))
-    else:
-        # First run after reset — save $20 defaults
-        for _bn, _bs in [("p21", _bot21_state), ("p31", _bot31_state),
-                          ("p22", _bot22_state), ("p32", _bot32_state)]:
-            _save_bot_balance(_bn, _bs)
-        print("No saved balances — starting fresh at $20.00 each")
+    # Reset all balances to $15 (user requested)
+    try:
+        _reset_conn = get_db()
+        _reset_conn.run("DELETE FROM bot_balances")
+        _reset_conn.close()
+    except:
+        pass
+    for _bot_state_ref in [_bot21_state, _bot31_state, _bot22_state, _bot32_state]:
+        _bot_state_ref["balance"] = 15.0
+        _bot_state_ref["peak_balance"] = 15.0
+    # Save the $15 balances immediately
+    for _bn, _bs in [("p21", _bot21_state), ("p31", _bot31_state),
+                      ("p22", _bot22_state), ("p32", _bot32_state)]:
+        _save_bot_balance(_bn, _bs)
+    print("Reset all Limitless balances to $15.00 each")
 except Exception as e:
     print("DB init error: {}".format(e))
 
@@ -9740,6 +9736,33 @@ def _poly_fetch_markets():
                 print("Poly API status: {}".format(r.status_code))
         except Exception as e:
             print("Poly fetch error: {}".format(e))
+
+    # Also fetch 1H markets via tag_id 102175 (hourly crypto tag)
+    # These use a different indexing system than 5M/15M
+    hourly_found = sum(1 for m in markets if m.get("timeframe") == "1H")
+    if hourly_found == 0:
+        try:
+            r = req.get(
+                "{}/markets".format(POLY_GAMMA_API),
+                params={"active": "true", "closed": "false", "tag_id": 102175,
+                        "limit": 50},
+                timeout=15
+            )
+            if r.status_code == 200:
+                batch = r.json()
+                if isinstance(batch, list):
+                    existing_ids = set(m.get("market_id") for m in markets)
+                    for m in batch:
+                        q = (m.get("question") or m.get("title") or "").lower()
+                        if "up or down" in q:
+                            parsed = _poly_parse_market(m)
+                            if parsed and parsed["market_id"] not in existing_ids:
+                                # Force timeframe to 1H if tag says hourly
+                                if not parsed.get("timeframe"):
+                                    parsed["timeframe"] = "1H"
+                                markets.append(parsed)
+        except Exception as e:
+            print("Poly 1H tag fetch error: {}".format(e))
 
     if markets:
         print("Poly scan: {} markets found".format(len(markets)))
