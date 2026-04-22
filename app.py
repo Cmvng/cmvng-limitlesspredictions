@@ -10000,66 +10000,15 @@ def _poly_fetch_markets():
 
 
 def _poly_get_baseline(parsed, price, indicators):
-    """Get the exact Price to Beat for a Polymarket market.
-    Priority: 1. Polymarket price-to-beat API
-              2. Chainlink RTDS cached PTB
-              3. Latest Chainlink price
-              4. yfinance candle open"""
-    import requests as req
+    """Get the Price to Beat directly from Chainlink RTDS cache.
+    Simple: read _chainlink_ptb[ASSET_TF] which stores the exact price."""
     asset = parsed.get("asset", "")
-    slug = parsed.get("slug", "")
     tf = parsed.get("timeframe", "")
-    
-    # Source 1: Polymarket price-to-beat API endpoint
-    if slug:
-        for url_pattern in [
-            "https://polymarket.com/api/equity/price-to-beat/{}",
-            "https://polymarket.com/api/crypto/price-to-beat/{}",
-            "https://gamma-api.polymarket.com/markets/{}",
-        ]:
-            try:
-                r = req.get(url_pattern.format(slug), timeout=5)
-                if r.status_code == 200:
-                    data = r.json()
-                    if isinstance(data, dict):
-                        # Try various field names
-                        for field in ["price_to_beat", "priceToBeat", "price", "value", "strikePrice"]:
-                            ptb = data.get(field)
-                            if ptb and float(ptb) > 0:
-                                return float(ptb)
-                        # For gamma-api market response, check description for dollar amount
-                        desc = data.get("description") or ""
-                        price_match = re.search(r'\$([0-9,]+\.?\d*)', desc)
-                        if price_match:
-                            try:
-                                val = float(price_match.group(1).replace(",", ""))
-                                if val > 0:
-                                    return val
-                            except:
-                                pass
-                    elif isinstance(data, (int, float)) and data > 0:
-                        return float(data)
-            except:
-                pass
-    
-    # Source 2: Chainlink RTDS cached PTB
-    expiry_dt = parsed.get("expiry_dt")
-    if expiry_dt and asset and tf:
-        end_ts = int(expiry_dt.timestamp())
-        ptb = _rtds_price_to_beat(asset, tf, end_ts)
-        if ptb:
-            return ptb
-    
-    # Source 3: Latest Chainlink price
-    chainlink = _rtds_current_price(asset)
-    if chainlink:
-        return chainlink
-    
-    # Source 4: yfinance candle open
-    if indicators and indicators.get("candle_open"):
-        return indicators["candle_open"]
-    
-    return price
+    key = "{}_{}".format(asset, tf)
+    entry = _chainlink_ptb.get(key)
+    if entry:
+        return entry[1]  # (end_ts, price) → return price
+    return None
 
 
 def run_poly_scan():
@@ -10126,6 +10075,9 @@ def run_poly_scan():
                 continue
 
             baseline = _poly_get_baseline(parsed, price, ind)
+            if baseline is None:
+                # No Chainlink PTB yet for this asset/timeframe — skip
+                continue
             parsed["baseline"] = baseline
 
             # 4H macro for 1H markets
