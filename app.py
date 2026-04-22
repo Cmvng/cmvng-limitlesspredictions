@@ -154,21 +154,22 @@ def _calc_bot_stake(state):
 
 
 def _calc_autoscale_stake(state):
-    """Auto-scaling stake calculator for P2.1 and P3.1.
+    """Fixed-step auto-scaling stake calculator for P2.1 and P3.1.
     
-    Tiers:
-      $5-$50:   $1 fixed
-      $50-$100: 3% of balance
-      $100-$300: 4% of balance
-      $300+:    5% of balance
+    Fixed stakes per tier (no compounding — same stake for wins AND losses):
+      Tier 1: $5-$50    → $1 per trade
+      Tier 2: $50-$100  → $2 per trade
+      Tier 3: $100-$300 → $5 per trade
+      Tier 4: $300-$700 → $10 per trade
+      Tier 5: $700+     → $20 per trade
     
-    Safety: 30% drawdown from peak → drop one tier
+    Safety: 30% drop from peak → drop one tier
+            Stays at lower tier until balance passes NEXT tier threshold
     Floor: $5 → stops trading
     """
     balance = state.get("balance", 0)
     peak = state.get("peak_balance", balance)
     floor = state.get("floor_balance", 5.0)
-    min_stake = 1.0
     
     # Check floor
     if balance <= floor:
@@ -182,37 +183,40 @@ def _calc_autoscale_stake(state):
     # Check 30% drawdown from peak
     in_drawdown = (peak > 0 and balance < peak * 0.70)
     
-    # Determine current tier based on balance
-    if balance >= 300:
-        normal_pct = 0.05   # Tier 4: 5%
-        safety_pct = 0.04   # Drop to Tier 3: 4%
+    # Determine tier based on balance
+    # Each tier has: (threshold, normal_stake, safety_stake)
+    # Safety stake = one tier below
+    if balance >= 700:
+        normal_stake = 20.0   # Tier 5
+        safety_stake = 10.0   # Drop to Tier 4
+    elif balance >= 300:
+        normal_stake = 10.0   # Tier 4
+        safety_stake = 5.0    # Drop to Tier 3
     elif balance >= 100:
-        normal_pct = 0.04   # Tier 3: 4%
-        safety_pct = 0.03   # Drop to Tier 2: 3%
+        normal_stake = 5.0    # Tier 3
+        safety_stake = 2.0    # Drop to Tier 2
     elif balance >= 50:
-        normal_pct = 0.03   # Tier 2: 3%
-        safety_pct = None    # Drop to Tier 1: $1 fixed
+        normal_stake = 2.0    # Tier 2
+        safety_stake = 1.0    # Drop to Tier 1
     else:
-        normal_pct = None    # Tier 1: $1 fixed
-        safety_pct = None
+        normal_stake = 1.0    # Tier 1
+        safety_stake = 1.0    # Can't drop lower
     
-    # Calculate stake
-    if in_drawdown and safety_pct is not None:
-        stake = max(min_stake, round(balance * safety_pct, 2))
-    elif in_drawdown and safety_pct is None:
-        stake = min_stake
-    elif normal_pct is not None:
-        stake = max(min_stake, round(balance * normal_pct, 2))
+    # Apply safety if in drawdown
+    if in_drawdown:
+        stake = safety_stake
     else:
-        stake = min_stake
+        stake = normal_stake
     
     # Never bet more than would take us below floor
     max_allowed = balance - floor
-    if max_allowed < min_stake:
-        return 0  # Not enough above floor for minimum stake
-    if stake > max_allowed:
-        stake = round(max_allowed, 2)
-    if stake > balance or stake < min_stake:
+    if max_allowed < stake:
+        # Try minimum $1 if current stake too big
+        if max_allowed >= 1.0:
+            stake = 1.0
+        else:
+            return 0
+    if stake > balance:
         return 0
     
     return stake
