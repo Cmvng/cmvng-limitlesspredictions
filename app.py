@@ -2170,7 +2170,7 @@ def _execute_poly_trade(condition_id, token_id, side, stake, price):
                     return True
 
                 if order_id and status == "LIVE":
-                    for _ in range(6):
+                    for _ in range(15):
                         time.sleep(2)
                         try:
                             info = client.get_order(order_id)
