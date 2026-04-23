@@ -10169,6 +10169,30 @@ def _poly_parse_market(market, timeframe_hint=None):
         if "up or down" not in q_lower and "updown" not in slug_lower:
             return None
 
+        # Get expiry FIRST (needed for duration-based timeframe detection)
+        end_date = market.get("endDate") or market.get("end_date_iso") or ""
+        exp_ts = market.get("expirationTimestamp") or market.get("expiration_timestamp")
+        expiry_dt = None
+        if exp_ts:
+            if isinstance(exp_ts, str):
+                exp_ts = int(exp_ts)
+            if exp_ts > 1e12:
+                exp_ts = exp_ts / 1000
+            expiry_dt = datetime.fromtimestamp(exp_ts, tz=timezone.utc)
+        elif end_date:
+            try:
+                expiry_dt = datetime.fromisoformat(end_date.replace("Z", "+00:00"))
+                exp_ts = int(expiry_dt.timestamp())
+            except:
+                return None
+        else:
+            return None
+
+        now = datetime.now(timezone.utc)
+        mins_left = (expiry_dt - now).total_seconds() / 60
+        if mins_left <= 0:
+            return None
+
         # Determine timeframe from slug pattern
         timeframe = None
         if "-15m-" in slug_lower or "-15m" in slug_lower or "15min" in slug_lower:
@@ -10211,28 +10235,6 @@ def _poly_parse_market(market, timeframe_hint=None):
                 timeframe = timeframe_hint
 
         if not timeframe:
-            return None
-
-        # Get expiry
-        end_date = market.get("endDate") or market.get("end_date_iso") or ""
-        exp_ts = market.get("expirationTimestamp") or market.get("expiration_timestamp")
-        if exp_ts:
-            if isinstance(exp_ts, str):
-                exp_ts = int(exp_ts)
-            if exp_ts > 1e12:
-                exp_ts = exp_ts / 1000
-            expiry_dt = datetime.fromtimestamp(exp_ts, tz=timezone.utc)
-        elif end_date:
-            try:
-                expiry_dt = datetime.fromisoformat(end_date.replace("Z", "+00:00"))
-            except:
-                return None
-        else:
-            return None
-
-        now = datetime.now(timezone.utc)
-        mins_left = (expiry_dt - now).total_seconds() / 60
-        if mins_left <= 0:
             return None
 
         # Get odds — outcomePrices is usually "[\"0.52\",\"0.48\"]"
@@ -10480,6 +10482,12 @@ def _poly_fetch_markets():
                                 event_markets = data.get("markets", [])
                             if event_markets:
                                 print("Poly 1H found: {} ({} markets)".format(event_slug, len(event_markets)))
+                                # Debug: log first market's key fields
+                                m0 = event_markets[0]
+                                print("  1H_RAW: q={} | slug={} | exp={}".format(
+                                    (m0.get("question") or m0.get("title") or "")[:60],
+                                    (m0.get("slug") or "")[:40],
+                                    m0.get("expirationTimestamp") or m0.get("end_date_iso") or "none"))
                             for m in event_markets:
                                 # First try normal parsing
                                 parsed = _poly_parse_market(m, timeframe_hint="1H")
