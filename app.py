@@ -10099,17 +10099,12 @@ def run_poly_scan():
             tf = parsed["timeframe"]
             mins_left = parsed["mins_left"]
 
-            # Debug: log first BTC market to see why it's filtered
-            if asset == "BTC" and tf in ("5M", "15M"):
-                print("POLY_FILTER {}: tf={} mins_left={:.1f} odds={:.1f}%".format(
-                    asset, tf, mins_left, parsed.get("yes_odds", 0)))
-
             # Skip if too little or too much time left
-            if tf == "5M" and (mins_left < 0.5 or mins_left > 5.5):
+            if tf == "5M" and (mins_left < 1 or mins_left > 5):
                 continue
-            if tf == "15M" and (mins_left < 1 or mins_left > 16):
+            if tf == "15M" and (mins_left < 2 or mins_left > 15):
                 continue
-            if tf == "1H" and (mins_left < 3 or mins_left > 62):
+            if tf == "1H" and (mins_left < 5 or mins_left > 60):
                 continue
 
             # Determine which sections this market belongs to
@@ -10127,35 +10122,18 @@ def run_poly_scan():
             if not sections:
                 continue
 
-            # Get yfinance candle data
-            # 5M markets: use 5m candles for BTC only (others use 15m to avoid rate limits)
-            # 15M markets: use 15m candles
-            # 1H markets: use 1h candles
-            if tf == "5M" and asset == "BTC":
-                yf_tf = "5m"
-            elif tf == "5M":
-                yf_tf = "15m"  # non-BTC 5M markets use 15m candles
-            elif tf == "15M":
-                yf_tf = "15m"
-            else:
-                yf_tf = "1h"
+            # Get yfinance candle data matching the market timeframe
+            yf_tf = "5m" if tf == "5M" else "15m" if tf == "15M" else "1h"
             ind = _calculate_indicators(asset, yf_tf)
             if not ind:
-                if asset == "BTC" and tf == "5M":
-                    print("POLY_BLOCK {}: indicators failed (yf_tf={})".format(asset, yf_tf))
                 continue
 
             price = ind.get("current")
             if not price:
-                if asset == "BTC" and tf == "5M":
-                    print("POLY_BLOCK {}: no current price".format(asset))
                 continue
 
             baseline = _poly_get_baseline(parsed, price, ind)
             if baseline is None:
-                if asset == "BTC" and tf == "5M":
-                    ptb_keys = list(_chainlink_ptb.keys())
-                    print("POLY_BLOCK {}: no baseline. PTB cache keys={}".format(asset, ptb_keys))
                 continue
             parsed["baseline"] = baseline
 
