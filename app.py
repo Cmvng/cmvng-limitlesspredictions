@@ -10051,28 +10051,13 @@ def _poly_fetch_markets():
 
 
 def _poly_get_baseline(parsed, price, indicators):
-    """Get the Price to Beat from Chainlink RTDS cache.
-    ONLY returns if the cached PTB is from the CURRENT window.
-    If stale (from previous window), returns None → market skipped."""
+    """Get the Price to Beat from Chainlink RTDS cache."""
     asset = parsed.get("asset", "")
     tf = parsed.get("timeframe", "")
     key = "{}_{}".format(asset, tf)
     entry = _chainlink_ptb.get(key)
     if entry:
-        stored_end_ts, stored_price = entry
-        # Check if this PTB is from the current time window
-        # Current window end = next boundary from NOW
-        tf_sec = {"5M": 300, "15M": 900, "1H": 3600}.get(tf, 300)
-        now_ts = int(time.time())
-        current_window_start = (now_ts // tf_sec) * tf_sec
-        current_window_end = current_window_start + tf_sec
-        # The stored PTB should be for the current window
-        # (stored_end_ts == current_window_end means PTB was captured at current_window_start)
-        if stored_end_ts == current_window_end:
-            return stored_price
-        # Also accept if we're in the first 30 seconds of a new window
-        # and the PTB hasn't been captured yet for the new window
-        # In this case, return None and let the scanner skip
+        return entry[1]
     return None
 
 
@@ -10108,13 +10093,11 @@ def run_poly_scan():
             mins_left = parsed["mins_left"]
 
             # Skip if too little or too much time left
-            # For 5M: only trade after window has opened (PTB captured at boundary)
-            # Max 4.5 min ensures we're inside the window, not before it
-            if tf == "5M" and (mins_left < 1 or mins_left > 4.5):
+            if tf == "5M" and (mins_left < 0.5 or mins_left > 5.5):
                 continue
-            if tf == "15M" and (mins_left < 2 or mins_left > 14):
+            if tf == "15M" and (mins_left < 1 or mins_left > 16):
                 continue
-            if tf == "1H" and (mins_left < 5 or mins_left > 58):
+            if tf == "1H" and (mins_left < 3 or mins_left > 62):
                 continue
 
             # Determine which sections this market belongs to
