@@ -2512,7 +2512,10 @@ def _calculate_indicators(asset, timeframe="1h"):
 
     try:
         if timeframe == "5m":
-            df = yf.download(ticker, period="1d", interval="5m", progress=False)
+            df = yf.download(ticker, period="5d", interval="5m", progress=False)
+            # Fallback: if 5m fails, use 15m candles (still works for scoring)
+            if df is None or len(df) < 20:
+                df = yf.download(ticker, period="5d", interval="15m", progress=False)
         elif timeframe == "15m":
             df = yf.download(ticker, period="5d", interval="15m", progress=False)
         elif timeframe == "1d":
@@ -10112,9 +10115,10 @@ def run_poly_scan():
             # Determine which sections this market belongs to
             sections = []
             if tf == "5M":
-                sections.append("all5m")
+                # 5M: BTC only
                 if asset == "BTC":
                     sections.append("btc5m")
+                # Skip non-BTC 5M markets entirely
             elif tf == "15M":
                 sections.append("all15m")
             elif tf == "1H":
@@ -10123,8 +10127,18 @@ def run_poly_scan():
             if not sections:
                 continue
 
-            # Get yfinance candle data for this asset at the appropriate timeframe
-            yf_tf = "5m" if tf == "5M" else "15m" if tf == "15M" else "1h"
+            # Get yfinance candle data
+            # 5M markets: use 5m candles for BTC only (others use 15m to avoid rate limits)
+            # 15M markets: use 15m candles
+            # 1H markets: use 1h candles
+            if tf == "5M" and asset == "BTC":
+                yf_tf = "5m"
+            elif tf == "5M":
+                yf_tf = "15m"  # non-BTC 5M markets use 15m candles
+            elif tf == "15M":
+                yf_tf = "15m"
+            else:
+                yf_tf = "1h"
             ind = _calculate_indicators(asset, yf_tf)
             if not ind:
                 if asset == "BTC" and tf == "5M":
@@ -10160,6 +10174,10 @@ def run_poly_scan():
 
             for section in sections:
                 for strat in strategies:
+                    # BTC 5M: only use P2.3 and P3.3 (distance math strategies)
+                    if tf == "5M" and asset == "BTC" and strat not in ("p23", "p33"):
+                        continue
+                    
                     key = "{}_{}_{}" .format(section, strat, parsed["market_id"])
                     if key in existing_keys:
                         continue
