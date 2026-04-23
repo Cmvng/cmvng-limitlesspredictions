@@ -1663,19 +1663,25 @@ def _is_volatile_window():
     """Check if current time is in a volatile period where ALL bots should pause.
     Volatile periods (UTC → Lagos):
       23:00-01:00 UTC (12am-2am Lagos) — daily candle close, funding rates
-      13:00-15:00 UTC (2pm-4pm Lagos) — US market open, Fed news
-      20:00-21:00 UTC (9pm-10pm Lagos) — US market close, trend reversal
-    Also checks next hour to catch trades that EXPIRE during volatile periods.
+      13:30-14:30 UTC (2:30pm-3:30pm Lagos) — US market open first hour
+      20:00-20:30 UTC (9pm-9:30pm Lagos) — US market close first 30 min
+    Only checks current hour — does NOT look ahead to next hour.
     """
-    utc_hour = datetime.now(timezone.utc).hour
-    next_hour = (utc_hour + 1) % 24
-    for h in [utc_hour, next_hour]:
-        if h >= 23 or h < 1:
-            return True
-        if 13 <= h < 15:
-            return True
-        if 20 <= h < 21:
-            return True
+    now = datetime.now(timezone.utc)
+    utc_hour = now.hour
+    utc_minute = now.minute
+
+    # Daily candle close
+    if utc_hour >= 23 or utc_hour < 1:
+        return True
+    # US market open (first hour only)
+    if utc_hour == 13 and utc_minute >= 30:
+        return True
+    if utc_hour == 14 and utc_minute < 30:
+        return True
+    # US market close (first 30 min only)
+    if utc_hour == 20 and utc_minute < 30:
+        return True
     return False
 
 def _fetch_orderbook(slug):
