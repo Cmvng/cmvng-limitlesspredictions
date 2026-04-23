@@ -705,6 +705,50 @@ def init_db():
             fired_at TEXT, resolved_at TEXT, slug TEXT
         )
     """)
+    conn.run("""
+        CREATE TABLE IF NOT EXISTS paper25_trades (
+            id SERIAL PRIMARY KEY, market_id TEXT, title TEXT, asset TEXT,
+            direction TEXT, baseline REAL, bet_odds REAL, bet_side TEXT,
+            current_price REAL, hours_left REAL, market_type TEXT,
+            indicators TEXT, score INTEGER, total_signals INTEGER,
+            simulated_stake REAL DEFAULT 1.0, simulated_payout REAL,
+            status TEXT DEFAULT 'Pending', outcome TEXT,
+            fired_at TEXT, resolved_at TEXT, slug TEXT
+        )
+    """)
+    conn.run("""
+        CREATE TABLE IF NOT EXISTS paper35_trades (
+            id SERIAL PRIMARY KEY, market_id TEXT, title TEXT, asset TEXT,
+            direction TEXT, baseline REAL, bet_odds REAL, bet_side TEXT,
+            current_price REAL, hours_left REAL, market_type TEXT,
+            indicators TEXT, score INTEGER, total_signals INTEGER,
+            simulated_stake REAL DEFAULT 1.0, simulated_payout REAL,
+            status TEXT DEFAULT 'Pending', outcome TEXT,
+            fired_at TEXT, resolved_at TEXT, slug TEXT
+        )
+    """)
+    conn.run("""
+        CREATE TABLE IF NOT EXISTS paper26_trades (
+            id SERIAL PRIMARY KEY, market_id TEXT, title TEXT, asset TEXT,
+            direction TEXT, baseline REAL, bet_odds REAL, bet_side TEXT,
+            current_price REAL, hours_left REAL, market_type TEXT,
+            indicators TEXT, score INTEGER, total_signals INTEGER,
+            simulated_stake REAL DEFAULT 1.0, simulated_payout REAL,
+            status TEXT DEFAULT 'Pending', outcome TEXT,
+            fired_at TEXT, resolved_at TEXT, slug TEXT
+        )
+    """)
+    conn.run("""
+        CREATE TABLE IF NOT EXISTS paper36_trades (
+            id SERIAL PRIMARY KEY, market_id TEXT, title TEXT, asset TEXT,
+            direction TEXT, baseline REAL, bet_odds REAL, bet_side TEXT,
+            current_price REAL, hours_left REAL, market_type TEXT,
+            indicators TEXT, score INTEGER, total_signals INTEGER,
+            simulated_stake REAL DEFAULT 1.0, simulated_payout REAL,
+            status TEXT DEFAULT 'Pending', outcome TEXT,
+            fired_at TEXT, resolved_at TEXT, slug TEXT
+        )
+    """)
     # Polymarket paper trades — single table for all sections/strategies
     conn.run("""
         CREATE TABLE IF NOT EXISTS poly_trades (
@@ -2938,6 +2982,8 @@ def _calculate_indicators(asset, timeframe="1h"):
             "dist_sigma": dist_sigma,
             "dist_momentum": dist_momentum,
             "candle_open": candle_open,
+            "_closes": closes.tolist() if hasattr(closes, 'tolist') else list(closes),
+            "_opens": opens.tolist() if hasattr(opens, 'tolist') else list(opens),
         }
 
         _indicator_cache[cache_key] = {"data": result, "updated": datetime.now(timezone.utc)}
@@ -4578,7 +4624,679 @@ def _score_paper34_trade(p, price, indicators=None, ind_macro=None, expiry_minut
     }
 
 
-def run_paper34_scan():
+# ═══════════════════════════════════════════════════════════
+# CANDLE SEQUENCE READER — shared by P2.5/P3.5/P2.6/P3.6
+# ═══════════════════════════════════════════════════════════
+
+def _read_candle_sequence(asset, timeframe="15m"):
+    """Read completed 15M candles within the current hour.
+    Returns list of dicts: [{color, size, open, close}, ...]
+    Ordered C1, C2, C3, C4 (oldest to newest within the hour).
+    """
+    try:
+        ind = _calculate_indicators(asset, timeframe)
+        if not ind:
+            return []
+
+        closes = ind.get("_closes", [])
+        opens = ind.get("_opens", [])
+        if not closes or not opens or len(closes) < 4:
+            return []
+
+        now = datetime.now(timezone.utc)
+        current_hour = now.hour
+        mins_into_hour = now.minute
+        completed = int(mins_into_hour // 15)
+
+        if completed < 1:
+            return []
+
+        candles = []
+        for i in range(completed):
+            idx = -(completed - i)
+            if abs(idx) > len(closes) or abs(idx) > len(opens):
+                continue
+            o = float(opens[idx])
+            c = float(closes[idx])
+            size = c - o
+            color = "GREEN" if c >= o else "RED"
+            candles.append({
+                "color": color,
+                "size": round(size, 6),
+                "abs_size": round(abs(size), 6),
+                "open": o,
+                "close": c,
+                "position": i + 1,  # C1=1, C2=2, C3=3, C4=4
+            })
+
+        return candles
+    except:
+        return []
+
+
+def _candle_sequence_signal(candles, indicator_dir, h_in_4h, baseline, current_price):
+    """Analyze candle sequence and return (bet_direction, confidence, reason).
+    bet_direction: 'BUY' or 'SELL' or None (skip)
+    confidence: 'HIGH', 'MEDIUM', 'LOW'
+    reason: string explaining the signal
+    """
+    if not candles:
+        return None, None, "NO_CANDLES"
+
+    n = len(candles)
+    c1 = candles[0]
+    c2 = candles[1] if n >= 2 else None
+    c3 = candles[2] if n >= 3 else None
+
+    is_strong_4h = h_in_4h in (0, 1)  # Hour 1-2 of 4H block
+    is_weak_4h = h_in_4h in (2, 3)    # Hour 3-4 of 4H block
+    is_transition = h_in_4h == 0       # Hour 1 = fresh 4H block
+
+    dist = current_price - baseline
+    dist_pct = abs(dist / baseline * 100) if baseline else 0
+    price_above_base = current_price > baseline
+
+    # ─── AFTER C1 ONLY (1 candle) ───
+    if n == 1:
+        if c1["color"] == "RED" and indicator_dir == "SELL":
+            if is_strong_4h and dist_pct > 0.03:
+                return "SELL", "LOW", "C1_WITH_TREND"
+            else:
+                return None, None, "C1_ONLY_WEAK"
+        elif c1["color"] == "GREEN" and indicator_dir == "BUY":
+            if is_strong_4h and dist_pct > 0.03:
+                return "BUY", "LOW", "C1_WITH_TREND"
+            else:
+                return None, None, "C1_ONLY_WEAK"
+        elif c1["color"] == "GREEN" and indicator_dir == "SELL":
+            # Fake-out: C1 green but indicators SELL
+            if is_strong_4h and c1["abs_size"] < abs(baseline * 0.001):
+                return "SELL", "LOW", "C1_FAKEOUT"
+            return None, None, "C1_CONFLICT"
+        elif c1["color"] == "RED" and indicator_dir == "BUY":
+            if is_strong_4h and c1["abs_size"] < abs(baseline * 0.001):
+                return "BUY", "LOW", "C1_DIP"
+            return None, None, "C1_CONFLICT"
+        return None, None, "C1_SKIP"
+
+    # ─── AFTER C2 (2 candles) — preferred entry ───
+    if n >= 2:
+        c1_c2_same = c1["color"] == c2["color"]
+        c2_smaller = c2["abs_size"] < c1["abs_size"]
+        c2_bigger = c2["abs_size"] > c1["abs_size"]
+
+        # PATTERN 1: Both candles same direction + matches indicators
+        if c1_c2_same and c1["color"] == "RED" and indicator_dir == "SELL":
+            if is_strong_4h:
+                conf = "HIGH"
+                reason = "C1C2_RED_STRONG4H"
+            elif is_weak_4h and dist_pct > 0.05:
+                conf = "MEDIUM"
+                reason = "C1C2_RED_WEAK4H_DIST"
+            elif is_weak_4h:
+                conf = "LOW"
+                reason = "C1C2_RED_WEAK4H"
+            else:
+                conf = "MEDIUM"
+                reason = "C1C2_RED"
+            return "SELL", conf, reason
+
+        if c1_c2_same and c1["color"] == "GREEN" and indicator_dir == "BUY":
+            if is_strong_4h:
+                conf = "HIGH"
+                reason = "C1C2_GREEN_STRONG4H"
+            elif is_weak_4h and dist_pct > 0.05:
+                conf = "MEDIUM"
+                reason = "C1C2_GREEN_WEAK4H_DIST"
+            elif is_weak_4h:
+                conf = "LOW"
+                reason = "C1C2_GREEN_WEAK4H"
+            else:
+                conf = "MEDIUM"
+                reason = "C1C2_GREEN"
+            return "BUY", conf, reason
+
+        # PATTERN 2: Pullback continuation — C1 with trend, C2 pulls back
+        if c1["color"] == "RED" and c2["color"] == "GREEN" and indicator_dir == "SELL":
+            # C1 red (with SELL), C2 green (pullback/bounce)
+            if c2["abs_size"] < c1["abs_size"] and not price_above_base:
+                # Bounce is smaller than drop + still below baseline
+                if is_strong_4h:
+                    return "SELL", "HIGH", "PULLBACK_SELL_STRONG"
+                else:
+                    return "SELL", "MEDIUM", "PULLBACK_SELL"
+            elif price_above_base:
+                # Bounce crossed above baseline — risky
+                return None, None, "BOUNCE_CROSSED_BASE"
+            else:
+                return "SELL", "LOW", "PULLBACK_SELL_WEAK"
+
+        if c1["color"] == "GREEN" and c2["color"] == "RED" and indicator_dir == "BUY":
+            if c2["abs_size"] < c1["abs_size"] and price_above_base:
+                if is_strong_4h:
+                    return "BUY", "HIGH", "PULLBACK_BUY_STRONG"
+                else:
+                    return "BUY", "MEDIUM", "PULLBACK_BUY"
+            elif not price_above_base:
+                return None, None, "DIP_CROSSED_BASE"
+            else:
+                return "BUY", "LOW", "PULLBACK_BUY_WEAK"
+
+        # PATTERN 3: Reversal at 4H transition
+        if is_transition and n >= 2:
+            if c1["color"] == "RED" and c2["color"] == "GREEN" and c2_bigger:
+                if indicator_dir == "BUY" or (indicator_dir == "SELL" and price_above_base):
+                    return "BUY", "HIGH", "4H_REVERSAL_UP"
+            if c1["color"] == "GREEN" and c2["color"] == "RED" and c2_bigger:
+                if indicator_dir == "SELL" or (indicator_dir == "BUY" and not price_above_base):
+                    return "SELL", "HIGH", "4H_REVERSAL_DOWN"
+
+        # PATTERN 4: Both candles oppose indicators — exhaustion in weak 4H
+        if c1_c2_same and c1["color"] == "GREEN" and indicator_dir == "SELL":
+            if is_weak_4h and c2_smaller:
+                # Two greens but in weak 4H with fading momentum + indicators SELL
+                return "SELL", "LOW", "EXHAUSTION_SELL"
+            return None, None, "CANDLES_OPPOSE_IND"
+
+        if c1_c2_same and c1["color"] == "RED" and indicator_dir == "BUY":
+            if is_weak_4h and c2_smaller:
+                return "BUY", "LOW", "EXHAUSTION_BUY"
+            return None, None, "CANDLES_OPPOSE_IND"
+
+    return None, None, "NO_PATTERN"
+
+
+# ═══════════════════════════════════════════════════════════
+# PAPER 2.5: P2.1 + Candle Sequence — 1H ONLY
+# ═══════════════════════════════════════════════════════════
+
+def _score_paper25_trade(p, price, indicators=None, ind_macro=None, expiry_minute=None, expiry_hour=None):
+    """Paper 2.5: 1H prediction using 15M candle sequence + P2.1 indicators.
+    Reads completed 15M candles within the hour to predict hourly close."""
+    if price is None:
+        return None
+
+    # 1H markets only
+    mtype = "15M" if p["is_short"] and p.get("mins_left", 0) <= 20 else "1H" if p["is_short"] else "Daily"
+    if mtype != "1H":
+        return None
+
+    mins_left = p.get("mins_left", 60)
+    if mins_left > 45:
+        return None  # Need at least C1 completed
+
+    asset = p["asset"]
+    baseline = p.get("baseline", 0)
+    if not baseline:
+        return None
+
+    yes_odds = p["yes_odds"]
+    no_odds = 100 - yes_odds
+    if not (15 <= yes_odds <= 75 or 15 <= no_odds <= 75):
+        return None
+
+    # Get P2.1 direction
+    scored21 = _score_paper21_trade(p, price, indicators=indicators, ind_macro=ind_macro,
+                                    expiry_minute=expiry_minute, expiry_hour=expiry_hour)
+
+    # Even if P2.1 didn't score (price_above mismatch), get indicator direction
+    tv_dir = _tv_trends.get(asset)
+    sma_dir = _pair_sma_cache.get(asset)
+    btc_trend = _btc_trend_cache.get("trend")
+    buy_count = sum(1 for d in [tv_dir, sma_dir, btc_trend] if d in ("BUY", "STRONG_BUY"))
+    sell_count = sum(1 for d in [tv_dir, sma_dir, btc_trend] if d in ("SELL", "STRONG_SELL"))
+    indicator_dir = "BUY" if buy_count > sell_count else "SELL" if sell_count > buy_count else None
+
+    if not indicator_dir:
+        return None
+
+    # 4H position
+    h_in_4h = (expiry_hour or 0) % 4 if expiry_hour is not None else 0
+
+    # Read candle sequence
+    candles = _read_candle_sequence(asset, "15m")
+    if not candles:
+        return None
+
+    # Get signal from candle sequence
+    bet_dir, confidence, reason = _candle_sequence_signal(
+        candles, indicator_dir, h_in_4h, baseline, price)
+
+    if not bet_dir or not confidence:
+        return None
+
+    # Convert direction to bet side
+    if bet_dir == "BUY":
+        bet_side = "YES" if p["direction"] == "above" else "NO"
+    else:
+        bet_side = "NO" if p["direction"] == "above" else "YES"
+
+    effective_odds = yes_odds if bet_side == "YES" else no_odds
+    if effective_odds < 15 or effective_odds > 75:
+        return None
+
+    share_price = effective_odds / 100.0
+    if bet_side == "NO":
+        share_price = 1.0 - (yes_odds / 100.0)
+    sim_payout = round(1.0 / share_price, 4) if share_price > 0 else 0
+
+    # Build indicator string
+    candle_str = " ".join(["C{}={}({:+.0f})".format(c["position"], c["color"], c["size"] if abs(c["size"]) > 0.001 else 0) for c in candles])
+    ind_parts = []
+    if tv_dir: ind_parts.append("TV={}".format(tv_dir))
+    if sma_dir: ind_parts.append("SMA={}".format(sma_dir))
+    if btc_trend: ind_parts.append("BTC={}".format(btc_trend))
+    ind_str = "[{}] {} | {} | 4H=H{}({})".format(
+        confidence,
+        " ".join(ind_parts),
+        candle_str,
+        h_in_4h + 1,
+        "strong" if h_in_4h in (0, 1) else "weak"
+    )
+
+    return {
+        "bet_side": bet_side, "bet_odds": effective_odds,
+        "score": len(candles) + len([d for d in [tv_dir, sma_dir, btc_trend] if d]),
+        "total_signals": len(candles) + 3,
+        "confidence": confidence, "indicators": ind_str,
+        "market_type": "1H", "sim_payout": sim_payout,
+    }
+
+
+# ═══════════════════════════════════════════════════════════
+# PAPER 3.5: P3.1 + Candle Sequence — 1H ONLY
+# ═══════════════════════════════════════════════════════════
+
+def _score_paper35_trade(p, price, indicators=None, ind_macro=None, expiry_minute=None, expiry_hour=None):
+    """Paper 3.5: 1H prediction using 15M candle sequence + P3.1 (7 indicators).
+    Same as P2.5 but uses P3.1's stricter indicator set."""
+    if price is None or not indicators:
+        return None
+
+    mtype = "15M" if p["is_short"] and p.get("mins_left", 0) <= 20 else "1H" if p["is_short"] else "Daily"
+    if mtype != "1H":
+        return None
+
+    mins_left = p.get("mins_left", 60)
+    if mins_left > 45:
+        return None
+
+    asset = p["asset"]
+    baseline = p.get("baseline", 0)
+    if not baseline:
+        return None
+
+    yes_odds = p["yes_odds"]
+    no_odds = 100 - yes_odds
+    if not (15 <= yes_odds <= 75 or 15 <= no_odds <= 75):
+        return None
+
+    # Get P3.1 direction (7 indicators)
+    tv_dir = _tv_trends.get(asset)
+    sma_dir = _pair_sma_cache.get(asset)
+    btc_trend = _btc_trend_cache.get("trend")
+    ut_trend = indicators.get("ut_trend")
+    ema_stack = indicators.get("ema_stack")
+    sqz_val = indicators.get("squeeze_val")
+    sqz_dir = "BUY" if sqz_val and sqz_val > 0 else "SELL" if sqz_val and sqz_val < 0 else None
+    rsi = indicators.get("rsi")
+    rsi_dir = "BUY" if rsi and rsi < 40 else "SELL" if rsi and rsi > 60 else None
+
+    all_signals = [tv_dir, sma_dir, btc_trend, ut_trend, ema_stack, sqz_dir, rsi_dir]
+    buy_c = sum(1 for s in all_signals if s in ("BUY", "STRONG_BUY"))
+    sell_c = sum(1 for s in all_signals if s in ("SELL", "STRONG_SELL"))
+    total = buy_c + sell_c
+
+    if total < 3:
+        return None
+    indicator_dir = "BUY" if buy_c > sell_c else "SELL" if sell_c > buy_c else None
+    if not indicator_dir:
+        return None
+
+    h_in_4h = (expiry_hour or 0) % 4 if expiry_hour is not None else 0
+
+    candles = _read_candle_sequence(asset, "15m")
+    if not candles:
+        return None
+
+    bet_dir, confidence, reason = _candle_sequence_signal(
+        candles, indicator_dir, h_in_4h, baseline, price)
+
+    if not bet_dir or not confidence:
+        return None
+
+    if bet_dir == "BUY":
+        bet_side = "YES" if p["direction"] == "above" else "NO"
+    else:
+        bet_side = "NO" if p["direction"] == "above" else "YES"
+
+    effective_odds = yes_odds if bet_side == "YES" else no_odds
+    if effective_odds < 15 or effective_odds > 75:
+        return None
+
+    share_price = effective_odds / 100.0
+    if bet_side == "NO":
+        share_price = 1.0 - (yes_odds / 100.0)
+    sim_payout = round(1.0 / share_price, 4) if share_price > 0 else 0
+
+    candle_str = " ".join(["C{}={}({:+.0f})".format(c["position"], c["color"], c["size"] if abs(c["size"]) > 0.001 else 0) for c in candles])
+    ind_parts = []
+    for label, val in [("TV", tv_dir), ("SMA", sma_dir), ("BTC", btc_trend), ("UT", ut_trend), ("EMA", ema_stack), ("SQZ", sqz_dir)]:
+        if val: ind_parts.append("{}={}".format(label, val))
+    ind_str = "[{}] {} | {} | 4H=H{}({}) | {}".format(
+        confidence, " ".join(ind_parts), candle_str,
+        h_in_4h + 1, "strong" if h_in_4h in (0, 1) else "weak", reason)
+
+    return {
+        "bet_side": bet_side, "bet_odds": effective_odds,
+        "score": len(candles) + total,
+        "total_signals": len(candles) + len(all_signals),
+        "confidence": confidence, "indicators": ind_str,
+        "market_type": "1H", "sim_payout": sim_payout,
+    }
+
+
+# ═══════════════════════════════════════════════════════════
+# PAPER 2.6: P2.1 + Candle Position Context — 15M MARKETS
+# ═══════════════════════════════════════════════════════════
+
+def _score_paper26_trade(p, price, indicators=None, ind_macro=None, expiry_minute=None, expiry_hour=None):
+    """Paper 2.6: 15M prediction using candle position within the hour.
+    Knows if this is the :00, :15, :30, or :45 candle and what prior candles did."""
+    if price is None:
+        return None
+
+    mtype = "15M" if p["is_short"] and p.get("mins_left", 0) <= 20 else "1H" if p["is_short"] else "Daily"
+    if mtype != "15M":
+        return None
+
+    asset = p["asset"]
+    baseline = p.get("baseline", 0)
+    if not baseline:
+        return None
+
+    yes_odds = p["yes_odds"]
+    no_odds = 100 - yes_odds
+    if not (20 <= yes_odds <= 72 or 20 <= no_odds <= 72):
+        return None
+
+    # Determine candle position within the hour
+    candle_pos = None
+    if expiry_minute is not None:
+        if expiry_minute in (0, 15):    candle_pos = 1  # :00 candle (C1)
+        elif expiry_minute in (15, 30): candle_pos = 2  # :15 candle (C2)
+        elif expiry_minute in (30, 45): candle_pos = 3  # :30 candle (C3)
+        elif expiry_minute in (45, 0):  candle_pos = 4  # :45 candle (C4)
+        # More precise: the candle that EXPIRES at this minute started 15 min ago
+        candle_pos = (expiry_minute // 15) if expiry_minute > 0 else 4
+
+    # SKIP C1 — no prior candle data, pure coin flip
+    if candle_pos == 1 or candle_pos == 0:
+        return None
+
+    # Get indicator direction
+    tv_dir = _tv_trends.get(asset)
+    sma_dir = _pair_sma_cache.get(asset)
+    btc_trend = _btc_trend_cache.get("trend")
+    buy_count = sum(1 for d in [tv_dir, sma_dir, btc_trend] if d in ("BUY", "STRONG_BUY"))
+    sell_count = sum(1 for d in [tv_dir, sma_dir, btc_trend] if d in ("SELL", "STRONG_SELL"))
+    indicator_dir = "BUY" if buy_count > sell_count else "SELL" if sell_count > buy_count else None
+    if not indicator_dir:
+        return None
+
+    h_in_4h = (expiry_hour or 0) % 4 if expiry_hour is not None else 0
+
+    # Read completed candles before this one
+    candles = _read_candle_sequence(asset, "15m")
+    prior_candles = [c for c in candles if c["position"] < candle_pos]
+
+    if not prior_candles:
+        return None  # Need at least 1 prior candle
+
+    # Analyze prior candles to predict THIS candle
+    last_candle = prior_candles[-1]
+    bet_dir = None
+    confidence = None
+    reason = ""
+
+    if candle_pos == 2:
+        # Predicting C2 using C1
+        c1 = prior_candles[0]
+        if c1["color"] == "RED" and indicator_dir == "SELL":
+            bet_dir = "SELL"
+            confidence = "MEDIUM" if h_in_4h in (0, 1) else "LOW"
+            reason = "C2_CONTINUE_SELL"
+        elif c1["color"] == "GREEN" and indicator_dir == "BUY":
+            bet_dir = "BUY"
+            confidence = "MEDIUM" if h_in_4h in (0, 1) else "LOW"
+            reason = "C2_CONTINUE_BUY"
+        elif c1["color"] == "GREEN" and indicator_dir == "SELL" and c1["abs_size"] < abs(baseline * 0.001):
+            bet_dir = "SELL"
+            confidence = "LOW"
+            reason = "C2_REVERSE_FAKEOUT"
+        elif c1["color"] == "RED" and indicator_dir == "BUY" and c1["abs_size"] < abs(baseline * 0.001):
+            bet_dir = "BUY"
+            confidence = "LOW"
+            reason = "C2_REVERSE_DIP"
+        else:
+            return None  # Conflicting
+
+    elif candle_pos == 3:
+        # Predicting C3 using C1 + C2 — THE SWEET SPOT
+        if len(prior_candles) < 2:
+            return None
+        c1 = prior_candles[0]
+        c2 = prior_candles[1]
+
+        both_red = c1["color"] == "RED" and c2["color"] == "RED"
+        both_green = c1["color"] == "GREEN" and c2["color"] == "GREEN"
+        red_green = c1["color"] == "RED" and c2["color"] == "GREEN"
+        green_red = c1["color"] == "GREEN" and c2["color"] == "RED"
+
+        if both_red and indicator_dir == "SELL":
+            # Two reds + SELL → C3 might bounce but hour stays down
+            if c2["abs_size"] < c1["abs_size"]:
+                # Momentum fading → C3 likely bounces GREEN
+                # But hour still goes down → SKIP this candle, bet on the hour instead
+                return None  # Let P2.5 handle the hour
+            else:
+                # Accelerating → C3 could continue RED
+                bet_dir = "SELL"
+                confidence = "MEDIUM" if h_in_4h in (0, 1) else "LOW"
+                reason = "C3_ACCEL_SELL"
+
+        elif both_green and indicator_dir == "BUY":
+            if c2["abs_size"] < c1["abs_size"]:
+                return None  # Fading, C3 might dip
+            else:
+                bet_dir = "BUY"
+                confidence = "MEDIUM" if h_in_4h in (0, 1) else "LOW"
+                reason = "C3_ACCEL_BUY"
+
+        elif green_red and indicator_dir == "BUY":
+            # C1 green, C2 red (pullback) + BUY indicators → C3 resumes up
+            if c2["abs_size"] < c1["abs_size"] and price > baseline:
+                bet_dir = "BUY"
+                confidence = "HIGH" if h_in_4h in (0, 1) else "MEDIUM"
+                reason = "C3_RESUME_BUY"
+            else:
+                return None
+
+        elif red_green and indicator_dir == "SELL":
+            if c2["abs_size"] < c1["abs_size"] and price < baseline:
+                bet_dir = "SELL"
+                confidence = "HIGH" if h_in_4h in (0, 1) else "MEDIUM"
+                reason = "C3_RESUME_SELL"
+            else:
+                return None
+
+        else:
+            return None  # Conflicting pattern
+
+    elif candle_pos == 4:
+        # Predicting C4 using C1 + C2 + C3 — best data
+        if len(prior_candles) < 3:
+            return None
+        c1, c2, c3 = prior_candles[0], prior_candles[1], prior_candles[2]
+
+        red_count = sum(1 for c in prior_candles if c["color"] == "RED")
+        green_count = sum(1 for c in prior_candles if c["color"] == "GREEN")
+
+        # C4 tends to follow the majority direction
+        if red_count >= 2 and indicator_dir == "SELL":
+            bet_dir = "SELL"
+            confidence = "HIGH" if red_count == 3 and h_in_4h in (0, 1) else "MEDIUM"
+            reason = "C4_MAJORITY_SELL"
+        elif green_count >= 2 and indicator_dir == "BUY":
+            bet_dir = "BUY"
+            confidence = "HIGH" if green_count == 3 and h_in_4h in (0, 1) else "MEDIUM"
+            reason = "C4_MAJORITY_BUY"
+        elif c3["color"] == "GREEN" and c1["color"] == "RED" and c2["color"] == "RED":
+            # RED RED GREEN → C4 likely RED (bounce was temporary)
+            if indicator_dir == "SELL":
+                bet_dir = "SELL"
+                confidence = "MEDIUM"
+                reason = "C4_BOUNCE_OVER"
+        elif c3["color"] == "RED" and c1["color"] == "GREEN" and c2["color"] == "GREEN":
+            if indicator_dir == "BUY":
+                bet_dir = "BUY"
+                confidence = "MEDIUM"
+                reason = "C4_DIP_OVER"
+        else:
+            return None
+
+    if not bet_dir or not confidence:
+        return None
+
+    # Convert to bet side
+    if bet_dir == "BUY":
+        bet_side = "YES" if p["direction"] == "above" else "NO"
+    else:
+        bet_side = "NO" if p["direction"] == "above" else "YES"
+
+    effective_odds = yes_odds if bet_side == "YES" else no_odds
+    if effective_odds < 20 or effective_odds > 72:
+        return None
+
+    share_price = effective_odds / 100.0
+    if bet_side == "NO":
+        share_price = 1.0 - (yes_odds / 100.0)
+    sim_payout = round(1.0 / share_price, 4) if share_price > 0 else 0
+
+    candle_str = " ".join(["C{}={}".format(c["position"], c["color"]) for c in prior_candles])
+    ind_parts = []
+    if tv_dir: ind_parts.append("TV={}".format(tv_dir))
+    if sma_dir: ind_parts.append("SMA={}".format(sma_dir))
+    if btc_trend: ind_parts.append("BTC={}".format(btc_trend))
+    ind_str = "[{}] {} | prior:{} | pos=C{} 4H=H{}({}) | {}".format(
+        confidence, " ".join(ind_parts), candle_str,
+        candle_pos, h_in_4h + 1,
+        "strong" if h_in_4h in (0, 1) else "weak", reason)
+
+    return {
+        "bet_side": bet_side, "bet_odds": effective_odds,
+        "score": len(prior_candles) + len([d for d in [tv_dir, sma_dir, btc_trend] if d]),
+        "total_signals": len(prior_candles) + 3,
+        "confidence": confidence, "indicators": ind_str,
+        "market_type": "15M", "sim_payout": sim_payout,
+    }
+
+
+# ═══════════════════════════════════════════════════════════
+# PAPER 3.6: P3.1 + Candle Position Context — 15M MARKETS
+# ═══════════════════════════════════════════════════════════
+
+def _score_paper36_trade(p, price, indicators=None, ind_macro=None, expiry_minute=None, expiry_hour=None):
+    """Paper 3.6: 15M prediction using candle position + P3.1 (7 indicators).
+    Same candle logic as P2.6 but requires 7-indicator majority for direction."""
+    if price is None or not indicators:
+        return None
+
+    mtype = "15M" if p["is_short"] and p.get("mins_left", 0) <= 20 else "1H" if p["is_short"] else "Daily"
+    if mtype != "15M":
+        return None
+
+    asset = p["asset"]
+    baseline = p.get("baseline", 0)
+    if not baseline:
+        return None
+
+    yes_odds = p["yes_odds"]
+    no_odds = 100 - yes_odds
+    if not (20 <= yes_odds <= 70 or 20 <= no_odds <= 70):
+        return None
+
+    candle_pos = (expiry_minute // 15) if expiry_minute and expiry_minute > 0 else 4
+    if candle_pos <= 1:
+        return None  # Skip C1
+
+    # 7 indicators for direction
+    tv_dir = _tv_trends.get(asset)
+    sma_dir = _pair_sma_cache.get(asset)
+    btc_trend = _btc_trend_cache.get("trend")
+    ut_trend = indicators.get("ut_trend")
+    ema_stack = indicators.get("ema_stack")
+    sqz_val = indicators.get("squeeze_val")
+    sqz_dir = "BUY" if sqz_val and sqz_val > 0 else "SELL" if sqz_val and sqz_val < 0 else None
+    rsi = indicators.get("rsi")
+    rsi_dir = "BUY" if rsi and rsi < 40 else "SELL" if rsi and rsi > 60 else None
+
+    all_signals = [tv_dir, sma_dir, btc_trend, ut_trend, ema_stack, sqz_dir, rsi_dir]
+    buy_c = sum(1 for s in all_signals if s in ("BUY", "STRONG_BUY"))
+    sell_c = sum(1 for s in all_signals if s in ("SELL", "STRONG_SELL"))
+
+    if buy_c + sell_c < 3:
+        return None
+    indicator_dir = "BUY" if buy_c > sell_c else "SELL" if sell_c > buy_c else None
+    if not indicator_dir:
+        return None
+
+    h_in_4h = (expiry_hour or 0) % 4 if expiry_hour is not None else 0
+
+    # Use P2.6 logic with P3.1 direction — delegate to shared candle analysis
+    # Temporarily set P2.6 fields and call the candle analysis
+    candles = _read_candle_sequence(asset, "15m")
+    prior_candles = [c for c in candles if c["position"] < candle_pos]
+    if not prior_candles:
+        return None
+
+    # Use same candle_sequence_signal for consistency
+    bet_dir, confidence, reason = _candle_sequence_signal(
+        prior_candles, indicator_dir, h_in_4h, baseline, price)
+
+    if not bet_dir or not confidence:
+        return None
+
+    if bet_dir == "BUY":
+        bet_side = "YES" if p["direction"] == "above" else "NO"
+    else:
+        bet_side = "NO" if p["direction"] == "above" else "YES"
+
+    effective_odds = yes_odds if bet_side == "YES" else no_odds
+    if effective_odds < 20 or effective_odds > 70:
+        return None
+
+    share_price = effective_odds / 100.0
+    if bet_side == "NO":
+        share_price = 1.0 - (yes_odds / 100.0)
+    sim_payout = round(1.0 / share_price, 4) if share_price > 0 else 0
+
+    candle_str = " ".join(["C{}={}".format(c["position"], c["color"]) for c in prior_candles])
+    ind_parts = []
+    for label, val in [("TV", tv_dir), ("SMA", sma_dir), ("BTC", btc_trend), ("UT", ut_trend), ("EMA", ema_stack), ("SQZ", sqz_dir)]:
+        if val: ind_parts.append("{}={}".format(label, val))
+    ind_str = "[{}] {} | prior:{} | pos=C{} 4H=H{}({}) | {}".format(
+        confidence, " ".join(ind_parts), candle_str,
+        candle_pos, h_in_4h + 1,
+        "strong" if h_in_4h in (0, 1) else "weak", reason)
+
+    return {
+        "bet_side": bet_side, "bet_odds": effective_odds,
+        "score": len(prior_candles) + buy_c + sell_c,
+        "total_signals": len(prior_candles) + len(all_signals),
+        "confidence": confidence, "indicators": ind_str,
+        "market_type": "15M", "sim_payout": sim_payout,
+    }
     """Scan markets for Paper 3 (momentum) and Paper 4 (reversal) signals."""
     import requests as req
     try:
@@ -4649,6 +5367,26 @@ def run_paper34_scan():
             p34_ids = set(str(row[0]) for row in p34_rows)
         except:
             p34_ids = set()
+        try:
+            p25_rows = conn.run("SELECT market_id FROM paper25_trades WHERE fired_at::timestamptz > NOW() - INTERVAL '30 hours'")
+            p25_ids = set(str(row[0]) for row in p25_rows)
+        except:
+            p25_ids = set()
+        try:
+            p35_rows = conn.run("SELECT market_id FROM paper35_trades WHERE fired_at::timestamptz > NOW() - INTERVAL '30 hours'")
+            p35_ids = set(str(row[0]) for row in p35_rows)
+        except:
+            p35_ids = set()
+        try:
+            p26_rows = conn.run("SELECT market_id FROM paper26_trades WHERE fired_at::timestamptz > NOW() - INTERVAL '30 hours'")
+            p26_ids = set(str(row[0]) for row in p26_rows)
+        except:
+            p26_ids = set()
+        try:
+            p36_rows = conn.run("SELECT market_id FROM paper36_trades WHERE fired_at::timestamptz > NOW() - INTERVAL '30 hours'")
+            p36_ids = set(str(row[0]) for row in p36_rows)
+        except:
+            p36_ids = set()
         # Get Bot 1 and Bot 2 market IDs to avoid overlap
         try:
             bot12_rows = conn.run("""SELECT market_id FROM limitless_predictions WHERE created_at > NOW() - INTERVAL '30 hours'
@@ -4672,6 +5410,10 @@ def run_paper34_scan():
         p33_count = 0
         p24_count = 0
         p34_count = 0
+        p25_count = 0
+        p35_count = 0
+        p26_count = 0
+        p36_count = 0
 
         for market in markets:
             try:
@@ -5197,11 +5939,119 @@ def run_paper34_scan():
                         except Exception as e:
                             print("Paper34 save error: {}".format(e))
 
+                # ── Paper 2.5 (1H candle sequence) ──
+                if parsed["market_id"] not in p25_ids:
+                    scored25 = _score_paper25_trade(parsed, price, indicators=ind, ind_macro=ind_macro, expiry_minute=expiry_minute, expiry_hour=expiry_hour)
+                    if scored25:
+                        try:
+                            c25 = get_db()
+                            c25.run(
+                                """INSERT INTO paper25_trades
+                                (market_id, title, asset, direction, baseline, bet_odds, bet_side,
+                                 current_price, hours_left, market_type, indicators, score,
+                                 total_signals, simulated_stake, simulated_payout, status, fired_at, slug)
+                                VALUES (:mid, :ttl, :ast, :dir, :base, :odds, :bs,
+                                        :pr, :hrs, :mt, :ind, :sc, :ts, 1.0, :sp, 'Pending', :now, :slg)""",
+                                mid=parsed["market_id"], ttl=parsed["title"], ast=asset,
+                                dir=parsed["direction"], base=parsed["baseline"],
+                                odds=scored25["bet_odds"], bs=scored25["bet_side"],
+                                pr=price, hrs=round(parsed["hours_left"], 2),
+                                mt=scored25["market_type"],
+                                ind="[{}] {}".format(scored25["confidence"], scored25["indicators"]),
+                                sc=scored25["score"], ts=scored25["total_signals"],
+                                sp=scored25["sim_payout"], now=now, slg=parsed["slug"])
+                            c25.close()
+                            p25_ids.add(parsed["market_id"])
+                            p25_count += 1
+                        except Exception as e:
+                            print("Paper25 save error: {}".format(e))
+
+                # ── Paper 3.5 (1H candle sequence + 7 indicators) ──
+                if parsed["market_id"] not in p35_ids:
+                    scored35 = _score_paper35_trade(parsed, price, indicators=ind, ind_macro=ind_macro, expiry_minute=expiry_minute, expiry_hour=expiry_hour)
+                    if scored35:
+                        try:
+                            c35 = get_db()
+                            c35.run(
+                                """INSERT INTO paper35_trades
+                                (market_id, title, asset, direction, baseline, bet_odds, bet_side,
+                                 current_price, hours_left, market_type, indicators, score,
+                                 total_signals, simulated_stake, simulated_payout, status, fired_at, slug)
+                                VALUES (:mid, :ttl, :ast, :dir, :base, :odds, :bs,
+                                        :pr, :hrs, :mt, :ind, :sc, :ts, 1.0, :sp, 'Pending', :now, :slg)""",
+                                mid=parsed["market_id"], ttl=parsed["title"], ast=asset,
+                                dir=parsed["direction"], base=parsed["baseline"],
+                                odds=scored35["bet_odds"], bs=scored35["bet_side"],
+                                pr=price, hrs=round(parsed["hours_left"], 2),
+                                mt=scored35["market_type"],
+                                ind="[{}] {}".format(scored35["confidence"], scored35["indicators"]),
+                                sc=scored35["score"], ts=scored35["total_signals"],
+                                sp=scored35["sim_payout"], now=now, slg=parsed["slug"])
+                            c35.close()
+                            p35_ids.add(parsed["market_id"])
+                            p35_count += 1
+                        except Exception as e:
+                            print("Paper35 save error: {}".format(e))
+
+                # ── Paper 2.6 (15M candle position context) ──
+                if parsed["market_id"] not in p26_ids:
+                    scored26 = _score_paper26_trade(parsed, price, indicators=ind, ind_macro=ind_macro, expiry_minute=expiry_minute, expiry_hour=expiry_hour)
+                    if scored26:
+                        try:
+                            c26 = get_db()
+                            c26.run(
+                                """INSERT INTO paper26_trades
+                                (market_id, title, asset, direction, baseline, bet_odds, bet_side,
+                                 current_price, hours_left, market_type, indicators, score,
+                                 total_signals, simulated_stake, simulated_payout, status, fired_at, slug)
+                                VALUES (:mid, :ttl, :ast, :dir, :base, :odds, :bs,
+                                        :pr, :hrs, :mt, :ind, :sc, :ts, 1.0, :sp, 'Pending', :now, :slg)""",
+                                mid=parsed["market_id"], ttl=parsed["title"], ast=asset,
+                                dir=parsed["direction"], base=parsed["baseline"],
+                                odds=scored26["bet_odds"], bs=scored26["bet_side"],
+                                pr=price, hrs=round(parsed["hours_left"], 2),
+                                mt=scored26["market_type"],
+                                ind="[{}] {}".format(scored26["confidence"], scored26["indicators"]),
+                                sc=scored26["score"], ts=scored26["total_signals"],
+                                sp=scored26["sim_payout"], now=now, slg=parsed["slug"])
+                            c26.close()
+                            p26_ids.add(parsed["market_id"])
+                            p26_count += 1
+                        except Exception as e:
+                            print("Paper26 save error: {}".format(e))
+
+                # ── Paper 3.6 (15M candle position + 7 indicators) ──
+                if parsed["market_id"] not in p36_ids:
+                    scored36 = _score_paper36_trade(parsed, price, indicators=ind, ind_macro=ind_macro, expiry_minute=expiry_minute, expiry_hour=expiry_hour)
+                    if scored36:
+                        try:
+                            c36 = get_db()
+                            c36.run(
+                                """INSERT INTO paper36_trades
+                                (market_id, title, asset, direction, baseline, bet_odds, bet_side,
+                                 current_price, hours_left, market_type, indicators, score,
+                                 total_signals, simulated_stake, simulated_payout, status, fired_at, slug)
+                                VALUES (:mid, :ttl, :ast, :dir, :base, :odds, :bs,
+                                        :pr, :hrs, :mt, :ind, :sc, :ts, 1.0, :sp, 'Pending', :now, :slg)""",
+                                mid=parsed["market_id"], ttl=parsed["title"], ast=asset,
+                                dir=parsed["direction"], base=parsed["baseline"],
+                                odds=scored36["bet_odds"], bs=scored36["bet_side"],
+                                pr=price, hrs=round(parsed["hours_left"], 2),
+                                mt=scored36["market_type"],
+                                ind="[{}] {}".format(scored36["confidence"], scored36["indicators"]),
+                                sc=scored36["score"], ts=scored36["total_signals"],
+                                sp=scored36["sim_payout"], now=now, slg=parsed["slug"])
+                            c36.close()
+                            p36_ids.add(parsed["market_id"])
+                            p36_count += 1
+                        except Exception as e:
+                            print("Paper36 save error: {}".format(e))
+
             except Exception as e:
                 print("Paper345 market error: {}".format(e))
 
-        if p3_count > 0 or p4_count > 0 or p5_count > 0 or p24_count > 0 or p34_count > 0:
-            print("P3:{} P4:{} P5:{} P3.1:{} P2.1:{} P5.1:{} P2.2:{} P3.2:{} P2.3:{} P3.3:{} P2.4:{} P3.4:{}".format(p3_count, p4_count, p5_count, p31_count, p21_count, p51_count, p22_count, p32_count, p23_count, p33_count, p24_count, p34_count))
+        if p3_count > 0 or p4_count > 0 or p5_count > 0 or p24_count > 0 or p34_count > 0 or p25_count > 0 or p35_count > 0 or p26_count > 0 or p36_count > 0:
+            print("P3:{} P4:{} P5:{} P3.1:{} P2.1:{} P5.1:{} P2.2:{} P3.2:{} P2.3:{} P3.3:{} P2.4:{} P3.4:{} P2.5:{} P3.5:{} P2.6:{} P3.6:{}".format(p3_count, p4_count, p5_count, p31_count, p21_count, p51_count, p22_count, p32_count, p23_count, p33_count, p24_count, p34_count, p25_count, p35_count, p26_count, p36_count))
         else:
             # Count how many assets we got indicators for
             ind_ok = sum(1 for v in indicator_cache_local.values() if v is not None)
@@ -5425,8 +6275,12 @@ def resolve_paper34_trades():
     r33 = _resolve_paper_table("paper33_trades")
     r24 = _resolve_paper_table("paper24_trades")
     r34 = _resolve_paper_table("paper34_trades")
-    if r3 or r4 or r5 or r24 or r34:
-        print("Resolved: P3={} P4={} P5={} P3.1={} P2.1={} P5.1={} P2.2={} P3.2={} P2.3={} P3.3={} P2.4={} P3.4={}".format(r3, r4, r5, r31, r21, r51, r22, r32, r23, r33, r24, r34))
+    r25 = _resolve_paper_table("paper25_trades")
+    r35 = _resolve_paper_table("paper35_trades")
+    r26 = _resolve_paper_table("paper26_trades")
+    r36 = _resolve_paper_table("paper36_trades")
+    if r3 or r4 or r5 or r24 or r34 or r25 or r35 or r26 or r36:
+        print("Resolved: P3={} P4={} P5={} P3.1={} P2.1={} P5.1={} P2.2={} P3.2={} P2.3={} P3.3={} P2.4={} P3.4={} P2.5={} P3.5={} P2.6={} P3.6={}".format(r3, r4, r5, r31, r21, r51, r22, r32, r23, r33, r24, r34, r25, r35, r26, r36))
 
 def _score_paper_trade(p, price):
     """Score a market for paper trading. Accepts 40-72% odds when ALL trends agree.
@@ -9675,6 +10529,10 @@ td{padding:8px 12px;border-bottom:1px solid #f4f3ed;color:var(--ink-2)}tr:last-c
     <a href="/app/paper33" class="nav-tab""" + (" active" if nav_active == "paper33" else "") + """">Paper 3.3</a>
     <a href="/app/paper24" class="nav-tab""" + (" active" if nav_active == "paper24" else "") + """">Paper 2.4</a>
     <a href="/app/paper34" class="nav-tab""" + (" active" if nav_active == "paper34" else "") + """">Paper 3.4</a>
+    <a href="/app/paper25" class="nav-tab""" + (" active" if nav_active == "paper25" else "") + """">Paper 2.5</a>
+    <a href="/app/paper35" class="nav-tab""" + (" active" if nav_active == "paper35" else "") + """">Paper 3.5</a>
+    <a href="/app/paper26" class="nav-tab""" + (" active" if nav_active == "paper26" else "") + """">Paper 2.6</a>
+    <a href="/app/paper36" class="nav-tab""" + (" active" if nav_active == "paper36" else "") + """">Paper 3.6</a>
     <a href="/app/paper4" class="nav-tab""" + (" active" if nav_active == "paper4" else "") + """">Paper 4</a>
     <a href="/app/paper5" class="nav-tab""" + (" active" if nav_active == "paper5" else "") + """">Paper 5</a>
     <a href="/app/paper51" class="nav-tab""" + (" active" if nav_active == "paper51" else "") + """">Paper 5.1</a>
@@ -10572,7 +11430,7 @@ def run_poly_scan():
         conn.close()
 
         poly_counts = {"btc5m": 0, "all5m": 0, "all15m": 0, "all1h": 0, "hourly24": 0}
-        strategies = ["p21", "p23", "p31", "p33", "p24", "p34"]
+        strategies = ["p21", "p23", "p31", "p33", "p24", "p34", "p25", "p35", "p26", "p36"]
         # BUG 3 FIX: Batch inserts with single connection
         inserts = []
 
@@ -10635,11 +11493,18 @@ def run_poly_scan():
             for section in sections:
                 for strat in strategies:
                     # Section-strategy filtering:
-                    # hourly24: only P2.4 and P3.4
-                    # all1h: only P2.1, P2.3, P3.1, P3.3 (not P2.4/P3.4)
-                    if section == "hourly24" and strat not in ("p24", "p34"):
+                    # hourly24: only P2.4, P3.4, P2.5, P3.5 (1H candle strategies)
+                    # all1h: only P2.1, P2.3, P3.1, P3.3 (base strategies on 1H)
+                    # 15M sections: P2.6/P3.6 added to existing strategies
+                    if section == "hourly24" and strat not in ("p24", "p34", "p25", "p35"):
                         continue
-                    if section == "all1h" and strat in ("p24", "p34"):
+                    if section == "all1h" and strat in ("p24", "p34", "p25", "p35", "p26", "p36"):
+                        continue
+                    # P2.5/P3.5 are 1H only — skip on 15M and 5M sections
+                    if section in ("btc5m", "all15m") and strat in ("p25", "p35"):
+                        continue
+                    # P2.6/P3.6 are 15M only — skip on 1H sections
+                    if section in ("all1h", "hourly24") and strat in ("p26", "p36"):
                         continue
                     
                     key = "{}_{}_{}" .format(section, strat, parsed["market_id"])
@@ -10675,6 +11540,26 @@ def run_poly_scan():
                                                           expiry_hour=expiry_hour)
                         elif strat == "p34":
                             scored = _score_paper34_trade(parsed, price, indicators=ind,
+                                                          ind_macro=ind_macro,
+                                                          expiry_minute=expiry_minute,
+                                                          expiry_hour=expiry_hour)
+                        elif strat == "p25":
+                            scored = _score_paper25_trade(parsed, price, indicators=ind,
+                                                          ind_macro=ind_macro,
+                                                          expiry_minute=expiry_minute,
+                                                          expiry_hour=expiry_hour)
+                        elif strat == "p35":
+                            scored = _score_paper35_trade(parsed, price, indicators=ind,
+                                                          ind_macro=ind_macro,
+                                                          expiry_minute=expiry_minute,
+                                                          expiry_hour=expiry_hour)
+                        elif strat == "p26":
+                            scored = _score_paper26_trade(parsed, price, indicators=ind,
+                                                          ind_macro=ind_macro,
+                                                          expiry_minute=expiry_minute,
+                                                          expiry_hour=expiry_hour)
+                        elif strat == "p36":
+                            scored = _score_paper36_trade(parsed, price, indicators=ind,
                                                           ind_macro=ind_macro,
                                                           expiry_minute=expiry_minute,
                                                           expiry_hour=expiry_hour)
@@ -10876,6 +11761,8 @@ def _build_poly_page(section, page_title, subtitle, description):
         strategies = [
             ("p24", "Paper 2.4", "P2.1 + Distance Math + 15M Candle Pattern (1H Only)"),
             ("p34", "Paper 3.4", "P3.1 + Distance Math + 15M Candle Pattern (1H Only)"),
+            ("p25", "Paper 2.5", "P2.1 + Candle Sequence (1H Only)"),
+            ("p35", "Paper 3.5", "P3.1 + Candle Sequence (1H Only)"),
         ]
     else:
         strategies = [
@@ -10883,6 +11770,8 @@ def _build_poly_page(section, page_title, subtitle, description):
             ("p23", "Paper 2.3", "P2.1 + Distance Math (Full Confidence)"),
             ("p31", "Paper 3.1", "7 Indicators + BTC Tiebreaker"),
             ("p33", "Paper 3.3", "P3.1 + Distance Math (Mixed Mode)"),
+            ("p26", "Paper 2.6", "P2.1 + Candle Position Context (15M)"),
+            ("p36", "Paper 3.6", "P3.1 + Candle Position Context (15M)"),
         ]
 
     try:
@@ -11151,6 +12040,34 @@ def paper34_page():
         "P3.1 + Distance Math + 15M Candle Pattern — 1H Only",
         "Uses completed 15-minute candles within the hourly window plus distance math to predict the 1H close.",
         extra_cols=[], nav_active="paper34")
+
+@app.route("/app/paper25")
+def paper25_page():
+    return _build_paper_page("paper25_trades", "Paper 2.5",
+        "P2.1 + Candle Sequence — 1H Only",
+        "Reads 15M candle sequence (color, size, position) within the hour + 4H macro position to predict hourly close. Fires after C1 or C2.",
+        extra_cols=[], nav_active="paper25")
+
+@app.route("/app/paper35")
+def paper35_page():
+    return _build_paper_page("paper35_trades", "Paper 3.5",
+        "P3.1 + Candle Sequence — 1H Only",
+        "Same as P2.5 but uses P3.1 (7 indicators) for direction. Stricter filtering, fewer but higher quality trades.",
+        extra_cols=[], nav_active="paper35")
+
+@app.route("/app/paper26")
+def paper26_page():
+    return _build_paper_page("paper26_trades", "Paper 2.6",
+        "P2.1 + Candle Position Context — 15M Only",
+        "Predicts individual 15M candles using position within the hour (:00, :15, :30, :45) and prior candle data. Skips C1.",
+        extra_cols=[], nav_active="paper26")
+
+@app.route("/app/paper36")
+def paper36_page():
+    return _build_paper_page("paper36_trades", "Paper 3.6",
+        "P3.1 + Candle Position Context — 15M Only",
+        "Same as P2.6 but uses P3.1 (7 indicators) for direction. Skips C1, best on C3 and C4.",
+        extra_cols=[], nav_active="paper36")
 
 
 # Start Polymarket threads (defined above)
