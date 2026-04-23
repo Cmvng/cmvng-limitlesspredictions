@@ -11766,11 +11766,6 @@ def run_poly_scan():
             tf = parsed["timeframe"]
             mins_left = parsed["mins_left"]
 
-            # Debug: log all 15M markets before filtering
-            if tf == "15M":
-                print("POLY_15M_MARKET: {} tf={} mins_left={:.1f} baseline={} odds={}".format(
-                    asset, tf, mins_left, parsed.get("baseline"), parsed.get("yes_odds")))
-
             # Skip if too little or too much time left
             # Wait for price to move from PTB before scoring:
             # 5M: score in last 4 mins (1 min of movement minimum)
@@ -11921,13 +11916,13 @@ def run_poly_scan():
                     poly_counts[section] = poly_counts.get(section, 0) + 1
 
                     # ─── POLYMARKET LIVE TRADING ───
-                    # P2.3 on 15M markets only, autoscale from $2.50
-                    if _poly_has_creds() and tf == "15M" and strat == "p23":
-                        live_state = _poly_live_p23
-                        bot_label = "POLY-P2.3"
-                        poly_stake = _calc_poly_autoscale_stake(live_state)
-
-                        if poly_stake > 0 and live_state["enabled"]:
+                    # P2.3 on 5M and 15M markets, autoscale from $2.50
+                    if strat == "p23" and tf in ("5M", "15M"):
+                        if _poly_has_creds() and _poly_live_p23["enabled"]:
+                            poly_stake = _calc_poly_autoscale_stake(_poly_live_p23)
+                            if poly_stake > 0:
+                                live_state = _poly_live_p23
+                                bot_label = "POLY-P2.3"
                                 # Get token ID from clob_tokens (already in parsed market)
                                 clob_toks = parsed.get("clob_tokens", [])
                                 cid = parsed.get("condition_id", "")
@@ -12094,22 +12089,26 @@ def _resolve_poly_trades():
                     bal -= stake
                 _poly_set_balance(section, strat, bal)
 
-                # Update LIVE bot balances for P2.3 and P3.1 on 15M
+                # Update LIVE bot balance for P2.3 on 15M
+                # This mirrors how Limitless P2.1 works — paper resolution updates live balance
                 mt = p.get("market_type", "")
-                if mt in ("5M", "15M") and strat == "p23":
-                    live_st = _poly_live_p23 if strat == "p23" else _poly_live_p31
+                if mt in ("5M", "15M") and strat == "p23" and _poly_live_p23.get("enabled"):
+                    live_st = _poly_live_p23
+                    poly_trade_stake = _calc_poly_autoscale_stake(live_st) or 2.50
                     if won:
-                        live_st["balance"] = round(live_st["balance"] + (payout - stake), 2)
+                        # Payout based on actual poly stake, not paper $1
+                        poly_payout = round(poly_trade_stake / (float(p.get("bet_odds") or 50) / 100.0), 2)
+                        live_st["balance"] = round(live_st["balance"] + (poly_payout - poly_trade_stake), 2)
                     else:
-                        live_st["balance"] = round(live_st["balance"] - stake, 2)
-                    # Update peak
+                        live_st["balance"] = round(live_st["balance"] - poly_trade_stake, 2)
                     if live_st["balance"] > live_st.get("peak_balance", 0):
                         live_st["peak_balance"] = live_st["balance"]
-                    # Re-enable if above floor
-                    if live_st["balance"] > live_st["floor_balance"] and not live_st["enabled"]:
+                    if live_st["balance"] <= live_st["floor_balance"]:
+                        live_st["enabled"] = False
+                        print("POLY-P2.3 STOPPED: bal=${:.2f}".format(live_st["balance"]))
+                    elif not live_st["enabled"] and live_st["balance"] > live_st["floor_balance"]:
                         live_st["enabled"] = True
-                        print("POLY-{} re-enabled: bal=${:.2f}".format(
-                            "P2.3" if strat == "p23" else "P3.1", live_st["balance"]))
+                        print("POLY-P2.3 re-enabled: bal=${:.2f}".format(live_st["balance"]))
 
             except Exception as e:
                 continue
