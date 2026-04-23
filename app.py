@@ -2119,50 +2119,54 @@ def _execute_poly_trade(condition_id, token_id, side, stake, price):
         from py_clob_client.clob_types import OrderArgs, MarketOrderArgs, OrderType
 
         # Polymarket minimum is 5 shares per order
+        # Cap total cost at stake amount ($2.50)
         min_shares = 5.0
-        shares = round(stake / price, 2)
-        if shares < min_shares:
-            shares = min_shares
-            stake = round(min_shares * price, 2)
+        max_price = round(stake / min_shares, 2)  # $2.50 / 5 = $0.50 max per share
+        order_price = min(round(price, 2), max_price)
+        shares = min_shares
 
-        # Try to get actual best ask from orderbook for better pricing
-        actual_price = price
+        # Never pay more than 2 cents above signal price
+        if order_price > round(price + 0.02, 2):
+            order_price = round(price + 0.02, 2)
+
+        # Skip if price is too high (odds too extreme)
+        if order_price > 0.70:
+            print("Poly skip: price {:.2f} too high for ${:.2f} stake".format(order_price, stake))
+            return False
+
+        # Try to get actual best ask from orderbook
+        actual_ask = None
         try:
             book = client.get_order_book(str(token_id))
             if book and hasattr(book, 'asks') and book.asks:
-                best_ask = float(book.asks[0].price) if book.asks else None
-                if best_ask and best_ask > 0:
-                    actual_price = best_ask
-                    print("Poly orderbook ask: {:.2f} (vs signal {:.2f})".format(actual_price, price))
+                actual_ask = float(book.asks[0].price) if book.asks else None
+                if actual_ask and actual_ask > 0:
+                    # Use the ask price but never more than our max
+                    order_price = min(round(actual_ask, 2), max_price)
         except:
             pass
 
-        # Use aggressive price — pay up to 10 cents above signal price
-        aggressive_price = round(min(max(actual_price, price) + 0.05, 0.95), 2)
-        aggressive_shares = max(min_shares, round(stake / aggressive_price, 2))
-
-        # ── Try GTC at aggressive price ──
+        # ── Try GTC at order price ──
         try:
             order_args = OrderArgs(
                 token_id=str(token_id),
-                price=aggressive_price,
-                size=aggressive_shares,
+                price=order_price,
+                size=shares,
                 side=BUY,
             )
             signed_order = client.create_order(order_args)
             gtc_resp = client.post_order(signed_order, OrderType.GTC)
-            print("Poly GTC resp: {}".format(str(gtc_resp)[:200]))
+            print("Poly GTC: price={:.2f} shares={} resp={}".format(order_price, shares, str(gtc_resp)[:150]))
 
             if gtc_resp:
                 order_id = gtc_resp.get("orderID") or gtc_resp.get("order_id")
                 status = (gtc_resp.get("status") or "").upper()
 
                 if status in ("MATCHED", "FILLED"):
-                    print("Poly GTC FILLED: {} ${:.2f} @{:.2f}".format(side, stake, aggressive_price))
+                    print("Poly GTC FILLED: {} ${:.2f} @{:.2f}".format(side, stake, order_price))
                     return True
 
                 if order_id and status == "LIVE":
-                    # Wait up to 12 seconds for fill
                     for _ in range(6):
                         time.sleep(2)
                         try:
@@ -2176,7 +2180,6 @@ def _execute_poly_trade(condition_id, token_id, side, stake, price):
                                     break
                         except:
                             pass
-                    # Cancel unfilled
                     try:
                         client.cancel(order_id)
                     except:
@@ -2184,10 +2187,10 @@ def _execute_poly_trade(condition_id, token_id, side, stake, price):
         except Exception as gtc_err:
             print("Poly GTC error: {}".format(gtc_err))
 
-        # ── FOK fallback at very aggressive price ──
+        # ── FOK fallback — capped at max_price ──
         try:
-            fok_price = round(min(aggressive_price + 0.05, 0.95), 2)
-            fok_amount = round(max(stake, min_shares * fok_price), 2)
+            fok_price = min(round(order_price + 0.02, 2), max_price)
+            fok_amount = round(min_shares * fok_price, 2)
             mo = MarketOrderArgs(
                 token_id=str(token_id),
                 amount=fok_amount,
