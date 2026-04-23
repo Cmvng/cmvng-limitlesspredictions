@@ -11432,7 +11432,7 @@ def run_poly_scan():
             existing_keys = set()
         conn.close()
 
-        poly_counts = {"btc5m": 0, "all5m": 0, "all15m": 0, "all1h": 0, "hourly24": 0}
+        poly_counts = {"btc5m": 0, "all5m": 0, "all15m": 0, "hourly24": 0}
         strategies = ["p21", "p23", "p31", "p33", "p24", "p34", "p25", "p35", "p26", "p36"]
         # BUG 3 FIX: Batch inserts with single connection
         inserts = []
@@ -11464,7 +11464,6 @@ def run_poly_scan():
             elif tf == "15M":
                 sections.append("all15m")
             elif tf == "1H":
-                sections.append("all1h")
                 sections.append("hourly24")
 
             if not sections:
@@ -11497,17 +11496,15 @@ def run_poly_scan():
                 for strat in strategies:
                     # Section-strategy filtering:
                     # hourly24: only P2.4, P3.4, P2.5, P3.5 (1H candle strategies)
-                    # all1h: only P2.1, P2.3, P3.1, P3.3 (base strategies on 1H)
-                    # 15M sections: P2.6/P3.6 added to existing strategies
+                    # P2.5/P3.5 are 1H only — skip on 15M and 5M sections
+                    # P2.6/P3.6 are 15M only — skip on 1H sections
                     if section == "hourly24" and strat not in ("p24", "p34", "p25", "p35"):
                         continue
-                    if section == "all1h" and strat in ("p24", "p34", "p25", "p35", "p26", "p36"):
+                    if section in ("btc5m", "all15m") and strat in ("p24", "p34", "p25", "p35"):
                         continue
-                    # P2.5/P3.5 are 1H only — skip on 15M and 5M sections
                     if section in ("btc5m", "all15m") and strat in ("p25", "p35"):
                         continue
-                    # P2.6/P3.6 are 15M only — skip on 1H sections
-                    if section in ("all1h", "hourly24") and strat in ("p26", "p36"):
+                    if section == "hourly24" and strat in ("p26", "p36"):
                         continue
                     
                     key = "{}_{}_{}" .format(section, strat, parsed["market_id"])
@@ -11616,9 +11613,9 @@ def run_poly_scan():
                 print("Poly batch save error: {}".format(e))
 
         total = sum(poly_counts.values())
-        print("Poly scan: {} markets found, {} trades | btc5m={} all5m={} all15m={} all1h={} h24={}".format(
+        print("Poly scan: {} markets found, {} trades | btc5m={} all5m={} all15m={} h24={}".format(
             len(markets), total, poly_counts["btc5m"], poly_counts["all5m"],
-            poly_counts["all15m"], poly_counts["all1h"], poly_counts["hourly24"]))
+            poly_counts["all15m"], poly_counts["hourly24"]))
 
     except Exception as e:
         print("Poly scan error: {}".format(e))
@@ -11880,8 +11877,7 @@ def _build_poly_page(section, page_title, subtitle, description):
     nav_tabs = [
         ("/app/poly/btc5m", "BTC 5M", section == "btc5m"),
         ("/app/poly/all15m", "All 15M", section == "all15m"),
-        ("/app/poly/all1h", "All 1H", section == "all1h"),
-        ("/app/poly/hourly24", "Hourly 2.4/3.4", section == "hourly24"),
+        ("/app/poly/hourly24", "All Hourly", section == "hourly24"),
         ("/app", "← Limitless", False),
     ]
 
@@ -12014,20 +12010,16 @@ def poly_all15m_page():
 
 @app.route("/app/poly/all1h")
 def poly_all1h_page():
-    return _build_poly_page(
-        "all1h",
-        "Polymarket — All Pairs 1H",
-        "4 strategies on all 1-hour crypto Up/Down markets",
-        "Tests all strategies across all available 1H Polymarket crypto pairs."
-    )
+    from flask import redirect
+    return redirect("/app/poly/hourly24")
 
 @app.route("/app/poly/hourly24")
 def poly_hourly24_page():
     return _build_poly_page(
         "hourly24",
-        "Polymarket — Hourly 2.4/3.4",
-        "15M candle pattern analysis on 1-hour markets",
-        "Paper 2.4 and 3.4 use completed 15-minute candles within the hour to predict the close."
+        "Polymarket — All Hourly",
+        "Candle sequence strategies on 1-hour crypto Up/Down markets",
+        "P2.4/P3.4 (distance + candle pattern) and P2.5/P3.5 (candle sequence) on all 1H markets."
     )
 
 @app.route("/app/paper24")
