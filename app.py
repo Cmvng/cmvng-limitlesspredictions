@@ -9919,42 +9919,66 @@ def _poly_fetch_markets():
 
     for asset_slug, asset_name in assets:
         for tf_slug, tf_seconds, tf_label in timeframes:
-            # Calculate current and next window end timestamps
-            # Windows are aligned: 5m at :00,:05,:10... 15m at :00,:15,:30,:45... 1h at :00
+            # Calculate current window START timestamp (Polymarket uses START in slug)
+            # Windows are aligned to epoch: 5m at :00,:05,:10... 15m at :00,:15,:30,:45
             window_start = (current_ts // tf_seconds) * tf_seconds
             window_end = window_start + tf_seconds
-            next_window_end = window_end + tf_seconds
+            prev_window_start = window_start - tf_seconds
 
-            # Try current window and next window
-            for end_ts in [window_end, next_window_end]:
-                mins_left = (end_ts - current_ts) / 60.0
+            # Try current window and previous window
+            for start_ts in [window_start, prev_window_start]:
+                this_end = start_ts + tf_seconds
+                mins_left = (this_end - current_ts) / 60.0
                 if mins_left <= 0 or mins_left > (tf_seconds / 60.0) + 2:
                     continue
 
-                slug = "{}-updown-{}-{}".format(asset_slug, tf_slug, end_ts)
+                # Polymarket slug format: btc-updown-5m-{window_start}
+                slug = "{}-updown-{}-{}".format(asset_slug, tf_slug, start_ts)
 
-                # Look up this specific market on Gamma API
+                # Look up via /events endpoint (Polymarket indexes by event slug)
                 try:
                     r = req.get(
-                        "{}/markets".format(POLY_GAMMA_API),
+                        "{}/events".format(POLY_GAMMA_API),
                         params={"slug": slug},
                         timeout=10
                     )
                     if r.status_code == 200:
                         data = r.json()
-                        # Response could be a list or single market
+                        event_markets = []
                         if isinstance(data, list) and data:
-                            market = data[0]
-                        elif isinstance(data, dict) and data.get("id"):
-                            market = data
-                        else:
-                            continue
+                            event_markets = data[0].get("markets", []) if isinstance(data[0], dict) else []
+                        elif isinstance(data, dict):
+                            event_markets = data.get("markets", [])
 
-                        parsed = _poly_parse_market(market)
-                        if parsed:
-                            markets.append(parsed)
+                        for market in event_markets:
+                            parsed = _poly_parse_market(market)
+                            if parsed:
+                                markets.append(parsed)
                 except Exception as e:
-                    pass  # Individual market lookup failure — skip silently
+                    pass
+
+                # Also try /markets endpoint as fallback
+                if not any(m.get("slug") == slug for m in markets):
+                    try:
+                        r = req.get(
+                            "{}/markets".format(POLY_GAMMA_API),
+                            params={"slug": slug},
+                            timeout=10
+                        )
+                        if r.status_code == 200:
+                            data = r.json()
+                            if isinstance(data, list) and data:
+                                market = data[0]
+                            elif isinstance(data, dict) and data.get("id"):
+                                market = data
+                            else:
+                                continue
+
+                            parsed = _poly_parse_market(market)
+                            if parsed:
+                                markets.append(parsed)
+                    except:
+                        pass
 
     if not markets:
         # Fallback: try broad search
@@ -10129,18 +10153,21 @@ def run_poly_scan():
             if not sections:
                 continue
 
-            # Get yfinance candle data matching the market timeframe
-            yf_tf = "5m" if tf == "5M" else "15m" if tf == "15M" else "1h"
+            # Get yfinance candle data — 15m for 5M and 15M (5m fails on Railway), 1h for 1H
+            yf_tf = "15m" if tf in ("5M", "15M") else "1h"
             ind = _calculate_indicators(asset, yf_tf)
             if not ind:
+                print("POLY_FAIL {}/{}: indicators None (yf_tf={})".format(asset, tf, yf_tf))
                 continue
 
             price = ind.get("current")
             if not price:
+                print("POLY_FAIL {}/{}: price None".format(asset, tf))
                 continue
 
             baseline = _poly_get_baseline(parsed, price, ind)
             if baseline is None:
+                print("POLY_FAIL {}/{}: baseline None, keys={}".format(asset, tf, list(_chainlink_ptb.keys())))
                 continue
             parsed["baseline"] = baseline
 
