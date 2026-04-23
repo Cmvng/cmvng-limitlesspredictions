@@ -11935,8 +11935,8 @@ def run_poly_scan():
                             asset, tf, section, poly_side, effective_odds))
 
                     # ─── POLYMARKET LIVE TRADING ───
-                    # P2.3 on 5M and 15M markets, autoscale from $2.50
-                    if strat == "p23" and tf in ("5M", "15M"):
+                    # P2.3 on 15M markets ONLY, autoscale from $2.50
+                    if strat == "p23" and tf == "15M":
                         if _poly_has_creds() and _poly_live_p23["enabled"] and not _is_volatile_window():
                             poly_stake = _calc_poly_autoscale_stake(_poly_live_p23)
                             if poly_stake > 0:
