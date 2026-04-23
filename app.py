@@ -7892,11 +7892,11 @@ tbody tr:hover{background:var(--bg)}
     <nav class="nav-tabs">
       <a href="/" class="nav-tab">Home</a>
       <a href="/app" class="nav-tab active">Crypto</a>
-      <a href="/app/football" class="nav-tab">Football</a>
-      <a href="/app/poly/btc5m" class="nav-tab">Polymarket</a>
       <a href="/app/paper" class="nav-tab">Bot 2</a>
       <a href="/app/paper3" class="nav-tab">Paper 3</a>
       <a href="/app/paper4" class="nav-tab">Paper 4</a>
+      <a href="/app/poly/btc5m" class="nav-tab">Polymarket</a>
+      <a href="/app/football" class="nav-tab">Football</a>
     </nav>
     <div class="pills">
       <span class="pill pill-active">
@@ -8096,8 +8096,8 @@ tbody tr:hover{background:var(--bg)}
     <nav class="nav-tabs">
       <a href="/" class="nav-tab">Home</a>
       <a href="/app" class="nav-tab">Crypto</a>
-      <a href="/app/football" class="nav-tab active">Football</a>
       <a href="/app/poly/btc5m" class="nav-tab">Polymarket</a>
+      <a href="/app/football" class="nav-tab active">Football</a>
     </nav>
   </div>
 </header>
@@ -8999,12 +8999,11 @@ tr:hover td{background:#fafaf7}
   <nav class="nav-tabs">
     <a href="/" class="nav-tab">Home</a>
     <a href="/app" class="nav-tab">Crypto</a>
-    <a href="/app/football" class="nav-tab">Football</a>
-      <a href="/app/poly/btc5m" class="nav-tab">Polymarket</a>
-      <a href="/app/paper" class="nav-tab">Bot 2</a>
-      <a href="/app/paper3" class="nav-tab">Paper 3</a>
-      <a href="/app/paper4" class="nav-tab">Paper 4</a>
     <a href="/app/paper" class="nav-tab active">Paper</a>
+    <a href="/app/paper3" class="nav-tab">Paper 3</a>
+    <a href="/app/paper4" class="nav-tab">Paper 4</a>
+    <a href="/app/poly/btc5m" class="nav-tab">Polymarket</a>
+    <a href="/app/football" class="nav-tab">Football</a>
   </nav>
 </header>
 
@@ -9235,17 +9234,17 @@ td{padding:8px 12px;border-bottom:1px solid #f4f3ed;color:var(--ink-2)}tr:last-c
     <a href="/app" class="nav-tab">Crypto</a>
     <a href="/app/paper" class="nav-tab">Bot 2</a>
     <a href="/app/paper3" class="nav-tab""" + (" active" if nav_active == "paper3" else "") + """">Paper 3</a>
-    <a href="/app/paper4" class="nav-tab""" + (" active" if nav_active == "paper4" else "") + """">Paper 4</a>
-    <a href="/app/paper23" class="nav-tab""" + (" active" if nav_active == "paper23" else "") + """">Paper 2.3</a>
-    <a href="/app/paper33" class="nav-tab""" + (" active" if nav_active == "paper33" else "") + """">Paper 3.3</a>
-    <a href="/app/paper22" class="nav-tab""" + (" active" if nav_active == "paper22" else "") + """">Paper 2.2</a>
-    <a href="/app/paper32" class="nav-tab""" + (" active" if nav_active == "paper32" else "") + """">Paper 3.2</a>
     <a href="/app/paper21" class="nav-tab""" + (" active" if nav_active == "paper21" else "") + """">Paper 2.1</a>
+    <a href="/app/paper22" class="nav-tab""" + (" active" if nav_active == "paper22" else "") + """">Paper 2.2</a>
+    <a href="/app/paper23" class="nav-tab""" + (" active" if nav_active == "paper23" else "") + """">Paper 2.3</a>
     <a href="/app/paper31" class="nav-tab""" + (" active" if nav_active == "paper31" else "") + """">Paper 3.1</a>
-    <a href="/app/paper51" class="nav-tab""" + (" active" if nav_active == "paper51" else "") + """">Paper 5.1</a>
+    <a href="/app/paper32" class="nav-tab""" + (" active" if nav_active == "paper32" else "") + """">Paper 3.2</a>
+    <a href="/app/paper33" class="nav-tab""" + (" active" if nav_active == "paper33" else "") + """">Paper 3.3</a>
+    <a href="/app/paper4" class="nav-tab""" + (" active" if nav_active == "paper4" else "") + """">Paper 4</a>
     <a href="/app/paper5" class="nav-tab""" + (" active" if nav_active == "paper5" else "") + """">Paper 5</a>
+    <a href="/app/paper51" class="nav-tab""" + (" active" if nav_active == "paper51" else "") + """">Paper 5.1</a>
+    <a href="/app/poly/btc5m" class="nav-tab">Polymarket</a>
     <a href="/app/football" class="nav-tab">Football</a>
-      <a href="/app/poly/btc5m" class="nav-tab">Polymarket</a>
   </nav>
 </header>
 <section class="hero">
@@ -10039,6 +10038,8 @@ def _poly_fetch_markets():
                                 event_markets = data[0].get("markets", []) if isinstance(data[0], dict) else []
                             elif isinstance(data, dict):
                                 event_markets = data.get("markets", [])
+                            if event_markets:
+                                print("Poly 1H found: {} ({} markets)".format(event_slug, len(event_markets)))
                             for m in event_markets:
                                 parsed = _poly_parse_market(m)
                                 if parsed:
@@ -10185,9 +10186,6 @@ def run_poly_scan():
 
             for section in sections:
                 for strat in strategies:
-                    # BTC 5M: only use P2.3 and P3.3 (distance math strategies)
-                    if tf == "5M" and asset == "BTC" and strat not in ("p23", "p33"):
-                        continue
                     
                     key = "{}_{}_{}" .format(section, strat, parsed["market_id"])
                     if key in existing_keys:
@@ -10518,7 +10516,6 @@ def _build_poly_page(section, page_title, subtitle, description):
     # Use same HTML structure as Limitless pages
     nav_tabs = [
         ("/app/poly/btc5m", "BTC 5M", section == "btc5m"),
-        ("/app/poly/all5m", "All 5M", section == "all5m"),
         ("/app/poly/all15m", "All 15M", section == "all15m"),
         ("/app/poly/all1h", "All 1H", section == "all1h"),
         ("/app", "← Limitless", False),
