@@ -10577,6 +10577,8 @@ def run_poly_scan():
             if tf == "15M" and (mins_left < 2 or mins_left > 15):
                 continue
             if tf == "1H" and (mins_left < 5 or mins_left > 60):
+                if mins_left > 0:
+                    print("POLY_1H_TIME {}: mins_left={:.1f} REJECTED (need 5-60)".format(asset, mins_left))
                 continue
 
             # Determine which sections this market belongs to
