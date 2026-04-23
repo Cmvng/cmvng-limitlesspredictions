@@ -3452,22 +3452,13 @@ def _score_paper5_trade(p, price, indicators, ind_macro=None, expiry_minute=None
                 confidence = "LOW"; reason = "STRONG_BTC_TIEBREAK_SELL"
 
 
-    # Polymarket Up/Down override: follow indicator direction without price_above check
-    if bet_side is None and "up or down" in p.get("title", "").lower():
-        final_dir = pair_dir or btc_trend
-        if final_dir == "BUY":
-            bet_side = "YES" if p["direction"] == "above" else "NO"
-            confidence = "MEDIUM"; reason = "POLY_TREND_UP"
-        elif final_dir == "SELL":
-            bet_side = "NO" if p["direction"] == "above" else "YES"
-            confidence = "MEDIUM"; reason = "POLY_TREND_DOWN"
     if bet_side is None: return None
 
     effective_odds = yes_odds if bet_side == "YES" else no_odds
     if effective_odds > 60: return None
 
     # Danger checks (skip for pullbacks)
-    if "PULLBACK" not in reason and "POLY" not in reason:
+    if "PULLBACK" not in reason:
         if smc_event == "CHOCH_BEAR" and bet_side == ("YES" if p["direction"] == "above" else "NO"):
             return None
         if smc_event == "CHOCH_BULL" and bet_side == ("NO" if p["direction"] == "above" else "YES"):
@@ -3834,41 +3825,16 @@ def _score_paper21_trade(p, price, indicators=None, ind_macro=None, expiry_minut
                 bet_side = "NO" if p["direction"] == "above" else "YES"
                 confidence = "HIGH" if btc_agrees else "MEDIUM"
                 reason = "WEAK_TREND_HOLDS_BEAR"
-    elif is_weak_period and "up or down" in p.get("title", "").lower():
-        # ═══ WEAK PERIOD on Polymarket: no UT Bot available, follow indicators ═══
-        if pair_dir == "BUY":
-            bet_side = "YES" if p["direction"] == "above" else "NO"
-            confidence = "MEDIUM" if btc_agrees else "LOW"
-            reason = "POLY_WEAK_UP"
-        elif pair_dir == "SELL":
-            bet_side = "NO" if p["direction"] == "above" else "YES"
-            confidence = "MEDIUM" if btc_agrees else "LOW"
-            reason = "POLY_WEAK_DOWN"
     else:
         # ═══ STRONG PERIOD ═══
-        is_poly_updown = "up or down" in p.get("title", "").lower()
-        
-        if is_poly_updown:
-            # Polymarket Up/Down: follow indicator direction regardless of price position
-            # The question is "will price close UP or DOWN?" not "will price be above $X?"
-            if pair_dir == "BUY":
-                bet_side = "YES" if p["direction"] == "above" else "NO"
-                confidence = "HIGH" if btc_agrees else "MEDIUM"
-                reason = "POLY_TREND_UP"
-            elif pair_dir == "SELL":
-                bet_side = "NO" if p["direction"] == "above" else "YES"
-                confidence = "HIGH" if btc_agrees else "MEDIUM"
-                reason = "POLY_TREND_DOWN"
-        else:
-            # Limitless: require price position to agree with direction
-            if pair_dir == "BUY" and price_above:
-                bet_side = "YES" if p["direction"] == "above" else "NO"
-                confidence = "HIGH" if btc_agrees else "MEDIUM"
-                reason = "TREND_BUY"
-            elif pair_dir == "SELL" and not price_above:
-                bet_side = "NO" if p["direction"] == "above" else "YES"
-                confidence = "HIGH" if btc_agrees else "MEDIUM"
-                reason = "TREND_SELL"
+        if pair_dir == "BUY" and price_above:
+            bet_side = "YES" if p["direction"] == "above" else "NO"
+            confidence = "HIGH" if btc_agrees else "MEDIUM"
+            reason = "TREND_BUY"
+        elif pair_dir == "SELL" and not price_above:
+            bet_side = "NO" if p["direction"] == "above" else "YES"
+            confidence = "HIGH" if btc_agrees else "MEDIUM"
+            reason = "TREND_SELL"
 
     if bet_side is None:
         return None
