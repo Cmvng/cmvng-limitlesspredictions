@@ -10586,11 +10586,11 @@ def run_poly_scan():
             # Skip if too little or too much time left
             # Wait for price to move from PTB before scoring:
             # 5M: score in last 4 mins (1 min of movement minimum)
-            # 15M: score in last 7 mins (8+ mins of movement, matches Limitless timing)
+            # 15M: score in last 10 mins (5+ mins of movement)
             # 1H: score in last 45 mins (15+ mins of movement)
             if tf == "5M" and (mins_left < 1 or mins_left > 4):
                 continue
-            if tf == "15M" and (mins_left < 2 or mins_left > 7):
+            if tf == "15M" and (mins_left < 2 or mins_left > 10):
                 continue
             if tf == "1H" and (mins_left < 5 or mins_left > 45):
                 continue
