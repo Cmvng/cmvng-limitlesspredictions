@@ -21,6 +21,11 @@ LIMITLESS_TOKEN_ID     = os.environ.get("LIMITLESS_TOKEN_ID", "")      # from De
 LIMITLESS_TOKEN_SECRET = os.environ.get("LIMITLESS_TOKEN_SECRET", "")  # from Derive Token (one-time)
 LIMITLESS_PRIV_KEY     = os.environ.get("LIMITLESS_PRIVATE_KEY", "")   # MetaMask private key 0x...
 
+# Polymarket CLOB API credentials (derived from wallet)
+POLY_API_KEY       = os.environ.get("POLY_API_KEY", "")
+POLY_API_SECRET    = os.environ.get("POLY_API_SECRET", "")
+POLY_API_PASSPHRASE = os.environ.get("POLY_API_PASSPHRASE", "")
+
 LAGOS_TZ      = timezone(timedelta(hours=1))
 LIMITLESS_API = "https://api.limitless.exchange"
 
@@ -149,6 +154,28 @@ _bot32_state = {
 }
 
 FAVOURITE_HOURLY = ["ADA", "BNB", "DOGE"]
+
+# ─── Polymarket LIVE trading bot states ───
+_poly_live_p23 = {
+    "enabled": True,
+    "balance": 15.0,
+    "peak_balance": 15.0,
+    "starting_balance": 15.0,
+    "floor_balance": 5.0,
+    "trades_today": 0,
+}
+
+_poly_live_p31 = {
+    "enabled": True,
+    "balance": 15.0,
+    "peak_balance": 15.0,
+    "starting_balance": 15.0,
+    "floor_balance": 5.0,
+    "trades_today": 0,
+}
+
+def _poly_has_creds():
+    return bool(POLY_API_KEY and POLY_API_SECRET and POLY_API_PASSPHRASE and LIMITLESS_PRIV_KEY)
 
 import math as _math
 
@@ -1948,6 +1975,118 @@ def _place_fok_order(slug, bet_side, token_id, stake, exchange_addr, profile_id,
     except Exception as e:
         print("FOK error: {}".format(e))
         return False
+
+
+# ═══════════════════════════════════════════════════════════
+# POLYMARKET LIVE ORDER EXECUTION
+# ═══════════════════════════════════════════════════════════
+
+_poly_clob_client = None
+
+def _get_poly_client():
+    """Get or create Polymarket CLOB client (singleton)."""
+    global _poly_clob_client
+    if _poly_clob_client is not None:
+        return _poly_clob_client
+    if not _poly_has_creds():
+        return None
+    try:
+        from py_clob_client.client import ClobClient
+        from py_clob_client.clob_types import ApiCreds
+        creds = ApiCreds(
+            api_key=POLY_API_KEY,
+            api_secret=POLY_API_SECRET,
+            api_passphrase=POLY_API_PASSPHRASE
+        )
+        client = ClobClient(
+            "https://clob.polymarket.com",
+            key=LIMITLESS_PRIV_KEY,
+            chain_id=137,
+            creds=creds,
+            signature_type=0,  # EOA — same wallet
+        )
+        _poly_clob_client = client
+        print("Polymarket CLOB client initialized")
+        return client
+    except Exception as e:
+        print("Poly client init error: {}".format(e))
+        return None
+
+
+def _execute_poly_trade(condition_id, token_id, side, stake, price):
+    """Place a market order on Polymarket.
+    side: 'UP' or 'DOWN'
+    token_id: the YES or NO token ID
+    stake: amount in USDC
+    price: price per share (e.g. 0.55 for 55% odds)
+    Returns True if filled."""
+    try:
+        client = _get_poly_client()
+        if not client:
+            print("Poly trade: no client")
+            return False
+
+        from py_clob_client.constants import BUY
+        from py_clob_client.order_builder.constants import OrderType as PolyOrderType
+
+        # We always BUY outcome tokens (UP or DOWN)
+        order = client.create_and_post_order(
+            {
+                "tokenID": token_id,
+                "price": round(price, 2),
+                "size": round(stake / price, 2),  # number of shares = stake / price
+                "side": BUY,
+            },
+            {
+                "tickSize": "0.01",
+                "negRisk": False,
+            },
+            PolyOrderType.FOK,  # Fill or Kill — immediate fill or cancel
+        )
+
+        if order and order.get("orderID"):
+            status = order.get("status", "")
+            if status in ("MATCHED", "FILLED", "matched", "filled"):
+                print("Poly FILLED: {} {} ${:.2f} @{:.2f}".format(side, token_id[:15], stake, price))
+                return True
+            else:
+                print("Poly order status: {} — {}".format(status, order.get("orderID", "")[:20]))
+                # Check if it was matched
+                if order.get("matchedAmount") and float(order.get("matchedAmount", 0)) > 0:
+                    print("Poly partially matched: {}".format(order.get("matchedAmount")))
+                    return True
+                return False
+        else:
+            print("Poly order failed: {}".format(str(order)[:100]))
+            return False
+
+    except Exception as e:
+        print("Poly trade error: {}".format(e))
+        return False
+
+
+def _get_poly_token_id(condition_id, side):
+    """Get the token ID for UP or DOWN from Polymarket Gamma API."""
+    try:
+        import requests as req
+        r = req.get("https://gamma-api.polymarket.com/markets/{}".format(condition_id), timeout=10)
+        if r.status_code == 200:
+            data = r.json()
+            tokens = data.get("tokens", [])
+            if isinstance(tokens, list) and len(tokens) >= 2:
+                # tokens[0] = YES/UP, tokens[1] = NO/DOWN
+                if side == "UP":
+                    return tokens[0].get("token_id")
+                else:
+                    return tokens[1].get("token_id")
+            elif isinstance(tokens, dict):
+                if side == "UP":
+                    return tokens.get("yes", {}).get("token_id") or tokens.get("0", {}).get("token_id")
+                else:
+                    return tokens.get("no", {}).get("token_id") or tokens.get("1", {}).get("token_id")
+    except Exception as e:
+        print("Poly token lookup error: {}".format(e))
+    return None
 
 def execute_trade(parsed_market, score, prediction_id, override_stake=None, bot_name=None, bot_balance_after=None):
     """Execute a trade using aggressive bidding.
@@ -8761,6 +8900,44 @@ def p32_set():
         _bot32_state["floor_balance"] = float(request.args["floor"])
     return {"balance": _bot32_state["balance"], "floor": _bot32_state.get("floor_balance", 0), "stake": _calc_autoscale_stake(_bot32_state)}, 200
 
+# ── Polymarket LIVE trading controls ──
+@app.route("/poly/live/status", methods=["GET"])
+def poly_live_status():
+    return {
+        "has_creds": _poly_has_creds(),
+        "p23": {
+            "enabled": _poly_live_p23["enabled"],
+            "balance": _poly_live_p23["balance"],
+            "peak": _poly_live_p23["peak_balance"],
+            "floor": _poly_live_p23["floor_balance"],
+            "stake": _calc_autoscale_stake(_poly_live_p23),
+            "trades_today": _poly_live_p23["trades_today"],
+        },
+        "p31": {
+            "enabled": _poly_live_p31["enabled"],
+            "balance": _poly_live_p31["balance"],
+            "peak": _poly_live_p31["peak_balance"],
+            "floor": _poly_live_p31["floor_balance"],
+            "stake": _calc_autoscale_stake(_poly_live_p31),
+            "trades_today": _poly_live_p31["trades_today"],
+        },
+    }, 200
+
+@app.route("/poly/live/set", methods=["GET"])
+def poly_live_set():
+    bot = request.args.get("bot", "p23")
+    st = _poly_live_p23 if bot == "p23" else _poly_live_p31
+    if request.args.get("balance"):
+        st["balance"] = float(request.args["balance"])
+        st["peak_balance"] = float(request.args["balance"])
+        st["starting_balance"] = float(request.args["balance"])
+    if request.args.get("floor"):
+        st["floor_balance"] = float(request.args["floor"])
+    if request.args.get("enabled"):
+        st["enabled"] = request.args["enabled"].lower() == "true"
+    return {"bot": bot, "balance": st["balance"], "floor": st["floor_balance"],
+            "enabled": st["enabled"], "stake": _calc_autoscale_stake(st)}, 200
+
 @app.route("/football/clear", methods=["GET"])
 def clear_football_picks():
     """Wipe old accumulator picks with broken formatting. Run once, then /football/scan."""
@@ -11591,6 +11768,37 @@ def run_poly_scan():
                     existing_keys.add(key)
                     poly_counts[section] = poly_counts.get(section, 0) + 1
 
+                    # ─── POLYMARKET LIVE TRADING ───
+                    # Only P2.3 and P3.1 on 15M markets
+                    if _poly_has_creds() and tf == "15M" and strat in ("p23", "p31"):
+                        live_state = _poly_live_p23 if strat == "p23" else _poly_live_p31
+                        bot_label = "POLY-P2.3" if strat == "p23" else "POLY-P3.1"
+
+                        if live_state["enabled"]:
+                            live_stake = _calc_autoscale_stake(live_state)
+                            if live_stake <= 0:
+                                live_state["enabled"] = False
+                                print("{} STOPPED: floor reached bal=${:.2f}".format(bot_label, live_state["balance"]))
+                            elif live_stake <= live_state["balance"]:
+                                cid = parsed.get("condition_id", "")
+                                if cid:
+                                    try:
+                                        token_id = _get_poly_token_id(cid, poly_side)
+                                        if token_id:
+                                            success = _execute_poly_trade(
+                                                cid, token_id, poly_side, live_stake, share_price)
+                                            if success:
+                                                live_state["balance"] = round(live_state["balance"] - live_stake, 2)
+                                                live_state["trades_today"] += 1
+                                                print("{} TRADE: {} {} ${:.2f} @{:.0f}% on {} | bal=${:.2f}".format(
+                                                    bot_label, poly_side, asset, live_stake,
+                                                    effective_odds, parsed["title"][:30], live_state["balance"]))
+                                                send_telegram("🟣 <b>{} TRADE</b>\n{} {} ${:.2f} @{:.0f}%\n{}\nBal: ${:.2f}".format(
+                                                    bot_label, poly_side, asset, live_stake,
+                                                    effective_odds, parsed["title"][:40], live_state["balance"]))
+                                    except Exception as pe:
+                                        print("{} trade error: {}".format(bot_label, pe))
+
         # BUG 3 FIX: Single connection for all inserts
         if inserts:
             try:
@@ -11722,6 +11930,23 @@ def _resolve_poly_trades():
                 else:
                     bal -= stake
                 _poly_set_balance(section, strat, bal)
+
+                # Update LIVE bot balances for P2.3 and P3.1 on 15M
+                mt = p.get("market_type", "")
+                if mt == "15M" and strat in ("p23", "p31"):
+                    live_st = _poly_live_p23 if strat == "p23" else _poly_live_p31
+                    if won:
+                        live_st["balance"] = round(live_st["balance"] + (payout - stake), 2)
+                    else:
+                        live_st["balance"] = round(live_st["balance"] - stake, 2)
+                    # Update peak
+                    if live_st["balance"] > live_st.get("peak_balance", 0):
+                        live_st["peak_balance"] = live_st["balance"]
+                    # Re-enable if above floor
+                    if live_st["balance"] > live_st["floor_balance"] and not live_st["enabled"]:
+                        live_st["enabled"] = True
+                        print("POLY-{} re-enabled: bal=${:.2f}".format(
+                            "P2.3" if strat == "p23" else "P3.1", live_st["balance"]))
 
             except Exception as e:
                 continue
@@ -12063,22 +12288,6 @@ def paper36_page():
         "P3.1 + Candle Position Context — 15M Only",
         "Same as P2.6 but uses P3.1 (7 indicators) for direction. Skips C1, best on C3 and C4.",
         extra_cols=[], nav_active="paper36")
-
-
-# ⚠️ TEMPORARY — Remove after getting credentials
-@app.route("/derive-poly-creds")
-def derive_poly_creds():
-    try:
-        from py_clob_client.client import ClobClient
-        pk = os.environ.get("LIMITLESS_PRIVATE_KEY", "")
-        if not pk:
-            return "No LIMITLESS_PRIVATE_KEY in env vars", 400
-        client = ClobClient("https://clob.polymarket.com", key=pk, chain_id=137)
-        creds = client.create_or_derive_api_creds()
-        return "<pre>POLY_API_KEY={}\nPOLY_API_SECRET={}\nPOLY_API_PASSPHRASE={}</pre>".format(
-            creds.api_key, creds.api_secret, creds.api_passphrase)
-    except Exception as e:
-        return "Error: {}".format(e), 500
 
 
 # Start Polymarket threads (defined above)
