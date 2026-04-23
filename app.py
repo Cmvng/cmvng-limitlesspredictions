@@ -12070,9 +12070,9 @@ def paper36_page():
 def derive_poly_creds():
     try:
         from py_clob_client.client import ClobClient
-        pk = os.environ.get("PRIVATE_KEY", "")
+        pk = os.environ.get("LIMITLESS_PRIVATE_KEY", "")
         if not pk:
-            return "No PRIVATE_KEY in env vars", 400
+            return "No LIMITLESS_PRIVATE_KEY in env vars", 400
         client = ClobClient("https://clob.polymarket.com", key=pk, chain_id=137)
         creds = client.create_or_derive_api_creds()
         return "<pre>POLY_API_KEY={}\nPOLY_API_SECRET={}\nPOLY_API_PASSPHRASE={}</pre>".format(
