@@ -10058,13 +10058,19 @@ def _poly_fetch_markets():
 
 
 def _poly_get_baseline(parsed, price, indicators):
-    """Get the Price to Beat from Chainlink RTDS cache."""
+    """Get the Price to Beat from Chainlink RTDS cache.
+    Priority: 1. Exact PTB from window boundary
+              2. Latest Chainlink streaming price (close approximation)"""
     asset = parsed.get("asset", "")
     tf = parsed.get("timeframe", "")
     key = "{}_{}".format(asset, tf)
     entry = _chainlink_ptb.get(key)
     if entry:
         return entry[1]
+    # Fallback: latest Chainlink price (within a few dollars of real PTB)
+    chainlink = _chainlink_prices.get(asset)
+    if chainlink:
+        return chainlink
     return None
 
 
