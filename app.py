@@ -9730,8 +9730,9 @@ def _poly_parse_market(market):
         if not asset:
             return None
 
-        # Must be an Up or Down market OR an above/below market
-        if "up or down" not in q_lower and "updown" not in slug_lower and "above" not in q_lower and "below" not in q_lower:
+        # Must be an Up or Down market (Polymarket format)
+        # Do NOT accept "above/below" — those are Limitless markets on the same API
+        if "up or down" not in q_lower and "updown" not in slug_lower:
             return None
 
         # Determine timeframe from slug pattern
