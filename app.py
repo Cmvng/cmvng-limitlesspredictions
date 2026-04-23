@@ -9476,14 +9476,6 @@ try:
                       ("p22", _bot22_state), ("p32", _bot32_state)]:
         _save_bot_balance(_bn, _bs)
     print("Reset all Limitless balances to $15.00 each")
-    # Clear old Polymarket trades
-    try:
-        _pc = get_db()
-        _pc.run("DELETE FROM poly_trades")
-        _pc.close()
-        print("Cleared old Polymarket trades")
-    except Exception as e:
-        print("Poly cleanup note: {}".format(e))
 except Exception as e:
     print("DB init error: {}".format(e))
 
