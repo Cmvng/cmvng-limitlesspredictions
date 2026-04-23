@@ -6,3 +6,4 @@ eth-account
 eth-abi
 web3
 websocket-client
+py-clob-client
