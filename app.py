@@ -10144,10 +10144,9 @@ def run_poly_scan():
                 continue
             parsed["baseline"] = baseline
 
-            # Debug: log first market that reaches scoring
-            if poly_counts["btc5m"] == 0 and poly_counts["all5m"] == 0 and asset == "BTC":
-                print("POLY_SCORE BTC: baseline={:.2f} price={:.2f} dist={:.2f} odds={:.1f}% tf={} mins={:.1f}".format(
-                    baseline, price, price - baseline, parsed["yes_odds"], tf, mins_left))
+            # Debug: log every market that reaches scoring
+            print("POLY→SCORE {}/{}: base={:.2f} price={:.2f} dist={:.2f} odds={:.1f}% mins={:.1f}".format(
+                asset, tf, baseline, price, price - baseline, parsed["yes_odds"], mins_left))
 
             # 4H macro for 1H markets
             ind_macro = None
