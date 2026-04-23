@@ -10481,10 +10481,22 @@ def _poly_fetch_markets():
                             if event_markets:
                                 print("Poly 1H found: {} ({} markets)".format(event_slug, len(event_markets)))
                             for m in event_markets:
+                                # First try normal parsing
                                 parsed = _poly_parse_market(m, timeframe_hint="1H")
+                                if not parsed:
+                                    # The market inside the event might not have "up or down" in question
+                                    # but we KNOW it's an Up/Down event from the event slug
+                                    # Force-inject "up or down" into the question for parsing
+                                    m_copy = dict(m)
+                                    orig_q = m_copy.get("question") or m_copy.get("title") or ""
+                                    if "up or down" not in orig_q.lower():
+                                        m_copy["question"] = "{} Up or Down".format(orig_q)
+                                    parsed = _poly_parse_market(m_copy, timeframe_hint="1H")
                                 if parsed:
                                     parsed["timeframe"] = "1H"
                                     markets.append(parsed)
+                                    print("POLY_1H_PARSED {}: mins_left={:.1f} q={}".format(
+                                        parsed["asset"], parsed["mins_left"], parsed.get("title", "")[:40]))
                     except:
                         pass
 
@@ -10570,6 +10582,11 @@ def run_poly_scan():
             asset = parsed["asset"]
             tf = parsed["timeframe"]
             mins_left = parsed["mins_left"]
+
+            # Debug: log all 1H markets reaching the loop
+            if tf == "1H":
+                print("POLY_1H_LOOP {}: mins_left={:.1f} title={}".format(
+                    asset, mins_left, parsed.get("title", "")[:50]))
 
             # Skip if too little or too much time left
             if tf == "5M" and (mins_left < 1 or mins_left > 5):
