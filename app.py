@@ -2536,6 +2536,10 @@ def _calculate_indicators(asset, timeframe="1h"):
         if df is None or len(df) < 20:
             return None
 
+        # Flatten MultiIndex columns (yfinance sometimes returns ("Close", "BTC-USD"))
+        if hasattr(df.columns, 'nlevels') and df.columns.nlevels > 1:
+            df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
+
         closes = df["Close"].values.flatten()
         highs = df["High"].values.flatten()
         lows = df["Low"].values.flatten()
@@ -10091,6 +10095,11 @@ def run_poly_scan():
             asset = parsed["asset"]
             tf = parsed["timeframe"]
             mins_left = parsed["mins_left"]
+
+            # Debug: log first BTC market to see why it's filtered
+            if asset == "BTC" and tf in ("5M", "15M"):
+                print("POLY_FILTER {}: tf={} mins_left={:.1f} odds={:.1f}%".format(
+                    asset, tf, mins_left, parsed.get("yes_odds", 0)))
 
             # Skip if too little or too much time left
             if tf == "5M" and (mins_left < 0.5 or mins_left > 5.5):
