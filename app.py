@@ -317,6 +317,68 @@ def _calc_autoscale_stake(state):
     
     return stake
 
+
+def _calc_poly_autoscale_stake(state):
+    """Auto-scaling stake for Polymarket. Same logic as Limitless but starts at $2.50.
+    
+    Polymarket minimum is 5 shares (~$2.50 at 50% odds).
+    
+    Fixed stakes per tier:
+      Tier 1: $2.50-$75   → $2.50 per trade
+      Tier 2: $75-$150    → $5 per trade
+      Tier 3: $150-$400   → $10 per trade
+      Tier 4: $400-$800   → $20 per trade
+      Tier 5: $800+       → $40 per trade
+    
+    Safety: 30% drop from peak → drop one tier
+    Floor: $2.50 → stops trading
+    """
+    balance = state.get("balance", 0)
+    peak = state.get("peak_balance", balance)
+    floor = state.get("floor_balance", 2.5)
+    
+    if balance <= floor:
+        return 0
+    
+    if balance > peak:
+        state["peak_balance"] = balance
+        peak = balance
+    
+    in_drawdown = (peak > 0 and balance < peak * 0.70)
+    
+    if balance >= 800:
+        normal_stake = 40.0
+        safety_stake = 20.0
+    elif balance >= 400:
+        normal_stake = 20.0
+        safety_stake = 10.0
+    elif balance >= 150:
+        normal_stake = 10.0
+        safety_stake = 5.0
+    elif balance >= 75:
+        normal_stake = 5.0
+        safety_stake = 2.50
+    else:
+        normal_stake = 2.50
+        safety_stake = 2.50
+    
+    if in_drawdown:
+        stake = safety_stake
+    else:
+        stake = normal_stake
+    
+    max_allowed = balance - floor
+    if max_allowed < stake:
+        if max_allowed >= 2.50:
+            stake = 2.50
+        else:
+            return 0
+    if stake > balance:
+        return 0
+    
+    return stake
+
+
 YAHOO_MAP = {
     "BTC":"BTC-USD",  "ETH":"ETH-USD",  "SOL":"SOL-USD",
     "ADA":"ADA-USD",  "BNB":"BNB-USD",  "DOGE":"DOGE-USD",
@@ -2061,10 +2123,8 @@ def _execute_poly_trade(condition_id, token_id, side, stake, price):
         min_shares = 5.0
         shares = round(stake / price, 2)
         if shares < min_shares:
-            # Increase stake to meet minimum
-            stake = round(min_shares * price, 2)
             shares = min_shares
-            print("Poly: adjusted stake to ${:.2f} for min {} shares @{:.2f}".format(stake, min_shares, price))
+            stake = round(min_shares * price, 2)
 
         # ── Step 1: Try GTC limit order ──
         try:
@@ -2110,10 +2170,10 @@ def _execute_poly_trade(condition_id, token_id, side, stake, price):
         except Exception as gtc_err:
             print("Poly GTC error: {}".format(gtc_err))
 
-        # ── Step 2: FOK fallback ──
+        # ── Step 2: FOK fallback — more aggressive price to guarantee fill ──
         try:
-            fok_price = round(min(price + 0.02, 0.95), 2)
-            fok_amount = max(round(stake, 2), round(min_shares * fok_price, 2))
+            fok_price = round(min(price + 0.05, 0.95), 2)
+            fok_amount = round(min_shares * fok_price, 2)
             mo = MarketOrderArgs(
                 token_id=str(token_id),
                 amount=fok_amount,
@@ -8988,7 +9048,7 @@ def poly_live_status():
             "balance": _poly_live_p23["balance"],
             "peak": _poly_live_p23["peak_balance"],
             "floor": _poly_live_p23["floor_balance"],
-            "stake": _calc_autoscale_stake(_poly_live_p23),
+            "stake": _calc_poly_autoscale_stake(_poly_live_p23),
             "trades_today": _poly_live_p23["trades_today"],
         },
         "p31": {
@@ -8996,7 +9056,7 @@ def poly_live_status():
             "balance": _poly_live_p31["balance"],
             "peak": _poly_live_p31["peak_balance"],
             "floor": _poly_live_p31["floor_balance"],
-            "stake": _calc_autoscale_stake(_poly_live_p31),
+            "stake": _calc_poly_autoscale_stake(_poly_live_p31),
             "trades_today": _poly_live_p31["trades_today"],
         },
     }, 200
@@ -11861,17 +11921,13 @@ def run_poly_scan():
                     poly_counts[section] = poly_counts.get(section, 0) + 1
 
                     # ─── POLYMARKET LIVE TRADING ───
-                    # P2.3 and P3.1 on 5M and 15M markets
-                    if _poly_has_creds() and tf in ("5M", "15M") and strat in ("p23", "p31"):
-                        live_state = _poly_live_p23 if strat == "p23" else _poly_live_p31
-                        bot_label = "POLY-P2.3" if strat == "p23" else "POLY-P3.1"
+                    # P2.3 on 15M markets only, autoscale from $2.50
+                    if _poly_has_creds() and tf == "15M" and strat == "p23":
+                        live_state = _poly_live_p23
+                        bot_label = "POLY-P2.3"
+                        poly_stake = _calc_poly_autoscale_stake(live_state)
 
-                        if live_state["enabled"]:
-                            live_stake = _calc_autoscale_stake(live_state)
-                            if live_stake <= 0:
-                                live_state["enabled"] = False
-                                print("{} STOPPED: floor reached bal=${:.2f}".format(bot_label, live_state["balance"]))
-                            elif live_stake <= live_state["balance"]:
+                        if poly_stake > 0 and live_state["enabled"]:
                                 # Get token ID from clob_tokens (already in parsed market)
                                 clob_toks = parsed.get("clob_tokens", [])
                                 cid = parsed.get("condition_id", "")
@@ -11886,20 +11942,20 @@ def run_poly_scan():
                                 if token_id:
                                     try:
                                         print("{} ATTEMPTING: {} {} ${:.2f} @{:.2f} token={}...".format(
-                                            bot_label, poly_side, asset, live_stake, share_price, str(token_id)[:20]))
+                                            bot_label, poly_side, asset, poly_stake, share_price, str(token_id)[:20]))
                                         success = _execute_poly_trade(
-                                            cid, token_id, poly_side, live_stake, share_price)
+                                            cid, token_id, poly_side, poly_stake, share_price)
                                         if success:
-                                            live_state["balance"] = round(live_state["balance"] - live_stake, 2)
+                                            live_state["balance"] = round(live_state["balance"] - poly_stake, 2)
                                             live_state["trades_today"] += 1
                                             print("{} TRADE: {} {} ${:.2f} @{:.0f}% on {} | bal=${:.2f}".format(
-                                                bot_label, poly_side, asset, live_stake,
+                                                bot_label, poly_side, asset, poly_stake,
                                                 effective_odds, parsed["title"][:30], live_state["balance"]))
                                             send_telegram("🟣 <b>{} TRADE</b>\n{} {} ${:.2f} @{:.0f}%\n{}\nBal: ${:.2f}".format(
-                                                bot_label, poly_side, asset, live_stake,
+                                                bot_label, poly_side, asset, poly_stake,
                                                 effective_odds, parsed["title"][:40], live_state["balance"]))
                                         else:
-                                            print("{} ORDER FAILED: {} {} ${:.2f}".format(bot_label, poly_side, asset, live_stake))
+                                            print("{} ORDER FAILED: {} {} ${:.2f}".format(bot_label, poly_side, asset, poly_stake))
                                     except Exception as pe:
                                         print("{} trade error: {}".format(bot_label, pe))
                                 else:
@@ -12040,7 +12096,7 @@ def _resolve_poly_trades():
 
                 # Update LIVE bot balances for P2.3 and P3.1 on 15M
                 mt = p.get("market_type", "")
-                if mt in ("5M", "15M") and strat in ("p23", "p31"):
+                if mt in ("5M", "15M") and strat == "p23":
                     live_st = _poly_live_p23 if strat == "p23" else _poly_live_p31
                     if won:
                         live_st["balance"] = round(live_st["balance"] + (payout - stake), 2)
