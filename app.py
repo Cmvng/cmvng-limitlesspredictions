@@ -26,6 +26,7 @@ POLY_API_KEY       = os.environ.get("POLY_API_KEY", "")
 POLY_API_SECRET    = os.environ.get("POLY_API_SECRET", "")
 POLY_API_PASSPHRASE = os.environ.get("POLY_API_PASSPHRASE", "")
 POLY_FUNDER_ADDRESS = os.environ.get("POLY_FUNDER_ADDRESS", "")
+POLY_PROXY_URL     = os.environ.get("POLY_PROXY_URL", "")  # Optional: residential proxy for geoblock bypass
 
 LAGOS_TZ      = timezone(timedelta(hours=1))
 LIMITLESS_API = "https://api.limitless.exchange"
@@ -2012,8 +2013,29 @@ def _get_poly_client():
         # Set API creds AFTER init (official pattern from docs)
         client.set_api_creds(creds)
 
+        # Set proxy if available (bypasses datacenter IP geoblock)
+        if POLY_PROXY_URL:
+            import requests as _req
+            session = _req.Session()
+            session.proxies = {
+                "http": POLY_PROXY_URL,
+                "https": POLY_PROXY_URL,
+            }
+            client.session = session
+            print("Polymarket proxy set: {}".format(POLY_PROXY_URL[:30]))
+
         _poly_clob_client = client
         print("Polymarket CLOB client initialized (type=2 funder={})".format(POLY_FUNDER_ADDRESS[:10]))
+
+        # Check geoblock status
+        try:
+            import requests as _greq
+            geo = _greq.get("https://polymarket.com/api/geoblock", timeout=10).json()
+            print("Poly geoblock check: blocked={} ip={} country={} region={}".format(
+                geo.get("blocked"), geo.get("ip", "?")[:15], geo.get("country", "?"), geo.get("region", "?")))
+        except Exception as ge:
+            print("Poly geoblock check failed: {}".format(ge))
+
         return client
     except Exception as e:
         print("Poly client init error: {}".format(e))
@@ -8983,6 +9005,15 @@ def poly_live_set():
         st["enabled"] = request.args["enabled"].lower() == "true"
     return {"bot": bot, "balance": st["balance"], "floor": st["floor_balance"],
             "enabled": st["enabled"], "stake": _calc_autoscale_stake(st)}, 200
+
+@app.route("/poly/geocheck", methods=["GET"])
+def poly_geocheck():
+    try:
+        import requests as req
+        geo = req.get("https://polymarket.com/api/geoblock", timeout=10).json()
+        return geo, 200
+    except Exception as e:
+        return {"error": str(e)}, 500
 
 @app.route("/football/clear", methods=["GET"])
 def clear_football_picks():
