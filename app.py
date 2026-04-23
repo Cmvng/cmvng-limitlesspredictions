@@ -2119,30 +2119,27 @@ def _execute_poly_trade(condition_id, token_id, side, stake, price):
         from py_clob_client.clob_types import OrderArgs, MarketOrderArgs, OrderType
 
         # Polymarket minimum is 5 shares per order
-        # Cap total cost at stake amount ($2.50)
+        # Price per share is ALWAYS capped — higher stakes buy MORE shares
         min_shares = 5.0
-        max_price = round(stake / min_shares, 2)  # $2.50 / 5 = $0.50 max per share
-        order_price = min(round(price, 2), max_price)
-        shares = min_shares
-
-        # Never pay more than 2 cents above signal price
-        if order_price > round(price + 0.02, 2):
-            order_price = round(price + 0.02, 2)
-
-        # Skip if price is too high (odds too extreme)
-        if order_price > 0.70:
-            print("Poly skip: price {:.2f} too high for ${:.2f} stake".format(order_price, stake))
+        
+        # Cap price: never pay more than signal price + 2 cents, max 70 cents
+        order_price = min(round(price + 0.02, 2), 0.70)
+        
+        # Skip if signal price already too high
+        if price > 0.72:
+            print("Poly skip: signal price {:.2f} too extreme".format(price))
             return False
 
-        # Try to get actual best ask from orderbook
-        actual_ask = None
+        # Calculate shares from stake / price — more stake = more shares
+        shares = max(min_shares, round(stake / order_price, 2))
+
+        # Try to get actual best ask — but still cap it
         try:
             book = client.get_order_book(str(token_id))
             if book and hasattr(book, 'asks') and book.asks:
                 actual_ask = float(book.asks[0].price) if book.asks else None
-                if actual_ask and actual_ask > 0:
-                    # Use the ask price but never more than our max
-                    order_price = min(round(actual_ask, 2), max_price)
+                if actual_ask and actual_ask > 0 and actual_ask <= order_price:
+                    order_price = round(actual_ask, 2)  # Use ask if cheaper
         except:
             pass
 
@@ -2187,10 +2184,11 @@ def _execute_poly_trade(condition_id, token_id, side, stake, price):
         except Exception as gtc_err:
             print("Poly GTC error: {}".format(gtc_err))
 
-        # ── FOK fallback — capped at max_price ──
+        # ── FOK fallback — same price cap ──
         try:
-            fok_price = min(round(order_price + 0.02, 2), max_price)
-            fok_amount = round(min_shares * fok_price, 2)
+            fok_price = min(round(order_price + 0.02, 2), 0.70)
+            fok_shares = max(min_shares, round(stake / fok_price, 2))
+            fok_amount = round(fok_shares * fok_price, 2)
             mo = MarketOrderArgs(
                 token_id=str(token_id),
                 amount=fok_amount,
