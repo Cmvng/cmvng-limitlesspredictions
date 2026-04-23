@@ -10967,8 +10967,8 @@ def _build_poly_page(section, page_title, subtitle, description):
                 "side": t.get("bet_side", ""),
                 "odds": "{}%".format(t.get("bet_odds", "")),
                 "type": t.get("market_type", ""),
-                "baseline": baseline_str,
-                "price": price_str,
+                "score": "{}/{}".format(t.get("score", ""), t.get("total_signals", "")),
+                "indicators": (t.get("indicators") or "")[:60],
                 "pnl": pnl_cell,
                 "status": status_cell,
                 "time": (t.get("fired_at") or "")[:16],
@@ -11005,7 +11005,7 @@ def _build_poly_page(section, page_title, subtitle, description):
               <td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td>
               <td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td>
             </tr>""".format(tr["id"], tr["title"], tr["asset"], tr["side"],
-                            tr["odds"], tr["type"], tr["baseline"], tr["price"],
+                            tr["odds"], tr["type"], tr["score"], tr["indicators"],
                             tr["pnl"], tr["status"], tr["time"])
 
         strats_html += """
@@ -11026,7 +11026,7 @@ def _build_poly_page(section, page_title, subtitle, description):
           <table style="width:100%; border-collapse:collapse; font-size:0.82em;">
             <tr style="background:#f0f0f0;">
               <th>#</th><th>Market</th><th>Asset</th><th>Side</th><th>Odds</th>
-              <th>Type</th><th>Price to Beat</th><th>Price</th><th>Sim P&amp;L</th><th>Status</th><th>Time</th>
+              <th>Type</th><th>Score</th><th>Indicators</th><th>Sim P&amp;L</th><th>Status</th><th>Time</th>
             </tr>
             {rows}
           </table>
