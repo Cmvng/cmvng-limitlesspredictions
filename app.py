@@ -10482,12 +10482,6 @@ def _poly_fetch_markets():
                                 event_markets = data.get("markets", [])
                             if event_markets:
                                 print("Poly 1H found: {} ({} markets)".format(event_slug, len(event_markets)))
-                                # Debug: log first market's key fields
-                                m0 = event_markets[0]
-                                print("  1H_RAW: q={} | slug={} | exp={}".format(
-                                    (m0.get("question") or m0.get("title") or "")[:60],
-                                    (m0.get("slug") or "")[:40],
-                                    m0.get("expirationTimestamp") or m0.get("end_date_iso") or "none"))
                             for m in event_markets:
                                 # First try normal parsing
                                 parsed = _poly_parse_market(m, timeframe_hint="1H")
@@ -10503,8 +10497,6 @@ def _poly_fetch_markets():
                                 if parsed:
                                     parsed["timeframe"] = "1H"
                                     markets.append(parsed)
-                                    print("POLY_1H_PARSED {}: mins_left={:.1f} q={}".format(
-                                        parsed["asset"], parsed["mins_left"], parsed.get("title", "")[:40]))
                     except:
                         pass
 
@@ -10591,19 +10583,12 @@ def run_poly_scan():
             tf = parsed["timeframe"]
             mins_left = parsed["mins_left"]
 
-            # Debug: log all 1H markets reaching the loop
-            if tf == "1H":
-                print("POLY_1H_LOOP {}: mins_left={:.1f} title={}".format(
-                    asset, mins_left, parsed.get("title", "")[:50]))
-
             # Skip if too little or too much time left
             if tf == "5M" and (mins_left < 1 or mins_left > 5):
                 continue
             if tf == "15M" and (mins_left < 2 or mins_left > 15):
                 continue
             if tf == "1H" and (mins_left < 5 or mins_left > 60):
-                if mins_left > 0:
-                    print("POLY_1H_TIME {}: mins_left={:.1f} REJECTED (need 5-60)".format(asset, mins_left))
                 continue
 
             # Determine which sections this market belongs to
@@ -10626,23 +10611,16 @@ def run_poly_scan():
             yf_tf = "15m" if tf in ("5M", "15M") else "1h"
             ind = _calculate_indicators(asset, yf_tf)
             if not ind:
-                print("POLY_FAIL {}/{}: indicators None (yf_tf={})".format(asset, tf, yf_tf))
                 continue
 
             price = ind.get("current")
             if not price:
-                print("POLY_FAIL {}/{}: price None".format(asset, tf))
                 continue
 
             baseline = _poly_get_baseline(parsed, price, ind)
             if baseline is None:
-                print("POLY_FAIL {}/{}: baseline None, keys={}".format(asset, tf, list(_chainlink_ptb.keys())))
                 continue
             parsed["baseline"] = baseline
-
-            # Debug: log every market that reaches scoring
-            print("POLY→SCORE {}/{}: base={:.2f} price={:.2f} dist={:.2f} odds={:.1f}% mins={:.1f}".format(
-                asset, tf, baseline, price, price - baseline, parsed["yes_odds"], mins_left))
 
             # 4H macro for 1H markets
             ind_macro = None
@@ -10654,6 +10632,13 @@ def run_poly_scan():
 
             for section in sections:
                 for strat in strategies:
+                    # Section-strategy filtering:
+                    # hourly24: only P2.4 and P3.4
+                    # all1h: only P2.1, P2.3, P3.1, P3.3 (not P2.4/P3.4)
+                    if section == "hourly24" and strat not in ("p24", "p34"):
+                        continue
+                    if section == "all1h" and strat in ("p24", "p34"):
+                        continue
                     
                     key = "{}_{}_{}" .format(section, strat, parsed["market_id"])
                     if key in existing_keys:
@@ -10885,12 +10870,18 @@ def _poly_scan_loop():
 
 def _build_poly_page(section, page_title, subtitle, description):
     """Build a Polymarket paper trading dashboard — uses same design as Limitless pages."""
-    strategies = [
-        ("p21", "Paper 2.1", "TV + SMA + BTC Tiebreaker"),
-        ("p23", "Paper 2.3", "P2.1 + Distance Math (Full Confidence)"),
-        ("p31", "Paper 3.1", "7 Indicators + BTC Tiebreaker"),
-        ("p33", "Paper 3.3", "P3.1 + Distance Math (Mixed Mode)"),
-    ]
+    if section == "hourly24":
+        strategies = [
+            ("p24", "Paper 2.4", "P2.1 + Distance Math + 15M Candle Pattern (1H Only)"),
+            ("p34", "Paper 3.4", "P3.1 + Distance Math + 15M Candle Pattern (1H Only)"),
+        ]
+    else:
+        strategies = [
+            ("p21", "Paper 2.1", "TV + SMA + BTC Tiebreaker"),
+            ("p23", "Paper 2.3", "P2.1 + Distance Math (Full Confidence)"),
+            ("p31", "Paper 3.1", "7 Indicators + BTC Tiebreaker"),
+            ("p33", "Paper 3.3", "P3.1 + Distance Math (Mixed Mode)"),
+        ]
 
     try:
         conn = get_db()
