@@ -12065,6 +12065,22 @@ def paper36_page():
         extra_cols=[], nav_active="paper36")
 
 
+# ⚠️ TEMPORARY — Remove after getting credentials
+@app.route("/derive-poly-creds")
+def derive_poly_creds():
+    try:
+        from py_clob_client.client import ClobClient
+        pk = os.environ.get("PRIVATE_KEY", "")
+        if not pk:
+            return "No PRIVATE_KEY in env vars", 400
+        client = ClobClient("https://clob.polymarket.com", key=pk, chain_id=137)
+        creds = client.create_or_derive_api_creds()
+        return "<pre>POLY_API_KEY={}\nPOLY_API_SECRET={}\nPOLY_API_PASSPHRASE={}</pre>".format(
+            creds.api_key, creds.api_secret, creds.api_passphrase)
+    except Exception as e:
+        return "Error: {}".format(e), 500
+
+
 # Start Polymarket threads (defined above)
 threading.Thread(target=_rtds_loop, daemon=True).start()
 threading.Thread(target=_poly_scan_loop, daemon=True).start()
