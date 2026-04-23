@@ -2107,8 +2107,7 @@ def _get_poly_client():
 
 
 def _execute_poly_trade(condition_id, token_id, side, stake, price):
-    """Place an order on Polymarket using official py-clob-client API.
-    Tries GTC limit first, then FOK fallback.
+    """Place an order on Polymarket. Uses aggressive FOK to guarantee fill.
     Returns True if filled."""
     try:
         client = _get_poly_client()
@@ -2126,12 +2125,28 @@ def _execute_poly_trade(condition_id, token_id, side, stake, price):
             shares = min_shares
             stake = round(min_shares * price, 2)
 
-        # ── Step 1: Try GTC limit order ──
+        # Try to get actual best ask from orderbook for better pricing
+        actual_price = price
+        try:
+            book = client.get_order_book(str(token_id))
+            if book and hasattr(book, 'asks') and book.asks:
+                best_ask = float(book.asks[0].price) if book.asks else None
+                if best_ask and best_ask > 0:
+                    actual_price = best_ask
+                    print("Poly orderbook ask: {:.2f} (vs signal {:.2f})".format(actual_price, price))
+        except:
+            pass
+
+        # Use aggressive price — pay up to 10 cents above signal price
+        aggressive_price = round(min(max(actual_price, price) + 0.05, 0.95), 2)
+        aggressive_shares = max(min_shares, round(stake / aggressive_price, 2))
+
+        # ── Try GTC at aggressive price ──
         try:
             order_args = OrderArgs(
                 token_id=str(token_id),
-                price=round(price, 2),
-                size=shares,
+                price=aggressive_price,
+                size=aggressive_shares,
                 side=BUY,
             )
             signed_order = client.create_order(order_args)
@@ -2143,12 +2158,12 @@ def _execute_poly_trade(condition_id, token_id, side, stake, price):
                 status = (gtc_resp.get("status") or "").upper()
 
                 if status in ("MATCHED", "FILLED"):
-                    print("Poly GTC FILLED: {} ${:.2f} @{:.2f}".format(side, stake, price))
+                    print("Poly GTC FILLED: {} ${:.2f} @{:.2f}".format(side, stake, aggressive_price))
                     return True
 
                 if order_id and status == "LIVE":
-                    # Wait up to 8 seconds for fill
-                    for _ in range(4):
+                    # Wait up to 12 seconds for fill
+                    for _ in range(6):
                         time.sleep(2)
                         try:
                             info = client.get_order(order_id)
@@ -2166,14 +2181,13 @@ def _execute_poly_trade(condition_id, token_id, side, stake, price):
                         client.cancel(order_id)
                     except:
                         pass
-
         except Exception as gtc_err:
             print("Poly GTC error: {}".format(gtc_err))
 
-        # ── Step 2: FOK fallback — more aggressive price to guarantee fill ──
+        # ── FOK fallback at very aggressive price ──
         try:
-            fok_price = round(min(price + 0.05, 0.95), 2)
-            fok_amount = round(min_shares * fok_price, 2)
+            fok_price = round(min(aggressive_price + 0.05, 0.95), 2)
+            fok_amount = round(max(stake, min_shares * fok_price), 2)
             mo = MarketOrderArgs(
                 token_id=str(token_id),
                 amount=fok_amount,
@@ -11914,6 +11928,11 @@ def run_poly_scan():
                     })
                     existing_keys.add(key)
                     poly_counts[section] = poly_counts.get(section, 0) + 1
+
+                    # Log P2.3 paper trade scoring for diagnostics
+                    if strat == "p23":
+                        print("POLY_P23_SCORED: {} tf={} sec={} side={} odds={:.0f}%".format(
+                            asset, tf, section, poly_side, effective_odds))
 
                     # ─── POLYMARKET LIVE TRADING ───
                     # P2.3 on 5M and 15M markets, autoscale from $2.50
