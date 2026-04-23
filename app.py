@@ -11831,24 +11831,39 @@ def run_poly_scan():
                                 live_state["enabled"] = False
                                 print("{} STOPPED: floor reached bal=${:.2f}".format(bot_label, live_state["balance"]))
                             elif live_stake <= live_state["balance"]:
+                                # Get token ID from clob_tokens (already in parsed market)
+                                clob_toks = parsed.get("clob_tokens", [])
                                 cid = parsed.get("condition_id", "")
-                                if cid:
+                                token_id = None
+
+                                if clob_toks and len(clob_toks) >= 2:
+                                    # clob_tokens[0] = YES/UP, clob_tokens[1] = NO/DOWN
+                                    token_id = clob_toks[0] if poly_side == "UP" else clob_toks[1]
+                                elif cid:
+                                    token_id = _get_poly_token_id(cid, poly_side)
+
+                                if token_id:
                                     try:
-                                        token_id = _get_poly_token_id(cid, poly_side)
-                                        if token_id:
-                                            success = _execute_poly_trade(
-                                                cid, token_id, poly_side, live_stake, share_price)
-                                            if success:
-                                                live_state["balance"] = round(live_state["balance"] - live_stake, 2)
-                                                live_state["trades_today"] += 1
-                                                print("{} TRADE: {} {} ${:.2f} @{:.0f}% on {} | bal=${:.2f}".format(
-                                                    bot_label, poly_side, asset, live_stake,
-                                                    effective_odds, parsed["title"][:30], live_state["balance"]))
-                                                send_telegram("🟣 <b>{} TRADE</b>\n{} {} ${:.2f} @{:.0f}%\n{}\nBal: ${:.2f}".format(
-                                                    bot_label, poly_side, asset, live_stake,
-                                                    effective_odds, parsed["title"][:40], live_state["balance"]))
+                                        print("{} ATTEMPTING: {} {} ${:.2f} @{:.2f} token={}...".format(
+                                            bot_label, poly_side, asset, live_stake, share_price, str(token_id)[:20]))
+                                        success = _execute_poly_trade(
+                                            cid, token_id, poly_side, live_stake, share_price)
+                                        if success:
+                                            live_state["balance"] = round(live_state["balance"] - live_stake, 2)
+                                            live_state["trades_today"] += 1
+                                            print("{} TRADE: {} {} ${:.2f} @{:.0f}% on {} | bal=${:.2f}".format(
+                                                bot_label, poly_side, asset, live_stake,
+                                                effective_odds, parsed["title"][:30], live_state["balance"]))
+                                            send_telegram("🟣 <b>{} TRADE</b>\n{} {} ${:.2f} @{:.0f}%\n{}\nBal: ${:.2f}".format(
+                                                bot_label, poly_side, asset, live_stake,
+                                                effective_odds, parsed["title"][:40], live_state["balance"]))
+                                        else:
+                                            print("{} ORDER FAILED: {} {} ${:.2f}".format(bot_label, poly_side, asset, live_stake))
                                     except Exception as pe:
                                         print("{} trade error: {}".format(bot_label, pe))
+                                else:
+                                    print("{} SKIP: no token_id for {} (clob_toks={}, cid={})".format(
+                                        bot_label, asset, len(clob_toks) if clob_toks else 0, cid[:20] if cid else "none"))
 
         # BUG 3 FIX: Single connection for all inserts
         if inserts:
