@@ -5297,6 +5297,9 @@ def _score_paper36_trade(p, price, indicators=None, ind_macro=None, expiry_minut
         "confidence": confidence, "indicators": ind_str,
         "market_type": "15M", "sim_payout": sim_payout,
     }
+
+
+def run_paper34_scan():
     """Scan markets for Paper 3 (momentum) and Paper 4 (reversal) signals."""
     import requests as req
     try:
