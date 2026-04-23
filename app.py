@@ -11814,7 +11814,7 @@ def run_poly_scan():
                     poly_counts[section] = poly_counts.get(section, 0) + 1
 
                     # ─── POLYMARKET LIVE TRADING ───
-                    # Only P2.3 and P3.1 on 15M markets
+                    # Only P2.3 and P3.1 on 5M and 15M markets
                     if strat in ("p23", "p31"):
                         print("POLY_LIVE_CHECK: strat={} tf={} section={} asset={} creds={} side={}".format(
                             strat, tf, section, asset, _poly_has_creds(), poly_side))
