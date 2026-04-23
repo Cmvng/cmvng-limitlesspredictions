@@ -1994,34 +1994,37 @@ def _get_poly_client():
     try:
         from py_clob_client.client import ClobClient
         from py_clob_client.clob_types import ApiCreds
+
         creds = ApiCreds(
             api_key=POLY_API_KEY,
             api_secret=POLY_API_SECRET,
             api_passphrase=POLY_API_PASSPHRASE
         )
+
+        # Initialize with key + chain_id + signature_type + funder
         client = ClobClient(
             "https://clob.polymarket.com",
             key=LIMITLESS_PRIV_KEY,
             chain_id=137,
-            creds=creds,
-            signature_type=2,  # GNOSIS_SAFE — Polymarket proxy wallet
-            funder=POLY_FUNDER_ADDRESS,  # proxy wallet address from settings
+            signature_type=2,  # GNOSIS_SAFE — browser wallet proxy
+            funder=POLY_FUNDER_ADDRESS,
         )
+        # Set API creds AFTER init (official pattern from docs)
+        client.set_api_creds(creds)
+
         _poly_clob_client = client
-        print("Polymarket CLOB client initialized")
+        print("Polymarket CLOB client initialized (type=2 funder={})".format(POLY_FUNDER_ADDRESS[:10]))
         return client
     except Exception as e:
         print("Poly client init error: {}".format(e))
+        import traceback
+        traceback.print_exc()
         return None
 
 
 def _execute_poly_trade(condition_id, token_id, side, stake, price):
-    """Place an order on Polymarket. Tries GTC limit first for better price,
-    falls back to FOK if not filled within 8 seconds.
-    side: 'UP' or 'DOWN'
-    token_id: the YES or NO token ID
-    stake: amount in USDC
-    price: price per share (e.g. 0.55 for 55% odds)
+    """Place an order on Polymarket using official py-clob-client API.
+    Tries GTC limit first, then FOK fallback.
     Returns True if filled."""
     try:
         client = _get_poly_client()
@@ -2030,83 +2033,81 @@ def _execute_poly_trade(condition_id, token_id, side, stake, price):
             return False
 
         from py_clob_client.order_builder.constants import BUY
-        from py_clob_client.clob_types import OrderArgs, OrderType
+        from py_clob_client.clob_types import OrderArgs, MarketOrderArgs, OrderType
 
-        size = round(stake / price, 2)
-
-        # ── Step 1: Try GTC limit order at current price ──
+        # ── Step 1: Try GTC limit order ──
         try:
             order_args = OrderArgs(
-                token_id=token_id,
+                token_id=str(token_id),
                 price=round(price, 2),
-                size=size,
+                size=round(stake / price, 2),
                 side=BUY,
             )
             signed_order = client.create_order(order_args)
             gtc_resp = client.post_order(signed_order, OrderType.GTC)
+            print("Poly GTC resp: {}".format(str(gtc_resp)[:200]))
 
-            order_id = gtc_resp.get("orderID") if gtc_resp else None
-            if order_id:
+            if gtc_resp:
+                order_id = gtc_resp.get("orderID") or gtc_resp.get("order_id")
                 status = (gtc_resp.get("status") or "").upper()
-                if status in ("MATCHED", "FILLED", "LIVE"):
-                    if status in ("MATCHED", "FILLED"):
-                        print("Poly GTC FILLED: {} {} ${:.2f} @{:.2f}".format(side, token_id[:15], stake, price))
-                        return True
 
+                if status in ("MATCHED", "FILLED"):
+                    print("Poly GTC FILLED: {} ${:.2f} @{:.2f}".format(side, stake, price))
+                    return True
+
+                if order_id and status == "LIVE":
                     # Wait up to 8 seconds for fill
                     for _ in range(4):
                         time.sleep(2)
                         try:
-                            order_info = client.get_order(order_id)
-                            if order_info:
-                                o_status = (order_info.get("status") or "").upper()
-                                if o_status in ("MATCHED", "FILLED"):
-                                    print("Poly GTC FILLED (wait): {} {} ${:.2f}".format(side, token_id[:15], stake))
+                            info = client.get_order(order_id)
+                            if info:
+                                s = (info.get("status") or "").upper()
+                                if s in ("MATCHED", "FILLED"):
+                                    print("Poly GTC FILLED (wait): {} ${:.2f}".format(side, stake))
                                     return True
-                                elif o_status in ("CANCELED", "CANCELLED", "EXPIRED"):
+                                elif s in ("CANCELED", "CANCELLED", "EXPIRED"):
                                     break
                         except:
                             pass
-
-                    # Cancel unfilled GTC
+                    # Cancel unfilled
                     try:
                         client.cancel(order_id)
-                        print("Poly GTC cancelled, trying FOK: {}".format(order_id[:20]))
                     except:
                         pass
-        except Exception as gtc_err:
-            print("Poly GTC error (trying FOK): {}".format(gtc_err))
 
-        # ── Step 2: Fallback to FOK at slightly worse price ──
+        except Exception as gtc_err:
+            print("Poly GTC error: {}".format(gtc_err))
+
+        # ── Step 2: FOK fallback ──
         try:
-            from py_clob_client.clob_types import MarketOrderArgs
             fok_price = round(min(price + 0.02, 0.95), 2)
             mo = MarketOrderArgs(
-                token_id=token_id,
-                amount=stake,
+                token_id=str(token_id),
+                amount=round(stake, 2),
                 side=BUY,
                 price=fok_price,
             )
             signed_fok = client.create_market_order(mo)
             fok_resp = client.post_order(signed_fok, OrderType.FOK)
+            print("Poly FOK resp: {}".format(str(fok_resp)[:200]))
 
             if fok_resp:
                 fok_status = (fok_resp.get("status") or "").upper()
                 if fok_status in ("MATCHED", "FILLED"):
-                    print("Poly FOK FILLED: {} {} ${:.2f} @{:.2f}".format(side, token_id[:15], stake, fok_price))
+                    print("Poly FOK FILLED: {} ${:.2f} @{:.2f}".format(side, stake, fok_price))
                     return True
                 else:
-                    print("Poly FOK status: {} resp={}".format(fok_status, str(fok_resp)[:80]))
-                    return False
-            else:
-                print("Poly FOK no response")
-                return False
+                    print("Poly FOK not filled: {}".format(fok_status))
+            return False
         except Exception as fok_err:
             print("Poly FOK error: {}".format(fok_err))
             return False
 
     except Exception as e:
         print("Poly trade error: {}".format(e))
+        import traceback
+        traceback.print_exc()
         return False
 
 
@@ -11664,6 +11665,11 @@ def run_poly_scan():
             tf = parsed["timeframe"]
             mins_left = parsed["mins_left"]
 
+            # Debug: log all 15M markets before filtering
+            if tf == "15M":
+                print("POLY_15M_MARKET: {} tf={} mins_left={:.1f} baseline={} odds={}".format(
+                    asset, tf, mins_left, parsed.get("baseline"), parsed.get("yes_odds")))
+
             # Skip if too little or too much time left
             # Wait for price to move from PTB before scoring:
             # 5M: score in last 4 mins (1 min of movement minimum)
@@ -11814,13 +11820,8 @@ def run_poly_scan():
                     poly_counts[section] = poly_counts.get(section, 0) + 1
 
                     # ─── POLYMARKET LIVE TRADING ───
-                    # Log every p23/p31 trade to diagnose
-                    if strat in ("p23", "p31"):
-                        should_trade = _poly_has_creds() and tf == "15M"
-                        print("POLY_LIVE: strat={} tf={} sec={} asset={} side={} creds={} match={}".format(
-                            strat, tf, section, asset, poly_side, _poly_has_creds(), should_trade))
-
-                    if _poly_has_creds() and tf == "15M" and strat in ("p23", "p31"):
+                    # P2.3 and P3.1 on 5M and 15M markets
+                    if _poly_has_creds() and tf in ("5M", "15M") and strat in ("p23", "p31"):
                         live_state = _poly_live_p23 if strat == "p23" else _poly_live_p31
                         bot_label = "POLY-P2.3" if strat == "p23" else "POLY-P3.1"
 
@@ -11998,7 +11999,7 @@ def _resolve_poly_trades():
 
                 # Update LIVE bot balances for P2.3 and P3.1 on 15M
                 mt = p.get("market_type", "")
-                if mt == "15M" and strat in ("p23", "p31"):
+                if mt in ("5M", "15M") and strat in ("p23", "p31"):
                     live_st = _poly_live_p23 if strat == "p23" else _poly_live_p31
                     if won:
                         live_st["balance"] = round(live_st["balance"] + (payout - stake), 2)
