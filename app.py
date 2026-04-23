@@ -2014,7 +2014,8 @@ def _get_poly_client():
 
 
 def _execute_poly_trade(condition_id, token_id, side, stake, price):
-    """Place a market order on Polymarket.
+    """Place an order on Polymarket. Tries GTC limit first for better price,
+    falls back to FOK if not filled within 8 seconds.
     side: 'UP' or 'DOWN'
     token_id: the YES or NO token ID
     stake: amount in USDC
@@ -2029,35 +2030,83 @@ def _execute_poly_trade(condition_id, token_id, side, stake, price):
         from py_clob_client.constants import BUY
         from py_clob_client.order_builder.constants import OrderType as PolyOrderType
 
-        # We always BUY outcome tokens (UP or DOWN)
-        order = client.create_and_post_order(
+        size = round(stake / price, 2)
+
+        # ── Step 1: Try GTC limit order at current price ──
+        try:
+            gtc_resp = client.create_and_post_order(
+                {
+                    "tokenID": token_id,
+                    "price": round(price, 2),
+                    "size": size,
+                    "side": BUY,
+                },
+                {
+                    "tickSize": "0.01",
+                    "negRisk": False,
+                },
+                PolyOrderType.GTC,
+            )
+
+            order_id = gtc_resp.get("orderID") if gtc_resp else None
+            if order_id:
+                status = (gtc_resp.get("status") or "").upper()
+                if status in ("MATCHED", "FILLED"):
+                    print("Poly GTC FILLED: {} {} ${:.2f} @{:.2f}".format(side, token_id[:15], stake, price))
+                    return True
+
+                # Wait up to 8 seconds for fill
+                for _ in range(4):
+                    time.sleep(2)
+                    try:
+                        order_info = client.get_order(order_id)
+                        if order_info:
+                            o_status = (order_info.get("status") or "").upper()
+                            if o_status in ("MATCHED", "FILLED"):
+                                print("Poly GTC FILLED (wait): {} {} ${:.2f}".format(side, token_id[:15], stake))
+                                return True
+                            elif o_status in ("CANCELED", "CANCELLED", "EXPIRED"):
+                                break
+                    except:
+                        pass
+
+                # Cancel unfilled GTC
+                try:
+                    client.cancel(order_id)
+                    print("Poly GTC cancelled, trying FOK: {}".format(order_id[:20]))
+                except:
+                    pass
+        except Exception as gtc_err:
+            print("Poly GTC error (trying FOK): {}".format(gtc_err))
+
+        # ── Step 2: Fallback to FOK at slightly worse price ──
+        fok_price = round(min(price + 0.02, 0.95), 2)  # Pay up to 2 cents more
+        fok_size = round(stake / fok_price, 2)
+
+        fok_resp = client.create_and_post_order(
             {
                 "tokenID": token_id,
-                "price": round(price, 2),
-                "size": round(stake / price, 2),  # number of shares = stake / price
+                "price": fok_price,
+                "size": fok_size,
                 "side": BUY,
             },
             {
                 "tickSize": "0.01",
                 "negRisk": False,
             },
-            PolyOrderType.FOK,  # Fill or Kill — immediate fill or cancel
+            PolyOrderType.FOK,
         )
 
-        if order and order.get("orderID"):
-            status = order.get("status", "")
-            if status in ("MATCHED", "FILLED", "matched", "filled"):
-                print("Poly FILLED: {} {} ${:.2f} @{:.2f}".format(side, token_id[:15], stake, price))
+        if fok_resp and fok_resp.get("orderID"):
+            fok_status = (fok_resp.get("status") or "").upper()
+            if fok_status in ("MATCHED", "FILLED"):
+                print("Poly FOK FILLED: {} {} ${:.2f} @{:.2f}".format(side, token_id[:15], stake, fok_price))
                 return True
             else:
-                print("Poly order status: {} — {}".format(status, order.get("orderID", "")[:20]))
-                # Check if it was matched
-                if order.get("matchedAmount") and float(order.get("matchedAmount", 0)) > 0:
-                    print("Poly partially matched: {}".format(order.get("matchedAmount")))
-                    return True
+                print("Poly FOK status: {}".format(fok_status))
                 return False
         else:
-            print("Poly order failed: {}".format(str(order)[:100]))
+            print("Poly FOK failed: {}".format(str(fok_resp)[:100]))
             return False
 
     except Exception as e:
