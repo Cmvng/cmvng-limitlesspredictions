@@ -25,6 +25,7 @@ LIMITLESS_PRIV_KEY     = os.environ.get("LIMITLESS_PRIVATE_KEY", "")   # MetaMas
 POLY_API_KEY       = os.environ.get("POLY_API_KEY", "")
 POLY_API_SECRET    = os.environ.get("POLY_API_SECRET", "")
 POLY_API_PASSPHRASE = os.environ.get("POLY_API_PASSPHRASE", "")
+POLY_FUNDER_ADDRESS = os.environ.get("POLY_FUNDER_ADDRESS", "")
 
 LAGOS_TZ      = timezone(timedelta(hours=1))
 LIMITLESS_API = "https://api.limitless.exchange"
@@ -175,7 +176,7 @@ _poly_live_p31 = {
 }
 
 def _poly_has_creds():
-    return bool(POLY_API_KEY and POLY_API_SECRET and POLY_API_PASSPHRASE and LIMITLESS_PRIV_KEY)
+    return bool(POLY_API_KEY and POLY_API_SECRET and POLY_API_PASSPHRASE and LIMITLESS_PRIV_KEY and POLY_FUNDER_ADDRESS)
 
 import math as _math
 
@@ -2003,7 +2004,8 @@ def _get_poly_client():
             key=LIMITLESS_PRIV_KEY,
             chain_id=137,
             creds=creds,
-            signature_type=0,  # EOA — same wallet
+            signature_type=2,  # GNOSIS_SAFE — Polymarket proxy wallet
+            funder=POLY_FUNDER_ADDRESS,  # proxy wallet address from settings
         )
         _poly_clob_client = client
         print("Polymarket CLOB client initialized")
