@@ -4874,7 +4874,7 @@ def _resolve_paper_table(table_name):
                 # P2.1 went live ~18:00 UTC Apr 21, 2026
                 if table_name == "paper21_trades":
                     fired = p.get("fired_at") or ""
-                    is_live_trade = fired >= "2026-04-23T00:30"
+                    is_live_trade = fired >= "2026-04-23T02:30"
                     if is_live_trade:
                         if won:
                             _bot21_state["balance"] = round(_bot21_state["balance"] + payout, 2)
@@ -4893,7 +4893,7 @@ def _resolve_paper_table(table_name):
                 # P3.1 went live ~18:00 UTC Apr 21, 2026
                 if table_name == "paper31_trades":
                     fired = p.get("fired_at") or ""
-                    is_live_trade = fired >= "2026-04-23T00:30"
+                    is_live_trade = fired >= "2026-04-23T02:30"
                     if is_live_trade:
                         if won:
                             _bot31_state["balance"] = round(_bot31_state["balance"] + payout, 2)
@@ -4911,7 +4911,7 @@ def _resolve_paper_table(table_name):
                 # Update Paper 2.2 balance
                 if table_name == "paper22_trades":
                     fired = p.get("fired_at") or ""
-                    is_live_trade = fired >= "2026-04-23T00:30"
+                    is_live_trade = fired >= "2026-04-23T02:30"
                     if is_live_trade:
                         if won:
                             _bot22_state["balance"] = round(_bot22_state["balance"] + payout, 2)
@@ -4928,7 +4928,7 @@ def _resolve_paper_table(table_name):
                 # Update Paper 3.2 balance
                 if table_name == "paper32_trades":
                     fired = p.get("fired_at") or ""
-                    is_live_trade = fired >= "2026-04-23T00:30"
+                    is_live_trade = fired >= "2026-04-23T02:30"
                     if is_live_trade:
                         if won:
                             _bot32_state["balance"] = round(_bot32_state["balance"] + payout, 2)
@@ -9477,12 +9477,12 @@ try:
     except:
         pass
     for _bot_state_ref in [_bot21_state, _bot31_state, _bot22_state, _bot32_state]:
-        _bot_state_ref["balance"] = 15.0
-        _bot_state_ref["peak_balance"] = 15.0
+        _bot_state_ref["balance"] = 13.0
+        _bot_state_ref["peak_balance"] = 13.0
     for _bn, _bs in [("p21", _bot21_state), ("p31", _bot31_state),
                       ("p22", _bot22_state), ("p32", _bot32_state)]:
         _save_bot_balance(_bn, _bs)
-    print("Reset all Limitless balances to $15.00 each")
+    print("Reset all Limitless balances to $13.00 each")
 except Exception as e:
     print("DB init error: {}".format(e))
 
