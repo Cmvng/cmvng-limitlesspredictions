@@ -2029,86 +2029,80 @@ def _execute_poly_trade(condition_id, token_id, side, stake, price):
             print("Poly trade: no client")
             return False
 
-        from py_clob_client.constants import BUY
-        from py_clob_client.order_builder.constants import OrderType as PolyOrderType
+        from py_clob_client.order_builder.constants import BUY
+        from py_clob_client.clob_types import OrderArgs, OrderType
 
         size = round(stake / price, 2)
 
         # ── Step 1: Try GTC limit order at current price ──
         try:
-            gtc_resp = client.create_and_post_order(
-                {
-                    "tokenID": token_id,
-                    "price": round(price, 2),
-                    "size": size,
-                    "side": BUY,
-                },
-                {
-                    "tickSize": "0.01",
-                    "negRisk": False,
-                },
-                PolyOrderType.GTC,
+            order_args = OrderArgs(
+                token_id=token_id,
+                price=round(price, 2),
+                size=size,
+                side=BUY,
             )
+            signed_order = client.create_order(order_args)
+            gtc_resp = client.post_order(signed_order, OrderType.GTC)
 
             order_id = gtc_resp.get("orderID") if gtc_resp else None
             if order_id:
                 status = (gtc_resp.get("status") or "").upper()
-                if status in ("MATCHED", "FILLED"):
-                    print("Poly GTC FILLED: {} {} ${:.2f} @{:.2f}".format(side, token_id[:15], stake, price))
-                    return True
+                if status in ("MATCHED", "FILLED", "LIVE"):
+                    if status in ("MATCHED", "FILLED"):
+                        print("Poly GTC FILLED: {} {} ${:.2f} @{:.2f}".format(side, token_id[:15], stake, price))
+                        return True
 
-                # Wait up to 8 seconds for fill
-                for _ in range(4):
-                    time.sleep(2)
+                    # Wait up to 8 seconds for fill
+                    for _ in range(4):
+                        time.sleep(2)
+                        try:
+                            order_info = client.get_order(order_id)
+                            if order_info:
+                                o_status = (order_info.get("status") or "").upper()
+                                if o_status in ("MATCHED", "FILLED"):
+                                    print("Poly GTC FILLED (wait): {} {} ${:.2f}".format(side, token_id[:15], stake))
+                                    return True
+                                elif o_status in ("CANCELED", "CANCELLED", "EXPIRED"):
+                                    break
+                        except:
+                            pass
+
+                    # Cancel unfilled GTC
                     try:
-                        order_info = client.get_order(order_id)
-                        if order_info:
-                            o_status = (order_info.get("status") or "").upper()
-                            if o_status in ("MATCHED", "FILLED"):
-                                print("Poly GTC FILLED (wait): {} {} ${:.2f}".format(side, token_id[:15], stake))
-                                return True
-                            elif o_status in ("CANCELED", "CANCELLED", "EXPIRED"):
-                                break
+                        client.cancel(order_id)
+                        print("Poly GTC cancelled, trying FOK: {}".format(order_id[:20]))
                     except:
                         pass
-
-                # Cancel unfilled GTC
-                try:
-                    client.cancel(order_id)
-                    print("Poly GTC cancelled, trying FOK: {}".format(order_id[:20]))
-                except:
-                    pass
         except Exception as gtc_err:
             print("Poly GTC error (trying FOK): {}".format(gtc_err))
 
         # ── Step 2: Fallback to FOK at slightly worse price ──
-        fok_price = round(min(price + 0.02, 0.95), 2)  # Pay up to 2 cents more
-        fok_size = round(stake / fok_price, 2)
+        try:
+            from py_clob_client.clob_types import MarketOrderArgs
+            fok_price = round(min(price + 0.02, 0.95), 2)
+            mo = MarketOrderArgs(
+                token_id=token_id,
+                amount=stake,
+                side=BUY,
+                price=fok_price,
+            )
+            signed_fok = client.create_market_order(mo)
+            fok_resp = client.post_order(signed_fok, OrderType.FOK)
 
-        fok_resp = client.create_and_post_order(
-            {
-                "tokenID": token_id,
-                "price": fok_price,
-                "size": fok_size,
-                "side": BUY,
-            },
-            {
-                "tickSize": "0.01",
-                "negRisk": False,
-            },
-            PolyOrderType.FOK,
-        )
-
-        if fok_resp and fok_resp.get("orderID"):
-            fok_status = (fok_resp.get("status") or "").upper()
-            if fok_status in ("MATCHED", "FILLED"):
-                print("Poly FOK FILLED: {} {} ${:.2f} @{:.2f}".format(side, token_id[:15], stake, fok_price))
-                return True
+            if fok_resp:
+                fok_status = (fok_resp.get("status") or "").upper()
+                if fok_status in ("MATCHED", "FILLED"):
+                    print("Poly FOK FILLED: {} {} ${:.2f} @{:.2f}".format(side, token_id[:15], stake, fok_price))
+                    return True
+                else:
+                    print("Poly FOK status: {} resp={}".format(fok_status, str(fok_resp)[:80]))
+                    return False
             else:
-                print("Poly FOK status: {}".format(fok_status))
+                print("Poly FOK no response")
                 return False
-        else:
-            print("Poly FOK failed: {}".format(str(fok_resp)[:100]))
+        except Exception as fok_err:
+            print("Poly FOK error: {}".format(fok_err))
             return False
 
     except Exception as e:
