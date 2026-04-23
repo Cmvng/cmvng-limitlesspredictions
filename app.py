@@ -11122,14 +11122,14 @@ def paper24_page():
     return _build_paper_page("paper24_trades", "Paper 2.4",
         "P2.1 + Distance Math + 15M Candle Pattern — 1H Only",
         "Uses completed 15-minute candles within the hourly window plus distance math to predict the 1H close.",
-        nav_active="paper24")
+        extra_cols=[], nav_active="paper24")
 
 @app.route("/app/paper34")
 def paper34_page():
     return _build_paper_page("paper34_trades", "Paper 3.4",
         "P3.1 + Distance Math + 15M Candle Pattern — 1H Only",
         "Uses completed 15-minute candles within the hourly window plus distance math to predict the 1H close.",
-        nav_active="paper34")
+        extra_cols=[], nav_active="paper34")
 
 
 # Start Polymarket threads (defined above)
