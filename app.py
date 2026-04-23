@@ -10118,15 +10118,21 @@ def run_poly_scan():
             yf_tf = "5m" if tf == "5M" else "15m" if tf == "15M" else "1h"
             ind = _calculate_indicators(asset, yf_tf)
             if not ind:
+                if asset == "BTC" and tf == "5M":
+                    print("POLY_BLOCK {}: indicators failed (yf_tf={})".format(asset, yf_tf))
                 continue
 
             price = ind.get("current")
             if not price:
+                if asset == "BTC" and tf == "5M":
+                    print("POLY_BLOCK {}: no current price".format(asset))
                 continue
 
             baseline = _poly_get_baseline(parsed, price, ind)
             if baseline is None:
-                # No Chainlink PTB yet for this asset/timeframe — skip
+                if asset == "BTC" and tf == "5M":
+                    ptb_keys = list(_chainlink_ptb.keys())
+                    print("POLY_BLOCK {}: no baseline. PTB cache keys={}".format(asset, ptb_keys))
                 continue
             parsed["baseline"] = baseline
 
