@@ -10480,8 +10480,6 @@ def _poly_fetch_markets():
                                 event_markets = data[0].get("markets", []) if isinstance(data[0], dict) else []
                             elif isinstance(data, dict):
                                 event_markets = data.get("markets", [])
-                            if event_markets:
-                                print("Poly 1H found: {} ({} markets)".format(event_slug, len(event_markets)))
                             for m in event_markets:
                                 # First try normal parsing
                                 parsed = _poly_parse_market(m, timeframe_hint="1H")
