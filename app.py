@@ -160,19 +160,19 @@ FAVOURITE_HOURLY = ["ADA", "BNB", "DOGE"]
 # ─── Polymarket LIVE trading bot states ───
 _poly_live_p23 = {
     "enabled": True,
-    "balance": 15.0,
-    "peak_balance": 15.0,
-    "starting_balance": 15.0,
-    "floor_balance": 5.0,
+    "balance": 35.0,
+    "peak_balance": 35.0,
+    "starting_balance": 35.0,
+    "floor_balance": 2.5,
     "trades_today": 0,
 }
 
 _poly_live_p31 = {
-    "enabled": True,
-    "balance": 15.0,
-    "peak_balance": 15.0,
-    "starting_balance": 15.0,
-    "floor_balance": 5.0,
+    "enabled": False,
+    "balance": 0.0,
+    "peak_balance": 0.0,
+    "starting_balance": 0.0,
+    "floor_balance": 2.5,
     "trades_today": 0,
 }
 
@@ -2057,12 +2057,21 @@ def _execute_poly_trade(condition_id, token_id, side, stake, price):
         from py_clob_client.order_builder.constants import BUY
         from py_clob_client.clob_types import OrderArgs, MarketOrderArgs, OrderType
 
+        # Polymarket minimum is 5 shares per order
+        min_shares = 5.0
+        shares = round(stake / price, 2)
+        if shares < min_shares:
+            # Increase stake to meet minimum
+            stake = round(min_shares * price, 2)
+            shares = min_shares
+            print("Poly: adjusted stake to ${:.2f} for min {} shares @{:.2f}".format(stake, min_shares, price))
+
         # ── Step 1: Try GTC limit order ──
         try:
             order_args = OrderArgs(
                 token_id=str(token_id),
                 price=round(price, 2),
-                size=round(stake / price, 2),
+                size=shares,
                 side=BUY,
             )
             signed_order = client.create_order(order_args)
@@ -2104,9 +2113,10 @@ def _execute_poly_trade(condition_id, token_id, side, stake, price):
         # ── Step 2: FOK fallback ──
         try:
             fok_price = round(min(price + 0.02, 0.95), 2)
+            fok_amount = max(round(stake, 2), round(min_shares * fok_price, 2))
             mo = MarketOrderArgs(
                 token_id=str(token_id),
-                amount=round(stake, 2),
+                amount=fok_amount,
                 side=BUY,
                 price=fok_price,
             )
