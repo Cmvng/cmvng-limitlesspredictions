@@ -10130,6 +10130,11 @@ def run_poly_scan():
                 continue
             parsed["baseline"] = baseline
 
+            # Debug: log first market that reaches scoring
+            if poly_counts["btc5m"] == 0 and poly_counts["all5m"] == 0 and asset == "BTC":
+                print("POLY_SCORE BTC: baseline={:.2f} price={:.2f} dist={:.2f} odds={:.1f}% tf={} mins={:.1f}".format(
+                    baseline, price, price - baseline, parsed["yes_odds"], tf, mins_left))
+
             # 4H macro for 1H markets
             ind_macro = None
             if tf == "1H":
@@ -10167,6 +10172,7 @@ def run_poly_scan():
                                                           expiry_minute=expiry_minute,
                                                           expiry_hour=expiry_hour)
                     except Exception as e:
+                        print("Poly score error {}/{}: {}".format(asset, strat, e))
                         continue
 
                     if not scored:
