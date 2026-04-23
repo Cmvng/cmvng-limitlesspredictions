@@ -11814,10 +11814,11 @@ def run_poly_scan():
                     poly_counts[section] = poly_counts.get(section, 0) + 1
 
                     # ─── POLYMARKET LIVE TRADING ───
-                    # Only P2.3 and P3.1 on 5M and 15M markets
+                    # Log every p23/p31 trade to diagnose
                     if strat in ("p23", "p31"):
-                        print("POLY_LIVE_CHECK: strat={} tf={} section={} asset={} creds={} side={}".format(
-                            strat, tf, section, asset, _poly_has_creds(), poly_side))
+                        should_trade = _poly_has_creds() and tf == "15M"
+                        print("POLY_LIVE: strat={} tf={} sec={} asset={} side={} creds={} match={}".format(
+                            strat, tf, section, asset, poly_side, _poly_has_creds(), should_trade))
 
                     if _poly_has_creds() and tf == "15M" and strat in ("p23", "p31"):
                         live_state = _poly_live_p23 if strat == "p23" else _poly_live_p31
