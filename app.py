@@ -4867,7 +4867,7 @@ def _resolve_paper_table(table_name):
                 # P2.1 went live ~18:00 UTC Apr 21, 2026
                 if table_name == "paper21_trades":
                     fired = p.get("fired_at") or ""
-                    is_live_trade = fired >= "2026-04-22T20:30"
+                    is_live_trade = fired >= "2026-04-23T00:30"
                     if is_live_trade:
                         if won:
                             _bot21_state["balance"] = round(_bot21_state["balance"] + payout, 2)
@@ -4886,7 +4886,7 @@ def _resolve_paper_table(table_name):
                 # P3.1 went live ~18:00 UTC Apr 21, 2026
                 if table_name == "paper31_trades":
                     fired = p.get("fired_at") or ""
-                    is_live_trade = fired >= "2026-04-22T20:30"
+                    is_live_trade = fired >= "2026-04-23T00:30"
                     if is_live_trade:
                         if won:
                             _bot31_state["balance"] = round(_bot31_state["balance"] + payout, 2)
@@ -4904,7 +4904,7 @@ def _resolve_paper_table(table_name):
                 # Update Paper 2.2 balance
                 if table_name == "paper22_trades":
                     fired = p.get("fired_at") or ""
-                    is_live_trade = fired >= "2026-04-22T20:30"
+                    is_live_trade = fired >= "2026-04-23T00:30"
                     if is_live_trade:
                         if won:
                             _bot22_state["balance"] = round(_bot22_state["balance"] + payout, 2)
@@ -4921,7 +4921,7 @@ def _resolve_paper_table(table_name):
                 # Update Paper 3.2 balance
                 if table_name == "paper32_trades":
                     fired = p.get("fired_at") or ""
-                    is_live_trade = fired >= "2026-04-22T20:30"
+                    is_live_trade = fired >= "2026-04-23T00:30"
                     if is_live_trade:
                         if won:
                             _bot32_state["balance"] = round(_bot32_state["balance"] + payout, 2)
@@ -9457,30 +9457,31 @@ def paper5_page():
 
 try:
     init_db()
-    # Load Limitless balances from DB (persistence mode)
-    _saved_bals = _load_bot_balances()
-    if _saved_bals:
-        for _bot_name, _bot_state_ref in [
-            ("p21", _bot21_state), ("p31", _bot31_state),
-            ("p22", _bot22_state), ("p32", _bot32_state),
-        ]:
-            if _bot_name in _saved_bals:
-                _bot_state_ref["balance"] = _saved_bals[_bot_name]["balance"]
-                _bot_state_ref["peak_balance"] = _saved_bals[_bot_name].get("peak_balance", _bot_state_ref["balance"])
-                _bot_state_ref["enabled"] = _saved_bals[_bot_name].get("enabled", True)
-        print("Loaded balances: {}".format(
-            ", ".join("{}=${:.2f}".format(k, v["balance"]) for k, v in _saved_bals.items())))
-    else:
-        for _bn, _bs in [("p21", _bot21_state), ("p31", _bot31_state),
-                          ("p22", _bot22_state), ("p32", _bot32_state)]:
-            _save_bot_balance(_bn, _bs)
-        print("No saved balances — starting fresh at $15.00 each")
-    # Clear old Polymarket trades (bad baseline data)
+    # ONE-TIME RESET to $15 (user requested Apr 23)
+    # ⚠️ NEXT DEPLOY: Replace this block with persistence mode:
+    #   _saved_bals = _load_bot_balances()
+    #   if _saved_bals: load them
+    #   else: save defaults
+    # DO NOT RESET AGAIN unless user explicitly asks
+    try:
+        _rc = get_db()
+        _rc.run("DELETE FROM bot_balances")
+        _rc.close()
+    except:
+        pass
+    for _bot_state_ref in [_bot21_state, _bot31_state, _bot22_state, _bot32_state]:
+        _bot_state_ref["balance"] = 15.0
+        _bot_state_ref["peak_balance"] = 15.0
+    for _bn, _bs in [("p21", _bot21_state), ("p31", _bot31_state),
+                      ("p22", _bot22_state), ("p32", _bot32_state)]:
+        _save_bot_balance(_bn, _bs)
+    print("Reset all Limitless balances to $15.00 each")
+    # Clear old Polymarket trades
     try:
         _pc = get_db()
         _pc.run("DELETE FROM poly_trades")
         _pc.close()
-        print("Cleared old Polymarket trades — fresh start with correct baseline")
+        print("Cleared old Polymarket trades")
     except Exception as e:
         print("Poly cleanup note: {}".format(e))
 except Exception as e:
