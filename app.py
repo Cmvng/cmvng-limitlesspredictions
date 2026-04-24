@@ -12385,11 +12385,19 @@ def _resolve_poly_trades():
                 if condition_id or slug:
                     try:
                         import requests as req
-                        # Try slug first, then condition_id
-                        for lookup in [slug, condition_id]:
-                            if not lookup or won is not None:
-                                continue
-                            mr = req.get("{}/markets/{}".format(POLY_GAMMA_API, lookup), timeout=10)
+                        # Gamma API uses different URL patterns:
+                        # By slug: /markets/slug/{slug}
+                        # By condition_id: /markets/{condition_id}
+                        lookups = []
+                        if slug:
+                            lookups.append("{}/markets/slug/{}".format(POLY_GAMMA_API, slug))
+                        if condition_id:
+                            lookups.append("{}/markets/{}".format(POLY_GAMMA_API, condition_id))
+                        
+                        for url in lookups:
+                            if won is not None:
+                                break
+                            mr = req.get(url, timeout=10)
                             if mr.status_code == 200:
                                 mdata = mr.json()
                                 
