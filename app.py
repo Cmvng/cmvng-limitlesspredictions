@@ -159,6 +159,15 @@ FAVOURITE_HOURLY = ["ADA", "BNB", "DOGE"]
 
 # ─── Polymarket LIVE trading bot states ───
 _poly_live_p23 = {
+    "enabled": False,
+    "balance": 35.0,
+    "peak_balance": 35.0,
+    "starting_balance": 35.0,
+    "floor_balance": 2.5,
+    "trades_today": 0,
+}
+
+_poly_live_p33 = {
     "enabled": True,
     "balance": 35.0,
     "peak_balance": 35.0,
@@ -2113,7 +2122,8 @@ def _get_poly_client():
 
 
 def _execute_poly_trade(condition_id, token_id, side, stake, price):
-    """Place an order on Polymarket. Uses aggressive FOK to guarantee fill.
+    """Place an order on Polymarket. GTC sits for up to 2 minutes,
+    then aggressive FOK fallback. Never pays more than 70 cents/share.
     Returns True if filled."""
     try:
         client = _get_poly_client()
@@ -2127,9 +2137,10 @@ def _execute_poly_trade(condition_id, token_id, side, stake, price):
         # Polymarket minimum is 5 shares per order
         # Price per share is ALWAYS capped — higher stakes buy MORE shares
         min_shares = 5.0
+        max_price = 0.70  # Never pay more than 70 cents per share
         
         # Cap price: never pay more than signal price + 2 cents, max 70 cents
-        order_price = min(round(price + 0.02, 2), 0.70)
+        order_price = min(round(price + 0.02, 2), max_price)
         
         # Skip if signal price already too high
         if price > 0.72:
@@ -2149,7 +2160,7 @@ def _execute_poly_trade(condition_id, token_id, side, stake, price):
         except:
             pass
 
-        # ── Try GTC at order price ──
+        # ── Try GTC — sits on book for up to 2 minutes ──
         try:
             order_args = OrderArgs(
                 token_id=str(token_id),
@@ -2170,31 +2181,55 @@ def _execute_poly_trade(condition_id, token_id, side, stake, price):
                     return True
 
                 if order_id and status == "LIVE":
-                    for _ in range(15):
+                    # Wait up to 2 minutes (60 checks × 2 sec) for market makers to fill
+                    for i in range(60):
                         time.sleep(2)
                         try:
                             info = client.get_order(order_id)
                             if info:
                                 s = (info.get("status") or "").upper()
                                 if s in ("MATCHED", "FILLED"):
-                                    print("Poly GTC FILLED (wait): {} ${:.2f}".format(side, stake))
+                                    print("Poly GTC FILLED (wait {}s): {} ${:.2f}".format((i+1)*2, side, stake))
                                     return True
                                 elif s in ("CANCELED", "CANCELLED", "EXPIRED"):
                                     break
                         except:
                             pass
+                    # Cancel GTC after 2 minutes — MUST confirm cancel before FOK
+                    gtc_cancelled = False
                     try:
                         client.cancel(order_id)
-                    except:
-                        pass
+                        gtc_cancelled = True
+                        print("Poly GTC cancelled after 2min — trying aggressive FOK")
+                    except Exception as cancel_err:
+                        # Cancel failed — check if it filled while we tried to cancel
+                        try:
+                            info = client.get_order(order_id)
+                            s = (info.get("status") or "").upper() if info else ""
+                            if s in ("MATCHED", "FILLED"):
+                                print("Poly GTC FILLED (during cancel): {} ${:.2f}".format(side, stake))
+                                return True
+                            elif s in ("CANCELED", "CANCELLED", "EXPIRED"):
+                                gtc_cancelled = True
+                            else:
+                                # Unknown state — don't risk double fill
+                                print("Poly GTC cancel failed, status={} — skipping FOK to avoid double fill".format(s))
+                                return False
+                        except:
+                            print("Poly GTC cancel failed, can't verify — skipping FOK to avoid double fill")
+                            return False
+                    if not gtc_cancelled:
+                        return False
         except Exception as gtc_err:
             print("Poly GTC error: {}".format(gtc_err))
 
-        # ── FOK fallback — same price cap ──
+        # ── Aggressive FOK fallback — cross the spread but stay under 70 cents ──
         try:
-            fok_price = min(round(order_price + 0.02, 2), 0.70)
+            # Pay up to 8 cents more than signal price, still capped at 70 cents
+            fok_price = min(round(price + 0.08, 2), max_price)
             fok_shares = max(min_shares, round(stake / fok_price, 2))
             fok_amount = round(fok_shares * fok_price, 2)
+            print("Poly FOK aggressive: price={:.2f} (signal was {:.2f}, max={:.2f})".format(fok_price, price, max_price))
             mo = MarketOrderArgs(
                 token_id=str(token_id),
                 amount=fok_amount,
@@ -4517,7 +4552,18 @@ def _score_paper33_trade(p, price, indicators=None, ind_macro=None, expiry_minut
     sigma = indicators.get("dist_sigma") if indicators else None
     momentum = indicators.get("dist_momentum") if indicators else None
     baseline = p.get("baseline", 0)
-    prob, dist_label = _calc_dist_score(price, baseline, sigma, momentum)
+    
+    # For Polymarket Up/Down markets, use displacement-blended momentum
+    # Same fix as P2.3: candle momentum misses the actual move from PTB
+    is_poly_updown = "up or down" in p.get("title", "").lower()
+    if is_poly_updown and p.get("mins_left"):
+        tf_mins = 15.0
+        time_rem = max(0.05, p["mins_left"] / tf_mins)
+        displacement = price - baseline
+        poly_momentum = displacement * 0.7 + (momentum or 0) * 0.3
+        prob, dist_label = _calc_dist_score(price, baseline, sigma, poly_momentum, time_rem)
+    else:
+        prob, dist_label = _calc_dist_score(price, baseline, sigma, momentum)
 
     # Determine timing
     mtype = "15M" if p["is_short"] and p.get("mins_left", 0) <= 20 else "1H" if p["is_short"] else "Daily"
@@ -4552,7 +4598,10 @@ def _score_paper33_trade(p, price, indicators=None, ind_macro=None, expiry_minut
                         return None
                     scored["bet_odds"] = effective_odds
             elif dist_label == "NEUTRAL":
-                return None  # coin flip + weak timing = no edge
+                if is_poly_updown:
+                    confidence = scored["confidence"]  # Poly: NEUTRAL = no opinion, trust indicators
+                else:
+                    return None  # Limitless: coin flip + weak timing = no edge
             else:
                 # DIST=BUY or SELL (moderate)
                 dist_agrees = (bet_side == "YES" and dist_label == "BUY") or \
@@ -9095,6 +9144,14 @@ def poly_live_status():
             "stake": _calc_poly_autoscale_stake(_poly_live_p23),
             "trades_today": _poly_live_p23["trades_today"],
         },
+        "p33": {
+            "enabled": _poly_live_p33["enabled"],
+            "balance": _poly_live_p33["balance"],
+            "peak": _poly_live_p33["peak_balance"],
+            "floor": _poly_live_p33["floor_balance"],
+            "stake": _calc_poly_autoscale_stake(_poly_live_p33),
+            "trades_today": _poly_live_p33["trades_today"],
+        },
         "p31": {
             "enabled": _poly_live_p31["enabled"],
             "balance": _poly_live_p31["balance"],
@@ -9108,7 +9165,7 @@ def poly_live_status():
 @app.route("/poly/live/set", methods=["GET"])
 def poly_live_set():
     bot = request.args.get("bot", "p23")
-    st = _poly_live_p23 if bot == "p23" else _poly_live_p31
+    st = _poly_live_p23 if bot == "p23" else _poly_live_p33 if bot == "p33" else _poly_live_p31
     if request.args.get("balance"):
         st["balance"] = float(request.args["balance"])
         st["peak_balance"] = float(request.args["balance"])
@@ -12006,6 +12063,46 @@ def run_poly_scan():
                                     print("{} SKIP: no token_id for {} (clob_toks={}, cid={})".format(
                                         bot_label, asset, len(clob_toks) if clob_toks else 0, cid[:20] if cid else "none"))
 
+                    # ─── POLYMARKET LIVE TRADING P3.3 ───
+                    # P3.3 on 15M markets ONLY, autoscale from $2.50
+                    if strat == "p33" and tf == "15M":
+                        if _poly_has_creds() and _poly_live_p33["enabled"] and not _is_volatile_window():
+                            poly_stake = _calc_poly_autoscale_stake(_poly_live_p33)
+                            if poly_stake > 0:
+                                live_state = _poly_live_p33
+                                bot_label = "POLY-P3.3"
+                                clob_toks = parsed.get("clob_tokens", [])
+                                cid = parsed.get("condition_id", "")
+                                token_id = None
+
+                                if clob_toks and len(clob_toks) >= 2:
+                                    token_id = clob_toks[0] if poly_side == "UP" else clob_toks[1]
+                                elif cid:
+                                    token_id = _get_poly_token_id(cid, poly_side)
+
+                                if token_id:
+                                    try:
+                                        print("{} ATTEMPTING: {} {} ${:.2f} @{:.2f} token={}...".format(
+                                            bot_label, poly_side, asset, poly_stake, share_price, str(token_id)[:20]))
+                                        success = _execute_poly_trade(
+                                            cid, token_id, poly_side, poly_stake, share_price)
+                                        if success:
+                                            live_state["balance"] = round(live_state["balance"] - poly_stake, 2)
+                                            live_state["trades_today"] += 1
+                                            print("{} TRADE: {} {} ${:.2f} @{:.0f}% on {} | bal=${:.2f}".format(
+                                                bot_label, poly_side, asset, poly_stake,
+                                                effective_odds, parsed["title"][:30], live_state["balance"]))
+                                            send_telegram("🟣 <b>{} TRADE</b>\n{} {} ${:.2f} @{:.0f}%\n{}\nBal: ${:.2f}".format(
+                                                bot_label, poly_side, asset, poly_stake,
+                                                effective_odds, parsed["title"][:40], live_state["balance"]))
+                                        else:
+                                            print("{} ORDER FAILED: {} {} ${:.2f}".format(bot_label, poly_side, asset, poly_stake))
+                                    except Exception as pe:
+                                        print("{} trade error: {}".format(bot_label, pe))
+                                else:
+                                    print("{} SKIP: no token_id for {} (clob_toks={}, cid={})".format(
+                                        bot_label, asset, len(clob_toks) if clob_toks else 0, cid[:20] if cid else "none"))
+
         # BUG 3 FIX: Single connection for all inserts
         if inserts:
             try:
@@ -12158,6 +12255,24 @@ def _resolve_poly_trades():
                     elif not live_st["enabled"] and live_st["balance"] > live_st["floor_balance"]:
                         live_st["enabled"] = True
                         print("POLY-P2.3 re-enabled: bal=${:.2f}".format(live_st["balance"]))
+
+                # Update LIVE bot balance for P3.3 on 15M
+                if mt in ("5M", "15M") and strat == "p33" and _poly_live_p33.get("enabled"):
+                    live_st = _poly_live_p33
+                    poly_trade_stake = _calc_poly_autoscale_stake(live_st) or 2.50
+                    if won:
+                        poly_payout = round(poly_trade_stake / (float(p.get("bet_odds") or 50) / 100.0), 2)
+                        live_st["balance"] = round(live_st["balance"] + (poly_payout - poly_trade_stake), 2)
+                    else:
+                        live_st["balance"] = round(live_st["balance"] - poly_trade_stake, 2)
+                    if live_st["balance"] > live_st.get("peak_balance", 0):
+                        live_st["peak_balance"] = live_st["balance"]
+                    if live_st["balance"] <= live_st["floor_balance"]:
+                        live_st["enabled"] = False
+                        print("POLY-P3.3 STOPPED: bal=${:.2f}".format(live_st["balance"]))
+                    elif not live_st["enabled"] and live_st["balance"] > live_st["floor_balance"]:
+                        live_st["enabled"] = True
+                        print("POLY-P3.3 re-enabled: bal=${:.2f}".format(live_st["balance"]))
 
             except Exception as e:
                 continue
