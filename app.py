@@ -1399,6 +1399,11 @@ def parse_market(market):
     is_short = any(t in tags or t in cats for t in
                    ["Minutely", "Minutes 15", "Minutes 30", "Minutes 5", "Hourly", "15 min", "30 min"])
     is_daily = not is_short
+    
+    # Use stableSlug to accurately distinguish 15M from 1H
+    stable_slug = market.get("stableSlug", "")
+    is_15m_market = "15min" in stable_slug or "5min" in stable_slug or "30min" in stable_slug
+    is_hourly_market = "hourly" in stable_slug
 
     return {
         "market_id":  str(market.get("id", "")),
@@ -1412,6 +1417,8 @@ def parse_market(market):
         "yes_odds":   yes_odds,
         "is_short":   is_short,
         "is_daily":   is_daily,
+        "is_15m_market": is_15m_market,
+        "is_hourly_market": is_hourly_market,
         "slug":       market.get("slug", ""),
     }
 
@@ -3822,7 +3829,7 @@ def _score_paper3_trade(p, price, indicators, ind_macro=None, expiry_minute=None
         elif m_sell >= 3: macro_dir = "SELL"
 
     # ── Market timing ──
-    mtype = "15M" if p["is_short"] and p.get("mins_left", 0) <= 20 else "1H" if p["is_short"] else "Daily"
+    mtype = "15M" if p.get("is_15m_market") else "1H" if p.get("is_hourly_market") else "Daily"
     is_weak_period = False
     if mtype == "15M" and expiry_minute is not None:
         is_weak_period = expiry_minute in (0, 30)
@@ -4049,7 +4056,7 @@ def _score_paper4_trade(p, price, indicators):
         share_price = 1.0 - (yes_odds / 100.0)
     sim_payout = round(1.0 / share_price, 4) if share_price > 0 else 0
 
-    mtype = "15M" if p["is_short"] and p["mins_left"] <= 20 else "1H" if p["is_short"] else "Daily"
+    mtype = "15M" if p.get("is_15m_market") else "1H" if p.get("is_hourly_market") else "Daily"
 
     bb_label = "LOWER" if bb_pos < 0.3 else "UPPER" if bb_pos > 0.7 else "MID"
 
@@ -4152,7 +4159,7 @@ def _score_paper5_trade(p, price, indicators, ind_macro=None, expiry_minute=None
         elif m_sell >= 2: macro_dir = "SELL"
 
     # ── Market timing ──
-    mtype = "15M" if p["is_short"] and p.get("mins_left", 0) <= 20 else "1H" if p["is_short"] else "Daily"
+    mtype = "15M" if p.get("is_15m_market") else "1H" if p.get("is_hourly_market") else "Daily"
     is_weak_period = False
     if mtype == "15M" and expiry_minute is not None:
         is_weak_period = expiry_minute in (0, 30)
@@ -4355,7 +4362,7 @@ def _score_paper31_trade(p, price, indicators, ind_macro=None, expiry_minute=Non
         elif m_total >= 2 and m_sell > m_buy and m_sell >= 2: macro_dir = "SELL"
 
     # ── Timing ──
-    mtype = "15M" if p["is_short"] and p.get("mins_left", 0) <= 20 else "1H" if p["is_short"] else "Daily"
+    mtype = "15M" if p.get("is_15m_market") else "1H" if p.get("is_hourly_market") else "Daily"
     is_weak_period = False
     if mtype == "15M" and expiry_minute is not None:
         is_weak_period = expiry_minute in (0, 30)
@@ -4556,7 +4563,7 @@ def _score_paper21_trade(p, price, indicators=None, ind_macro=None, expiry_minut
         elif m_total >= 2 and m_sell > m_buy and m_sell >= 2: macro_dir = "SELL"
 
     # ── Market timing ──
-    mtype = "15M" if p["is_short"] and p.get("mins_left", 0) <= 20 else "1H" if p["is_short"] else "Daily"
+    mtype = "15M" if p.get("is_15m_market") else "1H" if p.get("is_hourly_market") else "Daily"
     is_weak_period = False
     if mtype == "15M" and expiry_minute is not None:
         is_weak_period = expiry_minute in (0, 30)
@@ -4729,7 +4736,7 @@ def _score_paper51_trade(p, price, indicators, ind_macro=None, expiry_minute=Non
         elif m_sell >= 2: macro_dir = "SELL"
 
     # ── Timing ──
-    mtype = "15M" if p["is_short"] and p.get("mins_left", 0) <= 20 else "1H" if p["is_short"] else "Daily"
+    mtype = "15M" if p.get("is_15m_market") else "1H" if p.get("is_hourly_market") else "Daily"
     is_weak_period = False
     if mtype == "15M" and expiry_minute is not None:
         is_weak_period = expiry_minute in (0, 30)
@@ -4928,8 +4935,8 @@ def _score_paper33_trade(p, price, indicators=None, ind_macro=None, expiry_minut
     baseline = p.get("baseline", 0)
     prob, dist_label = _calc_dist_score(price, baseline, sigma, momentum)
 
-    # Determine timing
-    mtype = "15M" if p["is_short"] and p.get("mins_left", 0) <= 20 else "1H" if p["is_short"] else "Daily"
+    # Determine timing — use stableSlug for accurate market type
+    mtype = "15M" if p.get("is_15m_market") else "1H" if p.get("is_hourly_market") else "Daily"
     if mtype != "15M":
         return None  # 15M only
 
@@ -5107,7 +5114,7 @@ def _score_paper24_trade(p, price, indicators=None, ind_macro=None, expiry_minut
         return None
 
     # 1H markets only
-    mtype = "15M" if p["is_short"] and p.get("mins_left", 0) <= 20 else "1H" if p["is_short"] else "Daily"
+    mtype = "15M" if p.get("is_15m_market") else "1H" if p.get("is_hourly_market") else "Daily"
     if mtype != "1H":
         return None
 
@@ -5245,7 +5252,7 @@ def _score_paper34_trade(p, price, indicators=None, ind_macro=None, expiry_minut
     if price is None or not indicators:
         return None
 
-    mtype = "15M" if p["is_short"] and p.get("mins_left", 0) <= 20 else "1H" if p["is_short"] else "Daily"
+    mtype = "15M" if p.get("is_15m_market") else "1H" if p.get("is_hourly_market") else "Daily"
     if mtype != "1H":
         return None
 
@@ -5547,7 +5554,7 @@ def _score_paper25_trade(p, price, indicators=None, ind_macro=None, expiry_minut
         return None
 
     # 1H markets only
-    mtype = "15M" if p["is_short"] and p.get("mins_left", 0) <= 20 else "1H" if p["is_short"] else "Daily"
+    mtype = "15M" if p.get("is_15m_market") else "1H" if p.get("is_hourly_market") else "Daily"
     if mtype != "1H":
         return None
 
@@ -5643,7 +5650,7 @@ def _score_paper35_trade(p, price, indicators=None, ind_macro=None, expiry_minut
     if price is None or not indicators:
         return None
 
-    mtype = "15M" if p["is_short"] and p.get("mins_left", 0) <= 20 else "1H" if p["is_short"] else "Daily"
+    mtype = "15M" if p.get("is_15m_market") else "1H" if p.get("is_hourly_market") else "Daily"
     if mtype != "1H":
         return None
 
@@ -5736,7 +5743,7 @@ def _score_paper26_trade(p, price, indicators=None, ind_macro=None, expiry_minut
     if price is None:
         return None
 
-    mtype = "15M" if p["is_short"] and p.get("mins_left", 0) <= 20 else "1H" if p["is_short"] else "Daily"
+    mtype = "15M" if p.get("is_15m_market") else "1H" if p.get("is_hourly_market") else "Daily"
     if mtype != "15M":
         return None
 
@@ -5942,7 +5949,7 @@ def _score_paper36_trade(p, price, indicators=None, ind_macro=None, expiry_minut
     if price is None or not indicators:
         return None
 
-    mtype = "15M" if p["is_short"] and p.get("mins_left", 0) <= 20 else "1H" if p["is_short"] else "Daily"
+    mtype = "15M" if p.get("is_15m_market") else "1H" if p.get("is_hourly_market") else "Daily"
     if mtype != "15M":
         return None
 
@@ -6166,9 +6173,9 @@ def run_paper34_scan():
 
                 # Determine timeframe for indicators based on market type
                 mins_left = parsed.get("mins_left", 60)
-                if parsed["is_short"] and mins_left <= 20:
+                if parsed.get("is_15m_market"):
                     ind_tf = "15m"  # 15-minute market → 15m candles
-                elif parsed["is_short"]:
+                elif parsed.get("is_hourly_market"):
                     ind_tf = "1h"   # Hourly market → 1h candles
                 else:
                     ind_tf = "1d"   # Daily market → daily candles
