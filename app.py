@@ -3538,18 +3538,14 @@ def _fast_trade_scan():
                     
                     # ── EXECUTE LIVE TRADES ──
                     if both_agree:
-                        # DUAL SIGNAL: Both agree — highest confidence
-                        # P2.3: active sniper (45¢ → 66¢, topping up, matching asks)
-                        # P3.3: patient GTC at 50¢, sits for full market
                         bet_side = scored23["bet_side"]
-                        print("DUAL SIGNAL: {} {} — P2.3 sniper + P3.3 patient @50%".format(bet_side, asset))
+                        print("DUAL SIGNAL: {} {} — blast snipe".format(bet_side, asset))
                         
-                        # P3.3 patient order FIRST (instant, non-blocking)
+                        # P3.3 patient GTC at 50¢ (instant, sits for full market)
                         floor33 = _bot33_state.get("floor_balance", 0)
                         if _bot33_state["enabled"] and _bot33_state["balance"] > floor33:
                             real_stake33 = _calc_autoscale_stake(_bot33_state)
                             if real_stake33 > 0 and real_stake33 <= _bot33_state["balance"]:
-                                # Get token ID from market data
                                 _tok33 = None
                                 _tokens33 = market.get("tokens", {})
                                 if isinstance(_tokens33, dict):
@@ -3564,50 +3560,51 @@ def _fast_trade_scan():
                                         _bot33_state["balance"] = round(_bot33_state["balance"] - real_stake33, 2)
                                         _bot33_state["trades_today"] += 1
                                         trades_placed += 1
-                                        print("DUAL P3.3 patient @50%: {} {} ${:.2f} | bal=${:.2f}".format(
-                                            bet_side, asset, real_stake33, _bot33_state["balance"]))
+                                        print("DUAL P3.3 patient @50%: {} {} | bal=${:.2f}".format(
+                                            bet_side, asset, _bot33_state["balance"]))
                                         send_telegram("🎯 <b>P3.3 PATIENT @50%</b>\n{} {} ${:.2f}\n{}\nBal: ${:.2f}".format(
                                             bet_side, asset, real_stake33, parsed["title"][:40], _bot33_state["balance"]))
                         
-                        # P2.3 active sniper (45¢ → 66¢, takes ~27 seconds)
+                        # P2.3 active sniper (blast at 45¢, manage later)
                         floor23 = _bot23_state.get("floor_balance", 0)
                         if _bot23_state["enabled"] and _bot23_state["balance"] > floor23:
                             real_stake23 = _calc_autoscale_stake(_bot23_state)
                             if real_stake23 > 0 and real_stake23 <= _bot23_state["balance"]:
-                                success = _snipe_place_gtc(market, parsed, bet_side, real_stake23, None)
-                                if success:
+                                snipe_order = _snipe_place_gtc(market, parsed, bet_side, real_stake23, None)
+                                if snipe_order:
                                     _bot23_state["balance"] = round(_bot23_state["balance"] - real_stake23, 2)
                                     _bot23_state["trades_today"] += 1
                                     trades_placed += 1
-                                    send_telegram("⚡ <b>DUAL P2.3 SNIPE</b>\n{} {} ${:.2f}\n{}\nBal: ${:.2f}".format(
+                                    _active_snipe_orders.append(snipe_order)
+                                    send_telegram("⚡ <b>DUAL SNIPE @45%</b>\n{} {} ${:.2f}\n{}\nBal: ${:.2f}".format(
                                         bet_side, asset, real_stake23, parsed["title"][:40], _bot23_state["balance"]))
                     
                     elif scored23 and not scored33:
-                        # Only P2.3 scored — single signal sniper
                         floor23 = _bot23_state.get("floor_balance", 0)
                         if _bot23_state["enabled"] and _bot23_state["balance"] > floor23:
                             real_stake23 = _calc_autoscale_stake(_bot23_state)
                             if real_stake23 > 0 and real_stake23 <= _bot23_state["balance"]:
-                                success = _snipe_place_gtc(market, parsed, scored23["bet_side"], real_stake23, None)
-                                if success:
+                                snipe_order = _snipe_place_gtc(market, parsed, scored23["bet_side"], real_stake23, None)
+                                if snipe_order:
                                     _bot23_state["balance"] = round(_bot23_state["balance"] - real_stake23, 2)
                                     _bot23_state["trades_today"] += 1
                                     trades_placed += 1
-                                    send_telegram("🟢 <b>P2.3 SNIPE</b>\n{} {} ${:.2f}\n{}\nBal: ${:.2f}".format(
+                                    _active_snipe_orders.append(snipe_order)
+                                    send_telegram("🟢 <b>P2.3 SNIPE @45%</b>\n{} {} ${:.2f}\n{}\nBal: ${:.2f}".format(
                                         scored23["bet_side"], asset, real_stake23, parsed["title"][:40], _bot23_state["balance"]))
                     
                     elif scored33 and not scored23:
-                        # Only P3.3 scored — single signal sniper
                         floor33 = _bot33_state.get("floor_balance", 0)
                         if _bot33_state["enabled"] and _bot33_state["balance"] > floor33:
                             real_stake33 = _calc_autoscale_stake(_bot33_state)
                             if real_stake33 > 0 and real_stake33 <= _bot33_state["balance"]:
-                                success = _snipe_place_gtc(market, parsed, scored33["bet_side"], real_stake33, None)
-                                if success:
+                                snipe_order = _snipe_place_gtc(market, parsed, scored33["bet_side"], real_stake33, None)
+                                if snipe_order:
                                     _bot33_state["balance"] = round(_bot33_state["balance"] - real_stake33, 2)
                                     _bot33_state["trades_today"] += 1
                                     trades_placed += 1
-                                    send_telegram("🟢 <b>P3.3 SNIPE</b>\n{} {} ${:.2f}\n{}\nBal: ${:.2f}".format(
+                                    _active_snipe_orders.append(snipe_order)
+                                    send_telegram("🟢 <b>P3.3 SNIPE @45%</b>\n{} {} ${:.2f}\n{}\nBal: ${:.2f}".format(
                                         scored33["bet_side"], asset, real_stake33, parsed["title"][:40], _bot33_state["balance"]))
 
                 # ── P2.4 and P3.4: PAUSED for testing ──
@@ -3619,6 +3616,11 @@ def _fast_trade_scan():
 
         if trades_placed > 0:
             print("Fast scan: {} live trades placed".format(trades_placed))
+        
+        # MANAGE PHASE: Round-robin price management for all blast orders
+        if _active_snipe_orders:
+            print("Managing {} active snipe orders...".format(len(_active_snipe_orders)))
+            _manage_snipe_orders()
 
     except Exception as e:
         print("Fast trade scan error: {}".format(e))
@@ -3694,19 +3696,17 @@ def _warm_credentials():
         print("Credential cache error: {}".format(e))
     return False
 
-def _snipe_place_gtc(market_data, parsed, bet_side, stake, fixed_price_ignored):
-    """Active GTC sniper — places order at cheap price and tops up every 3 seconds.
-    Starts at 45¢, escalates to max 66¢ (guarantees at least 50% return).
-    Checks orderbook at each step to match best available price.
-    Returns True if order placed (may or may not fill later)."""
+def _snipe_place_gtc(market_data, parsed, bet_side, stake, _unused):
+    """BLAST PHASE: Place initial GTC at 45¢ on the book instantly.
+    Returns order tracking dict for the manage phase, or None on failure."""
     
     if not _cached_credentials["ready"]:
         if not _warm_credentials():
-            return False
+            return None
     
     slug = parsed.get("slug", "")
     if not slug:
-        return False
+        return None
     
     # Get token ID from market data
     token_id = None
@@ -3717,107 +3717,165 @@ def _snipe_place_gtc(market_data, parsed, bet_side, stake, fixed_price_ignored):
         else:
             token_id = tokens.get("no") or tokens.get("No") or tokens.get("NO")
     if not token_id:
-        position_ids = market_data.get("positionIds") or market_data.get("clobTokenIds") or []
-        if len(position_ids) >= 2:
-            token_id = position_ids[0] if bet_side == "YES" else position_ids[1]
-    if not token_id:
-        return False
+        return None
     
     exchange_addr = _cached_credentials["exchange_addr"]
     profile_id = _cached_credentials["profile_id"]
     fee_bps = _cached_credentials["fee_bps"] or 300
     
-    # Price ladder: start cheap, top up every 3 seconds
-    # All prices are for the BET SIDE (YES price for YES bets, NO price for NO bets)
+    # Place initial GTC at cheapest price (45¢)
+    initial_price = 0.45
+    order_id = _place_gtc_order(slug, bet_side, token_id, stake, initial_price,
+                                 exchange_addr, profile_id, fee_bps)
+    if order_id:
+        print("SNIPE BLAST: {} {} @45% on {} (id={})".format(
+            bet_side, parsed.get("asset", "?"), slug[:25], order_id[:12]))
+        return {
+            "order_id": order_id,
+            "slug": slug,
+            "bet_side": bet_side,
+            "token_id": token_id,
+            "stake": stake,
+            "asset": parsed.get("asset", "?"),
+            "current_price": initial_price,
+            "step_idx": 0,
+            "filled": False,
+            "fill_price": None,
+            "exchange_addr": exchange_addr,
+            "profile_id": profile_id,
+            "fee_bps": fee_bps,
+        }
+    return None
+
+# Active snipe orders being managed
+_active_snipe_orders = []
+
+def _manage_snipe_orders():
+    """MANAGE PHASE: Round-robin price management across all active snipe orders.
+    Tops up each order every cycle until filled or max price (66¢) reached.
+    Called after blast phase places all initial orders."""
+    global _active_snipe_orders
+    
+    if not _active_snipe_orders:
+        return
+    
     price_steps = [0.45, 0.48, 0.50, 0.52, 0.55, 0.58, 0.60, 0.62, 0.66]
+    max_rounds = 9  # Maximum escalation steps
     
-    current_order_id = None
-    filled = False
-    fill_price = None
-    
-    for step_idx, step_price in enumerate(price_steps):
-        if filled:
+    for round_num in range(max_rounds):
+        if not _active_snipe_orders:
             break
         
-        # Check orderbook for best available price to match
-        try:
-            ob = _fetch_orderbook(slug)
-            if ob:
-                _, best_ask, _ = _get_best_prices(ob, bet_side)
-                if best_ask and best_ask <= 0.66 and best_ask >= step_price:
-                    # There's an ask within our range — match it directly
-                    step_price = round(best_ask, 3)
-                    print("SNIPE matching ask at ${:.3f} for {}".format(step_price, slug[:25]))
-        except:
-            pass
+        still_active = []
         
-        # Cancel previous order before placing new one
-        if current_order_id:
-            # Check if previous order filled
-            status = _check_order_filled(current_order_id)
-            if status == "FILLED":
-                filled = True
-                fill_price = price_steps[step_idx - 1]
-                print("SNIPE FILLED at ${:.3f} during escalation for {}".format(fill_price, slug[:25]))
-                break
+        for order in _active_snipe_orders:
+            if order["filled"]:
+                continue
             
-            cancel_result = _cancel_order(current_order_id)
+            order_id = order["order_id"]
+            step_idx = order["step_idx"]
+            slug = order["slug"]
+            
+            # Check if current order filled
+            status = _check_order_filled(order_id)
+            if status == "FILLED":
+                order["filled"] = True
+                order["fill_price"] = order["current_price"]
+                print("SNIPE FILLED: {} {} @{:.0f}% on {}".format(
+                    order["bet_side"], order["asset"], order["current_price"] * 100, slug[:25]))
+                continue
+            
+            # Already at max price — leave it sitting
+            if step_idx >= len(price_steps) - 1:
+                print("SNIPE @{:.0f}% sitting on book for {}".format(
+                    price_steps[-1] * 100, slug[:25]))
+                continue
+            
+            # Determine next price
+            next_idx = step_idx + 1
+            next_price = price_steps[next_idx]
+            
+            # Check orderbook for asks to match within range
+            try:
+                ob = _fetch_orderbook(slug)
+                if ob:
+                    _, best_ask, _ = _get_best_prices(ob, order["bet_side"])
+                    if best_ask and best_ask <= 0.66 and best_ask > order["current_price"]:
+                        # Match the ask directly
+                        next_price = round(best_ask, 3)
+                        # Find the matching step index
+                        for si, sp in enumerate(price_steps):
+                            if sp >= next_price:
+                                next_idx = si
+                                break
+                        else:
+                            next_idx = len(price_steps) - 1
+                        print("SNIPE matching ask ${:.3f} for {}".format(next_price, slug[:25]))
+            except:
+                pass
+            
+            # Cancel current order
+            cancel_result = _cancel_order(order_id)
             if cancel_result == "FILLED":
-                filled = True
-                fill_price = price_steps[step_idx - 1]
-                print("SNIPE FILLED at ${:.3f} during cancel for {}".format(fill_price, slug[:25]))
-                break
+                order["filled"] = True
+                order["fill_price"] = order["current_price"]
+                print("SNIPE FILLED during cancel: {} {} @{:.0f}%".format(
+                    order["bet_side"], order["asset"], order["current_price"] * 100))
+                continue
             elif cancel_result != True:
-                # Cancel unclear — check one more time
-                recheck = _check_order_filled(current_order_id)
+                # Cancel unclear — check once more
+                recheck = _check_order_filled(order_id)
                 if recheck == "FILLED":
-                    filled = True
-                    fill_price = price_steps[step_idx - 1]
-                    break
-                # Can't confirm cancel — stop to avoid double fill
-                print("SNIPE cancel unclear — stopping for {}".format(slug[:25]))
-                return False
+                    order["filled"] = True
+                    order["fill_price"] = order["current_price"]
+                    continue
+                # Stop managing this order to avoid double fill
+                continue
             
             time.sleep(0.3)
+            
+            # Place new order at next price
+            new_order_id = _place_gtc_order(
+                slug, order["bet_side"], order["token_id"], order["stake"],
+                next_price, order["exchange_addr"], order["profile_id"], order["fee_bps"])
+            
+            if new_order_id:
+                order["order_id"] = new_order_id
+                order["current_price"] = next_price
+                order["step_idx"] = next_idx
+                print("SNIPE step {}: {} @{:.0f}% on {}".format(
+                    next_idx + 1, order["asset"], next_price * 100, slug[:25]))
+                still_active.append(order)
+            
+            time.sleep(0.3)  # Rate limit safety between markets
         
-        # Place GTC at this step price
-        order_id = _place_gtc_order(slug, bet_side, token_id, stake, step_price,
-                                     exchange_addr, profile_id, fee_bps)
-        if order_id:
-            current_order_id = order_id
-            print("SNIPE step {}: {} @{:.0f}% on {} (id={})".format(
-                step_idx + 1, bet_side, step_price * 100, slug[:25], order_id[:12]))
-        else:
-            # GTC placement failed — try next price
-            continue
+        _active_snipe_orders = [o for o in _active_snipe_orders if not o["filled"] and o["step_idx"] < len(price_steps) - 1]
         
-        # Wait 3 seconds before escalating (check for fill halfway)
-        time.sleep(1.5)
-        status = _check_order_filled(current_order_id)
-        if status == "FILLED":
-            filled = True
-            fill_price = step_price
-            print("SNIPE FILLED at ${:.3f} (step {}) for {}".format(fill_price, step_idx + 1, slug[:25]))
+        if not _active_snipe_orders:
             break
-        time.sleep(1.5)
+        
+        # Wait between rounds (all markets get one step per round)
+        time.sleep(2)
     
-    # Final check on last order
-    if not filled and current_order_id:
-        status = _check_order_filled(current_order_id)
-        if status == "FILLED":
-            filled = True
-            fill_price = price_steps[-1]
-            print("SNIPE FILLED at final price for {}".format(slug[:25]))
-        else:
-            # Leave the last order (66¢) sitting on the book for the rest of the market
-            print("SNIPE left GTC @{:.0f}% sitting on book for {}".format(
-                price_steps[-1] * 100, slug[:25]))
+    # Final check on remaining orders
+    for order in _active_snipe_orders:
+        if not order["filled"]:
+            status = _check_order_filled(order["order_id"])
+            if status == "FILLED":
+                order["filled"] = True
+                order["fill_price"] = order["current_price"]
+                print("SNIPE FILLED final check: {} {} @{:.0f}%".format(
+                    order["bet_side"], order["asset"], order["current_price"] * 100))
+            else:
+                print("SNIPE left @{:.0f}% on book: {} {}".format(
+                    order["current_price"] * 100, order["asset"], order["slug"][:25]))
     
-    if filled:
-        print("SNIPE COMPLETE: {} {} @${:.3f} on {} — return ${:.2f} per win".format(
-            bet_side, parsed.get("asset", "?"), fill_price, slug[:25], (1.0 / fill_price) - 1.0))
+    filled_count = sum(1 for o in _active_snipe_orders if o["filled"])
+    total = len(_active_snipe_orders)
+    if total > 0:
+        print("SNIPE MANAGE done: {}/{} filled".format(filled_count, total))
     
-    return True  # Order is on the book (placed or filled)
+    _active_snipe_orders = []
 
 def _rapid_poll_snipe():
     """Rapid-poll market sniper for 15M markets.
