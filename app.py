@@ -216,7 +216,7 @@ _poly_live_p23 = {
 }
 
 _poly_live_p33 = {
-    "enabled": True,
+    "enabled": False,
     "balance": 35.0,
     "peak_balance": 35.0,
     "starting_balance": 35.0,
