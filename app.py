@@ -2830,9 +2830,13 @@ def execute_trade(parsed_market, score, prediction_id, override_stake=None, bot_
                 ]
                 print("Using HOURLY entry strategy (4 phases, 15min total GTC window)")
             else:
-                # 15M markets: FOK immediately, no GTC phases
-                # Market moves too fast — every second of waiting costs money
-                phases = []
+                # 15M markets: GTC at cheap price on fresh/empty book
+                # Sniper detected this market within 1-2 seconds of creation
+                # Book is likely empty — our GTC sets the price
+                phases = [
+                    ("SNIPE",    0.05, 4),  # 5c below displayed, 20s wait (4 × 5s)
+                    ("CHASE",    0.02, 3),  # 2c below, 15s wait
+                ]
             
             filled_via_gtc = False
             current_fill_price = None
@@ -3014,12 +3018,69 @@ def execute_trade(parsed_market, score, prediction_id, override_stake=None, bot_
                         filled = True
                         fill_price = displayed_price
             else:
-                # 15M markets: FOK immediately, no GTC
-                print("15M market — FOK immediately")
-                success = _place_fok_order(slug, bet_side, token_id, stake, exchange_addr, profile_id, fee_bps)
-                if success:
-                    filled = True
-                    fill_price = displayed_price
+                # 15M markets: GTC on empty book then FOK fallback
+                print("15M empty book — GTC snipe then FOK")
+                snipe_phases = [
+                    ("SNIPE",  0.05, 4),   # 5c below, 20s wait
+                    ("CHASE",  0.02, 3),   # 2c below, 15s wait
+                ]
+                for phase_name, discount, check_count in snipe_phases:
+                    if filled:
+                        break
+                    ref_price = displayed_price if displayed_price else 0.50
+                    phase_price = round(max(0.01, min(ref_price - discount, ceiling)), 3)
+                    if phase_price >= ceiling:
+                        continue
+                    print("Phase {}: GTC at ${:.3f} (ref={:.3f})".format(phase_name, phase_price, ref_price))
+                    order_id = _place_gtc_order(slug, bet_side, token_id, stake, phase_price,
+                                                 exchange_addr, profile_id, fee_bps)
+                    if not order_id:
+                        continue
+                    
+                    phase_filled = False
+                    for check_num in range(check_count):
+                        time.sleep(5)
+                        status = _check_order_filled(order_id)
+                        if status == "FILLED":
+                            phase_filled = True
+                            fill_price = phase_price
+                            print("GTC FILLED in phase {} at ${:.3f} ({}s)".format(
+                                phase_name, phase_price, (check_num + 1) * 5))
+                            break
+                        if status == "CANCELLED":
+                            order_id = None
+                            break
+                    
+                    if phase_filled:
+                        filled = True
+                        break
+                    
+                    if order_id:
+                        final_check = _check_order_filled(order_id)
+                        if final_check == "FILLED":
+                            filled = True
+                            fill_price = phase_price
+                            break
+                        cancel_result = _cancel_order(order_id)
+                        time.sleep(0.5)
+                        if cancel_result == "FILLED":
+                            filled = True
+                            fill_price = phase_price
+                            break
+                        elif cancel_result != True:
+                            recheck = _check_order_filled(order_id)
+                            if recheck == "FILLED":
+                                filled = True
+                                fill_price = phase_price
+                                break
+                            return False
+                
+                if not filled:
+                    print("15M snipe phases done — FOK fallback")
+                    success = _place_fok_order(slug, bet_side, token_id, stake, exchange_addr, profile_id, fee_bps)
+                    if success:
+                        filled = True
+                        fill_price = displayed_price
 
         if filled:
             if override_stake is None:
@@ -3622,24 +3683,224 @@ def _precalc_indicators():
         except:
             pass
 
+# Track known market IDs to detect new markets via rapid polling
+_known_market_ids = set()
+
+def _rapid_poll_snipe():
+    """Rapid-poll market sniper for 15M markets.
+    Polls /markets/active every 500ms for 8 seconds looking for NEW markets.
+    When a new 15M market appears, immediately places a GTC at cheap price.
+    This gets the bot on the book within 1-2 seconds of market creation."""
+    import requests as req
+    global _known_market_ids
+    
+    # Quick dedup check
+    try:
+        conn = get_db()
+        p23_rows = conn.run("SELECT market_id FROM paper23_trades WHERE fired_at::timestamptz > NOW() - INTERVAL '30 hours'")
+        p23_ids = set(str(row[0]) for row in p23_rows)
+        p33_rows = conn.run("SELECT market_id FROM paper33_trades WHERE fired_at::timestamptz > NOW() - INTERVAL '30 hours'")
+        p33_ids = set(str(row[0]) for row in p33_rows)
+        conn.close()
+    except:
+        p23_ids = set()
+        p33_ids = set()
+    
+    trades_placed = 0
+    new_markets_found = 0
+    
+    # Rapid poll: 16 checks × 0.5s = 8 seconds of rapid scanning
+    for poll in range(16):
+        try:
+            r = req.get("{}/markets/active".format(LIMITLESS_API), timeout=5)
+            if r.status_code != 200:
+                time.sleep(0.5)
+                continue
+            markets = r.json().get("data", [])
+            
+            current_ids = set()
+            new_15m_markets = []
+            
+            for market in markets:
+                mid = str(market.get("id", ""))
+                current_ids.add(mid)
+                
+                # Is this a NEW market we haven't seen before?
+                if mid not in _known_market_ids:
+                    parsed = parse_market(market)
+                    if parsed and parsed.get("is_15m_market"):
+                        # Check mins_left — only trade markets with >10 minutes remaining
+                        if parsed.get("mins_left", 0) > 10:
+                            new_15m_markets.append((market, parsed))
+                            new_markets_found += 1
+            
+            # Update known markets
+            _known_market_ids = current_ids
+            
+            # Process new 15M markets immediately
+            for market, parsed in new_15m_markets:
+                asset = parsed["asset"]
+                
+                # Get price from cache
+                cached_ind = _indicator_cache.get("{}_15m".format(asset))
+                if cached_ind and cached_ind.get("data", {}).get("current"):
+                    price = cached_ind["data"]["current"]
+                    ind = cached_ind["data"]
+                else:
+                    # Cache miss — skip this poll, will catch on next
+                    continue
+                
+                # Macro from cache
+                ind_macro = None
+                macro_cache = _indicator_cache.get("{}_1h".format(asset))
+                if macro_cache:
+                    ind_macro = macro_cache.get("data")
+                
+                expiry_minute = parsed["expiry_dt"].minute if parsed.get("expiry_dt") else None
+                expiry_hour = parsed["expiry_dt"].hour if parsed.get("expiry_dt") else None
+                now_str = datetime.now(timezone.utc).isoformat()
+                
+                # Score P2.3
+                if parsed["market_id"] not in p23_ids:
+                    scored23 = _score_paper23_trade(parsed, price, indicators=ind, ind_macro=ind_macro,
+                                                     expiry_minute=expiry_minute, expiry_hour=expiry_hour)
+                    if scored23:
+                        p23_ids.add(parsed["market_id"])
+                        # Save paper trade
+                        try:
+                            c = get_db()
+                            c.run("""INSERT INTO paper23_trades
+                                (market_id, title, asset, direction, baseline, bet_odds, bet_side,
+                                 current_price, hours_left, market_type, indicators, score,
+                                 total_signals, simulated_stake, simulated_payout, status, fired_at, slug)
+                                VALUES (:mid, :ttl, :ast, :dir, :base, :odds, :bs,
+                                        :pr, :hrs, :mt, :ind, :sc, :ts, 1.0, :sp, 'Pending', :now, :slg)""",
+                                mid=parsed["market_id"], ttl=parsed["title"], ast=asset,
+                                dir=parsed["direction"], base=parsed["baseline"],
+                                odds=scored23["bet_odds"], bs=scored23["bet_side"],
+                                pr=price, hrs=round(parsed["hours_left"], 2),
+                                mt=scored23["market_type"],
+                                ind="[{}] {}".format(scored23["confidence"], scored23["indicators"]),
+                                sc=scored23["score"], ts=scored23["total_signals"],
+                                sp=scored23["sim_payout"], now=now_str, slg=parsed["slug"])
+                            c.close()
+                        except:
+                            pass
+                        # Live trade
+                        floor23 = _bot23_state.get("floor_balance", 0)
+                        if _bot23_state["enabled"] and _bot23_state["balance"] > floor23:
+                            real_stake23 = _calc_autoscale_stake(_bot23_state)
+                            if real_stake23 > 0 and real_stake23 <= _bot23_state["balance"]:
+                                try:
+                                    bal_after23 = round(_bot23_state["balance"] - real_stake23, 2)
+                                    success = execute_trade(parsed, scored23, None, override_stake=real_stake23,
+                                                           bot_name="P2.3", bot_balance_after=bal_after23)
+                                    if success:
+                                        _bot23_state["balance"] = bal_after23
+                                        _bot23_state["trades_today"] += 1
+                                        trades_placed += 1
+                                        print("SNIPE P2.3: {} {} ${:.2f} | bal=${:.2f}".format(
+                                            scored23["bet_side"], asset, real_stake23, _bot23_state["balance"]))
+                                        send_telegram("⚡ <b>SNIPE P2.3</b>\n{} {} ${:.2f}\n{}\nBal: ${:.2f}".format(
+                                            scored23["bet_side"], asset, real_stake23, parsed["title"][:40], _bot23_state["balance"]))
+                                except Exception as te:
+                                    print("Snipe P2.3 error: {}".format(te))
+                
+                # Score P3.3
+                if parsed["market_id"] not in p33_ids:
+                    scored33 = _score_paper33_trade(parsed, price, indicators=ind, ind_macro=ind_macro,
+                                                     expiry_minute=expiry_minute, expiry_hour=expiry_hour)
+                    if scored33:
+                        p33_ids.add(parsed["market_id"])
+                        try:
+                            c = get_db()
+                            c.run("""INSERT INTO paper33_trades
+                                (market_id, title, asset, direction, baseline, bet_odds, bet_side,
+                                 current_price, hours_left, market_type, indicators, score,
+                                 total_signals, simulated_stake, simulated_payout, status, fired_at, slug)
+                                VALUES (:mid, :ttl, :ast, :dir, :base, :odds, :bs,
+                                        :pr, :hrs, :mt, :ind, :sc, :ts, 1.0, :sp, 'Pending', :now, :slg)""",
+                                mid=parsed["market_id"], ttl=parsed["title"], ast=asset,
+                                dir=parsed["direction"], base=parsed["baseline"],
+                                odds=scored33["bet_odds"], bs=scored33["bet_side"],
+                                pr=price, hrs=round(parsed["hours_left"], 2),
+                                mt=scored33["market_type"],
+                                ind="[{}] {}".format(scored33["confidence"], scored33["indicators"]),
+                                sc=scored33["score"], ts=scored33["total_signals"],
+                                sp=scored33["sim_payout"], now=now_str, slg=parsed["slug"])
+                            c.close()
+                        except:
+                            pass
+                        floor33 = _bot33_state.get("floor_balance", 0)
+                        if _bot33_state["enabled"] and _bot33_state["balance"] > floor33:
+                            real_stake33 = _calc_autoscale_stake(_bot33_state)
+                            if real_stake33 > 0 and real_stake33 <= _bot33_state["balance"]:
+                                try:
+                                    bal_after33 = round(_bot33_state["balance"] - real_stake33, 2)
+                                    success = execute_trade(parsed, scored33, None, override_stake=real_stake33,
+                                                           bot_name="P3.3", bot_balance_after=bal_after33)
+                                    if success:
+                                        _bot33_state["balance"] = bal_after33
+                                        _bot33_state["trades_today"] += 1
+                                        trades_placed += 1
+                                        print("SNIPE P3.3: {} {} ${:.2f} | bal=${:.2f}".format(
+                                            scored33["bet_side"], asset, real_stake33, _bot33_state["balance"]))
+                                        send_telegram("⚡ <b>SNIPE P3.3</b>\n{} {} ${:.2f}\n{}\nBal: ${:.2f}".format(
+                                            scored33["bet_side"], asset, real_stake33, parsed["title"][:40], _bot33_state["balance"]))
+                                except Exception as te:
+                                    print("Snipe P3.3 error: {}".format(te))
+            
+            # If we found and traded new markets, stop polling early
+            if trades_placed > 0:
+                print("Sniper: {} new markets found, {} trades placed in poll #{}".format(
+                    new_markets_found, trades_placed, poll + 1))
+                return trades_placed
+            
+        except Exception as e:
+            pass
+        
+        time.sleep(0.5)  # 500ms between polls
+    
+    if new_markets_found > 0:
+        print("Sniper: {} new markets found, {} trades placed".format(new_markets_found, trades_placed))
+    return trades_placed
+
 
 def scan_loop():
     time.sleep(30)
-    # Initial precalc to warm the cache
+    # Initial precalc and market ID seeding
     try:
         _precalc_indicators()
     except:
         pass
+    # Seed known market IDs so first snipe doesn't trigger on existing markets
+    try:
+        import requests as _req
+        _r = _req.get("{}/markets/active".format(LIMITLESS_API), timeout=10)
+        if _r.status_code == 200:
+            for _m in _r.json().get("data", []):
+                _known_market_ids.add(str(_m.get("id", "")))
+            print("Seeded {} known market IDs".format(len(_known_market_ids)))
+    except:
+        pass
     
     while True:
-        # ── STEP 1: FAST TRADE SCAN (runs first — within 3-5 seconds of market open) ──
-        # Uses cached indicators, no yfinance calls, places live trades immediately
+        # ── STEP 1: RAPID-POLL SNIPER (15M markets) ──
+        # Polls every 500ms for 8 seconds looking for NEW markets
+        # Places GTC on empty book within 1-2 seconds of market creation
+        try:
+            snipe_count = _rapid_poll_snipe()
+        except Exception as e:
+            print("Sniper error: {}".format(e))
+            snipe_count = 0
+
+        # ── STEP 2: FAST TRADE SCAN (hourly markets + any 15M missed by sniper) ──
         try:
             _fast_trade_scan()
         except Exception as e:
             print("Fast scan error: {}".format(e))
 
-        # ── STEP 2: SLOW SCAN (runs after — paper tracking, Bot 1, Bot 2) ──
+        # ── STEP 3: SLOW SCAN (paper tracking, Bot 1, Bot 2) ──
         global _current_cycle_bot1_ids
         _current_cycle_bot1_ids = set()
         try:
@@ -3665,8 +3926,7 @@ def scan_loop():
         except Exception as e:
             print("Balance save error: {}".format(e))
         
-        # ── STEP 3: WAIT FOR NEXT BOUNDARY ──
-        # Pre-calc indicators 10 seconds before, scan 3 seconds after
+        # ── STEP 4: WAIT FOR NEXT BOUNDARY ──
         now_ts = time.time()
         interval = 300  # 5 minutes
         next_boundary = ((now_ts // interval) + 1) * interval
@@ -3676,16 +3936,16 @@ def scan_loop():
         wait_to_precalc = max(1, precalc_time - time.time())
         time.sleep(wait_to_precalc)
         
-        # Pre-calculate indicators so cache is warm
+        # Pre-calculate indicators so cache is warm for sniper
         try:
             _precalc_indicators()
         except:
             pass
         
-        # Wait until 3 seconds after boundary (market just opened)
-        scan_time = next_boundary + 3
-        wait_to_scan = max(0.5, scan_time - time.time())
-        time.sleep(wait_to_scan)
+        # Wait until 1 second BEFORE boundary — sniper starts polling
+        snipe_start = next_boundary - 1
+        wait_to_snipe = max(0.1, snipe_start - time.time())
+        time.sleep(wait_to_snipe)
 
 # ═══════════════════════════════════════════════════════════
 # TECHNICAL INDICATORS CALCULATOR
