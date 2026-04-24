@@ -12385,35 +12385,95 @@ def _resolve_poly_trades():
                 if condition_id or slug:
                     try:
                         import requests as req
-                        lookup = slug or condition_id
-                        mr = req.get("{}/markets/{}".format(POLY_GAMMA_API, lookup), timeout=10)
-                        if mr.status_code == 200:
-                            mdata = mr.json()
-                            # Check if resolved
-                            is_closed = mdata.get("closed") or mdata.get("active") == False
-                            wi = mdata.get("winningOutcomeIndex")
-                            if is_closed and wi is not None:
-                                # winningOutcomeIndex: 0 = first outcome (UP), 1 = second (DOWN)
-                                market_went_up = (wi == 0)
-                                bet_side = p.get("bet_side") or "UP"
-                                if bet_side == "UP":
-                                    won = market_went_up
-                                else:
-                                    won = not market_went_up
-                    except:
-                        pass
+                        # Try slug first, then condition_id
+                        for lookup in [slug, condition_id]:
+                            if not lookup or won is not None:
+                                continue
+                            mr = req.get("{}/markets/{}".format(POLY_GAMMA_API, lookup), timeout=10)
+                            if mr.status_code == 200:
+                                mdata = mr.json()
+                                
+                                # PRIMARY: Check outcomePrices — most reliable
+                                # When resolved: winning outcome → 1.0, losing → 0.0
+                                # outcomes[0] = UP, outcomes[1] = DOWN
+                                op = mdata.get("outcomePrices") or mdata.get("outcome_prices")
+                                if op:
+                                    if isinstance(op, str):
+                                        import json as _json
+                                        try:
+                                            op = _json.loads(op)
+                                        except:
+                                            op = None
+                                    if isinstance(op, list) and len(op) >= 2:
+                                        try:
+                                            p0 = float(op[0])  # UP price
+                                            p1 = float(op[1])  # DOWN price
+                                            if p0 >= 0.95:
+                                                # UP won
+                                                bet_side = p.get("bet_side") or "UP"
+                                                won = (bet_side == "UP")
+                                            elif p1 >= 0.95:
+                                                # DOWN won
+                                                bet_side = p.get("bet_side") or "UP"
+                                                won = (bet_side == "DOWN")
+                                        except:
+                                            pass
+                                
+                                # FALLBACK: Check winningOutcomeIndex
+                                if won is None:
+                                    wi = mdata.get("winningOutcomeIndex")
+                                    if wi is None:
+                                        wi = mdata.get("winning_outcome_index")
+                                    is_closed = mdata.get("closed") or mdata.get("active") == False
+                                    if is_closed and wi is not None:
+                                        market_went_up = (wi == 0)
+                                        bet_side = p.get("bet_side") or "UP"
+                                        if bet_side == "UP":
+                                            won = market_went_up
+                                        else:
+                                            won = not market_went_up
+                    except Exception as gamma_err:
+                        print("Poly resolve Gamma error: {}".format(gamma_err))
 
-                # If Gamma API didn't resolve, skip — don't use price fallback
-                # Price at resolution time != price at expiry time
-                # Only Gamma API knows the actual outcome
+                # If Gamma API didn't resolve, wait and retry
                 if won is None:
-                    # Only expire very old trades (24h+) that Gamma never resolved
-                    if now > expiry + timedelta(hours=24):
-                        won = False  # Mark as loss after 24h with no resolution
-                        print("Poly force-expired (24h): {} {} {} — marking as loss".format(
-                            p.get("strategy"), p.get("asset"), p.get("bet_side")))
+                    # Force resolve after 1 hour using Gamma with broader timeout
+                    if now > expiry + timedelta(hours=1):
+                        # Last attempt — try condition_id directly
+                        try:
+                            import requests as req
+                            if condition_id:
+                                mr2 = req.get("{}/markets/{}".format(POLY_GAMMA_API, condition_id), timeout=15)
+                                if mr2.status_code == 200:
+                                    mdata2 = mr2.json()
+                                    op2 = mdata2.get("outcomePrices") or mdata2.get("outcome_prices")
+                                    if op2:
+                                        if isinstance(op2, str):
+                                            import json as _json
+                                            try:
+                                                op2 = _json.loads(op2)
+                                            except:
+                                                op2 = None
+                                        if isinstance(op2, list) and len(op2) >= 2:
+                                            try:
+                                                p0 = float(op2[0])
+                                                p1 = float(op2[1])
+                                                if p0 >= 0.95:
+                                                    won = (p.get("bet_side") or "UP") == "UP"
+                                                elif p1 >= 0.95:
+                                                    won = (p.get("bet_side") or "UP") == "DOWN"
+                                            except:
+                                                pass
+                        except:
+                            pass
+                        
+                        if won is None:
+                            # Truly stuck — mark as loss after 1 hour
+                            won = False
+                            print("Poly force-expired (1h): {} {} {} — Gamma never resolved".format(
+                                p.get("strategy"), p.get("asset"), p.get("bet_side")))
                     else:
-                        continue  # Wait for Gamma API to resolve
+                        continue  # Keep waiting for Gamma
 
                 outcome = "WIN" if won else "LOSS"
                 status = "✅ Won" if won else "❌ Lost"
