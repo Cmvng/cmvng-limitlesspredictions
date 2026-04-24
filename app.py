@@ -12403,21 +12403,17 @@ def _resolve_poly_trades():
                     except:
                         pass
 
-                # Fallback: use current price vs baseline
+                # If Gamma API didn't resolve, skip — don't use price fallback
+                # Price at resolution time != price at expiry time
+                # Only Gamma API knows the actual outcome
                 if won is None:
-                    # Only use fallback if enough time has passed
-                    if now < expiry + timedelta(minutes=5):
-                        continue
-                    current_price = get_price(p["asset"])
-                    if current_price is None:
-                        continue
-                    baseline = float(p["baseline"])
-                    market_went_up = current_price > baseline
-                    bet_side = p.get("bet_side") or "UP"
-                    if bet_side == "UP":
-                        won = market_went_up
+                    # Only expire very old trades (24h+) that Gamma never resolved
+                    if now > expiry + timedelta(hours=24):
+                        won = False  # Mark as loss after 24h with no resolution
+                        print("Poly force-expired (24h): {} {} {} — marking as loss".format(
+                            p.get("strategy"), p.get("asset"), p.get("bet_side")))
                     else:
-                        won = not market_went_up
+                        continue  # Wait for Gamma API to resolve
 
                 outcome = "WIN" if won else "LOSS"
                 status = "✅ Won" if won else "❌ Lost"
