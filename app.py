@@ -3379,10 +3379,13 @@ def _fast_trade_scan():
     Called immediately at market open for fastest possible entry."""
     import requests as req
     try:
+        t_start = time.time()
         r = req.get("{}/markets/active".format(LIMITLESS_API), timeout=10)
         if r.status_code != 200:
+            print("Fast scan: API returned {}".format(r.status_code))
             return
         markets = r.json().get("data", [])
+        print("Fast scan: {} markets fetched in {:.1f}s".format(len(markets), time.time() - t_start))
 
         # Quick dedup check
         conn = get_db()
@@ -3438,11 +3441,18 @@ def _fast_trade_scan():
                     continue  # Skip daily
 
                 ind_cache = _indicator_cache.get("{}_{}".format(asset, ind_tf))
-                if not ind_cache:
-                    continue
-                ind = ind_cache.get("data")
-                if not ind:
-                    continue
+                if not ind_cache or not ind_cache.get("data"):
+                    # Cache miss — calculate now (slower but guarantees trade isn't skipped)
+                    try:
+                        fresh_ind = _calculate_indicators(asset, ind_tf)
+                        if fresh_ind:
+                            ind = fresh_ind
+                        else:
+                            continue
+                    except:
+                        continue
+                else:
+                    ind = ind_cache["data"]
 
                 # Macro indicators from cache
                 ind_macro = None
