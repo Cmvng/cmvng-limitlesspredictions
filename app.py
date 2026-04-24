@@ -957,6 +957,156 @@ def send_telegram(message):
             print("Telegram error: {}".format(e))
     threading.Thread(target=_send, daemon=True).start()
 
+
+def _correct_historical_resolutions():
+    """One-time correction: re-resolve all resolved paper trades using actual
+    API resolution instead of the old price fallback."""
+    import requests as req
+    
+    limitless_tables = [
+        "paper_trades", "paper3_trades", "paper4_trades", "paper5_trades",
+        "paper31_trades", "paper21_trades", "paper51_trades",
+        "paper22_trades", "paper32_trades", "paper23_trades", "paper33_trades",
+        "paper24_trades", "paper34_trades", "paper25_trades", "paper35_trades",
+        "paper26_trades", "paper36_trades",
+    ]
+    
+    corrected = 0
+    checked = 0
+    
+    for table in limitless_tables:
+        try:
+            conn = get_db()
+            rows = conn.run("SELECT * FROM {} WHERE status IN ('✅ Won', '❌ Lost')".format(table))
+            cols = [c['name'] for c in conn.columns]
+            items = [dict(zip(cols, r)) for r in rows]
+            conn.close()
+            
+            for p in items:
+                slug = p.get("slug")
+                if not slug:
+                    continue
+                checked += 1
+                try:
+                    mr = req.get("{}/markets/{}".format(LIMITLESS_API, slug), timeout=10)
+                    if mr.status_code != 200:
+                        continue
+                    mdata = mr.json()
+                    wi = mdata.get("winningOutcomeIndex")
+                    if wi is None:
+                        continue
+                    
+                    market_resolved_yes = (wi == 0)
+                    bet_side = p.get("bet_side") or "YES"
+                    correct_won = (bet_side == "YES") == market_resolved_yes if bet_side == "YES" else not market_resolved_yes
+                    if bet_side == "YES":
+                        correct_won = market_resolved_yes
+                    else:
+                        correct_won = not market_resolved_yes
+                    
+                    correct_status = "✅ Won" if correct_won else "❌ Lost"
+                    if correct_status != p.get("status", ""):
+                        stake = float(p.get("simulated_stake") or 1.0)
+                        odds = float(p.get("bet_odds") or 50)
+                        share_price = odds / 100.0
+                        if bet_side == "NO":
+                            share_price = 1.0 - share_price
+                        profit = round((stake / share_price) - stake, 4) if correct_won else round(-stake, 4)
+                        
+                        conn2 = get_db()
+                        conn2.run(
+                            "UPDATE {} SET status=:s, outcome=:o, simulated_payout=:p WHERE id=:i".format(table),
+                            s=correct_status, o="WIN" if correct_won else "LOSS", p=profit, i=p["id"])
+                        conn2.close()
+                        corrected += 1
+                except:
+                    continue
+                time.sleep(0.3)
+        except Exception as e:
+            print("Correction error {}: {}".format(table, e))
+    
+    # Fix Polymarket table
+    try:
+        conn = get_db()
+        rows = conn.run("SELECT * FROM poly_trades WHERE status IN ('✅ Won', '❌ Lost')")
+        cols = [c['name'] for c in conn.columns]
+        items = [dict(zip(cols, r)) for r in rows]
+        conn.close()
+        
+        for p in items:
+            slug = p.get("slug")
+            condition_id = p.get("condition_id")
+            if not slug and not condition_id:
+                continue
+            checked += 1
+            try:
+                correct_won = None
+                lookups = []
+                if slug:
+                    lookups.append("{}/markets/slug/{}".format(POLY_GAMMA_API, slug))
+                if condition_id:
+                    lookups.append("{}/markets/{}".format(POLY_GAMMA_API, condition_id))
+                
+                for url in lookups:
+                    if correct_won is not None:
+                        break
+                    mr = req.get(url, timeout=10)
+                    if mr.status_code == 200:
+                        mdata = mr.json()
+                        op = mdata.get("outcomePrices") or mdata.get("outcome_prices")
+                        if op:
+                            if isinstance(op, str):
+                                import json as _json
+                                try:
+                                    op = _json.loads(op)
+                                except:
+                                    op = None
+                            if isinstance(op, list) and len(op) >= 2:
+                                try:
+                                    p0 = float(op[0])
+                                    p1 = float(op[1])
+                                    bet_side = p.get("bet_side") or "UP"
+                                    if p0 >= 0.95:
+                                        correct_won = (bet_side == "UP")
+                                    elif p1 >= 0.95:
+                                        correct_won = (bet_side == "DOWN")
+                                except:
+                                    pass
+                        if correct_won is None:
+                            wi = mdata.get("winningOutcomeIndex")
+                            is_closed = mdata.get("closed") or mdata.get("active") == False
+                            if is_closed and wi is not None:
+                                bet_side = p.get("bet_side") or "UP"
+                                correct_won = (bet_side == "UP") if wi == 0 else (bet_side == "DOWN")
+                
+                if correct_won is None:
+                    continue
+                
+                correct_status = "✅ Won" if correct_won else "❌ Lost"
+                if correct_status != p.get("status", ""):
+                    stake = float(p.get("simulated_stake") or 1.0)
+                    odds = float(p.get("bet_odds") or 50)
+                    share_price = odds / 100.0
+                    if p.get("bet_side") in ("DOWN", "NO"):
+                        share_price = 1.0 - share_price
+                    profit = round((stake / share_price) - stake, 4) if correct_won else round(-stake, 4)
+                    
+                    conn2 = get_db()
+                    conn2.run(
+                        "UPDATE poly_trades SET status=:s, outcome=:o, simulated_payout=:p WHERE id=:i",
+                        s=correct_status, o="WIN" if correct_won else "LOSS", p=profit, i=p["id"])
+                    conn2.close()
+                    corrected += 1
+            except:
+                continue
+            time.sleep(0.3)
+    except Exception as e:
+        print("Poly correction error: {}".format(e))
+    
+    print("Resolution correction complete: checked={} corrected={}".format(checked, corrected))
+    if corrected > 0:
+        send_telegram("📊 <b>Resolution correction</b>\nChecked: {}\nCorrected: {}".format(checked, corrected))
+
 # ═══════════════════════════════════════════════════════════
 # YAHOO FINANCE
 # ═══════════════════════════════════════════════════════════
@@ -11422,6 +11572,8 @@ try:
                       ("p22", _bot22_state), ("p32", _bot32_state)]:
         _save_bot_balance(_bn, _bs)
     print("Limitless LIVE: P2.3=$20, P3.3=$20 | P2.1/P3.1/P2.2/P3.2=DISABLED")
+    # One-time correction of historical paper trade resolutions
+    threading.Thread(target=_correct_historical_resolutions, daemon=True).start()
 except Exception as e:
     print("DB init error: {}".format(e))
 
