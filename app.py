@@ -2091,27 +2091,30 @@ def _place_gtc_order(slug, bet_side, token_id, stake, price_per_share, exchange_
     else:
         api_price = our_price
 
-    # For GTC: makerAmount = USDC to spend, takerAmount = contracts to receive
-    # Key constraint: price × contracts must be an exact integer (no decimals)
-    # price is in 3 decimals (e.g. 0.825), contracts are integers
-    # price(0.825) × contracts(N) must = integer
-    # So contracts must be divisible by 1000/gcd(price_int, 1000)
-    # Simplest: make contracts = makerAmount / price, then round to nearest valid tick
+    # For GTC: makerAmount = collateral, takerAmount = contracts
+    # API validates: makerAmount = api_price × contracts / 1000
+    # For YES: api_price = our_price, straightforward
+    # For NO: api_price = 1 - our_price, but we still want to buy stake/our_price contracts
 
-    price_int = int(our_price * 1000)  # e.g. 0.325 → 325
-    if price_int <= 0:
+    api_price_int = int(api_price * 1000)
+    our_price_int = int(our_price * 1000)
+    if api_price_int <= 0 or our_price_int <= 0:
         return None
 
-    maker_amount = int(stake * 1e6)  # USDC in 6 decimals
     import math
-    tick = 1000 // math.gcd(price_int, 1000)
-    raw_contracts = maker_amount / (price_int / 1000)
-    taker_amount = int(raw_contracts // tick) * tick
+    # Tick must satisfy both api_price and integer math
+    tick = 1000 // math.gcd(api_price_int, 1000)
+    
+    # How many contracts can we get for our stake at our_price?
+    target_contracts = int((stake * 1e6) / (our_price_int / 1000))
+    # Round down to valid tick
+    taker_amount = int(target_contracts // tick) * tick
 
     if taker_amount <= 0:
         taker_amount = tick
 
-    maker_amount = (price_int * taker_amount) // 1000
+    # makerAmount = what the API expects = api_price × contracts
+    maker_amount = (api_price_int * taker_amount) // 1000
 
     salt = int(time.time() * 1000) * 1000 + random.randint(0, 999)
     ZERO_ADDR = "0x0000000000000000000000000000000000000000"
