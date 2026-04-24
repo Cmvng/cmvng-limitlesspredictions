@@ -7149,7 +7149,7 @@ def resolve_paper_trades():
                 if now < expiry + timedelta(minutes=2):
                     continue
 
-                # Try to get resolution from Limitless API first
+                # Try to get resolution from Limitless API
                 slug = p.get("slug")
                 won = None
                 if slug:
@@ -7165,22 +7165,53 @@ def resolve_paper_trades():
                                     won = market_resolved_yes
                                 else:
                                     won = not market_resolved_yes
+                            else:
+                                # Check prices — if resolved, one price will be ~1.0 and other ~0.0
+                                prices = mdata.get("prices") or []
+                                if isinstance(prices, list) and len(prices) >= 2:
+                                    try:
+                                        p0 = float(prices[0])
+                                        p1 = float(prices[1])
+                                        if p0 >= 0.95:
+                                            bet_side = p.get("bet_side") or "YES"
+                                            won = (bet_side == "YES")
+                                        elif p1 >= 0.95:
+                                            bet_side = p.get("bet_side") or "YES"
+                                            won = (bet_side == "NO")
+                                    except:
+                                        pass
+                                # Check status field
+                                if won is None:
+                                    status_val = mdata.get("status") or ""
+                                    if status_val.upper() in ("RESOLVED", "CLOSED"):
+                                        # Market resolved but no clear winner indicator
+                                        # Check expired flag + current prices
+                                        expired = mdata.get("expired")
+                                        if expired:
+                                            pass  # Still no indicator, wait for retry
                     except:
                         pass
 
-                # Fallback: use current price if API didn't resolve
+                # If API didn't resolve, wait and retry — don't guess with current price
                 if won is None:
-                    price = get_price(p["asset"])
-                    if price is None:
-                        continue
-                    baseline = float(p["baseline"])
-                    direction = p.get("direction") or "above"
-                    market_resolved_true = (price > baseline) if direction == "above" else (price < baseline)
-                    bet_side = p.get("bet_side") or "YES"
-                    if bet_side == "YES":
-                        won = market_resolved_true
+                    if now > expiry + timedelta(hours=1):
+                        # Force resolve after 1 hour using current price as last resort
+                        price = get_price(p["asset"])
+                        if price is not None:
+                            baseline = float(p["baseline"])
+                            direction = p.get("direction") or "above"
+                            market_resolved_true = (price > baseline) if direction == "above" else (price < baseline)
+                            bet_side = p.get("bet_side") or "YES"
+                            if bet_side == "YES":
+                                won = market_resolved_true
+                            else:
+                                won = not market_resolved_true
+                            print("Limitless force-resolved (1h): {} {} {} price={} baseline={}".format(
+                                p.get("table_name", ""), p["asset"], bet_side, price, baseline))
+                        else:
+                            continue
                     else:
-                        won = not market_resolved_true
+                        continue  # Wait for API to update
 
                 outcome = "WIN" if won else "LOSS"
                 status = "✅ Won" if won else "❌ Lost"
