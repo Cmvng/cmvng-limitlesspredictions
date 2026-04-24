@@ -945,15 +945,17 @@ def init_db():
 def send_telegram(message):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         return
-    try:
-        import requests
-        requests.post(
-            "https://api.telegram.org/bot{}/sendMessage".format(TELEGRAM_TOKEN),
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"},
-            timeout=10
-        )
-    except Exception as e:
-        print("Telegram error: {}".format(e))
+    def _send():
+        try:
+            import requests
+            requests.post(
+                "https://api.telegram.org/bot{}/sendMessage".format(TELEGRAM_TOKEN),
+                json={"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"},
+                timeout=10
+            )
+        except Exception as e:
+            print("Telegram error: {}".format(e))
+    threading.Thread(target=_send, daemon=True).start()
 
 # ═══════════════════════════════════════════════════════════
 # YAHOO FINANCE
@@ -6338,6 +6340,8 @@ def run_paper34_scan():
                                         _bot23_state["trades_today"] += 1
                                         print("P2.3 TRADE: {} {} ${:.2f} on {} | bal=${:.2f}".format(
                                             scored23["bet_side"], asset, real_stake23, parsed["title"][:30], _bot23_state["balance"]))
+                                        send_telegram("🟢 <b>P2.3 TRADE</b>\n{} {} ${:.2f}\n{}\nBal: ${:.2f}".format(
+                                            scored23["bet_side"], asset, real_stake23, parsed["title"][:40], _bot23_state["balance"]))
                                 except Exception as te:
                                     print("P2.3 trade error: {}".format(te))
 
@@ -6387,6 +6391,8 @@ def run_paper34_scan():
                                         _bot33_state["trades_today"] += 1
                                         print("P3.3 TRADE: {} {} ${:.2f} on {} | bal=${:.2f}".format(
                                             scored33["bet_side"], asset, real_stake33, parsed["title"][:30], _bot33_state["balance"]))
+                                        send_telegram("🟢 <b>P3.3 TRADE</b>\n{} {} ${:.2f}\n{}\nBal: ${:.2f}".format(
+                                            scored33["bet_side"], asset, real_stake33, parsed["title"][:40], _bot33_state["balance"]))
                                 except Exception as te:
                                     print("P3.3 trade error: {}".format(te))
 
