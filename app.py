@@ -93,26 +93,9 @@ _bot3_state = {
 }
 
 
-# Paper 2.1: Bot 2 + BTC Tiebreaker + 15M + 4H Pullback (LIVE trading)
+# Paper 2.1: Bot 2 + BTC Tiebreaker + 15M + 4H Pullback (paper only)
 _bot21_state = {
-    "enabled": True,
-    "balance": 20.0,
-    "peak_balance": 20.0,
-    "daily_loss": 0.0,
-    "daily_profit": 0.0,
-    "trades_today": 0,
-    "last_reset": None,
-    "stake_pct": 0.025,
-    "min_stake": 1.0,
-    "max_loss_pct": 0.60,
-    "starting_balance": 20.0,
-    "floor_balance": 5.0,
-    "compound_threshold": 9999.0,  # Never compound — fixed $1 stakes
-}
-
-# Paper 3.1: Paper 3 + BTC Tiebreaker + Dual Timeframe (LIVE trading)
-_bot31_state = {
-    "enabled": True,
+    "enabled": False,
     "balance": 20.0,
     "peak_balance": 20.0,
     "daily_loss": 0.0,
@@ -127,9 +110,26 @@ _bot31_state = {
     "compound_threshold": 9999.0,
 }
 
-# Paper 2.2: Bot 2.1 strategy, 15M ONLY (LIVE trading)
+# Paper 3.1: Paper 3 + BTC Tiebreaker + Dual Timeframe (paper only)
+_bot31_state = {
+    "enabled": False,
+    "balance": 20.0,
+    "peak_balance": 20.0,
+    "daily_loss": 0.0,
+    "daily_profit": 0.0,
+    "trades_today": 0,
+    "last_reset": None,
+    "stake_pct": 0.025,
+    "min_stake": 1.0,
+    "max_loss_pct": 0.60,
+    "starting_balance": 20.0,
+    "floor_balance": 5.0,
+    "compound_threshold": 9999.0,
+}
+
+# Paper 2.2: Bot 2.1 strategy, 15M ONLY (paper only)
 _bot22_state = {
-    "enabled": True,
+    "enabled": False,
     "balance": 20.0,
     "peak_balance": 20.0,
     "daily_loss": 0.0,
@@ -141,9 +141,9 @@ _bot22_state = {
     "floor_balance": 5.0,
 }
 
-# Paper 3.2: Bot 3.1 strategy, 15M ONLY (LIVE trading)
+# Paper 3.2: Bot 3.1 strategy, 15M ONLY (paper only)
 _bot32_state = {
-    "enabled": True,
+    "enabled": False,
     "balance": 20.0,
     "peak_balance": 20.0,
     "daily_loss": 0.0,
@@ -153,6 +153,30 @@ _bot32_state = {
     "min_stake": 1.0,
     "starting_balance": 20.0,
     "floor_balance": 5.0,
+}
+
+# Paper 2.3: P2.1 + Distance (LIVE trading on Limitless)
+_bot23_state = {
+    "enabled": True,
+    "balance": 20.0,
+    "peak_balance": 20.0,
+    "starting_balance": 20.0,
+    "floor_balance": 2.5,
+    "trades_today": 0,
+    "min_stake": 1.0,
+    "compound_threshold": 9999.0,
+}
+
+# Paper 3.3: P3.1 + Distance (LIVE trading on Limitless)
+_bot33_state = {
+    "enabled": True,
+    "balance": 20.0,
+    "peak_balance": 20.0,
+    "starting_balance": 20.0,
+    "floor_balance": 2.5,
+    "trades_today": 0,
+    "min_stake": 1.0,
+    "compound_threshold": 9999.0,
 }
 
 FAVOURITE_HOURLY = ["ADA", "BNB", "DOGE"]
@@ -169,6 +193,15 @@ _poly_live_p23 = {
 
 _poly_live_p33 = {
     "enabled": True,
+    "balance": 35.0,
+    "peak_balance": 35.0,
+    "starting_balance": 35.0,
+    "floor_balance": 2.5,
+    "trades_today": 0,
+}
+
+_poly_live_p21 = {
+    "enabled": False,
     "balance": 35.0,
     "peak_balance": 35.0,
     "starting_balance": 35.0,
@@ -6225,6 +6258,26 @@ def run_paper34_scan():
                         except Exception as e:
                             print("Paper23 save error: {}".format(e))
 
+                        # Place REAL trade via Paper 2.3 bot
+                        floor23 = _bot23_state.get("floor_balance", 0)
+                        if _bot23_state["enabled"] and _bot23_state["balance"] > floor23 and not _is_volatile_window():
+                            real_stake23 = _calc_autoscale_stake(_bot23_state)
+                            if real_stake23 <= 0:
+                                _bot23_state["enabled"] = False
+                                send_telegram("⚠️ <b>Paper 2.3 stopped — floor reached</b>\nBalance: ${:.2f}".format(_bot23_state["balance"]))
+                            elif real_stake23 <= _bot23_state["balance"]:
+                                try:
+                                    bal_after23 = round(_bot23_state["balance"] - real_stake23, 2)
+                                    success = execute_trade(parsed, scored23, None, override_stake=real_stake23,
+                                                           bot_name="P2.3", bot_balance_after=bal_after23)
+                                    if success:
+                                        _bot23_state["balance"] = bal_after23
+                                        _bot23_state["trades_today"] += 1
+                                        print("P2.3 TRADE: {} {} ${:.2f} on {} | bal=${:.2f}".format(
+                                            scored23["bet_side"], asset, real_stake23, parsed["title"][:30], _bot23_state["balance"]))
+                                except Exception as te:
+                                    print("P2.3 trade error: {}".format(te))
+
                 # Paper 3.3: P3.1 + Distance Math (mixed mode, 15M only)
                 if parsed["market_id"] not in p33_ids:
                     scored33 = _score_paper33_trade(parsed, price, indicators=ind, ind_macro=ind_macro, expiry_minute=expiry_minute, expiry_hour=expiry_hour)
@@ -6253,6 +6306,26 @@ def run_paper34_scan():
                             p33_count += 1
                         except Exception as e:
                             print("Paper33 save error: {}".format(e))
+
+                        # Place REAL trade via Paper 3.3 bot
+                        floor33 = _bot33_state.get("floor_balance", 0)
+                        if _bot33_state["enabled"] and _bot33_state["balance"] > floor33 and not _is_volatile_window():
+                            real_stake33 = _calc_autoscale_stake(_bot33_state)
+                            if real_stake33 <= 0:
+                                _bot33_state["enabled"] = False
+                                send_telegram("⚠️ <b>Paper 3.3 stopped — floor reached</b>\nBalance: ${:.2f}".format(_bot33_state["balance"]))
+                            elif real_stake33 <= _bot33_state["balance"]:
+                                try:
+                                    bal_after33 = round(_bot33_state["balance"] - real_stake33, 2)
+                                    success = execute_trade(parsed, scored33, None, override_stake=real_stake33,
+                                                           bot_name="P3.3", bot_balance_after=bal_after33)
+                                    if success:
+                                        _bot33_state["balance"] = bal_after33
+                                        _bot33_state["trades_today"] += 1
+                                        print("P3.3 TRADE: {} {} ${:.2f} on {} | bal=${:.2f}".format(
+                                            scored33["bet_side"], asset, real_stake33, parsed["title"][:30], _bot33_state["balance"]))
+                                except Exception as te:
+                                    print("P3.3 trade error: {}".format(te))
 
                 # Paper 2.4: P2.1 + Distance + 15M Candle Pattern (1H ONLY)
                 if parsed["market_id"] not in p24_ids:
@@ -6595,6 +6668,38 @@ def _resolve_paper_table(table_name):
                             send_telegram("⚠️ <b>Paper 3.2 stopped — floor reached</b>\nBalance: ${:.2f}".format(_bot32_state["balance"]))
                         print("P3.2 #{} {}: stake=${:.2f} payout=${:.2f} bal=${:.2f}".format(
                             p["id"], "WIN" if won else "LOSS", stake, payout, _bot32_state["balance"]))
+
+                # Update Paper 2.3 balance
+                if table_name == "paper23_trades":
+                    fired = p.get("fired_at") or ""
+                    is_live_trade = fired >= "2026-04-24T05:00"
+                    if is_live_trade:
+                        if won:
+                            _bot23_state["balance"] = round(_bot23_state["balance"] + payout, 2)
+                        else:
+                            pass  # stake already deducted at trade time
+                        floor23 = _bot23_state.get("floor_balance", 0)
+                        if _bot23_state["balance"] <= floor23:
+                            _bot23_state["enabled"] = False
+                            send_telegram("⚠️ <b>Paper 2.3 stopped — floor reached</b>\nBalance: ${:.2f}".format(_bot23_state["balance"]))
+                        print("P2.3 #{} {}: stake=${:.2f} payout=${:.2f} bal=${:.2f}".format(
+                            p["id"], "WIN" if won else "LOSS", stake, payout, _bot23_state["balance"]))
+
+                # Update Paper 3.3 balance
+                if table_name == "paper33_trades":
+                    fired = p.get("fired_at") or ""
+                    is_live_trade = fired >= "2026-04-24T05:00"
+                    if is_live_trade:
+                        if won:
+                            _bot33_state["balance"] = round(_bot33_state["balance"] + payout, 2)
+                        else:
+                            pass  # stake already deducted at trade time
+                        floor33 = _bot33_state.get("floor_balance", 0)
+                        if _bot33_state["balance"] <= floor33:
+                            _bot33_state["enabled"] = False
+                            send_telegram("⚠️ <b>Paper 3.3 stopped — floor reached</b>\nBalance: ${:.2f}".format(_bot33_state["balance"]))
+                        print("P3.3 #{} {}: stake=${:.2f} payout=${:.2f} bal=${:.2f}".format(
+                            p["id"], "WIN" if won else "LOSS", stake, payout, _bot33_state["balance"]))
 
                 # SKIP duplicate Bot 3 balance update below
                 if False and table_name == "paper3_trades":
@@ -9152,6 +9257,14 @@ def poly_live_status():
             "stake": _calc_poly_autoscale_stake(_poly_live_p33),
             "trades_today": _poly_live_p33["trades_today"],
         },
+        "p21": {
+            "enabled": _poly_live_p21["enabled"],
+            "balance": _poly_live_p21["balance"],
+            "peak": _poly_live_p21["peak_balance"],
+            "floor": _poly_live_p21["floor_balance"],
+            "stake": _calc_poly_autoscale_stake(_poly_live_p21),
+            "trades_today": _poly_live_p21["trades_today"],
+        },
         "p31": {
             "enabled": _poly_live_p31["enabled"],
             "balance": _poly_live_p31["balance"],
@@ -9165,7 +9278,7 @@ def poly_live_status():
 @app.route("/poly/live/set", methods=["GET"])
 def poly_live_set():
     bot = request.args.get("bot", "p23")
-    st = _poly_live_p23 if bot == "p23" else _poly_live_p33 if bot == "p33" else _poly_live_p31
+    st = _poly_live_p23 if bot == "p23" else _poly_live_p33 if bot == "p33" else _poly_live_p21 if bot == "p21" else _poly_live_p31
     if request.args.get("balance"):
         st["balance"] = float(request.args["balance"])
         st["peak_balance"] = float(request.args["balance"])
@@ -11858,7 +11971,7 @@ def run_poly_scan():
         conn.close()
 
         poly_counts = {"btc5m": 0, "all5m": 0, "all15m": 0, "hourly24": 0}
-        strategies = ["p21", "p23", "p31", "p33", "p24", "p34", "p25", "p35", "p26", "p36"]
+        strategies = ["p21", "p23", "p31", "p33", "p24", "p34", "p25", "p35", "p26", "p36", "bot2"]
         # BUG 3 FIX: Batch inserts with single connection
         inserts = []
 
@@ -11931,6 +12044,11 @@ def run_poly_scan():
                         continue
                     if section == "hourly24" and strat in ("p26", "p36"):
                         continue
+                    # bot2: 15M only (all15m section)
+                    if strat == "bot2" and section != "all15m":
+                        continue
+                    if section == "hourly24" and strat == "bot2":
+                        continue
                     
                     key = "{}_{}_{}" .format(section, strat, parsed["market_id"])
                     if key in existing_keys:
@@ -11988,12 +12106,21 @@ def run_poly_scan():
                                                           ind_macro=ind_macro,
                                                           expiry_minute=expiry_minute,
                                                           expiry_hour=expiry_hour)
+                        elif strat == "bot2":
+                            scored = _score_paper_trade(parsed, price)
                     except Exception as e:
                         print("Poly score error {}/{}: {}".format(asset, strat, e))
                         continue
 
                     if not scored:
                         continue
+
+                    # For bot2 strategy, map its fields to standard format
+                    if strat == "bot2":
+                        scored["confidence"] = "HIGH" if scored.get("signals_agree", 0) >= 3 else "MEDIUM"
+                        scored["indicators"] = "TV={} | SMA={} | BTC={}".format(
+                            scored.get("tv_dir", "—"), scored.get("sma_dir", "—"), scored.get("btc_dir", "—"))
+                        scored["score"] = scored.get("signals_agree", 0)
 
                     bet_side = scored["bet_side"]
                     poly_side = "UP" if bet_side == "YES" else "DOWN"
@@ -12103,7 +12230,45 @@ def run_poly_scan():
                                     print("{} SKIP: no token_id for {} (clob_toks={}, cid={})".format(
                                         bot_label, asset, len(clob_toks) if clob_toks else 0, cid[:20] if cid else "none"))
 
-        # BUG 3 FIX: Single connection for all inserts
+                    # ─── POLYMARKET LIVE TRADING P2.1 (Bot 2) ───
+                    # P2.1 on 15M markets ONLY — 78% win rate on Limitless 15M
+                    if strat == "p21" and tf == "15M":
+                        if _poly_has_creds() and _poly_live_p21["enabled"] and not _is_volatile_window():
+                            poly_stake = _calc_poly_autoscale_stake(_poly_live_p21)
+                            if poly_stake > 0:
+                                live_state = _poly_live_p21
+                                bot_label = "POLY-P2.1"
+                                clob_toks = parsed.get("clob_tokens", [])
+                                cid = parsed.get("condition_id", "")
+                                token_id = None
+
+                                if clob_toks and len(clob_toks) >= 2:
+                                    token_id = clob_toks[0] if poly_side == "UP" else clob_toks[1]
+                                elif cid:
+                                    token_id = _get_poly_token_id(cid, poly_side)
+
+                                if token_id:
+                                    try:
+                                        print("{} ATTEMPTING: {} {} ${:.2f} @{:.2f} token={}...".format(
+                                            bot_label, poly_side, asset, poly_stake, share_price, str(token_id)[:20]))
+                                        success = _execute_poly_trade(
+                                            cid, token_id, poly_side, poly_stake, share_price)
+                                        if success:
+                                            live_state["balance"] = round(live_state["balance"] - poly_stake, 2)
+                                            live_state["trades_today"] += 1
+                                            print("{} TRADE: {} {} ${:.2f} @{:.0f}% on {} | bal=${:.2f}".format(
+                                                bot_label, poly_side, asset, poly_stake,
+                                                effective_odds, parsed["title"][:30], live_state["balance"]))
+                                            send_telegram("🔵 <b>{} TRADE</b>\n{} {} ${:.2f} @{:.0f}%\n{}\nBal: ${:.2f}".format(
+                                                bot_label, poly_side, asset, poly_stake,
+                                                effective_odds, parsed["title"][:40], live_state["balance"]))
+                                        else:
+                                            print("{} ORDER FAILED: {} {} ${:.2f}".format(bot_label, poly_side, asset, poly_stake))
+                                    except Exception as pe:
+                                        print("{} trade error: {}".format(bot_label, pe))
+                                else:
+                                    print("{} SKIP: no token_id for {} (clob_toks={}, cid={})".format(
+                                        bot_label, asset, len(clob_toks) if clob_toks else 0, cid[:20] if cid else "none"))
         if inserts:
             try:
                 conn_batch = get_db()
@@ -12273,6 +12438,24 @@ def _resolve_poly_trades():
                     elif not live_st["enabled"] and live_st["balance"] > live_st["floor_balance"]:
                         live_st["enabled"] = True
                         print("POLY-P3.3 re-enabled: bal=${:.2f}".format(live_st["balance"]))
+
+                # Update LIVE bot balance for P2.1 on 15M
+                if mt in ("5M", "15M") and strat == "p21" and _poly_live_p21.get("enabled"):
+                    live_st = _poly_live_p21
+                    poly_trade_stake = _calc_poly_autoscale_stake(live_st) or 2.50
+                    if won:
+                        poly_payout = round(poly_trade_stake / (float(p.get("bet_odds") or 50) / 100.0), 2)
+                        live_st["balance"] = round(live_st["balance"] + (poly_payout - poly_trade_stake), 2)
+                    else:
+                        live_st["balance"] = round(live_st["balance"] - poly_trade_stake, 2)
+                    if live_st["balance"] > live_st.get("peak_balance", 0):
+                        live_st["peak_balance"] = live_st["balance"]
+                    if live_st["balance"] <= live_st["floor_balance"]:
+                        live_st["enabled"] = False
+                        print("POLY-P2.1 STOPPED: bal=${:.2f}".format(live_st["balance"]))
+                    elif not live_st["enabled"] and live_st["balance"] > live_st["floor_balance"]:
+                        live_st["enabled"] = True
+                        print("POLY-P2.1 re-enabled: bal=${:.2f}".format(live_st["balance"]))
 
             except Exception as e:
                 continue
