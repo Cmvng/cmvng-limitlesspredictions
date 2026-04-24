@@ -4439,18 +4439,37 @@ def _score_paper23_trade(p, price, indicators=None, ind_macro=None, expiry_minut
     baseline = p.get("baseline", 0)
 
     # Calculate distance probability
-    prob, dist_label = _calc_dist_score(price, baseline, sigma, momentum)
+    # For Polymarket Up/Down markets, baseline ≈ current price (Chainlink PTB)
+    # Use actual time remaining from market data for accurate probability
+    is_poly_updown = "up or down" in p.get("title", "").lower()
+    if is_poly_updown and p.get("mins_left"):
+        # Polymarket: use actual mins left as fraction of window
+        # 15M window: 10 mins left = 0.67, 5 mins left = 0.33
+        tf_mins = 15.0  # 15M market
+        time_rem = max(0.05, p["mins_left"] / tf_mins)
+    else:
+        time_rem = 0.67  # Limitless default
+    
+    prob, dist_label = _calc_dist_score(price, baseline, sigma, momentum, time_rem)
 
     bet_side = scored["bet_side"]
 
     # FULL CONFIDENCE: DIST must agree with bet direction
-    # YES bet needs DIST=BUY or STRONG_BUY (prob > 53%)
-    # NO bet needs DIST=SELL or STRONG_SELL (prob < 47%)
-    # NEUTRAL (47-53%) = true coin flip → skip
-    if bet_side == "YES" and dist_label in ("SELL", "STRONG_SELL", "NEUTRAL"):
-        return None  # distance doesn't confirm YES
-    if bet_side == "NO" and dist_label in ("BUY", "STRONG_BUY", "NEUTRAL"):
-        return None  # distance doesn't confirm NO
+    # On Polymarket, baselines are tight so we accept NEUTRAL as non-opposing
+    # (indicators already confirmed direction — NEUTRAL just means distance is close)
+    if is_poly_updown:
+        # Poly mode: only reject if DIST actively OPPOSES the bet
+        # NEUTRAL = distance is close, trust indicators → allow trade
+        if bet_side == "YES" and dist_label in ("SELL", "STRONG_SELL"):
+            return None  # distance actively opposes YES
+        if bet_side == "NO" and dist_label in ("BUY", "STRONG_BUY"):
+            return None  # distance actively opposes NO
+    else:
+        # Limitless mode: strict — NEUTRAL also rejected
+        if bet_side == "YES" and dist_label in ("SELL", "STRONG_SELL", "NEUTRAL"):
+            return None  # distance doesn't confirm YES
+        if bet_side == "NO" and dist_label in ("BUY", "STRONG_BUY", "NEUTRAL"):
+            return None  # distance doesn't confirm NO
 
     # Distance confirms — upgrade confidence
     if dist_label in ("STRONG_BUY", "STRONG_SELL"):
