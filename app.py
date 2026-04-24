@@ -3544,50 +3544,35 @@ def _fast_trade_scan():
                         bet_side = scored23["bet_side"]
                         print("DUAL SIGNAL: {} {} — P2.3@58% P3.3@52%".format(bet_side, asset))
                         
-                        # P2.3 aggressive entry at 58%
+                        # P2.3 aggressive entry at 58% — direct GTC, no execute_trade
                         floor23 = _bot23_state.get("floor_balance", 0)
                         if _bot23_state["enabled"] and _bot23_state["balance"] > floor23:
                             real_stake23 = _calc_autoscale_stake(_bot23_state)
                             if real_stake23 > 0 and real_stake23 <= _bot23_state["balance"]:
-                                try:
-                                    # Override the score odds to force 58% entry
-                                    scored23_copy = dict(scored23)
-                                    scored23_copy["_fixed_entry"] = 0.58
-                                    bal_after23 = round(_bot23_state["balance"] - real_stake23, 2)
-                                    success = execute_trade(parsed, scored23_copy, None, override_stake=real_stake23,
-                                                           bot_name="P2.3", bot_balance_after=bal_after23)
-                                    if success:
-                                        _bot23_state["balance"] = bal_after23
-                                        _bot23_state["trades_today"] += 1
-                                        trades_placed += 1
-                                        print("DUAL P2.3 @58%: {} {} ${:.2f} | bal=${:.2f}".format(
-                                            bet_side, asset, real_stake23, _bot23_state["balance"]))
-                                        send_telegram("⚡ <b>DUAL P2.3 @58%</b>\n{} {} ${:.2f}\n{}\nBal: ${:.2f}".format(
-                                            bet_side, asset, real_stake23, parsed["title"][:40], _bot23_state["balance"]))
-                                except Exception as te:
-                                    print("Dual P2.3 error: {}".format(te))
+                                success = _snipe_place_gtc(market, parsed, bet_side, real_stake23, 0.58)
+                                if success:
+                                    _bot23_state["balance"] = round(_bot23_state["balance"] - real_stake23, 2)
+                                    _bot23_state["trades_today"] += 1
+                                    trades_placed += 1
+                                    print("DUAL P2.3 @58%: {} {} ${:.2f} | bal=${:.2f}".format(
+                                        bet_side, asset, real_stake23, _bot23_state["balance"]))
+                                    send_telegram("⚡ <b>DUAL P2.3 @58%</b>\n{} {} ${:.2f}\n{}\nBal: ${:.2f}".format(
+                                        bet_side, asset, real_stake23, parsed["title"][:40], _bot23_state["balance"]))
                         
-                        # P3.3 patient entry at 52%
+                        # P3.3 patient entry at 52% — direct GTC
                         floor33 = _bot33_state.get("floor_balance", 0)
                         if _bot33_state["enabled"] and _bot33_state["balance"] > floor33:
                             real_stake33 = _calc_autoscale_stake(_bot33_state)
                             if real_stake33 > 0 and real_stake33 <= _bot33_state["balance"]:
-                                try:
-                                    scored33_copy = dict(scored33)
-                                    scored33_copy["_fixed_entry"] = 0.52
-                                    bal_after33 = round(_bot33_state["balance"] - real_stake33, 2)
-                                    success = execute_trade(parsed, scored33_copy, None, override_stake=real_stake33,
-                                                           bot_name="P3.3", bot_balance_after=bal_after33)
-                                    if success:
-                                        _bot33_state["balance"] = bal_after33
-                                        _bot33_state["trades_today"] += 1
-                                        trades_placed += 1
-                                        print("DUAL P3.3 @52%: {} {} ${:.2f} | bal=${:.2f}".format(
-                                            bet_side, asset, real_stake33, _bot33_state["balance"]))
-                                        send_telegram("⚡ <b>DUAL P3.3 @52%</b>\n{} {} ${:.2f}\n{}\nBal: ${:.2f}".format(
-                                            bet_side, asset, real_stake33, parsed["title"][:40], _bot33_state["balance"]))
-                                except Exception as te:
-                                    print("Dual P3.3 error: {}".format(te))
+                                success = _snipe_place_gtc(market, parsed, bet_side, real_stake33, 0.52)
+                                if success:
+                                    _bot33_state["balance"] = round(_bot33_state["balance"] - real_stake33, 2)
+                                    _bot33_state["trades_today"] += 1
+                                    trades_placed += 1
+                                    print("DUAL P3.3 @52%: {} {} ${:.2f} | bal=${:.2f}".format(
+                                        bet_side, asset, real_stake33, _bot33_state["balance"]))
+                                    send_telegram("⚡ <b>DUAL P3.3 @52%</b>\n{} {} ${:.2f}\n{}\nBal: ${:.2f}".format(
+                                        bet_side, asset, real_stake33, parsed["title"][:40], _bot33_state["balance"]))
                     
                     elif scored23 and not scored33:
                         # Only P2.3 scored — single entry at 58%
@@ -3595,22 +3580,15 @@ def _fast_trade_scan():
                         if _bot23_state["enabled"] and _bot23_state["balance"] > floor23:
                             real_stake23 = _calc_autoscale_stake(_bot23_state)
                             if real_stake23 > 0 and real_stake23 <= _bot23_state["balance"]:
-                                try:
-                                    scored23_copy = dict(scored23)
-                                    scored23_copy["_fixed_entry"] = 0.58
-                                    bal_after23 = round(_bot23_state["balance"] - real_stake23, 2)
-                                    success = execute_trade(parsed, scored23_copy, None, override_stake=real_stake23,
-                                                           bot_name="P2.3", bot_balance_after=bal_after23)
-                                    if success:
-                                        _bot23_state["balance"] = bal_after23
-                                        _bot23_state["trades_today"] += 1
-                                        trades_placed += 1
-                                        print("SINGLE P2.3 @58%: {} {} ${:.2f} | bal=${:.2f}".format(
-                                            scored23["bet_side"], asset, real_stake23, _bot23_state["balance"]))
-                                        send_telegram("🟢 <b>P2.3 @58%</b>\n{} {} ${:.2f}\n{}\nBal: ${:.2f}".format(
-                                            scored23["bet_side"], asset, real_stake23, parsed["title"][:40], _bot23_state["balance"]))
-                                except Exception as te:
-                                    print("Single P2.3 error: {}".format(te))
+                                success = _snipe_place_gtc(market, parsed, scored23["bet_side"], real_stake23, 0.58)
+                                if success:
+                                    _bot23_state["balance"] = round(_bot23_state["balance"] - real_stake23, 2)
+                                    _bot23_state["trades_today"] += 1
+                                    trades_placed += 1
+                                    print("SINGLE P2.3 @58%: {} {} ${:.2f} | bal=${:.2f}".format(
+                                        scored23["bet_side"], asset, real_stake23, _bot23_state["balance"]))
+                                    send_telegram("🟢 <b>P2.3 @58%</b>\n{} {} ${:.2f}\n{}\nBal: ${:.2f}".format(
+                                        scored23["bet_side"], asset, real_stake23, parsed["title"][:40], _bot23_state["balance"]))
                     
                     elif scored33 and not scored23:
                         # Only P3.3 scored — single entry at 58%
@@ -3618,22 +3596,15 @@ def _fast_trade_scan():
                         if _bot33_state["enabled"] and _bot33_state["balance"] > floor33:
                             real_stake33 = _calc_autoscale_stake(_bot33_state)
                             if real_stake33 > 0 and real_stake33 <= _bot33_state["balance"]:
-                                try:
-                                    scored33_copy = dict(scored33)
-                                    scored33_copy["_fixed_entry"] = 0.58
-                                    bal_after33 = round(_bot33_state["balance"] - real_stake33, 2)
-                                    success = execute_trade(parsed, scored33_copy, None, override_stake=real_stake33,
-                                                           bot_name="P3.3", bot_balance_after=bal_after33)
-                                    if success:
-                                        _bot33_state["balance"] = bal_after33
-                                        _bot33_state["trades_today"] += 1
-                                        trades_placed += 1
-                                        print("SINGLE P3.3 @58%: {} {} ${:.2f} | bal=${:.2f}".format(
-                                            scored33["bet_side"], asset, real_stake33, _bot33_state["balance"]))
-                                        send_telegram("🟢 <b>P3.3 @58%</b>\n{} {} ${:.2f}\n{}\nBal: ${:.2f}".format(
-                                            scored33["bet_side"], asset, real_stake33, parsed["title"][:40], _bot33_state["balance"]))
-                                except Exception as te:
-                                    print("Single P3.3 error: {}".format(te))
+                                success = _snipe_place_gtc(market, parsed, scored33["bet_side"], real_stake33, 0.58)
+                                if success:
+                                    _bot33_state["balance"] = round(_bot33_state["balance"] - real_stake33, 2)
+                                    _bot33_state["trades_today"] += 1
+                                    trades_placed += 1
+                                    print("SINGLE P3.3 @58%: {} {} ${:.2f} | bal=${:.2f}".format(
+                                        scored33["bet_side"], asset, real_stake33, _bot33_state["balance"]))
+                                    send_telegram("🟢 <b>P3.3 @58%</b>\n{} {} ${:.2f}\n{}\nBal: ${:.2f}".format(
+                                        scored33["bet_side"], asset, real_stake33, parsed["title"][:40], _bot33_state["balance"]))
 
                 # ── P2.4 and P3.4: PAUSED for testing ──
                 # Paper tracking still runs in run_paper34_scan
@@ -3676,6 +3647,89 @@ def _precalc_indicators():
 
 # Track known market IDs to detect new markets via rapid polling
 _known_market_ids = set()
+
+# Cached trading credentials — fetched once, reused forever
+_cached_credentials = {
+    "exchange_addr": None,
+    "profile_id": None,
+    "fee_bps": None,
+    "ready": False,
+}
+
+def _warm_credentials():
+    """Fetch and cache exchange_addr, profile_id, fee_bps from any active market.
+    These are the same for all CLOB markets. Only needs to run once."""
+    import requests as req
+    if _cached_credentials["ready"]:
+        return True
+    try:
+        # Get profile
+        pid = _get_limitless_profile_id()
+        if pid:
+            _cached_credentials["profile_id"] = pid
+            _cached_credentials["fee_bps"] = _trading_state.get("fee_rate_bps", 300)
+        
+        # Get exchange_addr from any active market
+        r = req.get("{}/markets/active".format(LIMITLESS_API), timeout=10)
+        if r.status_code == 200:
+            markets = r.json().get("data", [])
+            for m in markets:
+                venue = m.get("venue", {})
+                if isinstance(venue, dict) and venue.get("exchange"):
+                    _cached_credentials["exchange_addr"] = venue["exchange"]
+                    break
+        
+        if _cached_credentials["exchange_addr"] and _cached_credentials["profile_id"]:
+            _cached_credentials["ready"] = True
+            print("Credentials cached: exchange={} profile={} fee={}bps".format(
+                _cached_credentials["exchange_addr"][:10],
+                _cached_credentials["profile_id"],
+                _cached_credentials["fee_bps"]))
+            return True
+    except Exception as e:
+        print("Credential cache error: {}".format(e))
+    return False
+
+def _snipe_place_gtc(market_data, parsed, bet_side, stake, fixed_price):
+    """Direct GTC placement — skips execute_trade entirely.
+    Uses cached credentials + token ID from market data.
+    Total time: ~200-500ms (signing + API post only)."""
+    
+    if not _cached_credentials["ready"]:
+        if not _warm_credentials():
+            return False
+    
+    slug = parsed.get("slug", "")
+    if not slug:
+        return False
+    
+    # Get token ID from market data (already fetched by rapid poll)
+    token_id = None
+    tokens = market_data.get("tokens", {})
+    if isinstance(tokens, dict):
+        if bet_side == "YES":
+            token_id = tokens.get("yes") or tokens.get("Yes") or tokens.get("YES")
+        else:
+            token_id = tokens.get("no") or tokens.get("No") or tokens.get("NO")
+    if not token_id:
+        position_ids = market_data.get("positionIds") or market_data.get("clobTokenIds") or []
+        if len(position_ids) >= 2:
+            token_id = position_ids[0] if bet_side == "YES" else position_ids[1]
+    if not token_id:
+        return False
+    
+    exchange_addr = _cached_credentials["exchange_addr"]
+    profile_id = _cached_credentials["profile_id"]
+    fee_bps = _cached_credentials["fee_bps"] or 300
+    
+    # Place GTC directly — no market fetch, no orderbook fetch
+    order_id = _place_gtc_order(slug, bet_side, token_id, stake, fixed_price,
+                                 exchange_addr, profile_id, fee_bps)
+    if order_id:
+        print("SNIPE GTC: {} {} @{:.0f}% on {} (id={})".format(
+            bet_side, parsed.get("asset", "?"), fixed_price * 100, slug[:30], order_id[:12]))
+        return True
+    return False
 
 def _rapid_poll_snipe():
     """Rapid-poll market sniper for 15M markets.
@@ -12394,6 +12448,8 @@ try:
     _bot24_state["enabled"] = False
     _bot34_state["enabled"] = False
     print("Limitless LIVE: P2.3=$20, P3.3=$20 (DUAL SIGNAL) | P2.4/P3.4=PAUSED | P2.1/P3.1/P2.2/P3.2=DISABLED")
+    # Warm trading credentials for sniper
+    threading.Thread(target=_warm_credentials, daemon=True).start()
     # One-time correction of historical paper trade resolutions
     threading.Thread(target=_correct_historical_resolutions, daemon=True).start()
 except Exception as e:
