@@ -2184,11 +2184,12 @@ def _execute_poly_trade_async(condition_id, token_id, side, stake, price,
         finally:
             _poly_active_trades.discard(trade_key)
     threading.Thread(target=_run, daemon=True).start()
-    """Place an order on Polymarket using dual approach:
-    1. GTC limit order at good price — sits on book for the whole window
-    2. FOK market attempts every 30s — grabs liquidity when it appears
-    First one to fill wins. Never pays more than 70 cents/share.
-    Returns True if filled."""
+
+
+def _execute_poly_trade(condition_id, token_id, side, stake, price):
+    """Two-step execution: FOK first, then GTC if FOK fails.
+    Only one order exists at any time — no double fill risk.
+    Never pays more than 70 cents/share. Returns True if filled."""
     try:
         client = _get_poly_client()
         if not client:
@@ -2205,14 +2206,36 @@ def _execute_poly_trade_async(condition_id, token_id, side, stake, price,
             print("Poly skip: signal price {:.2f} too extreme".format(price))
             return False
 
-        # GTC price: signal price + 2 cents (the good price that sits on book)
-        gtc_price = min(round(price + 0.02, 2), max_price)
+        # ── STEP 1: FOK at aggressive price — instant fill if liquidity exists ──
+        fok_price = min(round(price + 0.08, 2), max_price)
+        fok_shares = max(min_shares, round(stake / fok_price, 2))
+        fok_amount = round(fok_shares * fok_price, 2)
+
+        try:
+            mo = MarketOrderArgs(
+                token_id=str(token_id),
+                amount=fok_amount,
+                side=BUY,
+                price=fok_price,
+            )
+            signed_fok = client.create_market_order(mo)
+            fok_resp = client.post_order(signed_fok, OrderType.FOK)
+
+            if fok_resp:
+                fok_status = (fok_resp.get("status") or "").upper()
+                if fok_status in ("MATCHED", "FILLED"):
+                    print("Poly FOK FILLED: {} ${:.2f} @{:.2f}".format(side, stake, fok_price))
+                    return True
+                else:
+                    print("Poly FOK no fill — placing GTC to wait")
+        except Exception as fok_err:
+            print("Poly FOK error: {} — placing GTC to wait".format(fok_err))
+
+        # ── STEP 2: GTC at good price — sits on book for up to 12 minutes ──
+        gtc_price = min(round(price + 0.05, 2), max_price)
         gtc_shares = max(min_shares, round(stake / gtc_price, 2))
 
-        # FOK price: signal price + 8 cents (aggressive, crosses spread)
-        fok_price = min(round(price + 0.08, 2), max_price)
-
-        # Try to get actual best ask
+        # Use actual best ask if cheaper
         try:
             book = client.get_order_book(str(token_id))
             if book and hasattr(book, 'asks') and book.asks:
@@ -2223,7 +2246,6 @@ def _execute_poly_trade_async(condition_id, token_id, side, stake, price,
         except:
             pass
 
-        # ── Place GTC at good price — sits on book ──
         gtc_order_id = None
         try:
             order_args = OrderArgs(
@@ -2234,8 +2256,8 @@ def _execute_poly_trade_async(condition_id, token_id, side, stake, price,
             )
             signed_order = client.create_order(order_args)
             gtc_resp = client.post_order(signed_order, OrderType.GTC)
-            print("Poly GTC placed: price={:.2f} shares={} resp={}".format(
-                gtc_price, gtc_shares, str(gtc_resp)[:150]))
+            print("Poly GTC placed: {} @{:.2f} shares={} resp={}".format(
+                side, gtc_price, gtc_shares, str(gtc_resp)[:150]))
 
             if gtc_resp:
                 gtc_order_id = gtc_resp.get("orderID") or gtc_resp.get("order_id")
@@ -2245,78 +2267,44 @@ def _execute_poly_trade_async(condition_id, token_id, side, stake, price,
                     return True
         except Exception as gtc_err:
             print("Poly GTC error: {}".format(gtc_err))
+            return False
 
-        # ── Loop: check GTC + retry FOK every 30 seconds ──
-        # Run for up to 10 minutes (20 iterations × 30 sec)
-        # GTC stays on book the whole time catching dips
-        # FOK retries grab liquidity when it appears
-        max_attempts = 20  # 20 × 30s = 10 minutes max
-        for attempt in range(max_attempts):
-            time.sleep(30)
+        if not gtc_order_id:
+            print("Poly GTC: no order ID returned")
+            return False
 
-            # Check if GTC filled on its own (price dipped to our level)
-            if gtc_order_id:
-                try:
-                    info = client.get_order(gtc_order_id)
-                    if info:
-                        s = (info.get("status") or "").upper()
-                        if s in ("MATCHED", "FILLED"):
-                            print("Poly GTC FILLED (dip after {}s): {} ${:.2f} @{:.2f}".format(
-                                (attempt+1)*30, side, stake, gtc_price))
-                            return True
-                        elif s in ("CANCELED", "CANCELLED", "EXPIRED"):
-                            print("Poly GTC cancelled externally — stopping")
-                            gtc_order_id = None
-                            break
-                except:
-                    pass
-
-            # Try FOK at aggressive price
+        # ── Poll GTC until filled or time runs out ──
+        # Check every 15 seconds for up to 12 minutes (48 checks)
+        max_checks = 48
+        for i in range(max_checks):
+            time.sleep(15)
             try:
-                fok_shares = max(min_shares, round(stake / fok_price, 2))
-                fok_amount = round(fok_shares * fok_price, 2)
-                mo = MarketOrderArgs(
-                    token_id=str(token_id),
-                    amount=fok_amount,
-                    side=BUY,
-                    price=fok_price,
-                )
-                signed_fok = client.create_market_order(mo)
-                fok_resp = client.post_order(signed_fok, OrderType.FOK)
-
-                if fok_resp:
-                    fok_status = (fok_resp.get("status") or "").upper()
-                    if fok_status in ("MATCHED", "FILLED"):
-                        print("Poly FOK FILLED (attempt {} after {}s): {} ${:.2f} @{:.2f}".format(
-                            attempt+1, (attempt+1)*30, side, stake, fok_price))
-                        # Cancel the GTC since FOK filled
-                        if gtc_order_id:
-                            try:
-                                client.cancel(gtc_order_id)
-                            except:
-                                pass
-                        return True
-            except Exception as fok_err:
-                # FOK failed — that's fine, GTC is still sitting on book
-                if attempt == 0:
-                    print("Poly FOK retry #{}: no fill (GTC still on book @{:.2f})".format(attempt+1, gtc_price))
-
-        # ── Time's up — cancel GTC if still live ──
-        if gtc_order_id:
-            try:
-                # Check one last time before cancelling
                 info = client.get_order(gtc_order_id)
                 if info:
                     s = (info.get("status") or "").upper()
                     if s in ("MATCHED", "FILLED"):
-                        print("Poly GTC FILLED (final check): {} ${:.2f} @{:.2f}".format(side, stake, gtc_price))
+                        print("Poly GTC FILLED (after {}s): {} ${:.2f} @{:.2f}".format(
+                            (i+1)*15, side, stake, gtc_price))
                         return True
-                client.cancel(gtc_order_id)
-                print("Poly GTC cancelled after {}min — no fill".format(max_attempts * 30 // 60))
+                    elif s in ("CANCELED", "CANCELLED", "EXPIRED"):
+                        print("Poly GTC cancelled/expired after {}s".format((i+1)*15))
+                        return False
             except:
                 pass
 
-        print("Poly order EXPIRED: {} {} ${:.2f} — no liquidity".format(side, side, stake))
+        # ── Time's up — check final status and cancel ──
+        try:
+            info = client.get_order(gtc_order_id)
+            if info:
+                s = (info.get("status") or "").upper()
+                if s in ("MATCHED", "FILLED"):
+                    print("Poly GTC FILLED (final): {} ${:.2f} @{:.2f}".format(side, stake, gtc_price))
+                    return True
+            client.cancel(gtc_order_id)
+            print("Poly GTC cancelled after 12min — no fill")
+        except:
+            pass
+
         return False
 
     except Exception as e:
