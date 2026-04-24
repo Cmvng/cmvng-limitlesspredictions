@@ -2009,19 +2009,25 @@ def _get_best_prices_from_market(market_data, bet_side):
 
 def _get_best_prices(orderbook, bet_side):
     """Extract best bid and ask from orderbook for the given side (YES/NO).
+    Limitless orderbook is flat: {"bids": [...], "asks": [...], "adjustedMidpoint": ...}
+    These are YES token prices. For NO bets, invert: NO_price = 1 - YES_price.
     Returns (best_bid, best_ask, midpoint) or (None, None, None)."""
     if not orderbook:
         return None, None, None
 
     try:
-        # Limitless orderbook format: {"yes": {"bids": [...], "asks": [...]}, "no": {...}}
-        side_key = bet_side.lower()
-        side_book = orderbook.get(side_key, {})
+        # Limitless flat format: bids and asks at top level for YES token
+        bids = orderbook.get("bids", [])
+        asks = orderbook.get("asks", [])
+        
+        # Also check nested format (yes/no sub-objects) as fallback
+        if not bids and not asks:
+            side_key = bet_side.lower()
+            side_book = orderbook.get(side_key, {})
+            if side_book:
+                bids = side_book.get("bids", [])
+                asks = side_book.get("asks", [])
 
-        bids = side_book.get("bids", [])
-        asks = side_book.get("asks", [])
-
-        # Bids and asks are lists of [price, size] or {"price": x, "size": y}
         def parse_level(level):
             if isinstance(level, list) and len(level) >= 2:
                 return float(level[0]), float(level[1])
@@ -2029,23 +2035,31 @@ def _get_best_prices(orderbook, bet_side):
                 return float(level.get("price", 0)), float(level.get("size", 0))
             return 0, 0
 
-        best_bid = None
+        yes_best_bid = None
         if bids:
             prices = [parse_level(b)[0] for b in bids]
             prices = [p for p in prices if p > 0]
             if prices:
-                best_bid = max(prices)
+                yes_best_bid = max(prices)
 
-        best_ask = None
+        yes_best_ask = None
         if asks:
             prices = [parse_level(a)[0] for a in asks]
             prices = [p for p in prices if p > 0]
             if prices:
-                best_ask = min(prices)
+                yes_best_ask = min(prices)
+
+        # For NO bets, invert: NO_bid = 1 - YES_ask, NO_ask = 1 - YES_bid
+        if bet_side == "NO":
+            best_bid = round(1.0 - yes_best_ask, 4) if yes_best_ask else None
+            best_ask = round(1.0 - yes_best_bid, 4) if yes_best_bid else None
+        else:
+            best_bid = yes_best_bid
+            best_ask = yes_best_ask
 
         midpoint = None
         if best_bid and best_ask:
-            midpoint = (best_bid + best_ask) / 2
+            midpoint = round((best_bid + best_ask) / 2, 4)
 
         return best_bid, best_ask, midpoint
     except Exception as e:
@@ -2053,7 +2067,11 @@ def _get_best_prices(orderbook, bet_side):
         return None, None, None
 
 def _place_gtc_order(slug, bet_side, token_id, stake, price_per_share, exchange_addr, profile_id, fee_bps):
-    """Place a GTC limit order. Returns order_id on success, None on failure."""
+    """Place a GTC limit order. Returns order_id on success, None on failure.
+    price_per_share: the price for the SIDE being bet (YES or NO).
+    Limitless API always uses YES-side pricing internally.
+    For NO bets: API price = 1 - NO_price (convert to YES equivalent).
+    """
     import requests as req
     from web3 import Web3
     from eth_account import Account
@@ -2062,8 +2080,16 @@ def _place_gtc_order(slug, bet_side, token_id, stake, price_per_share, exchange_
     account = Account.from_key(LIMITLESS_PRIV_KEY)
     wallet_addr = account.address
 
-    # Round price to 3 decimal places (API requirement)
-    price_per_share = round(price_per_share, 3)
+    # The price we want to pay per share of our side
+    our_price = round(price_per_share, 3)
+    
+    # Limitless API price field: always in YES token terms
+    # For YES bets: api_price = our_price (we're buying YES at this price)
+    # For NO bets: api_price = 1 - our_price (the YES price equivalent)
+    if bet_side == "NO":
+        api_price = round(1.0 - our_price, 3)
+    else:
+        api_price = our_price
 
     # For GTC: makerAmount = USDC to spend, takerAmount = contracts to receive
     # Key constraint: price × contracts must be an exact integer (no decimals)
@@ -2072,25 +2098,19 @@ def _place_gtc_order(slug, bet_side, token_id, stake, price_per_share, exchange_
     # So contracts must be divisible by 1000/gcd(price_int, 1000)
     # Simplest: make contracts = makerAmount / price, then round to nearest valid tick
 
-    price_int = int(price_per_share * 1000)  # e.g. 0.825 → 825
+    price_int = int(our_price * 1000)  # e.g. 0.325 → 325
     if price_int <= 0:
         return None
 
-    # Calculate contracts such that price × contracts is exactly makerAmount
     maker_amount = int(stake * 1e6)  # USDC in 6 decimals
-    # contracts = makerAmount / price, but must satisfy: price * contracts = integer
-    # Since price has 3 decimals: price = P/1000, so P * contracts must be divisible by 1000
-    # contracts must be a multiple of 1000 / gcd(P, 1000)
     import math
     tick = 1000 // math.gcd(price_int, 1000)
     raw_contracts = maker_amount / (price_int / 1000)
-    taker_amount = int(raw_contracts // tick) * tick  # Round down to nearest valid tick
+    taker_amount = int(raw_contracts // tick) * tick
 
     if taker_amount <= 0:
-        taker_amount = tick  # Minimum 1 tick
+        taker_amount = tick
 
-    # Recalculate makerAmount using integer math to avoid floating point errors
-    # price_per_share = price_int / 1000, so maker = price_int * contracts / 1000
     maker_amount = (price_int * taker_amount) // 1000
 
     salt = int(time.time() * 1000) * 1000 + random.randint(0, 999)
@@ -2130,15 +2150,15 @@ def _place_gtc_order(slug, bet_side, token_id, stake, price_per_share, exchange_
             "side": 0,
             "signatureType": 0,
             "signature": "0x" + signature if not signature.startswith("0x") else signature,
-            "price": round(price_per_share, 3),
+            "price": api_price,
         },
         "orderType": "GTC",
         "marketSlug": slug,
         "ownerId": profile_id,
     }
 
-    print("GTC payload: price={:.4f} makerAmt={} takerAmt={}".format(
-        price_per_share, maker_amount, taker_amount))
+    print("GTC payload: side={} our_price={:.4f} api_price={:.4f} makerAmt={} takerAmt={}".format(
+        bet_side, our_price, api_price, maker_amount, taker_amount))
 
     order_body = json.dumps(order_payload)
     headers = _hmac_headers("POST", "/orders", order_body)
@@ -2151,8 +2171,8 @@ def _place_gtc_order(slug, bet_side, token_id, stake, price_per_share, exchange_
         if r.status_code in (200, 201):
             result = r.json() if r.text else {}
             order_id = result.get("id") or result.get("orderId") or result.get("order", {}).get("id")
-            print("GTC order placed: {} @ ${:.4f} on {} (id={})".format(
-                bet_side, price_per_share, slug[:30], order_id))
+            print("GTC order placed: {} @ ${:.4f} (api=${:.4f}) on {} (id={})".format(
+                bet_side, our_price, api_price, slug[:30], order_id))
             return order_id
         else:
             print("GTC order failed: {} - {}".format(r.status_code, r.text[:150]))
