@@ -40,6 +40,30 @@ _pair_sma_cache = {}  # {"ETH": {"trend": "BUY", "price": 2340, "sma10": 2330, "
 # Debug log for last scan
 _last_scan_log = {"time": None, "total": 0, "qualified": 0, "filtered": []}
 
+# Shared baseline cache — populated by Limitless scanner from market titles
+# Polymarket uses these as primary baseline source (same Chainlink oracle)
+_limitless_baselines = {}  # {"BTC_15M": (expiry_ts, baseline), ...}
+
+def _store_limitless_baseline(parsed):
+    """Store baseline from Limitless market title for cross-platform use."""
+    asset = parsed.get("asset", "")
+    mins_left = parsed.get("mins_left", 60)
+    baseline = parsed.get("baseline", 0)
+    expiry_dt = parsed.get("expiry_dt")
+    if not asset or not baseline or not expiry_dt:
+        return
+    if parsed.get("is_short") and mins_left <= 20:
+        tf = "15M"
+    elif parsed.get("is_short"):
+        tf = "1H"
+    else:
+        return
+    key = "{}_{}".format(asset, tf)
+    exp_ts = int(expiry_dt.timestamp())
+    existing = _limitless_baselines.get(key)
+    if not existing or exp_ts > existing[0]:
+        _limitless_baselines[key] = (exp_ts, baseline)
+
 # ═══════════════════════════════════════════════════════════
 # AUTO-TRADING STATE
 # ═══════════════════════════════════════════════════════════
@@ -5812,6 +5836,9 @@ def run_paper34_scan():
                 if not parsed:
                     continue
 
+                # Store baseline for Polymarket cross-reference
+                _store_limitless_baseline(parsed)
+
                 asset = parsed["asset"]
                 if asset not in price_cache:
                     price_cache[asset] = get_price(asset)
@@ -11360,15 +11387,16 @@ def _rtds_loop():
     
     def _store_ptb(asset, price, ts_sec):
         """Store Price to Beat at window boundaries.
-        Simple: just store the latest PTB per asset per timeframe."""
+        Captures the first Chainlink price within 60 seconds of window start.
+        First price is closest to the actual PTB used for resolution."""
         for tf_label, tf_sec in [("5M", 300), ("15M", 900), ("1H", 3600)]:
             window_start = (ts_sec // tf_sec) * tf_sec
             window_end = window_start + tf_sec
             key = "{}_{}".format(asset, tf_label)
             existing = _chainlink_ptb.get(key)
             
-            # Store if this is a new window boundary (within first 15 seconds)
-            if ts_sec - window_start <= 15:
+            # Store if within first 60 seconds of window AND this is a new window
+            if ts_sec - window_start <= 60:
                 if not existing or existing[0] != window_end:
                     _chainlink_ptb[key] = (window_end, price)
                     print("PTB {} {} = ${:,.2f}".format(asset, tf_label, price))
@@ -11925,15 +11953,18 @@ def _poly_fetch_markets():
 
 def _poly_get_baseline(parsed, price, indicators):
     """Get the Price to Beat from Chainlink RTDS cache.
-    Priority: 1. Exact PTB from window boundary
+    Priority: 1. Chainlink PTB captured at window boundary (within 60s)
               2. Latest Chainlink streaming price (close approximation)"""
     asset = parsed.get("asset", "")
     tf = parsed.get("timeframe", "")
     key = "{}_{}".format(asset, tf)
+    
+    # Chainlink PTB from window boundary
     entry = _chainlink_ptb.get(key)
     if entry:
         return entry[1]
-    # Fallback: latest Chainlink price (within a few dollars of real PTB)
+    
+    # Fallback: latest Chainlink streaming price
     chainlink = _chainlink_prices.get(asset)
     if chainlink:
         return chainlink
