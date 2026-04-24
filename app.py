@@ -2830,12 +2830,9 @@ def execute_trade(parsed_market, score, prediction_id, override_stake=None, bot_
                 ]
                 print("Using HOURLY entry strategy (4 phases, 15min total GTC window)")
             else:
-                # 15M markets: fast but still try GTC on empty book first
-                # Place cheap order, wait 30s for sellers, then escalate fast
-                phases = [
-                    ("CHEAP",    0.05, 6),  # 5c below, 30s wait (6 × 5s)
-                    ("NEAR",     0.02, 4),  # 2c below, 20s wait
-                ]
+                # 15M markets: FOK immediately, no GTC phases
+                # Market moves too fast — every second of waiting costs money
+                phases = []
             
             filled_via_gtc = False
             current_fill_price = None
@@ -3017,69 +3014,12 @@ def execute_trade(parsed_market, score, prediction_id, override_stake=None, bot_
                         filled = True
                         fill_price = displayed_price
             else:
-                # 15M markets: quick GTC attempt on empty book before FOK
-                print("Empty orderbook on 15M market — quick GTC attempt")
-                quick_phases = [
-                    ("CHEAP",  0.05, 6),   # 5c below, 30s wait
-                    ("NEAR",   0.02, 4),   # 2c below, 20s wait
-                ]
-                for phase_name, discount, check_count in quick_phases:
-                    if filled:
-                        break
-                    ref_price = displayed_price if displayed_price else 0.50
-                    phase_price = round(max(0.01, min(ref_price - discount, ceiling)), 3)
-                    if phase_price >= ceiling:
-                        continue
-                    print("Phase {}: GTC at ${:.3f} (ref={:.3f})".format(phase_name, phase_price, ref_price))
-                    order_id = _place_gtc_order(slug, bet_side, token_id, stake, phase_price,
-                                                 exchange_addr, profile_id, fee_bps)
-                    if not order_id:
-                        continue
-                    
-                    phase_filled = False
-                    for check_num in range(check_count):
-                        time.sleep(5)
-                        status = _check_order_filled(order_id)
-                        if status == "FILLED":
-                            phase_filled = True
-                            fill_price = phase_price
-                            print("GTC FILLED in phase {} at ${:.3f} ({}s)".format(
-                                phase_name, phase_price, (check_num + 1) * 5))
-                            break
-                        if status == "CANCELLED":
-                            order_id = None
-                            break
-                    
-                    if phase_filled:
-                        filled = True
-                        break
-                    
-                    if order_id:
-                        final_check = _check_order_filled(order_id)
-                        if final_check == "FILLED":
-                            filled = True
-                            fill_price = phase_price
-                            break
-                        cancel_result = _cancel_order(order_id)
-                        time.sleep(0.5)
-                        if cancel_result == "FILLED":
-                            filled = True
-                            fill_price = phase_price
-                            break
-                        elif cancel_result != True:
-                            recheck = _check_order_filled(order_id)
-                            if recheck == "FILLED":
-                                filled = True
-                                fill_price = phase_price
-                                break
-                            return False
-                
-                if not filled:
-                    print("15M GTC phases done — FOK at market price")
-                    success = _place_fok_order(slug, bet_side, token_id, stake, exchange_addr, profile_id, fee_bps)
-                    if success:
-                        filled = True
-                        fill_price = displayed_price
+                # 15M markets: FOK immediately, no GTC
+                print("15M market — FOK immediately")
+                success = _place_fok_order(slug, bet_side, token_id, stake, exchange_addr, profile_id, fee_bps)
+                if success:
+                    filled = True
+                    fill_price = displayed_price
 
         if filled:
             if override_stake is None:
