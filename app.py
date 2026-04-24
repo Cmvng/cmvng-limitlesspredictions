@@ -4529,41 +4529,18 @@ def _score_paper23_trade(p, price, indicators=None, ind_macro=None, expiry_minut
     baseline = p.get("baseline", 0)
 
     # Calculate distance probability
-    # For Polymarket Up/Down markets, baseline = Chainlink PTB set at window open.
-    # Problem: yfinance momentum uses candle-to-candle changes which average near
-    # zero during chop even when price has moved significantly from baseline.
-    # Fix: on Polymarket, use actual displacement from PTB as the momentum signal.
-    is_poly_updown = "up or down" in p.get("title", "").lower()
-    if is_poly_updown and p.get("mins_left"):
-        tf_mins = 15.0
-        time_rem = max(0.05, p["mins_left"] / tf_mins)
-        # Use displacement from PTB as momentum — this IS the directional signal
-        # If price moved +$50 from baseline, that's the real momentum, not candle chop
-        displacement = price - baseline
-        # Blend: 70% displacement (the actual move from PTB) + 30% candle momentum (trend direction)
-        poly_momentum = displacement * 0.7 + (momentum or 0) * 0.3
-        prob, dist_label = _calc_dist_score(price, baseline, sigma, poly_momentum, time_rem)
-    else:
-        time_rem = 0.67
-        prob, dist_label = _calc_dist_score(price, baseline, sigma, momentum, time_rem)
+    prob, dist_label = _calc_dist_score(price, baseline, sigma, momentum)
 
     bet_side = scored["bet_side"]
 
     # FULL CONFIDENCE: DIST must agree with bet direction
-    # On Polymarket, NEUTRAL means price is still very close to PTB — no strong signal
-    # either way. Accept it as non-opposing since P2.1 indicators already confirmed.
-    if is_poly_updown:
-        # Poly mode: only reject if DIST actively OPPOSES the bet
-        if bet_side == "YES" and dist_label in ("SELL", "STRONG_SELL"):
-            return None  # distance actively opposes YES
-        if bet_side == "NO" and dist_label in ("BUY", "STRONG_BUY"):
-            return None  # distance actively opposes NO
-    else:
-        # Limitless mode: strict — NEUTRAL also rejected
-        if bet_side == "YES" and dist_label in ("SELL", "STRONG_SELL", "NEUTRAL"):
-            return None  # distance doesn't confirm YES
-        if bet_side == "NO" and dist_label in ("BUY", "STRONG_BUY", "NEUTRAL"):
-            return None  # distance doesn't confirm NO
+    # YES bet needs DIST=BUY or STRONG_BUY (prob > 53%)
+    # NO bet needs DIST=SELL or STRONG_SELL (prob < 47%)
+    # NEUTRAL (47-53%) = true coin flip → skip
+    if bet_side == "YES" and dist_label in ("SELL", "STRONG_SELL", "NEUTRAL"):
+        return None  # distance doesn't confirm YES
+    if bet_side == "NO" and dist_label in ("BUY", "STRONG_BUY", "NEUTRAL"):
+        return None  # distance doesn't confirm NO
 
     # Distance confirms — upgrade confidence
     if dist_label in ("STRONG_BUY", "STRONG_SELL"):
@@ -4607,18 +4584,7 @@ def _score_paper33_trade(p, price, indicators=None, ind_macro=None, expiry_minut
     sigma = indicators.get("dist_sigma") if indicators else None
     momentum = indicators.get("dist_momentum") if indicators else None
     baseline = p.get("baseline", 0)
-    
-    # For Polymarket Up/Down markets, use displacement-blended momentum
-    # Same fix as P2.3: candle momentum misses the actual move from PTB
-    is_poly_updown = "up or down" in p.get("title", "").lower()
-    if is_poly_updown and p.get("mins_left"):
-        tf_mins = 15.0
-        time_rem = max(0.05, p["mins_left"] / tf_mins)
-        displacement = price - baseline
-        poly_momentum = displacement * 0.7 + (momentum or 0) * 0.3
-        prob, dist_label = _calc_dist_score(price, baseline, sigma, poly_momentum, time_rem)
-    else:
-        prob, dist_label = _calc_dist_score(price, baseline, sigma, momentum)
+    prob, dist_label = _calc_dist_score(price, baseline, sigma, momentum)
 
     # Determine timing
     mtype = "15M" if p["is_short"] and p.get("mins_left", 0) <= 20 else "1H" if p["is_short"] else "Daily"
@@ -4653,10 +4619,7 @@ def _score_paper33_trade(p, price, indicators=None, ind_macro=None, expiry_minut
                         return None
                     scored["bet_odds"] = effective_odds
             elif dist_label == "NEUTRAL":
-                if is_poly_updown:
-                    confidence = scored["confidence"]  # Poly: NEUTRAL = no opinion, trust indicators
-                else:
-                    return None  # Limitless: coin flip + weak timing = no edge
+                return None  # coin flip + weak timing = no edge
             else:
                 # DIST=BUY or SELL (moderate)
                 dist_agrees = (bet_side == "YES" and dist_label == "BUY") or \
