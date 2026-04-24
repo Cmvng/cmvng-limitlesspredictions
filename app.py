@@ -11297,25 +11297,31 @@ def paper5_page():
 
 try:
     init_db()
-    # ONE-TIME RESET to $15 (user requested Apr 23)
-    # ⚠️ NEXT DEPLOY: Replace this block with persistence mode:
-    #   _saved_bals = _load_bot_balances()
-    #   if _saved_bals: load them
-    #   else: save defaults
-    # DO NOT RESET AGAIN unless user explicitly asks
+    # Reset bot balances on deploy
     try:
         _rc = get_db()
         _rc.run("DELETE FROM bot_balances")
         _rc.close()
     except:
         pass
+    # Disable all old bots — only P2.3 and P3.3 trade live
     for _bot_state_ref in [_bot21_state, _bot31_state, _bot22_state, _bot32_state]:
         _bot_state_ref["balance"] = 14.0
         _bot_state_ref["peak_balance"] = 14.0
+        _bot_state_ref["enabled"] = False
+    # Set P2.3 and P3.3 live with $20
+    _bot23_state["balance"] = 20.0
+    _bot23_state["peak_balance"] = 20.0
+    _bot23_state["starting_balance"] = 20.0
+    _bot23_state["enabled"] = True
+    _bot33_state["balance"] = 20.0
+    _bot33_state["peak_balance"] = 20.0
+    _bot33_state["starting_balance"] = 20.0
+    _bot33_state["enabled"] = True
     for _bn, _bs in [("p21", _bot21_state), ("p31", _bot31_state),
                       ("p22", _bot22_state), ("p32", _bot32_state)]:
         _save_bot_balance(_bn, _bs)
-    print("Reset all Limitless balances to $14.00 each")
+    print("Limitless LIVE: P2.3=$20, P3.3=$20 | P2.1/P3.1/P2.2/P3.2=DISABLED")
 except Exception as e:
     print("DB init error: {}".format(e))
 
