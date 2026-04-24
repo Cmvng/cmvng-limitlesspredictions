@@ -153,7 +153,7 @@ _bot31_state = {
 
 # Paper 2.2: Bot 2.1 strategy, 15M ONLY (paper only)
 _bot22_state = {
-    "enabled": False,
+    "enabled": True,
     "balance": 20.0,
     "peak_balance": 20.0,
     "daily_loss": 0.0,
@@ -163,6 +163,7 @@ _bot22_state = {
     "min_stake": 1.0,
     "starting_balance": 20.0,
     "floor_balance": 5.0,
+    "compound_threshold": 9999.0,
 }
 
 # Paper 3.2: Bot 3.1 strategy, 15M ONLY (paper only)
@@ -3407,6 +3408,11 @@ def _fast_trade_scan():
         except:
             p33_ids = set()
         try:
+            p22_rows = conn.run("SELECT market_id FROM paper22_trades WHERE fired_at::timestamptz > NOW() - INTERVAL '30 hours'")
+            p22_ids = set(str(row[0]) for row in p22_rows)
+        except:
+            p22_ids = set()
+        try:
             p24_rows = conn.run("SELECT market_id FROM paper24_trades WHERE fired_at::timestamptz > NOW() - INTERVAL '30 hours'")
             p24_ids = set(str(row[0]) for row in p24_rows)
         except:
@@ -3476,11 +3482,17 @@ def _fast_trade_scan():
                 expiry_hour = parsed["expiry_dt"].hour if parsed.get("expiry_dt") else None
                 now = datetime.now(timezone.utc).isoformat()
 
-                # ── DUAL-SIGNAL SYSTEM: Score both P2.3 and P3.3 first, then execute ──
+                # ── TRIPLE-SIGNAL SYSTEM: Score P2.2, P2.3, P3.3 first, then execute ──
+                scored22 = None
                 scored23 = None
                 scored33 = None
                 
                 if parsed.get("is_15m_market"):
+                    if parsed["market_id"] not in p22_ids:
+                        scored22 = _score_paper21_trade(parsed, price, indicators=ind, ind_macro=ind_macro,
+                                                         expiry_minute=expiry_minute, expiry_hour=expiry_hour)
+                        if scored22 and scored22.get("market_type") != "15M":
+                            scored22 = None  # P2.2 is 15M only
                     if parsed["market_id"] not in p23_ids:
                         scored23 = _score_paper23_trade(parsed, price, indicators=ind, ind_macro=ind_macro,
                                                          expiry_minute=expiry_minute, expiry_hour=expiry_hour)
@@ -3488,10 +3500,42 @@ def _fast_trade_scan():
                         scored33 = _score_paper33_trade(parsed, price, indicators=ind, ind_macro=ind_macro,
                                                          expiry_minute=expiry_minute, expiry_hour=expiry_hour)
                     
-                    # Check if both agree on direction
-                    both_agree = (scored23 and scored33 and scored23["bet_side"] == scored33["bet_side"])
+                    # Determine agreement
+                    scored_list = [s for s in [scored22, scored23, scored33] if s]
+                    if len(scored_list) >= 2:
+                        # Check if all scored bots agree on direction
+                        sides = set(s["bet_side"] for s in scored_list)
+                        all_agree = len(sides) == 1
+                    else:
+                        all_agree = False
                     
-                    # Save paper trades regardless
+                    both_23_33 = (scored23 and scored33 and scored23["bet_side"] == scored33["bet_side"])
+                    triple_agree = (scored22 and scored23 and scored33 and 
+                                    scored22["bet_side"] == scored23["bet_side"] == scored33["bet_side"])
+                    
+                    # Save paper trades
+                    if scored22 and parsed["market_id"] not in p22_ids:
+                        p22_ids.add(parsed["market_id"])
+                        try:
+                            c = get_db()
+                            c.run("""INSERT INTO paper22_trades
+                                (market_id, title, asset, direction, baseline, bet_odds, bet_side,
+                                 current_price, hours_left, market_type, indicators, score,
+                                 total_signals, simulated_stake, simulated_payout, status, fired_at, slug)
+                                VALUES (:mid, :ttl, :ast, :dir, :base, :odds, :bs,
+                                        :pr, :hrs, :mt, :ind, :sc, :ts, 1.0, :sp, 'Pending', :now, :slg)""",
+                                mid=parsed["market_id"], ttl=parsed["title"], ast=asset,
+                                dir=parsed["direction"], base=parsed["baseline"],
+                                odds=scored22["bet_odds"], bs=scored22["bet_side"],
+                                pr=price, hrs=round(parsed["hours_left"], 2),
+                                mt=scored22["market_type"],
+                                ind="[{}] {}".format(scored22["confidence"], scored22["indicators"]),
+                                sc=scored22["score"], ts=scored22["total_signals"],
+                                sp=scored22["sim_payout"], now=now, slg=parsed["slug"])
+                            c.close()
+                        except:
+                            pass
+                    
                     if scored23 and parsed["market_id"] not in p23_ids:
                         p23_ids.add(parsed["market_id"])
                         try:
@@ -3537,75 +3581,188 @@ def _fast_trade_scan():
                             pass
                     
                     # ── EXECUTE LIVE TRADES ──
-                    if both_agree:
-                        bet_side = scored23["bet_side"]
-                        print("DUAL SIGNAL: {} {} — blast snipe".format(bet_side, asset))
+                    # Determine the bet side from whichever scored
+                    active_score = scored23 or scored33 or scored22
+                    if not active_score:
+                        pass  # No scores, skip
+                    else:
+                        bet_side = active_score["bet_side"]
                         
-                        # P3.3 patient GTC at 50¢ (instant, sits for full market)
-                        floor33 = _bot33_state.get("floor_balance", 0)
-                        if _bot33_state["enabled"] and _bot33_state["balance"] > floor33:
-                            real_stake33 = _calc_autoscale_stake(_bot33_state)
-                            if real_stake33 > 0 and real_stake33 <= _bot33_state["balance"]:
-                                _tok33 = None
-                                _tokens33 = market.get("tokens", {})
-                                if isinstance(_tokens33, dict):
-                                    _tok33 = _tokens33.get("yes" if bet_side == "YES" else "no") or \
-                                             _tokens33.get("Yes" if bet_side == "YES" else "No")
-                                if _tok33 and _cached_credentials["ready"]:
-                                    _oid33 = _place_gtc_order(parsed["slug"], bet_side, _tok33, real_stake33, 0.50,
-                                                               _cached_credentials["exchange_addr"],
-                                                               _cached_credentials["profile_id"],
-                                                               _cached_credentials["fee_bps"] or 300)
-                                    if _oid33:
-                                        _bot33_state["balance"] = round(_bot33_state["balance"] - real_stake33, 2)
-                                        _bot33_state["trades_today"] += 1
+                        if triple_agree:
+                            # TRIPLE SIGNAL: All 3 agree — highest confidence
+                            # P2.2: patient GTC at 42¢ (deepest discount)
+                            # P3.3: patient GTC at 45¢ 
+                            # P2.3: active sniper 48¢→66¢
+                            print("TRIPLE SIGNAL: {} {} — P2.2@42% P3.3@45% P2.3 sniper".format(bet_side, asset))
+                            
+                            # P2.2 deepest patient at 42¢
+                            floor22 = _bot22_state.get("floor_balance", 5)
+                            if _bot22_state["enabled"] and _bot22_state["balance"] > floor22:
+                                real_stake22 = _calc_autoscale_stake(_bot22_state)
+                                if real_stake22 > 0 and real_stake22 <= _bot22_state["balance"]:
+                                    _tok22 = None
+                                    _tokens22 = market.get("tokens", {})
+                                    if isinstance(_tokens22, dict):
+                                        _tok22 = _tokens22.get("yes" if bet_side == "YES" else "no") or \
+                                                 _tokens22.get("Yes" if bet_side == "YES" else "No")
+                                    if _tok22 and _cached_credentials["ready"]:
+                                        _oid22 = _place_gtc_order(parsed["slug"], bet_side, _tok22, real_stake22, 0.42,
+                                                                   _cached_credentials["exchange_addr"],
+                                                                   _cached_credentials["profile_id"],
+                                                                   _cached_credentials["fee_bps"] or 300)
+                                        if _oid22:
+                                            _bot22_state["balance"] = round(_bot22_state["balance"] - real_stake22, 2)
+                                            _bot22_state["trades_today"] += 1
+                                            trades_placed += 1
+                                            print("TRIPLE P2.2 @42%: {} {} | bal=${:.2f}".format(bet_side, asset, _bot22_state["balance"]))
+                                            send_telegram("💎 <b>P2.2 DEEP @42%</b>\n{} {} ${:.2f}\n{}\nBal: ${:.2f}".format(
+                                                bet_side, asset, real_stake22, parsed["title"][:40], _bot22_state["balance"]))
+                            
+                            # P3.3 patient at 45¢
+                            floor33 = _bot33_state.get("floor_balance", 5)
+                            if _bot33_state["enabled"] and _bot33_state["balance"] > floor33:
+                                real_stake33 = _calc_autoscale_stake(_bot33_state)
+                                if real_stake33 > 0 and real_stake33 <= _bot33_state["balance"]:
+                                    _tok33 = None
+                                    _tokens33 = market.get("tokens", {})
+                                    if isinstance(_tokens33, dict):
+                                        _tok33 = _tokens33.get("yes" if bet_side == "YES" else "no") or \
+                                                 _tokens33.get("Yes" if bet_side == "YES" else "No")
+                                    if _tok33 and _cached_credentials["ready"]:
+                                        _oid33 = _place_gtc_order(parsed["slug"], bet_side, _tok33, real_stake33, 0.45,
+                                                                   _cached_credentials["exchange_addr"],
+                                                                   _cached_credentials["profile_id"],
+                                                                   _cached_credentials["fee_bps"] or 300)
+                                        if _oid33:
+                                            _bot33_state["balance"] = round(_bot33_state["balance"] - real_stake33, 2)
+                                            _bot33_state["trades_today"] += 1
+                                            trades_placed += 1
+                                            print("TRIPLE P3.3 @45%: {} {} | bal=${:.2f}".format(bet_side, asset, _bot33_state["balance"]))
+                                            send_telegram("🎯 <b>P3.3 PATIENT @45%</b>\n{} {} ${:.2f}\n{}\nBal: ${:.2f}".format(
+                                                bet_side, asset, real_stake33, parsed["title"][:40], _bot33_state["balance"]))
+                            
+                            # P2.3 active sniper 48¢→66¢
+                            floor23 = _bot23_state.get("floor_balance", 5)
+                            if _bot23_state["enabled"] and _bot23_state["balance"] > floor23:
+                                real_stake23 = _calc_autoscale_stake(_bot23_state)
+                                if real_stake23 > 0 and real_stake23 <= _bot23_state["balance"]:
+                                    snipe_order = _snipe_place_gtc(market, parsed, bet_side, real_stake23, None)
+                                    if snipe_order:
+                                        _bot23_state["balance"] = round(_bot23_state["balance"] - real_stake23, 2)
+                                        _bot23_state["trades_today"] += 1
                                         trades_placed += 1
-                                        print("DUAL P3.3 patient @50%: {} {} | bal=${:.2f}".format(
-                                            bet_side, asset, _bot33_state["balance"]))
-                                        send_telegram("🎯 <b>P3.3 PATIENT @50%</b>\n{} {} ${:.2f}\n{}\nBal: ${:.2f}".format(
-                                            bet_side, asset, real_stake33, parsed["title"][:40], _bot33_state["balance"]))
+                                        _active_snipe_orders.append(snipe_order)
+                                        send_telegram("⚡ <b>TRIPLE SNIPE @45%</b>\n{} {} ${:.2f}\n{}\nBal: ${:.2f}".format(
+                                            bet_side, asset, real_stake23, parsed["title"][:40], _bot23_state["balance"]))
                         
-                        # P2.3 active sniper (blast at 45¢, manage later)
-                        floor23 = _bot23_state.get("floor_balance", 0)
-                        if _bot23_state["enabled"] and _bot23_state["balance"] > floor23:
-                            real_stake23 = _calc_autoscale_stake(_bot23_state)
-                            if real_stake23 > 0 and real_stake23 <= _bot23_state["balance"]:
-                                snipe_order = _snipe_place_gtc(market, parsed, bet_side, real_stake23, None)
-                                if snipe_order:
-                                    _bot23_state["balance"] = round(_bot23_state["balance"] - real_stake23, 2)
-                                    _bot23_state["trades_today"] += 1
-                                    trades_placed += 1
-                                    _active_snipe_orders.append(snipe_order)
-                                    send_telegram("⚡ <b>DUAL SNIPE @45%</b>\n{} {} ${:.2f}\n{}\nBal: ${:.2f}".format(
-                                        bet_side, asset, real_stake23, parsed["title"][:40], _bot23_state["balance"]))
-                    
-                    elif scored23 and not scored33:
-                        floor23 = _bot23_state.get("floor_balance", 0)
-                        if _bot23_state["enabled"] and _bot23_state["balance"] > floor23:
-                            real_stake23 = _calc_autoscale_stake(_bot23_state)
-                            if real_stake23 > 0 and real_stake23 <= _bot23_state["balance"]:
-                                snipe_order = _snipe_place_gtc(market, parsed, scored23["bet_side"], real_stake23, None)
-                                if snipe_order:
-                                    _bot23_state["balance"] = round(_bot23_state["balance"] - real_stake23, 2)
-                                    _bot23_state["trades_today"] += 1
-                                    trades_placed += 1
-                                    _active_snipe_orders.append(snipe_order)
-                                    send_telegram("🟢 <b>P2.3 SNIPE @45%</b>\n{} {} ${:.2f}\n{}\nBal: ${:.2f}".format(
-                                        scored23["bet_side"], asset, real_stake23, parsed["title"][:40], _bot23_state["balance"]))
-                    
-                    elif scored33 and not scored23:
-                        floor33 = _bot33_state.get("floor_balance", 0)
-                        if _bot33_state["enabled"] and _bot33_state["balance"] > floor33:
-                            real_stake33 = _calc_autoscale_stake(_bot33_state)
-                            if real_stake33 > 0 and real_stake33 <= _bot33_state["balance"]:
-                                snipe_order = _snipe_place_gtc(market, parsed, scored33["bet_side"], real_stake33, None)
-                                if snipe_order:
-                                    _bot33_state["balance"] = round(_bot33_state["balance"] - real_stake33, 2)
-                                    _bot33_state["trades_today"] += 1
-                                    trades_placed += 1
-                                    _active_snipe_orders.append(snipe_order)
-                                    send_telegram("🟢 <b>P3.3 SNIPE @45%</b>\n{} {} ${:.2f}\n{}\nBal: ${:.2f}".format(
-                                        scored33["bet_side"], asset, real_stake33, parsed["title"][:40], _bot33_state["balance"]))
+                        elif both_23_33:
+                            # DUAL SIGNAL: P2.3 + P3.3 agree (P2.2 didn't score or disagrees)
+                            print("DUAL SIGNAL: {} {} — P3.3@50% P2.3 sniper".format(bet_side, asset))
+                            
+                            # P3.3 patient at 50¢
+                            floor33 = _bot33_state.get("floor_balance", 5)
+                            if _bot33_state["enabled"] and _bot33_state["balance"] > floor33:
+                                real_stake33 = _calc_autoscale_stake(_bot33_state)
+                                if real_stake33 > 0 and real_stake33 <= _bot33_state["balance"]:
+                                    _tok33 = None
+                                    _tokens33 = market.get("tokens", {})
+                                    if isinstance(_tokens33, dict):
+                                        _tok33 = _tokens33.get("yes" if bet_side == "YES" else "no") or \
+                                                 _tokens33.get("Yes" if bet_side == "YES" else "No")
+                                    if _tok33 and _cached_credentials["ready"]:
+                                        _oid33 = _place_gtc_order(parsed["slug"], bet_side, _tok33, real_stake33, 0.50,
+                                                                   _cached_credentials["exchange_addr"],
+                                                                   _cached_credentials["profile_id"],
+                                                                   _cached_credentials["fee_bps"] or 300)
+                                        if _oid33:
+                                            _bot33_state["balance"] = round(_bot33_state["balance"] - real_stake33, 2)
+                                            _bot33_state["trades_today"] += 1
+                                            trades_placed += 1
+                                            send_telegram("🎯 <b>P3.3 PATIENT @50%</b>\n{} {} ${:.2f}\n{}\nBal: ${:.2f}".format(
+                                                bet_side, asset, real_stake33, parsed["title"][:40], _bot33_state["balance"]))
+                            
+                            # P2.3 active sniper
+                            floor23 = _bot23_state.get("floor_balance", 5)
+                            if _bot23_state["enabled"] and _bot23_state["balance"] > floor23:
+                                real_stake23 = _calc_autoscale_stake(_bot23_state)
+                                if real_stake23 > 0 and real_stake23 <= _bot23_state["balance"]:
+                                    snipe_order = _snipe_place_gtc(market, parsed, bet_side, real_stake23, None)
+                                    if snipe_order:
+                                        _bot23_state["balance"] = round(_bot23_state["balance"] - real_stake23, 2)
+                                        _bot23_state["trades_today"] += 1
+                                        trades_placed += 1
+                                        _active_snipe_orders.append(snipe_order)
+                                        send_telegram("⚡ <b>DUAL SNIPE</b>\n{} {} ${:.2f}\n{}\nBal: ${:.2f}".format(
+                                            bet_side, asset, real_stake23, parsed["title"][:40], _bot23_state["balance"]))
+                            
+                            # P2.2 also trades if it scored same direction
+                            if scored22 and scored22["bet_side"] == bet_side:
+                                floor22 = _bot22_state.get("floor_balance", 5)
+                                if _bot22_state["enabled"] and _bot22_state["balance"] > floor22:
+                                    real_stake22 = _calc_autoscale_stake(_bot22_state)
+                                    if real_stake22 > 0 and real_stake22 <= _bot22_state["balance"]:
+                                        _tok22 = None
+                                        _tokens22 = market.get("tokens", {})
+                                        if isinstance(_tokens22, dict):
+                                            _tok22 = _tokens22.get("yes" if bet_side == "YES" else "no") or \
+                                                     _tokens22.get("Yes" if bet_side == "YES" else "No")
+                                        if _tok22 and _cached_credentials["ready"]:
+                                            _oid22 = _place_gtc_order(parsed["slug"], bet_side, _tok22, real_stake22, 0.42,
+                                                                       _cached_credentials["exchange_addr"],
+                                                                       _cached_credentials["profile_id"],
+                                                                       _cached_credentials["fee_bps"] or 300)
+                                            if _oid22:
+                                                _bot22_state["balance"] = round(_bot22_state["balance"] - real_stake22, 2)
+                                                _bot22_state["trades_today"] += 1
+                                                trades_placed += 1
+                                                send_telegram("💎 <b>P2.2 DEEP @42%</b>\n{} {} ${:.2f}\n{}\nBal: ${:.2f}".format(
+                                                    bet_side, asset, real_stake22, parsed["title"][:40], _bot22_state["balance"]))
+                        
+                        else:
+                            # SINGLE SIGNAL: only one bot scored
+                            single_score = scored23 or scored33 or scored22
+                            single_side = single_score["bet_side"]
+                            
+                            # Use whichever bot scored for the sniper
+                            if scored23:
+                                floor = _bot23_state.get("floor_balance", 5)
+                                if _bot23_state["enabled"] and _bot23_state["balance"] > floor:
+                                    real_stake = _calc_autoscale_stake(_bot23_state)
+                                    if real_stake > 0 and real_stake <= _bot23_state["balance"]:
+                                        snipe_order = _snipe_place_gtc(market, parsed, single_side, real_stake, None)
+                                        if snipe_order:
+                                            _bot23_state["balance"] = round(_bot23_state["balance"] - real_stake, 2)
+                                            _bot23_state["trades_today"] += 1
+                                            trades_placed += 1
+                                            _active_snipe_orders.append(snipe_order)
+                                            send_telegram("🟢 <b>P2.3 SNIPE</b>\n{} {} ${:.2f}\n{}\nBal: ${:.2f}".format(
+                                                single_side, asset, real_stake, parsed["title"][:40], _bot23_state["balance"]))
+                            elif scored33:
+                                floor = _bot33_state.get("floor_balance", 5)
+                                if _bot33_state["enabled"] and _bot33_state["balance"] > floor:
+                                    real_stake = _calc_autoscale_stake(_bot33_state)
+                                    if real_stake > 0 and real_stake <= _bot33_state["balance"]:
+                                        snipe_order = _snipe_place_gtc(market, parsed, single_side, real_stake, None)
+                                        if snipe_order:
+                                            _bot33_state["balance"] = round(_bot33_state["balance"] - real_stake, 2)
+                                            _bot33_state["trades_today"] += 1
+                                            trades_placed += 1
+                                            _active_snipe_orders.append(snipe_order)
+                                            send_telegram("🟢 <b>P3.3 SNIPE</b>\n{} {} ${:.2f}\n{}\nBal: ${:.2f}".format(
+                                                single_side, asset, real_stake, parsed["title"][:40], _bot33_state["balance"]))
+                            elif scored22:
+                                floor = _bot22_state.get("floor_balance", 5)
+                                if _bot22_state["enabled"] and _bot22_state["balance"] > floor:
+                                    real_stake = _calc_autoscale_stake(_bot22_state)
+                                    if real_stake > 0 and real_stake <= _bot22_state["balance"]:
+                                        snipe_order = _snipe_place_gtc(market, parsed, single_side, real_stake, None)
+                                        if snipe_order:
+                                            _bot22_state["balance"] = round(_bot22_state["balance"] - real_stake, 2)
+                                            _bot22_state["trades_today"] += 1
+                                            trades_placed += 1
+                                            _active_snipe_orders.append(snipe_order)
+                                            send_telegram("🟢 <b>P2.2 SNIPE</b>\n{} {} ${:.2f}\n{}\nBal: ${:.2f}".format(
+                                                single_side, asset, real_stake, parsed["title"][:40], _bot22_state["balance"]))
 
                 # ── P2.4 and P3.4: PAUSED for testing ──
                 # Paper tracking still runs in run_paper34_scan
@@ -12593,7 +12750,7 @@ try:
     _bot33_state["enabled"] = True
     _bot24_state["enabled"] = False
     _bot34_state["enabled"] = False
-    print("Limitless LIVE: P2.3=$20, P3.3=$20 (DUAL SIGNAL) | P2.4/P3.4=PAUSED | P2.1/P3.1/P2.2/P3.2=DISABLED")
+    print("Limitless LIVE: P2.2=$20, P2.3=$20, P3.3=$20 (TRIPLE SIGNAL) | P2.4/P3.4=PAUSED")
     # Warm trading credentials for sniper
     threading.Thread(target=_warm_credentials, daemon=True).start()
     # One-time correction of historical paper trade resolutions
