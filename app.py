@@ -3539,11 +3539,37 @@ def _fast_trade_scan():
                     # ── EXECUTE LIVE TRADES ──
                     if both_agree:
                         # DUAL SIGNAL: Both agree — highest confidence
-                        # Run ONE sniper with active price management (45¢ → 66¢)
-                        # Use P2.3 balance for the trade, P3.3 records paper only
+                        # P2.3: active sniper (45¢ → 66¢, topping up, matching asks)
+                        # P3.3: patient GTC at 50¢, sits for full market
                         bet_side = scored23["bet_side"]
-                        print("DUAL SIGNAL: {} {} — sniper active".format(bet_side, asset))
+                        print("DUAL SIGNAL: {} {} — P2.3 sniper + P3.3 patient @50%".format(bet_side, asset))
                         
+                        # P3.3 patient order FIRST (instant, non-blocking)
+                        floor33 = _bot33_state.get("floor_balance", 0)
+                        if _bot33_state["enabled"] and _bot33_state["balance"] > floor33:
+                            real_stake33 = _calc_autoscale_stake(_bot33_state)
+                            if real_stake33 > 0 and real_stake33 <= _bot33_state["balance"]:
+                                # Get token ID from market data
+                                _tok33 = None
+                                _tokens33 = market.get("tokens", {})
+                                if isinstance(_tokens33, dict):
+                                    _tok33 = _tokens33.get("yes" if bet_side == "YES" else "no") or \
+                                             _tokens33.get("Yes" if bet_side == "YES" else "No")
+                                if _tok33 and _cached_credentials["ready"]:
+                                    _oid33 = _place_gtc_order(parsed["slug"], bet_side, _tok33, real_stake33, 0.50,
+                                                               _cached_credentials["exchange_addr"],
+                                                               _cached_credentials["profile_id"],
+                                                               _cached_credentials["fee_bps"] or 300)
+                                    if _oid33:
+                                        _bot33_state["balance"] = round(_bot33_state["balance"] - real_stake33, 2)
+                                        _bot33_state["trades_today"] += 1
+                                        trades_placed += 1
+                                        print("DUAL P3.3 patient @50%: {} {} ${:.2f} | bal=${:.2f}".format(
+                                            bet_side, asset, real_stake33, _bot33_state["balance"]))
+                                        send_telegram("🎯 <b>P3.3 PATIENT @50%</b>\n{} {} ${:.2f}\n{}\nBal: ${:.2f}".format(
+                                            bet_side, asset, real_stake33, parsed["title"][:40], _bot33_state["balance"]))
+                        
+                        # P2.3 active sniper (45¢ → 66¢, takes ~27 seconds)
                         floor23 = _bot23_state.get("floor_balance", 0)
                         if _bot23_state["enabled"] and _bot23_state["balance"] > floor23:
                             real_stake23 = _calc_autoscale_stake(_bot23_state)
@@ -3553,7 +3579,7 @@ def _fast_trade_scan():
                                     _bot23_state["balance"] = round(_bot23_state["balance"] - real_stake23, 2)
                                     _bot23_state["trades_today"] += 1
                                     trades_placed += 1
-                                    send_telegram("⚡ <b>DUAL SNIPE</b>\n{} {} ${:.2f}\n{}\nBal: ${:.2f}".format(
+                                    send_telegram("⚡ <b>DUAL P2.3 SNIPE</b>\n{} {} ${:.2f}\n{}\nBal: ${:.2f}".format(
                                         bet_side, asset, real_stake23, parsed["title"][:40], _bot23_state["balance"]))
                     
                     elif scored23 and not scored33:
