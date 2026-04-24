@@ -203,6 +203,29 @@ _bot33_state = {
     "compound_threshold": 9999.0,
 }
 
+# ─── P2.4 and P3.4: 1H market bots with cheap entry strategy ───
+_bot24_state = {
+    "enabled": True,
+    "balance": 12.0,
+    "peak_balance": 12.0,
+    "starting_balance": 12.0,
+    "floor_balance": 2.0,
+    "trades_today": 0,
+    "min_stake": 1.0,
+    "compound_threshold": 9999.0,
+}
+
+_bot34_state = {
+    "enabled": True,
+    "balance": 12.0,
+    "peak_balance": 12.0,
+    "starting_balance": 12.0,
+    "floor_balance": 2.0,
+    "trades_today": 0,
+    "min_stake": 1.0,
+    "compound_threshold": 9999.0,
+}
+
 FAVOURITE_HOURLY = ["ADA", "BNB", "DOGE"]
 
 # ─── Polymarket LIVE trading bot states ───
@@ -2564,10 +2587,11 @@ def _get_poly_token_id(condition_id, side):
         print("Poly token lookup error: {}".format(e))
     return None
 
-def execute_trade(parsed_market, score, prediction_id, override_stake=None, bot_name=None, bot_balance_after=None):
+def execute_trade(parsed_market, score, prediction_id, override_stake=None, bot_name=None, bot_balance_after=None, is_hourly=False):
     """Execute a trade using aggressive bidding.
     If override_stake is provided, uses that exact amount (for Bot 2/3).
     If None, uses Bot 1's state to calculate stake.
+    If is_hourly=True, uses wider phase timings for 1H markets (more time to get cheap entries).
     """
     import requests as req
 
@@ -2764,11 +2788,23 @@ def execute_trade(parsed_market, score, prediction_id, override_stake=None, bot_
             # 3. NEAR MARKET: current_ask - 0.01 (wait 20s)
             # 4. FOK MARKET: guaranteed fill, last resort
             
-            phases = [
-                ("CHEAP",    0.05, 6),  # 5 cents below ask, 30s wait (6 × 5s)
-                ("MID",      0.03, 6),  # 3 cents below ask, 30s wait
-                ("NEAR",     0.01, 4),  # 1 cent below ask, 20s wait
-            ]
+            # Phases differ for 15M vs 1H markets
+            if is_hourly:
+                # 1H markets: much more time, so aim for deeper discounts
+                # Total GTC wait: 15 minutes (phases 1-4), then FOK with 45 min remaining
+                phases = [
+                    ("ULTRA_CHEAP",  0.10, 24),  # 10c below ask, 2 minutes (24 × 5s)
+                    ("CHEAP",        0.07, 36),  # 7c below ask, 3 minutes
+                    ("GOOD",         0.05, 60),  # 5c below ask, 5 minutes
+                    ("DECENT",       0.03, 60),  # 3c below ask, 5 minutes
+                ]
+                print("Using HOURLY entry strategy (4 phases, 15min total GTC window)")
+            else:
+                # 15M markets: market moves too fast for GTC waiting
+                # Best entry = FOK immediately at market open (~50% odds)
+                # Skip all GTC phases and go straight to FOK
+                phases = []
+                print("Using 15M entry: FOK immediately at market price")
             
             filled_via_gtc = False
             current_fill_price = None
@@ -3194,11 +3230,20 @@ def scan_loop():
         # Save bot balances to DB (persists across deploys)
         try:
             for _bn, _bs in [("p21", _bot21_state), ("p31", _bot31_state),
-                              ("p22", _bot22_state), ("p32", _bot32_state)]:
+                              ("p22", _bot22_state), ("p32", _bot32_state),
+                              ("p24", _bot24_state), ("p34", _bot34_state)]:
                 _save_bot_balance(_bn, _bs)
         except Exception as e:
             print("Balance save error: {}".format(e))
-        time.sleep(300)
+        
+        # Align to next 5-minute clock boundary (:00, :05, :10, :15, etc.)
+        # Critical: :00, :15, :30, :45 are when 15M markets open — bot must scan at these times
+        # Adding 3 seconds offset so the scan starts just AFTER the market opens
+        now_ts = time.time()
+        interval = 300  # 5 minutes
+        next_boundary = ((now_ts // interval) + 1) * interval + 3  # 3s after boundary
+        wait_seconds = max(5, next_boundary - now_ts)  # At least 5s between cycles
+        time.sleep(wait_seconds)
 
 # ═══════════════════════════════════════════════════════════
 # TECHNICAL INDICATORS CALCULATOR
@@ -6616,6 +6661,28 @@ def run_paper34_scan():
                         except Exception as e:
                             print("Paper24 save error: {}".format(e))
 
+                        # Place REAL trade via Paper 2.4 bot (hourly markets — 24/7)
+                        floor24 = _bot24_state.get("floor_balance", 0)
+                        if _bot24_state["enabled"] and _bot24_state["balance"] > floor24:
+                            real_stake24 = _calc_autoscale_stake(_bot24_state)
+                            if real_stake24 <= 0:
+                                _bot24_state["enabled"] = False
+                                send_telegram("⚠️ <b>Paper 2.4 stopped — floor reached</b>\nBalance: ${:.2f}".format(_bot24_state["balance"]))
+                            elif real_stake24 <= _bot24_state["balance"]:
+                                try:
+                                    bal_after24 = round(_bot24_state["balance"] - real_stake24, 2)
+                                    success = execute_trade(parsed, scored24, None, override_stake=real_stake24,
+                                                           bot_name="P2.4", bot_balance_after=bal_after24, is_hourly=True)
+                                    if success:
+                                        _bot24_state["balance"] = bal_after24
+                                        _bot24_state["trades_today"] += 1
+                                        print("P2.4 TRADE: {} {} ${:.2f} on {} | bal=${:.2f}".format(
+                                            scored24["bet_side"], asset, real_stake24, parsed["title"][:30], _bot24_state["balance"]))
+                                        send_telegram("🟢 <b>P2.4 TRADE (1H)</b>\n{} {} ${:.2f}\n{}\nBal: ${:.2f}".format(
+                                            scored24["bet_side"], asset, real_stake24, parsed["title"][:40], _bot24_state["balance"]))
+                                except Exception as te:
+                                    print("P2.4 trade error: {}".format(te))
+
                 # Paper 3.4: P3.1 + Distance + 15M Candle Pattern (1H ONLY)
                 if parsed["market_id"] not in p34_ids:
                     scored34 = _score_paper34_trade(parsed, price, indicators=ind, ind_macro=ind_macro, expiry_minute=expiry_minute, expiry_hour=expiry_hour)
@@ -6644,6 +6711,28 @@ def run_paper34_scan():
                             p34_count += 1
                         except Exception as e:
                             print("Paper34 save error: {}".format(e))
+
+                        # Place REAL trade via Paper 3.4 bot (hourly markets — 24/7)
+                        floor34 = _bot34_state.get("floor_balance", 0)
+                        if _bot34_state["enabled"] and _bot34_state["balance"] > floor34:
+                            real_stake34 = _calc_autoscale_stake(_bot34_state)
+                            if real_stake34 <= 0:
+                                _bot34_state["enabled"] = False
+                                send_telegram("⚠️ <b>Paper 3.4 stopped — floor reached</b>\nBalance: ${:.2f}".format(_bot34_state["balance"]))
+                            elif real_stake34 <= _bot34_state["balance"]:
+                                try:
+                                    bal_after34 = round(_bot34_state["balance"] - real_stake34, 2)
+                                    success = execute_trade(parsed, scored34, None, override_stake=real_stake34,
+                                                           bot_name="P3.4", bot_balance_after=bal_after34, is_hourly=True)
+                                    if success:
+                                        _bot34_state["balance"] = bal_after34
+                                        _bot34_state["trades_today"] += 1
+                                        print("P3.4 TRADE: {} {} ${:.2f} on {} | bal=${:.2f}".format(
+                                            scored34["bet_side"], asset, real_stake34, parsed["title"][:30], _bot34_state["balance"]))
+                                        send_telegram("🟢 <b>P3.4 TRADE (1H)</b>\n{} {} ${:.2f}\n{}\nBal: ${:.2f}".format(
+                                            scored34["bet_side"], asset, real_stake34, parsed["title"][:40], _bot34_state["balance"]))
+                                except Exception as te:
+                                    print("P3.4 trade error: {}".format(te))
 
                 # ── Paper 2.5 (1H candle sequence) ──
                 if parsed["market_id"] not in p25_ids:
@@ -11609,10 +11698,18 @@ try:
     _bot33_state["peak_balance"] = 20.0
     _bot33_state["starting_balance"] = 20.0
     _bot33_state["enabled"] = True
+    _bot24_state["balance"] = 12.0
+    _bot24_state["peak_balance"] = 12.0
+    _bot24_state["starting_balance"] = 12.0
+    _bot24_state["enabled"] = True
+    _bot34_state["balance"] = 12.0
+    _bot34_state["peak_balance"] = 12.0
+    _bot34_state["starting_balance"] = 12.0
+    _bot34_state["enabled"] = True
     for _bn, _bs in [("p21", _bot21_state), ("p31", _bot31_state),
                       ("p22", _bot22_state), ("p32", _bot32_state)]:
         _save_bot_balance(_bn, _bs)
-    print("Limitless LIVE: P2.3=$20, P3.3=$20 | P2.1/P3.1/P2.2/P3.2=DISABLED")
+    print("Limitless LIVE: P2.3=$20, P3.3=$20, P2.4=$12 (1H), P3.4=$12 (1H) | P2.1/P3.1/P2.2/P3.2=DISABLED")
     # One-time correction of historical paper trade resolutions
     threading.Thread(target=_correct_historical_resolutions, daemon=True).start()
 except Exception as e:
