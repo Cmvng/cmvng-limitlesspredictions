@@ -4439,27 +4439,31 @@ def _score_paper23_trade(p, price, indicators=None, ind_macro=None, expiry_minut
     baseline = p.get("baseline", 0)
 
     # Calculate distance probability
-    # For Polymarket Up/Down markets, baseline ≈ current price (Chainlink PTB)
-    # Use actual time remaining from market data for accurate probability
+    # For Polymarket Up/Down markets, baseline = Chainlink PTB set at window open.
+    # Problem: yfinance momentum uses candle-to-candle changes which average near
+    # zero during chop even when price has moved significantly from baseline.
+    # Fix: on Polymarket, use actual displacement from PTB as the momentum signal.
     is_poly_updown = "up or down" in p.get("title", "").lower()
     if is_poly_updown and p.get("mins_left"):
-        # Polymarket: use actual mins left as fraction of window
-        # 15M window: 10 mins left = 0.67, 5 mins left = 0.33
-        tf_mins = 15.0  # 15M market
+        tf_mins = 15.0
         time_rem = max(0.05, p["mins_left"] / tf_mins)
+        # Use displacement from PTB as momentum — this IS the directional signal
+        # If price moved +$50 from baseline, that's the real momentum, not candle chop
+        displacement = price - baseline
+        # Blend: 70% displacement (the actual move from PTB) + 30% candle momentum (trend direction)
+        poly_momentum = displacement * 0.7 + (momentum or 0) * 0.3
+        prob, dist_label = _calc_dist_score(price, baseline, sigma, poly_momentum, time_rem)
     else:
-        time_rem = 0.67  # Limitless default
-    
-    prob, dist_label = _calc_dist_score(price, baseline, sigma, momentum, time_rem)
+        time_rem = 0.67
+        prob, dist_label = _calc_dist_score(price, baseline, sigma, momentum, time_rem)
 
     bet_side = scored["bet_side"]
 
     # FULL CONFIDENCE: DIST must agree with bet direction
-    # On Polymarket, baselines are tight so we accept NEUTRAL as non-opposing
-    # (indicators already confirmed direction — NEUTRAL just means distance is close)
+    # On Polymarket, NEUTRAL means price is still very close to PTB — no strong signal
+    # either way. Accept it as non-opposing since P2.1 indicators already confirmed.
     if is_poly_updown:
         # Poly mode: only reject if DIST actively OPPOSES the bet
-        # NEUTRAL = distance is close, trust indicators → allow trade
         if bet_side == "YES" and dist_label in ("SELL", "STRONG_SELL"):
             return None  # distance actively opposes YES
         if bet_side == "NO" and dist_label in ("BUY", "STRONG_BUY"):
