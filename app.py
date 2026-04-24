@@ -2211,9 +2211,10 @@ def _execute_poly_trade_async(condition_id, token_id, side, stake, price,
 
 
 def _execute_poly_trade(condition_id, token_id, side, stake, price):
-    """Two-step execution: FOK first, then GTC if FOK fails.
-    Only one order exists at any time — no double fill risk.
-    Never pays more than 70 cents/share. Returns True if filled."""
+    """Escalating execution: FOK first, then GTC that walks up the book.
+    Each step raises the price until filled or max 70 cents reached.
+    Only one order at a time — no double fill risk.
+    Returns True if filled."""
     try:
         client = _get_poly_client()
         if not client:
@@ -2251,84 +2252,134 @@ def _execute_poly_trade(condition_id, token_id, side, stake, price):
                     print("Poly FOK FILLED: {} ${:.2f} @{:.2f}".format(side, stake, fok_price))
                     return True
                 else:
-                    print("Poly FOK no fill — placing GTC to wait")
+                    print("Poly FOK no fill — escalating GTC")
         except Exception as fok_err:
-            print("Poly FOK error: {} — placing GTC to wait".format(fok_err))
+            print("Poly FOK error: {} — escalating GTC".format(fok_err))
 
-        # ── STEP 2: GTC at good price — sits on book for up to 12 minutes ──
-        gtc_price = min(round(price + 0.05, 2), max_price)
-        gtc_shares = max(min_shares, round(stake / gtc_price, 2))
+        # ── STEP 2: Escalating GTC — walk up the book until filled ──
+        # Start at signal+3c, raise by 3-5c each round, cap at 70c
+        # Each level waits 2 minutes before escalating
+        price_levels = []
+        p = round(price + 0.03, 2)
+        for bump in [0, 0.03, 0.04, 0.05, 0.05]:
+            p = round(p + bump, 2)
+            if p > max_price:
+                p = max_price
+            price_levels.append(p)
+            if p >= max_price:
+                break
+        # Always end with max_price if not already there
+        if price_levels[-1] < max_price:
+            price_levels.append(max_price)
 
-        # Use actual best ask if cheaper
-        try:
-            book = client.get_order_book(str(token_id))
-            if book and hasattr(book, 'asks') and book.asks:
-                actual_ask = float(book.asks[0].price) if book.asks else None
-                if actual_ask and actual_ask > 0 and actual_ask <= gtc_price:
-                    gtc_price = round(actual_ask, 2)
-                    gtc_shares = max(min_shares, round(stake / gtc_price, 2))
-        except:
-            pass
+        for level_idx, gtc_price in enumerate(price_levels):
+            gtc_shares = max(min_shares, round(stake / gtc_price, 2))
 
-        gtc_order_id = None
-        try:
-            order_args = OrderArgs(
-                token_id=str(token_id),
-                price=gtc_price,
-                size=gtc_shares,
-                side=BUY,
-            )
-            signed_order = client.create_order(order_args)
-            gtc_resp = client.post_order(signed_order, OrderType.GTC)
-            print("Poly GTC placed: {} @{:.2f} shares={} resp={}".format(
-                side, gtc_price, gtc_shares, str(gtc_resp)[:150]))
-
-            if gtc_resp:
-                gtc_order_id = gtc_resp.get("orderID") or gtc_resp.get("order_id")
-                status = (gtc_resp.get("status") or "").upper()
-                if status in ("MATCHED", "FILLED"):
-                    print("Poly GTC FILLED immediately: {} ${:.2f} @{:.2f}".format(side, stake, gtc_price))
-                    return True
-        except Exception as gtc_err:
-            print("Poly GTC error: {}".format(gtc_err))
-            return False
-
-        if not gtc_order_id:
-            print("Poly GTC: no order ID returned")
-            return False
-
-        # ── Poll GTC until filled or time runs out ──
-        # Check every 15 seconds for up to 12 minutes (48 checks)
-        max_checks = 48
-        for i in range(max_checks):
-            time.sleep(15)
+            # Place GTC at this price level
+            gtc_order_id = None
             try:
-                info = client.get_order(gtc_order_id)
-                if info:
-                    s = (info.get("status") or "").upper()
-                    if s in ("MATCHED", "FILLED"):
-                        print("Poly GTC FILLED (after {}s): {} ${:.2f} @{:.2f}".format(
-                            (i+1)*15, side, stake, gtc_price))
+                order_args = OrderArgs(
+                    token_id=str(token_id),
+                    price=gtc_price,
+                    size=gtc_shares,
+                    side=BUY,
+                )
+                signed_order = client.create_order(order_args)
+                gtc_resp = client.post_order(signed_order, OrderType.GTC)
+                print("Poly GTC level {}: {} @{:.2f} shares={}".format(
+                    level_idx+1, side, gtc_price, gtc_shares))
+
+                if gtc_resp:
+                    gtc_order_id = gtc_resp.get("orderID") or gtc_resp.get("order_id")
+                    status = (gtc_resp.get("status") or "").upper()
+                    if status in ("MATCHED", "FILLED"):
+                        print("Poly GTC FILLED immediately at level {}: {} ${:.2f} @{:.2f}".format(
+                            level_idx+1, side, stake, gtc_price))
                         return True
-                    elif s in ("CANCELED", "CANCELLED", "EXPIRED"):
-                        print("Poly GTC cancelled/expired after {}s".format((i+1)*15))
-                        return False
-            except:
-                pass
+            except Exception as gtc_err:
+                print("Poly GTC error at level {}: {}".format(level_idx+1, gtc_err))
+                continue
 
-        # ── Time's up — check final status and cancel ──
-        try:
-            info = client.get_order(gtc_order_id)
-            if info:
-                s = (info.get("status") or "").upper()
-                if s in ("MATCHED", "FILLED"):
-                    print("Poly GTC FILLED (final): {} ${:.2f} @{:.2f}".format(side, stake, gtc_price))
-                    return True
-            client.cancel(gtc_order_id)
-            print("Poly GTC cancelled after 12min — no fill")
-        except:
-            pass
+            if not gtc_order_id:
+                continue
 
+            # Wait 2 minutes at this level (8 checks × 15 sec)
+            filled = False
+            for i in range(8):
+                time.sleep(15)
+                try:
+                    info = client.get_order(gtc_order_id)
+                    if info:
+                        s = (info.get("status") or "").upper()
+                        if s in ("MATCHED", "FILLED"):
+                            print("Poly GTC FILLED at level {} (after {}s): {} ${:.2f} @{:.2f}".format(
+                                level_idx+1, (i+1)*15, side, stake, gtc_price))
+                            return True
+                        elif s in ("CANCELED", "CANCELLED", "EXPIRED"):
+                            filled = False
+                            break
+                except:
+                    pass
+
+            # Cancel this level before escalating to next
+            if gtc_order_id:
+                cancelled_ok = False
+                try:
+                    # Check one more time before cancelling
+                    info = client.get_order(gtc_order_id)
+                    if info:
+                        s = (info.get("status") or "").upper()
+                        if s in ("MATCHED", "FILLED"):
+                            print("Poly GTC FILLED at level {} (during cancel): {} ${:.2f} @{:.2f}".format(
+                                level_idx+1, side, stake, gtc_price))
+                            return True
+                        elif s in ("CANCELED", "CANCELLED", "EXPIRED"):
+                            cancelled_ok = True
+                    if not cancelled_ok:
+                        client.cancel(gtc_order_id)
+                        # Verify cancel actually worked
+                        time.sleep(1)
+                        info2 = client.get_order(gtc_order_id)
+                        if info2:
+                            s2 = (info2.get("status") or "").upper()
+                            if s2 in ("MATCHED", "FILLED"):
+                                # Filled between check and cancel — we're done
+                                print("Poly GTC FILLED at level {} (race): {} ${:.2f} @{:.2f}".format(
+                                    level_idx+1, side, stake, gtc_price))
+                                return True
+                            elif s2 in ("CANCELED", "CANCELLED", "EXPIRED"):
+                                cancelled_ok = True
+                            else:
+                                # Unknown state — don't escalate, risk double fill
+                                print("Poly GTC level {} status={} — stopping to avoid double fill".format(
+                                    level_idx+1, s2))
+                                return False
+                        else:
+                            cancelled_ok = True
+                except Exception as cancel_err:
+                    # Cancel failed — check if it filled
+                    try:
+                        info3 = client.get_order(gtc_order_id)
+                        if info3:
+                            s3 = (info3.get("status") or "").upper()
+                            if s3 in ("MATCHED", "FILLED"):
+                                print("Poly GTC FILLED at level {} (cancel failed): {} ${:.2f} @{:.2f}".format(
+                                    level_idx+1, side, stake, gtc_price))
+                                return True
+                    except:
+                        pass
+                    print("Poly GTC cancel failed at level {} — stopping to avoid double fill".format(level_idx+1))
+                    return False
+
+                if not cancelled_ok:
+                    return False
+
+                if level_idx < len(price_levels) - 1:
+                    print("Poly GTC level {} cancelled @{:.2f} — escalating to {:.2f}".format(
+                        level_idx+1, gtc_price, price_levels[level_idx+1]))
+
+        print("Poly order EXPIRED: {} ${:.2f} — no fill at any level (max {:.2f})".format(
+            side, stake, max_price))
         return False
 
     except Exception as e:
