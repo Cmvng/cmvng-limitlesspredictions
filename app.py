@@ -2825,12 +2825,16 @@ def execute_trade(parsed_market, score, prediction_id, override_stake=None, bot_
                 if ob:
                     _, fresh_ask, _ = _get_best_prices(ob, bet_side)
                 else:
-                    fresh_ask = best_ask
+                    fresh_ask = None
+                
+                # If no ask on the book, use displayed price as reference
+                # On empty books, WE set the price — place GTC and wait for sellers to come
+                if not fresh_ask:
+                    fresh_ask = displayed_price if displayed_price else best_ask
                 
                 if not fresh_ask:
-                    # Orderbook went empty — skip to FOK
-                    print("Orderbook went empty in phase {} — going to FOK".format(phase_name))
-                    break
+                    print("No price reference in phase {} — skipping".format(phase_name))
+                    continue
                 
                 # Calculate phase price: ask - discount, but never above ceiling, never below 0.01
                 phase_price = round(max(0.01, min(fresh_ask - discount, ceiling)), 3)
@@ -2918,13 +2922,83 @@ def execute_trade(parsed_market, score, prediction_id, override_stake=None, bot_
                     fill_price = displayed_price
 
         else:
-            # ── PATH B: No orderbook (404/empty) → FOK immediately ──
-            # No GTC, no cancel, no double-spend risk
-            print("No orderbook liquidity — FOK only (no GTC)")
-            success = _place_fok_order(slug, bet_side, token_id, stake, exchange_addr, profile_id, fee_bps)
-            if success:
-                filled = True
-                fill_price = displayed_price
+            # ── PATH B: No orderbook data ──
+            if is_hourly and displayed_price:
+                # Hourly markets: place GTC on empty book at cheap price and wait
+                # We ARE the first order — sellers will come match against us
+                print("Empty orderbook on 1H market — placing GTC at cheap price and waiting")
+                hourly_phases_b = [
+                    ("ULTRA_CHEAP",  0.10, 24),  # 10c below displayed, 2 minutes
+                    ("CHEAP",        0.07, 36),  # 7c below, 3 minutes
+                    ("GOOD",         0.05, 60),  # 5c below, 5 minutes
+                    ("DECENT",       0.03, 60),  # 3c below, 5 minutes
+                ]
+                for phase_name, discount, check_count in hourly_phases_b:
+                    if filled:
+                        break
+                    phase_price = round(max(0.01, min(displayed_price - discount, ceiling)), 3)
+                    if phase_price >= ceiling:
+                        continue
+                    print("Phase {}: GTC at ${:.3f} (displayed={:.3f}, discount={:.2f})".format(
+                        phase_name, phase_price, displayed_price, discount))
+                    order_id = _place_gtc_order(slug, bet_side, token_id, stake, phase_price,
+                                                 exchange_addr, profile_id, fee_bps)
+                    if not order_id:
+                        continue
+                    
+                    phase_filled = False
+                    for check_num in range(check_count):
+                        time.sleep(5)
+                        status = _check_order_filled(order_id)
+                        if status == "FILLED":
+                            phase_filled = True
+                            fill_price = phase_price
+                            print("GTC FILLED in phase {} at ${:.3f} ({}s)".format(
+                                phase_name, phase_price, (check_num + 1) * 5))
+                            break
+                        if status == "CANCELLED":
+                            order_id = None
+                            break
+                    
+                    if phase_filled:
+                        filled = True
+                        break
+                    
+                    # Cancel before escalating
+                    if order_id:
+                        final_check = _check_order_filled(order_id)
+                        if final_check == "FILLED":
+                            filled = True
+                            fill_price = phase_price
+                            break
+                        cancel_result = _cancel_order(order_id)
+                        time.sleep(0.5)
+                        if cancel_result == "FILLED":
+                            filled = True
+                            fill_price = phase_price
+                            break
+                        elif cancel_result != True:
+                            recheck = _check_order_filled(order_id)
+                            if recheck == "FILLED":
+                                filled = True
+                                fill_price = phase_price
+                                break
+                            return False
+                
+                # FOK last resort for hourly
+                if not filled:
+                    print("All hourly GTC phases done — FOK at market price")
+                    success = _place_fok_order(slug, bet_side, token_id, stake, exchange_addr, profile_id, fee_bps)
+                    if success:
+                        filled = True
+                        fill_price = displayed_price
+            else:
+                # 15M markets or no price reference: FOK immediately
+                print("No orderbook liquidity — FOK only (no GTC)")
+                success = _place_fok_order(slug, bet_side, token_id, stake, exchange_addr, profile_id, fee_bps)
+                if success:
+                    filled = True
+                    fill_price = displayed_price
 
         if filled:
             if override_stake is None:
