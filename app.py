@@ -2154,9 +2154,40 @@ def _get_poly_client():
         return None
 
 
-def _execute_poly_trade(condition_id, token_id, side, stake, price):
-    """Place an order on Polymarket. GTC sits for up to 2 minutes,
-    then aggressive FOK fallback. Never pays more than 70 cents/share.
+_poly_active_trades = set()  # Track markets with active trade threads
+
+def _execute_poly_trade_async(condition_id, token_id, side, stake, price, 
+                               live_state, bot_label, asset, effective_odds, title):
+    """Run _execute_poly_trade in a background thread so the scanner isn't blocked.
+    Updates balance and sends telegram on success."""
+    trade_key = "{}_{}".format(bot_label, condition_id)
+    if trade_key in _poly_active_trades:
+        print("{} SKIP: trade already active for {}".format(bot_label, asset))
+        return
+    _poly_active_trades.add(trade_key)
+    
+    def _run():
+        try:
+            success = _execute_poly_trade(condition_id, token_id, side, stake, price)
+            if success:
+                live_state["balance"] = round(live_state["balance"] - stake, 2)
+                live_state["trades_today"] += 1
+                print("{} TRADE: {} {} ${:.2f} @{:.0f}% on {} | bal=${:.2f}".format(
+                    bot_label, side, asset, stake, effective_odds, title[:30], live_state["balance"]))
+                emoji = "🟣" if "P3.3" in bot_label else "🔵"
+                send_telegram("{} <b>{} TRADE</b>\n{} {} ${:.2f} @{:.0f}%\n{}\nBal: ${:.2f}".format(
+                    emoji, bot_label, side, asset, stake, effective_odds, title[:40], live_state["balance"]))
+            else:
+                print("{} ORDER EXPIRED: {} {} ${:.2f}".format(bot_label, side, asset, stake))
+        except Exception as e:
+            print("{} async trade error: {}".format(bot_label, e))
+        finally:
+            _poly_active_trades.discard(trade_key)
+    threading.Thread(target=_run, daemon=True).start()
+    """Place an order on Polymarket using dual approach:
+    1. GTC limit order at good price — sits on book for the whole window
+    2. FOK market attempts every 30s — grabs liquidity when it appears
+    First one to fill wins. Never pays more than 70 cents/share.
     Returns True if filled."""
     try:
         client = _get_poly_client()
@@ -2167,123 +2198,126 @@ def _execute_poly_trade(condition_id, token_id, side, stake, price):
         from py_clob_client.order_builder.constants import BUY
         from py_clob_client.clob_types import OrderArgs, MarketOrderArgs, OrderType
 
-        # Polymarket minimum is 5 shares per order
-        # Price per share is ALWAYS capped — higher stakes buy MORE shares
         min_shares = 5.0
-        max_price = 0.70  # Never pay more than 70 cents per share
-        
-        # Cap price: never pay more than signal price + 2 cents, max 70 cents
-        order_price = min(round(price + 0.02, 2), max_price)
-        
-        # Skip if signal price already too high
+        max_price = 0.70
+
         if price > 0.72:
             print("Poly skip: signal price {:.2f} too extreme".format(price))
             return False
 
-        # Calculate shares from stake / price — more stake = more shares
-        shares = max(min_shares, round(stake / order_price, 2))
+        # GTC price: signal price + 2 cents (the good price that sits on book)
+        gtc_price = min(round(price + 0.02, 2), max_price)
+        gtc_shares = max(min_shares, round(stake / gtc_price, 2))
 
-        # Try to get actual best ask — but still cap it
+        # FOK price: signal price + 8 cents (aggressive, crosses spread)
+        fok_price = min(round(price + 0.08, 2), max_price)
+
+        # Try to get actual best ask
         try:
             book = client.get_order_book(str(token_id))
             if book and hasattr(book, 'asks') and book.asks:
                 actual_ask = float(book.asks[0].price) if book.asks else None
-                if actual_ask and actual_ask > 0 and actual_ask <= order_price:
-                    order_price = round(actual_ask, 2)  # Use ask if cheaper
+                if actual_ask and actual_ask > 0 and actual_ask <= gtc_price:
+                    gtc_price = round(actual_ask, 2)
+                    gtc_shares = max(min_shares, round(stake / gtc_price, 2))
         except:
             pass
 
-        # ── Try GTC — sits on book for up to 2 minutes ──
+        # ── Place GTC at good price — sits on book ──
+        gtc_order_id = None
         try:
             order_args = OrderArgs(
                 token_id=str(token_id),
-                price=order_price,
-                size=shares,
+                price=gtc_price,
+                size=gtc_shares,
                 side=BUY,
             )
             signed_order = client.create_order(order_args)
             gtc_resp = client.post_order(signed_order, OrderType.GTC)
-            print("Poly GTC: price={:.2f} shares={} resp={}".format(order_price, shares, str(gtc_resp)[:150]))
+            print("Poly GTC placed: price={:.2f} shares={} resp={}".format(
+                gtc_price, gtc_shares, str(gtc_resp)[:150]))
 
             if gtc_resp:
-                order_id = gtc_resp.get("orderID") or gtc_resp.get("order_id")
+                gtc_order_id = gtc_resp.get("orderID") or gtc_resp.get("order_id")
                 status = (gtc_resp.get("status") or "").upper()
-
                 if status in ("MATCHED", "FILLED"):
-                    print("Poly GTC FILLED: {} ${:.2f} @{:.2f}".format(side, stake, order_price))
+                    print("Poly GTC FILLED immediately: {} ${:.2f} @{:.2f}".format(side, stake, gtc_price))
                     return True
-
-                if order_id and status == "LIVE":
-                    # Wait up to 2 minutes (60 checks × 2 sec) for market makers to fill
-                    for i in range(60):
-                        time.sleep(2)
-                        try:
-                            info = client.get_order(order_id)
-                            if info:
-                                s = (info.get("status") or "").upper()
-                                if s in ("MATCHED", "FILLED"):
-                                    print("Poly GTC FILLED (wait {}s): {} ${:.2f}".format((i+1)*2, side, stake))
-                                    return True
-                                elif s in ("CANCELED", "CANCELLED", "EXPIRED"):
-                                    break
-                        except:
-                            pass
-                    # Cancel GTC after 2 minutes — MUST confirm cancel before FOK
-                    gtc_cancelled = False
-                    try:
-                        client.cancel(order_id)
-                        gtc_cancelled = True
-                        print("Poly GTC cancelled after 2min — trying aggressive FOK")
-                    except Exception as cancel_err:
-                        # Cancel failed — check if it filled while we tried to cancel
-                        try:
-                            info = client.get_order(order_id)
-                            s = (info.get("status") or "").upper() if info else ""
-                            if s in ("MATCHED", "FILLED"):
-                                print("Poly GTC FILLED (during cancel): {} ${:.2f}".format(side, stake))
-                                return True
-                            elif s in ("CANCELED", "CANCELLED", "EXPIRED"):
-                                gtc_cancelled = True
-                            else:
-                                # Unknown state — don't risk double fill
-                                print("Poly GTC cancel failed, status={} — skipping FOK to avoid double fill".format(s))
-                                return False
-                        except:
-                            print("Poly GTC cancel failed, can't verify — skipping FOK to avoid double fill")
-                            return False
-                    if not gtc_cancelled:
-                        return False
         except Exception as gtc_err:
             print("Poly GTC error: {}".format(gtc_err))
 
-        # ── Aggressive FOK fallback — cross the spread but stay under 70 cents ──
-        try:
-            # Pay up to 8 cents more than signal price, still capped at 70 cents
-            fok_price = min(round(price + 0.08, 2), max_price)
-            fok_shares = max(min_shares, round(stake / fok_price, 2))
-            fok_amount = round(fok_shares * fok_price, 2)
-            print("Poly FOK aggressive: price={:.2f} (signal was {:.2f}, max={:.2f})".format(fok_price, price, max_price))
-            mo = MarketOrderArgs(
-                token_id=str(token_id),
-                amount=fok_amount,
-                side=BUY,
-                price=fok_price,
-            )
-            signed_fok = client.create_market_order(mo)
-            fok_resp = client.post_order(signed_fok, OrderType.FOK)
-            print("Poly FOK resp: {}".format(str(fok_resp)[:200]))
+        # ── Loop: check GTC + retry FOK every 30 seconds ──
+        # Run for up to 10 minutes (20 iterations × 30 sec)
+        # GTC stays on book the whole time catching dips
+        # FOK retries grab liquidity when it appears
+        max_attempts = 20  # 20 × 30s = 10 minutes max
+        for attempt in range(max_attempts):
+            time.sleep(30)
 
-            if fok_resp:
-                fok_status = (fok_resp.get("status") or "").upper()
-                if fok_status in ("MATCHED", "FILLED"):
-                    print("Poly FOK FILLED: {} ${:.2f} @{:.2f}".format(side, stake, fok_price))
-                    return True
-                else:
-                    print("Poly FOK not filled: {}".format(fok_status))
-            return False
-        except Exception as fok_err:
-            print("Poly FOK error: {}".format(fok_err))
-            return False
+            # Check if GTC filled on its own (price dipped to our level)
+            if gtc_order_id:
+                try:
+                    info = client.get_order(gtc_order_id)
+                    if info:
+                        s = (info.get("status") or "").upper()
+                        if s in ("MATCHED", "FILLED"):
+                            print("Poly GTC FILLED (dip after {}s): {} ${:.2f} @{:.2f}".format(
+                                (attempt+1)*30, side, stake, gtc_price))
+                            return True
+                        elif s in ("CANCELED", "CANCELLED", "EXPIRED"):
+                            print("Poly GTC cancelled externally — stopping")
+                            gtc_order_id = None
+                            break
+                except:
+                    pass
+
+            # Try FOK at aggressive price
+            try:
+                fok_shares = max(min_shares, round(stake / fok_price, 2))
+                fok_amount = round(fok_shares * fok_price, 2)
+                mo = MarketOrderArgs(
+                    token_id=str(token_id),
+                    amount=fok_amount,
+                    side=BUY,
+                    price=fok_price,
+                )
+                signed_fok = client.create_market_order(mo)
+                fok_resp = client.post_order(signed_fok, OrderType.FOK)
+
+                if fok_resp:
+                    fok_status = (fok_resp.get("status") or "").upper()
+                    if fok_status in ("MATCHED", "FILLED"):
+                        print("Poly FOK FILLED (attempt {} after {}s): {} ${:.2f} @{:.2f}".format(
+                            attempt+1, (attempt+1)*30, side, stake, fok_price))
+                        # Cancel the GTC since FOK filled
+                        if gtc_order_id:
+                            try:
+                                client.cancel(gtc_order_id)
+                            except:
+                                pass
+                        return True
+            except Exception as fok_err:
+                # FOK failed — that's fine, GTC is still sitting on book
+                if attempt == 0:
+                    print("Poly FOK retry #{}: no fill (GTC still on book @{:.2f})".format(attempt+1, gtc_price))
+
+        # ── Time's up — cancel GTC if still live ──
+        if gtc_order_id:
+            try:
+                # Check one last time before cancelling
+                info = client.get_order(gtc_order_id)
+                if info:
+                    s = (info.get("status") or "").upper()
+                    if s in ("MATCHED", "FILLED"):
+                        print("Poly GTC FILLED (final check): {} ${:.2f} @{:.2f}".format(side, stake, gtc_price))
+                        return True
+                client.cancel(gtc_order_id)
+                print("Poly GTC cancelled after {}min — no fill".format(max_attempts * 30 // 60))
+            except:
+                pass
+
+        print("Poly order EXPIRED: {} {} ${:.2f} — no liquidity".format(side, side, stake))
+        return False
 
     except Exception as e:
         print("Poly trade error: {}".format(e))
@@ -12177,19 +12211,9 @@ def run_poly_scan():
                                     try:
                                         print("{} ATTEMPTING: {} {} ${:.2f} @{:.2f} token={}...".format(
                                             bot_label, poly_side, asset, poly_stake, share_price, str(token_id)[:20]))
-                                        success = _execute_poly_trade(
-                                            cid, token_id, poly_side, poly_stake, share_price)
-                                        if success:
-                                            live_state["balance"] = round(live_state["balance"] - poly_stake, 2)
-                                            live_state["trades_today"] += 1
-                                            print("{} TRADE: {} {} ${:.2f} @{:.0f}% on {} | bal=${:.2f}".format(
-                                                bot_label, poly_side, asset, poly_stake,
-                                                effective_odds, parsed["title"][:30], live_state["balance"]))
-                                            send_telegram("🟣 <b>{} TRADE</b>\n{} {} ${:.2f} @{:.0f}%\n{}\nBal: ${:.2f}".format(
-                                                bot_label, poly_side, asset, poly_stake,
-                                                effective_odds, parsed["title"][:40], live_state["balance"]))
-                                        else:
-                                            print("{} ORDER FAILED: {} {} ${:.2f}".format(bot_label, poly_side, asset, poly_stake))
+                                        _execute_poly_trade_async(
+                                            cid, token_id, poly_side, poly_stake, share_price,
+                                            live_state, bot_label, asset, effective_odds, parsed["title"])
                                     except Exception as pe:
                                         print("{} trade error: {}".format(bot_label, pe))
                                 else:
@@ -12217,19 +12241,9 @@ def run_poly_scan():
                                     try:
                                         print("{} ATTEMPTING: {} {} ${:.2f} @{:.2f} token={}...".format(
                                             bot_label, poly_side, asset, poly_stake, share_price, str(token_id)[:20]))
-                                        success = _execute_poly_trade(
-                                            cid, token_id, poly_side, poly_stake, share_price)
-                                        if success:
-                                            live_state["balance"] = round(live_state["balance"] - poly_stake, 2)
-                                            live_state["trades_today"] += 1
-                                            print("{} TRADE: {} {} ${:.2f} @{:.0f}% on {} | bal=${:.2f}".format(
-                                                bot_label, poly_side, asset, poly_stake,
-                                                effective_odds, parsed["title"][:30], live_state["balance"]))
-                                            send_telegram("🟣 <b>{} TRADE</b>\n{} {} ${:.2f} @{:.0f}%\n{}\nBal: ${:.2f}".format(
-                                                bot_label, poly_side, asset, poly_stake,
-                                                effective_odds, parsed["title"][:40], live_state["balance"]))
-                                        else:
-                                            print("{} ORDER FAILED: {} {} ${:.2f}".format(bot_label, poly_side, asset, poly_stake))
+                                        _execute_poly_trade_async(
+                                            cid, token_id, poly_side, poly_stake, share_price,
+                                            live_state, bot_label, asset, effective_odds, parsed["title"])
                                     except Exception as pe:
                                         print("{} trade error: {}".format(bot_label, pe))
                                 else:
@@ -12257,19 +12271,9 @@ def run_poly_scan():
                                     try:
                                         print("{} ATTEMPTING: {} {} ${:.2f} @{:.2f} token={}...".format(
                                             bot_label, poly_side, asset, poly_stake, share_price, str(token_id)[:20]))
-                                        success = _execute_poly_trade(
-                                            cid, token_id, poly_side, poly_stake, share_price)
-                                        if success:
-                                            live_state["balance"] = round(live_state["balance"] - poly_stake, 2)
-                                            live_state["trades_today"] += 1
-                                            print("{} TRADE: {} {} ${:.2f} @{:.0f}% on {} | bal=${:.2f}".format(
-                                                bot_label, poly_side, asset, poly_stake,
-                                                effective_odds, parsed["title"][:30], live_state["balance"]))
-                                            send_telegram("🔵 <b>{} TRADE</b>\n{} {} ${:.2f} @{:.0f}%\n{}\nBal: ${:.2f}".format(
-                                                bot_label, poly_side, asset, poly_stake,
-                                                effective_odds, parsed["title"][:40], live_state["balance"]))
-                                        else:
-                                            print("{} ORDER FAILED: {} {} ${:.2f}".format(bot_label, poly_side, asset, poly_stake))
+                                        _execute_poly_trade_async(
+                                            cid, token_id, poly_side, poly_stake, share_price,
+                                            live_state, bot_label, asset, effective_odds, parsed["title"])
                                     except Exception as pe:
                                         print("{} trade error: {}".format(bot_label, pe))
                                 else:
