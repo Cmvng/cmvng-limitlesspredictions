@@ -3211,6 +3211,22 @@ def run_scan():
 
 _current_cycle_bot1_ids = set()  # Shared between scanners in same cycle
 
+def _precalc_indicators():
+    """Pre-calculate and cache all indicators for all assets.
+    Called ~10 seconds before 15M window opens so cache is warm when scan fires."""
+    assets = ["BTC", "ETH", "SOL", "XRP", "DOGE"]
+    for asset in assets:
+        try:
+            # Warm up price cache
+            get_price(asset)
+            # Warm up 15m indicators (for 15M markets)
+            _calculate_indicators(asset, "15m")
+            # Warm up 1h indicators (for 1H markets)  
+            _calculate_indicators(asset, "1h")
+        except:
+            pass
+
+
 def scan_loop():
     time.sleep(30)
     while True:
@@ -3236,14 +3252,27 @@ def scan_loop():
         except Exception as e:
             print("Balance save error: {}".format(e))
         
-        # Align to next 5-minute clock boundary (:00, :05, :10, :15, etc.)
-        # Critical: :00, :15, :30, :45 are when 15M markets open — bot must scan at these times
-        # Adding 3 seconds offset so the scan starts just AFTER the market opens
+        # Align to next 5-minute clock boundary
+        # Schedule: pre-calc indicators 10s before boundary, scan 3s after boundary
         now_ts = time.time()
         interval = 300  # 5 minutes
-        next_boundary = ((now_ts // interval) + 1) * interval + 3  # 3s after boundary
-        wait_seconds = max(5, next_boundary - now_ts)  # At least 5s between cycles
-        time.sleep(wait_seconds)
+        next_boundary = ((now_ts // interval) + 1) * interval
+        
+        # Wait until 10 seconds before the boundary, then pre-calc
+        precalc_time = next_boundary - 10
+        wait_to_precalc = max(1, precalc_time - time.time())
+        time.sleep(wait_to_precalc)
+        
+        # Pre-calculate indicators so cache is warm when scan fires
+        try:
+            _precalc_indicators()
+        except:
+            pass
+        
+        # Wait until 3 seconds after the boundary (market just opened)
+        scan_time = next_boundary + 3
+        wait_to_scan = max(0.5, scan_time - time.time())
+        time.sleep(wait_to_scan)
 
 # ═══════════════════════════════════════════════════════════
 # TECHNICAL INDICATORS CALCULATOR
@@ -6559,9 +6588,9 @@ def run_paper34_scan():
                         except Exception as e:
                             print("Paper23 save error: {}".format(e))
 
-                        # Place REAL trade via Paper 2.3 bot
+                        # Place REAL trade via Paper 2.3 bot (24/7)
                         floor23 = _bot23_state.get("floor_balance", 0)
-                        if _bot23_state["enabled"] and _bot23_state["balance"] > floor23 and not _is_volatile_window():
+                        if _bot23_state["enabled"] and _bot23_state["balance"] > floor23:
                             real_stake23 = _calc_autoscale_stake(_bot23_state)
                             if real_stake23 <= 0:
                                 _bot23_state["enabled"] = False
@@ -6610,9 +6639,9 @@ def run_paper34_scan():
                         except Exception as e:
                             print("Paper33 save error: {}".format(e))
 
-                        # Place REAL trade via Paper 3.3 bot
+                        # Place REAL trade via Paper 3.3 bot (24/7)
                         floor33 = _bot33_state.get("floor_balance", 0)
-                        if _bot33_state["enabled"] and _bot33_state["balance"] > floor33 and not _is_volatile_window():
+                        if _bot33_state["enabled"] and _bot33_state["balance"] > floor33:
                             real_stake33 = _calc_autoscale_stake(_bot33_state)
                             if real_stake33 <= 0:
                                 _bot33_state["enabled"] = False
