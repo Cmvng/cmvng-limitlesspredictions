@@ -3427,18 +3427,30 @@ def _fast_trade_scan():
         price_cache = {}
         trades_placed = 0
 
+        fresh_count = 0
+        skip_count = 0
         for market in markets:
             try:
                 parsed = parse_market(market)
                 if not parsed:
                     continue
                 
-                # Only trade FRESH markets (less than 3 minutes old)
-                mins_left = parsed.get("mins_left", 0)
-                if parsed.get("is_15m_market") and mins_left < 12:
-                    continue  # 15M market more than 3 min old
-                if parsed.get("is_hourly_market") and mins_left < 55:
-                    continue  # Hourly more than 5 min old
+                # Only trade FRESH markets
+                hours_left = parsed.get("hours_left", 0)
+                if parsed.get("is_15m_market"):
+                    # 15M markets have 0.25 hours total. Fresh = more than 0.20 hours left (12 min)
+                    if hours_left < 0.20:
+                        skip_count += 1
+                        continue
+                elif parsed.get("is_hourly_market"):
+                    # 1H markets have 1.0 hours total. Fresh = more than 0.92 hours left (55 min)
+                    if hours_left < 0.92:
+                        skip_count += 1
+                        continue
+                else:
+                    continue  # Skip daily/other
+                
+                fresh_count += 1
 
                 asset = parsed["asset"]
                 if asset not in price_cache:
@@ -3772,20 +3784,150 @@ def _fast_trade_scan():
                                             send_telegram("🟢 <b>P2.2 SNIPE</b>\n{} {} ${:.2f}\n{}\nBal: ${:.2f}".format(
                                                 single_side, asset, real_stake, parsed["title"][:40], _bot22_state["balance"]))
 
-                # ── P2.4 and P3.4: PAUSED for testing ──
-                # Paper tracking still runs in run_paper34_scan
-                # Live trading disabled until P2.3/P3.3 entries are verified
+                # ── P2.4 and P3.4: HOURLY MARKETS ──
+                if parsed.get("is_hourly_market"):
+                    scored24 = None
+                    scored34 = None
+                    
+                    if parsed["market_id"] not in p24_ids:
+                        scored24 = _score_paper24_trade(parsed, price, indicators=ind, ind_macro=ind_macro,
+                                                         expiry_minute=expiry_minute, expiry_hour=expiry_hour)
+                    if parsed["market_id"] not in p34_ids:
+                        scored34 = _score_paper34_trade(parsed, price, indicators=ind, ind_macro=ind_macro,
+                                                         expiry_minute=expiry_minute, expiry_hour=expiry_hour)
+                    
+                    both_hourly = (scored24 and scored34 and scored24["bet_side"] == scored34["bet_side"])
+                    
+                    # Save paper trades
+                    if scored24 and parsed["market_id"] not in p24_ids:
+                        p24_ids.add(parsed["market_id"])
+                        try:
+                            c = get_db()
+                            c.run("""INSERT INTO paper24_trades
+                                (market_id, title, asset, direction, baseline, bet_odds, bet_side,
+                                 current_price, hours_left, market_type, indicators, score,
+                                 total_signals, simulated_stake, simulated_payout, status, fired_at, slug)
+                                VALUES (:mid, :ttl, :ast, :dir, :base, :odds, :bs,
+                                        :pr, :hrs, :mt, :ind, :sc, :ts, 1.0, :sp, 'Pending', :now, :slg)""",
+                                mid=parsed["market_id"], ttl=parsed["title"], ast=asset,
+                                dir=parsed["direction"], base=parsed["baseline"],
+                                odds=scored24["bet_odds"], bs=scored24["bet_side"],
+                                pr=price, hrs=round(parsed["hours_left"], 2),
+                                mt=scored24["market_type"],
+                                ind="[{}] {}".format(scored24["confidence"], scored24["indicators"]),
+                                sc=scored24["score"], ts=scored24["total_signals"],
+                                sp=scored24["sim_payout"], now=now, slg=parsed["slug"])
+                            c.close()
+                        except:
+                            pass
+                    
+                    if scored34 and parsed["market_id"] not in p34_ids:
+                        p34_ids.add(parsed["market_id"])
+                        try:
+                            c = get_db()
+                            c.run("""INSERT INTO paper34_trades
+                                (market_id, title, asset, direction, baseline, bet_odds, bet_side,
+                                 current_price, hours_left, market_type, indicators, score,
+                                 total_signals, simulated_stake, simulated_payout, status, fired_at, slug)
+                                VALUES (:mid, :ttl, :ast, :dir, :base, :odds, :bs,
+                                        :pr, :hrs, :mt, :ind, :sc, :ts, 1.0, :sp, 'Pending', :now, :slg)""",
+                                mid=parsed["market_id"], ttl=parsed["title"], ast=asset,
+                                dir=parsed["direction"], base=parsed["baseline"],
+                                odds=scored34["bet_odds"], bs=scored34["bet_side"],
+                                pr=price, hrs=round(parsed["hours_left"], 2),
+                                mt=scored34["market_type"],
+                                ind="[{}] {}".format(scored34["confidence"], scored34["indicators"]),
+                                sc=scored34["score"], ts=scored34["total_signals"],
+                                sp=scored34["sim_payout"], now=now, slg=parsed["slug"])
+                            c.close()
+                        except:
+                            pass
+                    
+                    # Execute hourly trades
+                    if both_hourly:
+                        h_side = scored24["bet_side"]
+                        print("DUAL 1H: {} {} — P3.4@45% P2.4 sniper".format(h_side, asset))
+                        
+                        # P3.4 patient at 45¢
+                        floor34 = _bot34_state.get("floor_balance", 5)
+                        if _bot34_state["enabled"] and _bot34_state["balance"] > floor34:
+                            real_stake34 = _calc_autoscale_stake(_bot34_state)
+                            if real_stake34 > 0 and real_stake34 <= _bot34_state["balance"]:
+                                _tok34 = None
+                                _tokens34 = market.get("tokens", {})
+                                if isinstance(_tokens34, dict):
+                                    _tok34 = _tokens34.get("yes" if h_side == "YES" else "no") or \
+                                             _tokens34.get("Yes" if h_side == "YES" else "No")
+                                if _tok34 and _cached_credentials["ready"]:
+                                    _oid34 = _place_gtc_order(parsed["slug"], h_side, _tok34, real_stake34, 0.45,
+                                                               _cached_credentials["exchange_addr"],
+                                                               _cached_credentials["profile_id"],
+                                                               _cached_credentials["fee_bps"] or 300)
+                                    if _oid34:
+                                        _bot34_state["balance"] = round(_bot34_state["balance"] - real_stake34, 2)
+                                        _bot34_state["trades_today"] += 1
+                                        trades_placed += 1
+                                        send_telegram("🎯 <b>P3.4 1H @45%</b>\n{} {} ${:.2f}\n{}\nBal: ${:.2f}".format(
+                                            h_side, asset, real_stake34, parsed["title"][:40], _bot34_state["balance"]))
+                        
+                        # P2.4 active sniper
+                        floor24 = _bot24_state.get("floor_balance", 5)
+                        if _bot24_state["enabled"] and _bot24_state["balance"] > floor24:
+                            real_stake24 = _calc_autoscale_stake(_bot24_state)
+                            if real_stake24 > 0 and real_stake24 <= _bot24_state["balance"]:
+                                snipe_order = _snipe_place_gtc(market, parsed, h_side, real_stake24, None)
+                                if snipe_order:
+                                    _bot24_state["balance"] = round(_bot24_state["balance"] - real_stake24, 2)
+                                    _bot24_state["trades_today"] += 1
+                                    trades_placed += 1
+                                    _active_snipe_orders.append(snipe_order)
+                                    send_telegram("⚡ <b>P2.4 1H SNIPE</b>\n{} {} ${:.2f}\n{}\nBal: ${:.2f}".format(
+                                        h_side, asset, real_stake24, parsed["title"][:40], _bot24_state["balance"]))
+                    
+                    elif scored24:
+                        floor24 = _bot24_state.get("floor_balance", 5)
+                        if _bot24_state["enabled"] and _bot24_state["balance"] > floor24:
+                            real_stake24 = _calc_autoscale_stake(_bot24_state)
+                            if real_stake24 > 0 and real_stake24 <= _bot24_state["balance"]:
+                                snipe_order = _snipe_place_gtc(market, parsed, scored24["bet_side"], real_stake24, None)
+                                if snipe_order:
+                                    _bot24_state["balance"] = round(_bot24_state["balance"] - real_stake24, 2)
+                                    _bot24_state["trades_today"] += 1
+                                    trades_placed += 1
+                                    _active_snipe_orders.append(snipe_order)
+                                    send_telegram("🟢 <b>P2.4 1H SNIPE</b>\n{} {} ${:.2f}\n{}\nBal: ${:.2f}".format(
+                                        scored24["bet_side"], asset, real_stake24, parsed["title"][:40], _bot24_state["balance"]))
+                    
+                    elif scored34:
+                        floor34 = _bot34_state.get("floor_balance", 5)
+                        if _bot34_state["enabled"] and _bot34_state["balance"] > floor34:
+                            real_stake34 = _calc_autoscale_stake(_bot34_state)
+                            if real_stake34 > 0 and real_stake34 <= _bot34_state["balance"]:
+                                snipe_order = _snipe_place_gtc(market, parsed, scored34["bet_side"], real_stake34, None)
+                                if snipe_order:
+                                    _bot34_state["balance"] = round(_bot34_state["balance"] - real_stake34, 2)
+                                    _bot34_state["trades_today"] += 1
+                                    trades_placed += 1
+                                    _active_snipe_orders.append(snipe_order)
+                                    send_telegram("🟢 <b>P3.4 1H SNIPE</b>\n{} {} ${:.2f}\n{}\nBal: ${:.2f}".format(
+                                        scored34["bet_side"], asset, real_stake34, parsed["title"][:40], _bot34_state["balance"]))
 
             except Exception as e:
                 continue
 
-        if trades_placed > 0:
-            print("Fast scan: {} live trades placed".format(trades_placed))
+        if trades_placed > 0 or fresh_count > 0:
+            print("Fast scan: {} fresh, {} skipped, {} trades placed".format(fresh_count, skip_count, trades_placed))
         
-        # MANAGE PHASE: Run in background thread so it doesn't block
+        # MANAGE PHASE: Run in background thread with its OWN copy of orders
         if _active_snipe_orders:
-            print("Managing {} active snipe orders in background...".format(len(_active_snipe_orders)))
-            threading.Thread(target=_manage_snipe_orders, daemon=True).start()
+            orders_to_manage = list(_active_snipe_orders)  # Copy for thread safety
+            _active_snipe_orders.clear()  # Clear main list immediately
+            print("Managing {} snipe orders in background...".format(len(orders_to_manage)))
+            def _run_manage(orders):
+                global _active_snipe_orders
+                _active_snipe_orders = orders
+                _manage_snipe_orders()
+            threading.Thread(target=_run_manage, args=(orders_to_manage,), daemon=True).start()
 
     except Exception as e:
         print("Fast trade scan error: {}".format(e))
@@ -4100,16 +4242,8 @@ def scan_loop():
         pass
     
     while True:
-        # ── STEP 1: RAPID-POLL SNIPER (15M markets) ──
-        # Polls every 500ms for 8 seconds looking for NEW markets
-        # Places GTC on empty book within 1-2 seconds of market creation
-        try:
-            snipe_count = _rapid_poll_snipe()
-        except Exception as e:
-            print("Sniper error: {}".format(e))
-            snipe_count = 0
-
-        # ── STEP 2: FAST TRADE SCAN (hourly markets + any 15M missed by sniper) ──
+        # ── STEP 1: FAST TRADE SCAN (runs at boundary + 1 second) ──
+        # Scores and places GTC blast orders on fresh markets
         try:
             _fast_trade_scan()
         except Exception as e:
@@ -4157,10 +4291,10 @@ def scan_loop():
         except:
             pass
         
-        # Wait until 1 second BEFORE boundary — sniper starts polling
-        snipe_start = next_boundary - 1
-        wait_to_snipe = max(0.1, snipe_start - time.time())
-        time.sleep(wait_to_snipe)
+        # Wait until 1 second AFTER boundary (markets just created)
+        scan_time = next_boundary + 1
+        wait_to_scan = max(0.1, scan_time - time.time())
+        time.sleep(wait_to_scan)
 
 # ═══════════════════════════════════════════════════════════
 # TECHNICAL INDICATORS CALCULATOR
@@ -7458,27 +7592,7 @@ def run_paper34_scan():
                         except Exception as e:
                             print("Paper23 save error: {}".format(e))
 
-                        # Place REAL trade via Paper 2.3 bot (24/7)
-                        floor23 = _bot23_state.get("floor_balance", 0)
-                        if _bot23_state["enabled"] and _bot23_state["balance"] > floor23:
-                            real_stake23 = _calc_autoscale_stake(_bot23_state)
-                            if real_stake23 <= 0:
-                                _bot23_state["enabled"] = False
-                                send_telegram("⚠️ <b>Paper 2.3 stopped — floor reached</b>\nBalance: ${:.2f}".format(_bot23_state["balance"]))
-                            elif real_stake23 <= _bot23_state["balance"]:
-                                try:
-                                    bal_after23 = round(_bot23_state["balance"] - real_stake23, 2)
-                                    success = execute_trade(parsed, scored23, None, override_stake=real_stake23,
-                                                           bot_name="P2.3", bot_balance_after=bal_after23)
-                                    if success:
-                                        _bot23_state["balance"] = bal_after23
-                                        _bot23_state["trades_today"] += 1
-                                        print("P2.3 TRADE: {} {} ${:.2f} on {} | bal=${:.2f}".format(
-                                            scored23["bet_side"], asset, real_stake23, parsed["title"][:30], _bot23_state["balance"]))
-                                        send_telegram("🟢 <b>P2.3 TRADE</b>\n{} {} ${:.2f}\n{}\nBal: ${:.2f}".format(
-                                            scored23["bet_side"], asset, real_stake23, parsed["title"][:40], _bot23_state["balance"]))
-                                except Exception as te:
-                                    print("P2.3 trade error: {}".format(te))
+                        # P2.3 LIVE trade — DISABLED here, handled by fast_trade_scan
 
                 # Paper 3.3: P3.1 + Distance Math (mixed mode, 15M only)
                 if parsed["market_id"] not in p33_ids:
@@ -7509,27 +7623,7 @@ def run_paper34_scan():
                         except Exception as e:
                             print("Paper33 save error: {}".format(e))
 
-                        # Place REAL trade via Paper 3.3 bot (24/7)
-                        floor33 = _bot33_state.get("floor_balance", 0)
-                        if _bot33_state["enabled"] and _bot33_state["balance"] > floor33:
-                            real_stake33 = _calc_autoscale_stake(_bot33_state)
-                            if real_stake33 <= 0:
-                                _bot33_state["enabled"] = False
-                                send_telegram("⚠️ <b>Paper 3.3 stopped — floor reached</b>\nBalance: ${:.2f}".format(_bot33_state["balance"]))
-                            elif real_stake33 <= _bot33_state["balance"]:
-                                try:
-                                    bal_after33 = round(_bot33_state["balance"] - real_stake33, 2)
-                                    success = execute_trade(parsed, scored33, None, override_stake=real_stake33,
-                                                           bot_name="P3.3", bot_balance_after=bal_after33)
-                                    if success:
-                                        _bot33_state["balance"] = bal_after33
-                                        _bot33_state["trades_today"] += 1
-                                        print("P3.3 TRADE: {} {} ${:.2f} on {} | bal=${:.2f}".format(
-                                            scored33["bet_side"], asset, real_stake33, parsed["title"][:30], _bot33_state["balance"]))
-                                        send_telegram("🟢 <b>P3.3 TRADE</b>\n{} {} ${:.2f}\n{}\nBal: ${:.2f}".format(
-                                            scored33["bet_side"], asset, real_stake33, parsed["title"][:40], _bot33_state["balance"]))
-                                except Exception as te:
-                                    print("P3.3 trade error: {}".format(te))
+                        # P3.3 LIVE trade — DISABLED here, handled by fast_trade_scan
 
                 # Paper 2.4: P2.1 + Distance + 15M Candle Pattern (1H ONLY)
                 if parsed["market_id"] not in p24_ids:
@@ -7560,27 +7654,7 @@ def run_paper34_scan():
                         except Exception as e:
                             print("Paper24 save error: {}".format(e))
 
-                        # Place REAL trade via Paper 2.4 bot (hourly markets — 24/7)
-                        floor24 = _bot24_state.get("floor_balance", 0)
-                        if _bot24_state["enabled"] and _bot24_state["balance"] > floor24:
-                            real_stake24 = _calc_autoscale_stake(_bot24_state)
-                            if real_stake24 <= 0:
-                                _bot24_state["enabled"] = False
-                                send_telegram("⚠️ <b>Paper 2.4 stopped — floor reached</b>\nBalance: ${:.2f}".format(_bot24_state["balance"]))
-                            elif real_stake24 <= _bot24_state["balance"]:
-                                try:
-                                    bal_after24 = round(_bot24_state["balance"] - real_stake24, 2)
-                                    success = execute_trade(parsed, scored24, None, override_stake=real_stake24,
-                                                           bot_name="P2.4", bot_balance_after=bal_after24, is_hourly=True)
-                                    if success:
-                                        _bot24_state["balance"] = bal_after24
-                                        _bot24_state["trades_today"] += 1
-                                        print("P2.4 TRADE: {} {} ${:.2f} on {} | bal=${:.2f}".format(
-                                            scored24["bet_side"], asset, real_stake24, parsed["title"][:30], _bot24_state["balance"]))
-                                        send_telegram("🟢 <b>P2.4 TRADE (1H)</b>\n{} {} ${:.2f}\n{}\nBal: ${:.2f}".format(
-                                            scored24["bet_side"], asset, real_stake24, parsed["title"][:40], _bot24_state["balance"]))
-                                except Exception as te:
-                                    print("P2.4 trade error: {}".format(te))
+                        # P2.4 LIVE trade — DISABLED here, handled by fast_trade_scan
 
                 # Paper 3.4: P3.1 + Distance + 15M Candle Pattern (1H ONLY)
                 if parsed["market_id"] not in p34_ids:
@@ -7611,27 +7685,7 @@ def run_paper34_scan():
                         except Exception as e:
                             print("Paper34 save error: {}".format(e))
 
-                        # Place REAL trade via Paper 3.4 bot (hourly markets — 24/7)
-                        floor34 = _bot34_state.get("floor_balance", 0)
-                        if _bot34_state["enabled"] and _bot34_state["balance"] > floor34:
-                            real_stake34 = _calc_autoscale_stake(_bot34_state)
-                            if real_stake34 <= 0:
-                                _bot34_state["enabled"] = False
-                                send_telegram("⚠️ <b>Paper 3.4 stopped — floor reached</b>\nBalance: ${:.2f}".format(_bot34_state["balance"]))
-                            elif real_stake34 <= _bot34_state["balance"]:
-                                try:
-                                    bal_after34 = round(_bot34_state["balance"] - real_stake34, 2)
-                                    success = execute_trade(parsed, scored34, None, override_stake=real_stake34,
-                                                           bot_name="P3.4", bot_balance_after=bal_after34, is_hourly=True)
-                                    if success:
-                                        _bot34_state["balance"] = bal_after34
-                                        _bot34_state["trades_today"] += 1
-                                        print("P3.4 TRADE: {} {} ${:.2f} on {} | bal=${:.2f}".format(
-                                            scored34["bet_side"], asset, real_stake34, parsed["title"][:30], _bot34_state["balance"]))
-                                        send_telegram("🟢 <b>P3.4 TRADE (1H)</b>\n{} {} ${:.2f}\n{}\nBal: ${:.2f}".format(
-                                            scored34["bet_side"], asset, real_stake34, parsed["title"][:40], _bot34_state["balance"]))
-                                except Exception as te:
-                                    print("P3.4 trade error: {}".format(te))
+                        # P3.4 LIVE trade — DISABLED here, handled by fast_trade_scan
 
                 # ── Paper 2.5 (1H candle sequence) ──
                 if parsed["market_id"] not in p25_ids:
@@ -12597,9 +12651,17 @@ try:
     _bot33_state["peak_balance"] = 20.0
     _bot33_state["starting_balance"] = 20.0
     _bot33_state["enabled"] = True
-    _bot24_state["enabled"] = False
-    _bot34_state["enabled"] = False
-    print("Limitless LIVE: P2.2=$20, P2.3=$20, P3.3=$20 (TRIPLE SIGNAL) | P2.4/P3.4=PAUSED")
+    _bot24_state["enabled"] = True
+    _bot24_state["balance"] = 20.0
+    _bot24_state["peak_balance"] = 20.0
+    _bot24_state["starting_balance"] = 20.0
+    _bot24_state["floor_balance"] = 5.0
+    _bot34_state["enabled"] = True
+    _bot34_state["balance"] = 20.0
+    _bot34_state["peak_balance"] = 20.0
+    _bot34_state["starting_balance"] = 20.0
+    _bot34_state["floor_balance"] = 5.0
+    print("Limitless LIVE: P2.2=$20, P2.3=$20, P3.3=$20, P2.4=$20, P3.4=$20 | TRIPLE+DUAL SIGNAL")
     # Warm trading credentials for sniper
     threading.Thread(target=_warm_credentials, daemon=True).start()
     # One-time correction of historical paper trade resolutions
