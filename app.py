@@ -3382,18 +3382,56 @@ def run_scan():
 _current_cycle_bot1_ids = set()  # Shared between scanners in same cycle
 
 def _fast_trade_scan():
-    """Fast scanner for live trading bots only (P2.3, P3.3, P2.4, P3.4).
-    Uses cached indicators — no yfinance calls. Runs within 3-5 seconds.
-    Called immediately at market open for fastest possible entry."""
+    """Fast scanner for live trading bots.
+    Phase 1: Rapid poll to detect new markets (polls every 1s for 10s)
+    Phase 2: Score and place orders on fresh markets with ask matching
+    """
     import requests as req
     try:
+        # Phase 1: Rapid poll to detect when new markets appear
         t_start = time.time()
-        r = req.get("{}/markets/active".format(LIMITLESS_API), timeout=10)
-        if r.status_code != 200:
-            print("Fast scan: API returned {}".format(r.status_code))
+        known_ids = set()
+        markets = []
+        new_market_found = False
+        
+        # First fetch to get baseline
+        try:
+            r = req.get("{}/markets/active".format(LIMITLESS_API), timeout=10)
+            if r.status_code == 200:
+                markets = r.json().get("data", [])
+                for m in markets:
+                    known_ids.add(str(m.get("id", "")))
+        except:
+            pass
+        
+        # Rapid poll: check every 1 second for 10 seconds for new markets
+        for poll in range(10):
+            try:
+                r = req.get("{}/markets/active".format(LIMITLESS_API), timeout=5)
+                if r.status_code != 200:
+                    time.sleep(1)
+                    continue
+                fresh_markets = r.json().get("data", [])
+                
+                for m in fresh_markets:
+                    mid = str(m.get("id", ""))
+                    if mid not in known_ids:
+                        new_market_found = True
+                        known_ids.add(mid)
+                
+                if new_market_found:
+                    markets = fresh_markets  # Use the latest fetch with new markets
+                    print("New markets detected in poll #{} ({:.1f}s)".format(poll + 1, time.time() - t_start))
+                    break
+                    
+            except:
+                pass
+            time.sleep(1)
+        
+        if not markets:
             return
-        markets = r.json().get("data", [])
-        print("Fast scan: {} markets fetched in {:.1f}s".format(len(markets), time.time() - t_start))
+        
+        print("Fast scan: {} markets, new_detected={}".format(len(markets), new_market_found))
 
         # Quick dedup check
         conn = get_db()
@@ -4004,8 +4042,16 @@ def _warm_credentials():
     return False
 
 def _snipe_place_gtc(market_data, parsed, bet_side, stake, _unused):
-    """BLAST PHASE: Place initial GTC at 45¢ on the book instantly.
-    Returns order tracking dict for the manage phase, or None on failure."""
+    """Smart entry: check orderbook ask, match if within range, otherwise GTC at max.
+    
+    Logic:
+    1. Check orderbook for best ask
+    2. If ask <= 50%: match immediately (great price)
+    3. If ask 50-66%: place GTC at ask - 2%, wait 5s, then match ask
+    4. If ask > 66%: place GTC at 66% and leave it
+    5. No ask: place GTC at 66% and leave it
+    
+    Returns order tracking dict or None."""
     
     if not _cached_credentials["ready"]:
         if not _warm_credentials():
@@ -4029,29 +4075,96 @@ def _snipe_place_gtc(market_data, parsed, bet_side, stake, _unused):
     exchange_addr = _cached_credentials["exchange_addr"]
     profile_id = _cached_credentials["profile_id"]
     fee_bps = _cached_credentials["fee_bps"] or 300
+    asset = parsed.get("asset", "?")
     
-    # Place initial GTC at cheapest price (45¢)
-    initial_price = 0.45
-    order_id = _place_gtc_order(slug, bet_side, token_id, stake, initial_price,
-                                 exchange_addr, profile_id, fee_bps)
-    if order_id:
-        print("SNIPE BLAST: {} {} @45% on {} (id={})".format(
-            bet_side, parsed.get("asset", "?"), slug[:25], order_id[:12]))
-        return {
-            "order_id": order_id,
-            "slug": slug,
-            "bet_side": bet_side,
-            "token_id": token_id,
-            "stake": stake,
-            "asset": parsed.get("asset", "?"),
-            "current_price": initial_price,
-            "step_idx": 0,
-            "filled": False,
-            "fill_price": None,
-            "exchange_addr": exchange_addr,
-            "profile_id": profile_id,
-            "fee_bps": fee_bps,
-        }
+    # Check orderbook for best ask
+    best_ask = None
+    try:
+        ob = _fetch_orderbook(slug)
+        if ob:
+            _, best_ask, _ = _get_best_prices(ob, bet_side)
+    except:
+        pass
+    
+    if best_ask and best_ask <= 0.50:
+        # GREAT PRICE: match ask immediately
+        price = round(best_ask, 3)
+        print("SNIPE MATCH: {} {} ask@{:.0f}% — instant fill".format(bet_side, asset, price * 100))
+        order_id = _place_gtc_order(slug, bet_side, token_id, stake, price,
+                                     exchange_addr, profile_id, fee_bps)
+        if order_id:
+            return {
+                "order_id": order_id, "slug": slug, "bet_side": bet_side,
+                "token_id": token_id, "stake": stake, "asset": asset,
+                "current_price": price, "step_idx": 8, "filled": False,
+                "fill_price": None, "exchange_addr": exchange_addr,
+                "profile_id": profile_id, "fee_bps": fee_bps,
+            }
+    
+    elif best_ask and best_ask <= 0.66:
+        # DECENT PRICE: try GTC slightly below ask first, then match
+        try_price = round(best_ask - 0.02, 3)
+        print("SNIPE TRY: {} {} ask@{:.0f}% — GTC@{:.0f}% then match".format(
+            bet_side, asset, best_ask * 100, try_price * 100))
+        order_id = _place_gtc_order(slug, bet_side, token_id, stake, try_price,
+                                     exchange_addr, profile_id, fee_bps)
+        if order_id:
+            # Wait 5 seconds for fill
+            time.sleep(5)
+            status = _check_order_filled(order_id)
+            if status == "FILLED":
+                print("SNIPE FILLED: {} {} @{:.0f}% (below ask)".format(bet_side, asset, try_price * 100))
+                return {
+                    "order_id": order_id, "slug": slug, "bet_side": bet_side,
+                    "token_id": token_id, "stake": stake, "asset": asset,
+                    "current_price": try_price, "step_idx": 8, "filled": True,
+                    "fill_price": try_price, "exchange_addr": exchange_addr,
+                    "profile_id": profile_id, "fee_bps": fee_bps,
+                }
+            
+            # Not filled — cancel and match the ask
+            cancel_result = _cancel_order(order_id)
+            if cancel_result == "FILLED":
+                print("SNIPE FILLED: {} {} @{:.0f}% (during cancel)".format(bet_side, asset, try_price * 100))
+                return {
+                    "order_id": order_id, "slug": slug, "bet_side": bet_side,
+                    "token_id": token_id, "stake": stake, "asset": asset,
+                    "current_price": try_price, "step_idx": 8, "filled": True,
+                    "fill_price": try_price, "exchange_addr": exchange_addr,
+                    "profile_id": profile_id, "fee_bps": fee_bps,
+                }
+            
+            time.sleep(0.3)
+            
+            # Match the ask directly
+            match_price = round(best_ask, 3)
+            print("SNIPE MATCH: {} {} @{:.0f}% — matching ask".format(bet_side, asset, match_price * 100))
+            order_id2 = _place_gtc_order(slug, bet_side, token_id, stake, match_price,
+                                          exchange_addr, profile_id, fee_bps)
+            if order_id2:
+                return {
+                    "order_id": order_id2, "slug": slug, "bet_side": bet_side,
+                    "token_id": token_id, "stake": stake, "asset": asset,
+                    "current_price": match_price, "step_idx": 8, "filled": False,
+                    "fill_price": None, "exchange_addr": exchange_addr,
+                    "profile_id": profile_id, "fee_bps": fee_bps,
+                }
+    
+    else:
+        # NO ASK or ASK > 66%: place GTC at 66% max and leave it
+        max_price = 0.66
+        print("SNIPE MAX: {} {} no ask or ask>{:.0f}% — GTC@66%".format(bet_side, asset, 66))
+        order_id = _place_gtc_order(slug, bet_side, token_id, stake, max_price,
+                                     exchange_addr, profile_id, fee_bps)
+        if order_id:
+            return {
+                "order_id": order_id, "slug": slug, "bet_side": bet_side,
+                "token_id": token_id, "stake": stake, "asset": asset,
+                "current_price": max_price, "step_idx": 8, "filled": False,
+                "fill_price": None, "exchange_addr": exchange_addr,
+                "profile_id": profile_id, "fee_bps": fee_bps,
+            }
+    
     return None
 
 # Active snipe orders being managed
@@ -4301,10 +4414,11 @@ def scan_loop():
         except:
             pass
         
-        # Wait until 1 second AFTER boundary (markets just created)
-        scan_time = next_boundary + 1
-        wait_to_scan = max(0.1, scan_time - time.time())
-        time.sleep(wait_to_scan)
+        # Wait until 10 seconds AFTER boundary, then start rapid polling
+        # Markets are created at :XX:11-16, so start checking at :XX:10
+        poll_start = next_boundary + 10
+        wait_to_poll = max(0.1, poll_start - time.time())
+        time.sleep(wait_to_poll)
 
 # ═══════════════════════════════════════════════════════════
 # TECHNICAL INDICATORS CALCULATOR
