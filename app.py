@@ -3387,6 +3387,9 @@ def _fast_trade_scan():
     try:
         t_start = time.time()
         
+        # Diagnostic: show baseline size
+        print("POLL START: _known={} IDs, polling for 8s...".format(len(_known_market_ids)))
+        
         # Poll for 8 seconds, collecting all new market IDs
         new_market_ids = set()
         markets = []
@@ -3396,11 +3399,16 @@ def _fast_trade_scan():
                 r = req.get("{}/markets/active".format(LIMITLESS_API), timeout=5)
                 if r.status_code == 200:
                     all_markets = r.json().get("data", [])
+                    poll_new = 0
                     for m in all_markets:
                         mid = str(m.get("id", ""))
                         if mid not in _known_market_ids:
                             new_market_ids.add(mid)
+                            poll_new += 1
                     markets = all_markets
+                    if poll_new > 0 or poll == 0:
+                        print("POLL #{}: {} markets, {} new this poll, {} new total".format(
+                            poll + 1, len(all_markets), poll_new, len(new_market_ids)))
             except:
                 pass
             time.sleep(1)
