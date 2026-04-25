@@ -3471,6 +3471,7 @@ def _fast_trade_scan():
 
         price_cache = {}
         trades_placed = 0
+        _unscored_15m = []  # Markets where first pass found no signal (for second pass)
 
         fresh_count = 0
         skip_count = 0
@@ -3580,6 +3581,10 @@ def _fast_trade_scan():
                     
                     # Determine agreement
                     scored_list = [s for s in [scored22, scored23, scored33] if s]
+                    
+                    # Track unscored 15M markets for second pass with fresh indicators
+                    if not scored_list and parsed.get("is_15m_market"):
+                        _unscored_15m.append((market, parsed, asset, hours_left))
                     if len(scored_list) >= 2:
                         # Check if all scored bots agree on direction
                         sides = set(s["bet_side"] for s in scored_list)
@@ -3828,6 +3833,103 @@ def _fast_trade_scan():
         if trades_placed > 0 or fresh_count > 0:
             print("Fast scan: {} fresh, {} skipped, {} trades placed".format(fresh_count, skip_count, trades_placed))
         
+        # ── SECOND PASS: Re-score unscored 15M markets with FRESH indicators ──
+        if _unscored_15m:
+            print("SECOND PASS: {} unscored 15M markets — recalculating fresh indicators".format(len(_unscored_15m)))
+            for _us_market, _us_parsed, _us_asset, _us_h_left in _unscored_15m:
+                try:
+                    # FORCE fresh by clearing cache for this asset
+                    _indicator_cache.pop("{}_15m".format(_us_asset), None)
+                    _indicator_cache.pop("{}_1h".format(_us_asset), None)
+                    
+                    _fresh_ind = _calculate_indicators(_us_asset, "15m")
+                    if not _fresh_ind:
+                        continue
+                    _fresh_macro = _calculate_indicators(_us_asset, "1h")
+                    _us_price = _fresh_ind.get("current") or get_price(_us_asset)
+                    if not _us_price:
+                        continue
+                    
+                    _us_expiry_minute = _us_parsed["expiry_dt"].minute if _us_parsed.get("expiry_dt") else None
+                    _us_expiry_hour = _us_parsed["expiry_dt"].hour if _us_parsed.get("expiry_dt") else None
+                    
+                    # Re-score all 3 bots
+                    _us_s22 = None
+                    _us_s23 = None
+                    _us_s33 = None
+                    if _us_parsed["market_id"] not in p22_ids:
+                        _us_s22 = _score_paper21_trade(_us_parsed, _us_price, indicators=_fresh_ind, ind_macro=_fresh_macro,
+                                                        expiry_minute=_us_expiry_minute, expiry_hour=_us_expiry_hour)
+                        if _us_s22 and _us_s22.get("market_type") != "15M":
+                            _us_s22 = None
+                    if _us_parsed["market_id"] not in p23_ids:
+                        _us_s23 = _score_paper23_trade(_us_parsed, _us_price, indicators=_fresh_ind, ind_macro=_fresh_macro,
+                                                        expiry_minute=_us_expiry_minute, expiry_hour=_us_expiry_hour)
+                    if _us_parsed["market_id"] not in p33_ids:
+                        _us_s33 = _score_paper33_trade(_us_parsed, _us_price, indicators=_fresh_ind, ind_macro=_fresh_macro,
+                                                        expiry_minute=_us_expiry_minute, expiry_hour=_us_expiry_hour)
+                    
+                    _us_scored = [s for s in [_us_s22, _us_s23, _us_s33] if s]
+                    if not _us_scored:
+                        continue
+                    
+                    print("SECOND PASS HIT: {} — {} bots scored".format(_us_asset, len(_us_scored)))
+                    
+                    # Save paper trades and place live orders
+                    for _us_bot_id, _us_scored_val, _us_state, _us_table, _us_id_set in [
+                        ("P2.2", _us_s22, _bot22_state, "paper22_trades", p22_ids),
+                        ("P2.3", _us_s23, _bot23_state, "paper23_trades", p23_ids),
+                        ("P3.3", _us_s33, _bot33_state, "paper33_trades", p33_ids),
+                    ]:
+                        if not _us_scored_val:
+                            continue
+                        if _us_parsed["market_id"] in _us_id_set:
+                            continue
+                        
+                        # Save paper trade
+                        try:
+                            _us_now = datetime.now(timezone.utc).isoformat()
+                            _us_c = get_db()
+                            _us_c.run("""INSERT INTO {}
+                                (market_id, title, asset, direction, baseline, bet_odds, bet_side,
+                                 current_price, hours_left, market_type, indicators, score,
+                                 total_signals, simulated_stake, simulated_payout, status, fired_at, slug)
+                                VALUES (:mid, :ttl, :ast, :dir, :base, :odds, :bs,
+                                        :pr, :hrs, :mt, :ind, :sc, :ts, 1.0, :sp, 'Pending', :now, :slg)""".format(_us_table),
+                                mid=_us_parsed["market_id"], ttl=_us_parsed["title"], ast=_us_asset,
+                                dir=_us_parsed["direction"], base=_us_parsed["baseline"],
+                                odds=_us_scored_val["bet_odds"], bs=_us_scored_val["bet_side"],
+                                pr=_us_price, hrs=round(_us_h_left, 2),
+                                mt=_us_scored_val["market_type"],
+                                ind="[{}] {}".format(_us_scored_val["confidence"], _us_scored_val["indicators"]),
+                                sc=_us_scored_val["score"], ts=_us_scored_val["total_signals"],
+                                sp=_us_scored_val["sim_payout"], now=_us_now, slg=_us_parsed["slug"])
+                            _us_c.close()
+                            _us_id_set.add(_us_parsed["market_id"])
+                        except:
+                            pass
+                        
+                        # Place live order
+                        _us_floor = _us_state.get("floor_balance", 8)
+                        _us_stake = _us_state.get("fixed_stake", 1.00)
+                        if _us_state["enabled"] and _us_state["balance"] > _us_floor and _us_stake <= _us_state["balance"] - _us_floor:
+                            _us_snipe = _snipe_place_gtc(_us_market, _us_parsed, _us_scored_val["bet_side"], _us_stake, None)
+                            if _us_snipe:
+                                _us_state["balance"] = round(_us_state["balance"] - _us_stake, 2)
+                                _us_state["trades_today"] = _us_state.get("trades_today", 0) + 1
+                                trades_placed += 1
+                                _active_snipe_orders.append(_us_snipe)
+                                print("2ND PASS {} SNIPE: {} {} ${:.2f} | bal=${:.2f}".format(
+                                    _us_bot_id, _us_scored_val["bet_side"], _us_asset, _us_stake, _us_state["balance"]))
+                                send_telegram("🔄 <b>2ND PASS {} SNIPE</b>\n{} {} ${:.2f}\n{}\nBal: ${:.2f}".format(
+                                    _us_bot_id, _us_scored_val["bet_side"], _us_asset, _us_stake,
+                                    _us_parsed["title"][:40], _us_state["balance"]))
+                except Exception as _us_err:
+                    print("Second pass error {}: {}".format(_us_asset, _us_err))
+            
+            if trades_placed > 0:
+                print("Second pass: {} additional trades placed".format(trades_placed))
+        
         # MANAGE PHASE: Run in background thread with its OWN copy of orders
         if _active_snipe_orders:
             orders_to_manage = list(_active_snipe_orders)  # Copy for thread safety
@@ -3854,6 +3956,46 @@ def _precalc_indicators():
             _calculate_indicators(asset, "1h")
         except:
             pass
+
+def _backup_live_snipe(bot_id, bot_state, scored, parsed, market, asset):
+    """Backup live order — called from paper scan when fast scan missed a signal.
+    Returns True if order placed."""
+    if not _cached_credentials["ready"]:
+        return False
+    floor = bot_state.get("floor_balance", 8)
+    stake = bot_state.get("fixed_stake", 1.00)
+    
+    # P2.4/P3.4: skip XRP on 1H, reduce BTC/ETH
+    if bot_id in ("P2.4", "P3.4") and parsed.get("is_hourly_market"):
+        if asset == "XRP":
+            return False
+        if asset in ("BTC", "ETH"):
+            stake = 1.00
+    
+    if not bot_state["enabled"] or bot_state["balance"] <= floor:
+        return False
+    if stake <= 0 or stake > bot_state["balance"] - floor:
+        return False
+    
+    # Check market has enough time (>3 min for 15M, >15 min for 1H)
+    h_left = parsed.get("hours_left", 0)
+    if parsed.get("is_15m_market") and h_left < 0.05:
+        return False
+    if parsed.get("is_hourly_market") and h_left < 0.25:
+        return False
+    
+    side = scored["bet_side"]
+    snipe_order = _snipe_place_gtc(market, parsed, side, stake, None)
+    if snipe_order:
+        bot_state["balance"] = round(bot_state["balance"] - stake, 2)
+        bot_state["trades_today"] = bot_state.get("trades_today", 0) + 1
+        _active_snipe_orders.append(snipe_order)
+        print("BACKUP {} SNIPE: {} {} ${:.2f} | bal=${:.2f}".format(
+            bot_id, side, asset, stake, bot_state["balance"]))
+        send_telegram("🔄 <b>BACKUP {} SNIPE</b>\n{} {} ${:.2f}\n{}\nBal: ${:.2f}".format(
+            bot_id, side, asset, stake, parsed["title"][:40], bot_state["balance"]))
+        return True
+    return False
 
 # Track known market IDs to detect new markets via rapid polling
 _known_market_ids = set()
@@ -7433,7 +7575,11 @@ def run_paper34_scan():
                         except Exception as e:
                             print("Paper22 save error: {}".format(e))
 
-                        # P2.2 LIVE trade — DISABLED here, handled by fast_trade_scan
+                        # P2.2 BACKUP live trade (if fast scan missed this signal)
+                        try:
+                            _backup_live_snipe("P2.2", _bot22_state, scored22, parsed, market, asset)
+                        except Exception as _e22:
+                            print("P2.2 backup error: {}".format(_e22))
                         # Paper tracking continues above
 
                 # Paper 3.2: Same as P3.1 but 15M ONLY (LIVE trading)
@@ -7515,7 +7661,11 @@ def run_paper34_scan():
                         except Exception as e:
                             print("Paper23 save error: {}".format(e))
 
-                        # P2.3 LIVE trade — DISABLED here, handled by fast_trade_scan
+                        # P2.3 BACKUP live trade (if fast scan missed this signal)
+                        try:
+                            _backup_live_snipe("P2.3", _bot23_state, scored23, parsed, market, asset)
+                        except Exception as _e23:
+                            print("P2.3 backup error: {}".format(_e23))
 
                 # Paper 3.3: P3.1 + Distance Math (mixed mode, 15M only)
                 if parsed["market_id"] not in p33_ids:
@@ -7546,7 +7696,11 @@ def run_paper34_scan():
                         except Exception as e:
                             print("Paper33 save error: {}".format(e))
 
-                        # P3.3 LIVE trade — DISABLED here, handled by fast_trade_scan
+                        # P3.3 BACKUP live trade (if fast scan missed this signal)
+                        try:
+                            _backup_live_snipe("P3.3", _bot33_state, scored33, parsed, market, asset)
+                        except Exception as _e33:
+                            print("P3.3 backup error: {}".format(_e33))
 
                 # Paper 2.4: P2.1 + Distance + 15M Candle Pattern (1H ONLY)
                 if parsed["market_id"] not in p24_ids:
@@ -7577,7 +7731,11 @@ def run_paper34_scan():
                         except Exception as e:
                             print("Paper24 save error: {}".format(e))
 
-                        # P2.4 LIVE trade — DISABLED here, handled by fast_trade_scan
+                        # P2.4 BACKUP live trade (if fast scan missed this signal)
+                        try:
+                            _backup_live_snipe("P2.4", _bot24_state, scored24, parsed, market, asset)
+                        except Exception as _e24:
+                            print("P2.4 backup error: {}".format(_e24))
 
                 # Paper 3.4: P3.1 + Distance + 15M Candle Pattern (1H ONLY)
                 if parsed["market_id"] not in p34_ids:
@@ -7608,7 +7766,11 @@ def run_paper34_scan():
                         except Exception as e:
                             print("Paper34 save error: {}".format(e))
 
-                        # P3.4 LIVE trade — DISABLED here, handled by fast_trade_scan
+                        # P3.4 BACKUP live trade (if fast scan missed this signal)
+                        try:
+                            _backup_live_snipe("P3.4", _bot34_state, scored34, parsed, market, asset)
+                        except Exception as _e34:
+                            print("P3.4 backup error: {}".format(_e34))
 
                 # ── Paper 2.5 (1H candle sequence) ──
                 if parsed["market_id"] not in p25_ids:
@@ -7876,6 +8038,11 @@ def _resolve_paper_table(table_name):
                             send_telegram("⚠️ <b>Paper 2.2 stopped — floor reached</b>\nBalance: ${:.2f}".format(_bot22_state["balance"]))
                         print("P2.2 #{} {}: stake=${:.2f} payout=${:.2f} bal=${:.2f}".format(
                             p["id"], "WIN" if won else "LOSS", stake, payout, _bot22_state["balance"]))
+                        _emoji22 = "✅" if won else "❌"
+                        _pnl22 = "+${:.2f}".format(payout - stake) if won else "-${:.2f}".format(stake)
+                        send_telegram("{} <b>P2.2 {}</b> #{}\n{} {}\nBal: ${:.2f}".format(
+                            _emoji22, "WIN" if won else "LOSS", p["id"], _pnl22,
+                            p.get("title", "")[:30], _bot22_state["balance"]))
 
                 # Update Paper 3.2 balance
                 if table_name == "paper32_trades":
@@ -7909,6 +8076,11 @@ def _resolve_paper_table(table_name):
                             send_telegram("⚠️ <b>Paper 2.3 stopped — floor reached</b>\nBalance: ${:.2f}".format(_bot23_state["balance"]))
                         print("P2.3 #{} {}: stake=${:.2f} payout=${:.2f} bal=${:.2f}".format(
                             p["id"], "WIN" if won else "LOSS", stake, payout, _bot23_state["balance"]))
+                        _emoji23 = "✅" if won else "❌"
+                        _pnl23 = "+${:.2f}".format(payout - stake) if won else "-${:.2f}".format(stake)
+                        send_telegram("{} <b>P2.3 {}</b> #{}\n{} {}\nBal: ${:.2f}".format(
+                            _emoji23, "WIN" if won else "LOSS", p["id"], _pnl23,
+                            p.get("title", "")[:30], _bot23_state["balance"]))
 
                 # Update Paper 3.3 balance
                 if table_name == "paper33_trades":
@@ -7923,8 +8095,55 @@ def _resolve_paper_table(table_name):
                         if _bot33_state["balance"] <= floor33:
                             _bot33_state["enabled"] = False
                             send_telegram("⚠️ <b>Paper 3.3 stopped — floor reached</b>\nBalance: ${:.2f}".format(_bot33_state["balance"]))
+                        _emoji33 = "✅" if won else "❌"
+                        _pnl33 = "+${:.2f}".format(payout - stake) if won else "-${:.2f}".format(stake)
                         print("P3.3 #{} {}: stake=${:.2f} payout=${:.2f} bal=${:.2f}".format(
                             p["id"], "WIN" if won else "LOSS", stake, payout, _bot33_state["balance"]))
+                        send_telegram("{} <b>P3.3 {}</b> #{}\n{} {}\nBal: ${:.2f}".format(
+                            _emoji33, "WIN" if won else "LOSS", p["id"], _pnl33, 
+                            p.get("title", "")[:30], _bot33_state["balance"]))
+
+                # Update Paper 2.4 balance
+                if table_name == "paper24_trades":
+                    fired = p.get("fired_at") or ""
+                    is_live_trade = fired >= "2026-04-25T12:00"
+                    if is_live_trade:
+                        if won:
+                            _bot24_state["balance"] = round(_bot24_state["balance"] + payout, 2)
+                        else:
+                            pass  # stake already deducted at trade time
+                        floor24 = _bot24_state.get("floor_balance", 8)
+                        if _bot24_state["balance"] <= floor24:
+                            _bot24_state["enabled"] = False
+                            send_telegram("⚠️ <b>P2.4 stopped — floor reached</b>\nBalance: ${:.2f}".format(_bot24_state["balance"]))
+                        _emoji24 = "✅" if won else "❌"
+                        _pnl24 = "+${:.2f}".format(payout - stake) if won else "-${:.2f}".format(stake)
+                        print("P2.4 #{} {}: stake=${:.2f} payout=${:.2f} bal=${:.2f}".format(
+                            p["id"], "WIN" if won else "LOSS", stake, payout, _bot24_state["balance"]))
+                        send_telegram("{} <b>P2.4 {}</b> #{}\n{} {}\nBal: ${:.2f}".format(
+                            _emoji24, "WIN" if won else "LOSS", p["id"], _pnl24,
+                            p.get("title", "")[:30], _bot24_state["balance"]))
+
+                # Update Paper 3.4 balance
+                if table_name == "paper34_trades":
+                    fired = p.get("fired_at") or ""
+                    is_live_trade = fired >= "2026-04-25T12:00"
+                    if is_live_trade:
+                        if won:
+                            _bot34_state["balance"] = round(_bot34_state["balance"] + payout, 2)
+                        else:
+                            pass  # stake already deducted at trade time
+                        floor34 = _bot34_state.get("floor_balance", 8)
+                        if _bot34_state["balance"] <= floor34:
+                            _bot34_state["enabled"] = False
+                            send_telegram("⚠️ <b>P3.4 stopped — floor reached</b>\nBalance: ${:.2f}".format(_bot34_state["balance"]))
+                        _emoji34 = "✅" if won else "❌"
+                        _pnl34 = "+${:.2f}".format(payout - stake) if won else "-${:.2f}".format(stake)
+                        print("P3.4 #{} {}: stake=${:.2f} payout=${:.2f} bal=${:.2f}".format(
+                            p["id"], "WIN" if won else "LOSS", stake, payout, _bot34_state["balance"]))
+                        send_telegram("{} <b>P3.4 {}</b> #{}\n{} {}\nBal: ${:.2f}".format(
+                            _emoji34, "WIN" if won else "LOSS", p["id"], _pnl34,
+                            p.get("title", "")[:30], _bot34_state["balance"]))
 
                 # SKIP duplicate Bot 3 balance update below
                 if False and table_name == "paper3_trades":
