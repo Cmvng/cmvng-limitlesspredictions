@@ -930,6 +930,28 @@ def init_db():
             fired_at TEXT, resolved_at TEXT, slug TEXT
         )
     """)
+    conn.run("""
+        CREATE TABLE IF NOT EXISTS paper27_trades (
+            id SERIAL PRIMARY KEY, market_id TEXT, title TEXT, asset TEXT,
+            direction TEXT, baseline REAL, bet_odds REAL, bet_side TEXT,
+            current_price REAL, hours_left REAL, market_type TEXT,
+            indicators TEXT, score INTEGER, total_signals INTEGER,
+            simulated_stake REAL DEFAULT 1.0, simulated_payout REAL,
+            status TEXT DEFAULT 'Pending', outcome TEXT,
+            fired_at TEXT, resolved_at TEXT, slug TEXT
+        )
+    """)
+    conn.run("""
+        CREATE TABLE IF NOT EXISTS paper37_trades (
+            id SERIAL PRIMARY KEY, market_id TEXT, title TEXT, asset TEXT,
+            direction TEXT, baseline REAL, bet_odds REAL, bet_side TEXT,
+            current_price REAL, hours_left REAL, market_type TEXT,
+            indicators TEXT, score INTEGER, total_signals INTEGER,
+            simulated_stake REAL DEFAULT 1.0, simulated_payout REAL,
+            status TEXT DEFAULT 'Pending', outcome TEXT,
+            fired_at TEXT, resolved_at TEXT, slug TEXT
+        )
+    """)
     # Polymarket paper trades — single table for all sections/strategies
     conn.run("""
         CREATE TABLE IF NOT EXISTS poly_trades (
@@ -992,7 +1014,7 @@ def _correct_historical_resolutions():
         "paper31_trades", "paper21_trades", "paper51_trades",
         "paper22_trades", "paper32_trades", "paper23_trades", "paper33_trades",
         "paper24_trades", "paper34_trades", "paper25_trades", "paper35_trades",
-        "paper26_trades", "paper36_trades",
+        "paper26_trades", "paper36_trades", "paper27_trades", "paper37_trades",
     ]
     
     corrected = 0
@@ -4847,6 +4869,112 @@ def _calculate_indicators(asset, timeframe="1h"):
             smc_near_bear_ob = any(current >= ol - smc_atr*0.5 and current <= oh + smc_atr*0.5 for oh, ol in s_int_beo)
 
         # === Distance Math: sigma + momentum for close probability ===
+        # === ADX (Average Directional Index) — Trend Strength ===
+        adx = None
+        plus_di = None
+        minus_di = None
+        if n >= 28:
+            adx_period = 14
+            # Calculate +DM, -DM
+            plus_dm_list = []
+            minus_dm_list = []
+            tr_adx_list = []
+            for i in range(1, n):
+                h = float(highs[i]); l = float(lows[i])
+                ph = float(highs[i-1]); pl = float(lows[i-1]); pc = float(closes[i-1])
+                up_move = h - ph
+                down_move = pl - l
+                pdm = up_move if up_move > down_move and up_move > 0 else 0
+                mdm = down_move if down_move > up_move and down_move > 0 else 0
+                plus_dm_list.append(pdm)
+                minus_dm_list.append(mdm)
+                tr_adx_list.append(max(h - l, abs(h - pc), abs(l - pc)))
+            # Smoothed averages (Wilder's smoothing)
+            if len(plus_dm_list) >= adx_period * 2:
+                s_plus_dm = sum(plus_dm_list[:adx_period])
+                s_minus_dm = sum(minus_dm_list[:adx_period])
+                s_tr = sum(tr_adx_list[:adx_period])
+                dx_list = []
+                for i in range(adx_period, len(plus_dm_list)):
+                    s_plus_dm = s_plus_dm - s_plus_dm / adx_period + plus_dm_list[i]
+                    s_minus_dm = s_minus_dm - s_minus_dm / adx_period + minus_dm_list[i]
+                    s_tr = s_tr - s_tr / adx_period + tr_adx_list[i]
+                    if s_tr > 0:
+                        pdi = 100 * s_plus_dm / s_tr
+                        mdi = 100 * s_minus_dm / s_tr
+                    else:
+                        pdi = mdi = 0
+                    denom = pdi + mdi
+                    dx = 100 * abs(pdi - mdi) / denom if denom > 0 else 0
+                    dx_list.append(dx)
+                if len(dx_list) >= adx_period:
+                    adx_val = sum(dx_list[:adx_period]) / adx_period
+                    for i in range(adx_period, len(dx_list)):
+                        adx_val = (adx_val * (adx_period - 1) + dx_list[i]) / adx_period
+                    adx = round(adx_val, 1)
+                    plus_di = round(pdi, 1)
+                    minus_di = round(mdi, 1)
+
+        # === Volume Ratio (current vs 20-period average) ===
+        vol_ratio = None
+        if volumes is not None and n >= 20:
+            try:
+                cur_vol = float(volumes[-1])
+                avg_vol_20 = float(sum(volumes[-20:])) / 20
+                if avg_vol_20 > 0:
+                    vol_ratio = round(cur_vol / avg_vol_20, 2)
+            except:
+                pass
+
+        # === Parabolic SAR ===
+        psar_dir = None
+        psar_value = None
+        if n >= 10:
+            af_start = 0.02; af_max = 0.20; af_step = 0.02
+            psar = float(lows[0])
+            af = af_start
+            bull = True
+            ep = float(highs[0])
+            for i in range(1, n):
+                h_i = float(highs[i]); l_i = float(lows[i])
+                prev_psar = psar
+                if bull:
+                    psar = prev_psar + af * (ep - prev_psar)
+                    psar = min(psar, float(lows[i-1]))
+                    if i >= 2: psar = min(psar, float(lows[i-2]))
+                    if l_i < psar:
+                        bull = False; psar = ep; ep = l_i; af = af_start
+                    else:
+                        if h_i > ep: ep = h_i; af = min(af + af_step, af_max)
+                else:
+                    psar = prev_psar + af * (ep - prev_psar)
+                    psar = max(psar, float(highs[i-1]))
+                    if i >= 2: psar = max(psar, float(highs[i-2]))
+                    if h_i > psar:
+                        bull = True; psar = ep; ep = h_i; af = af_start
+                    else:
+                        if l_i < ep: ep = l_i; af = min(af + af_step, af_max)
+            psar_value = round(psar, 6)
+            psar_dir = "BUY" if bull else "SELL"
+
+        # === Stochastic Slow ===
+        stoch_k = None
+        stoch_d = None
+        if n >= 17:
+            k_period = 14; d_period = 3
+            k_vals = []
+            for si in range(n - d_period - 1, n):
+                s_start = max(0, si - k_period + 1)
+                hh = max(float(x) for x in highs[s_start:si+1])
+                ll = min(float(x) for x in lows[s_start:si+1])
+                if hh - ll > 0:
+                    k_vals.append(100 * (float(closes[si]) - ll) / (hh - ll))
+                else:
+                    k_vals.append(50)
+            if len(k_vals) >= d_period:
+                stoch_k = round(k_vals[-1], 1)
+                stoch_d = round(sum(k_vals[-d_period:]) / d_period, 1)
+
         dist_sigma = None
         dist_momentum = None
         if n >= 12:
@@ -4894,6 +5022,14 @@ def _calculate_indicators(asset, timeframe="1h"):
             "pivot_signal": pivot_signal,
             "dist_sigma": dist_sigma,
             "dist_momentum": dist_momentum,
+            "adx": adx,
+            "plus_di": plus_di,
+            "minus_di": minus_di,
+            "vol_ratio": vol_ratio,
+            "psar_dir": psar_dir,
+            "psar_value": psar_value,
+            "stoch_k": stoch_k,
+            "stoch_d": stoch_d,
             "candle_open": candle_open,
             "_closes": closes.tolist() if hasattr(closes, 'tolist') else list(closes),
             "_opens": opens.tolist() if hasattr(opens, 'tolist') else list(opens),
@@ -6086,6 +6222,111 @@ def _score_paper23_trade(p, price, indicators=None, ind_macro=None, expiry_minut
 
 
 # ═══════════════════════════════════════════════════════════
+# PAPER 2.7: P2.3 + ADX + RSI + Volume + Parabolic SAR
+# More selective: only trades when trend strength AND momentum confirm
+# ═══════════════════════════════════════════════════════════
+
+def _score_paper27_trade(p, price, indicators=None, ind_macro=None, expiry_minute=None, expiry_hour=None):
+    """Paper 2.7: P2.3 strategy (P2.1 + DIST full confidence) + additional filters:
+    1. ADX must show trend strength (>20 = trending, >25 = strong trend)
+    2. RSI must confirm direction (>55 for YES, <45 for NO)
+    3. Volume must be above average (vol_ratio > 1.0)
+    4. Parabolic SAR must agree with bet direction
+    
+    GATE: ADX > 20 (required — skip if choppy)
+    BOOST: RSI + Volume + PSAR — need at least 2 of 3 to confirm
+    """
+    # First get P2.3's decision (which already includes P2.1 + DIST filter)
+    scored = _score_paper23_trade(p, price, indicators=indicators, ind_macro=ind_macro,
+                                   expiry_minute=expiry_minute, expiry_hour=expiry_hour)
+    if scored is None:
+        return None
+
+    # Only 15M
+    if scored["market_type"] != "15M":
+        return None
+
+    if not indicators:
+        return None
+
+    bet_side = scored["bet_side"]
+    
+    # === GATE: ADX trend strength ===
+    adx = indicators.get("adx")
+    if adx is not None and adx < 20:
+        return None  # No trend — market is choppy, skip
+
+    # === CONFIRMATIONS: count how many additional filters agree ===
+    confirmations = 0
+    conf_details = []
+
+    # 1. RSI confirmation
+    rsi = indicators.get("rsi")
+    rsi_confirms = False
+    if rsi is not None:
+        if bet_side == "YES" and rsi > 55:
+            rsi_confirms = True
+        elif bet_side == "NO" and rsi < 45:
+            rsi_confirms = True
+        elif bet_side == "YES" and rsi > 50:
+            rsi_confirms = True  # mild confirmation
+        elif bet_side == "NO" and rsi < 50:
+            rsi_confirms = True  # mild confirmation
+    if rsi_confirms:
+        confirmations += 1
+        conf_details.append("RSI={:.0f}✓".format(rsi))
+    else:
+        conf_details.append("RSI={:.0f}✗".format(rsi if rsi else 0))
+
+    # 2. Volume confirmation
+    vol_ratio = indicators.get("vol_ratio")
+    vol_confirms = False
+    if vol_ratio is not None and vol_ratio >= 1.0:
+        vol_confirms = True
+        confirmations += 1
+        conf_details.append("VOL={:.1f}x✓".format(vol_ratio))
+    else:
+        conf_details.append("VOL={:.1f}x✗".format(vol_ratio if vol_ratio else 0))
+
+    # 3. Parabolic SAR confirmation
+    psar_dir = indicators.get("psar_dir")
+    psar_confirms = False
+    if psar_dir:
+        if (bet_side == "YES" and psar_dir == "BUY") or (bet_side == "NO" and psar_dir == "SELL"):
+            psar_confirms = True
+            confirmations += 1
+            conf_details.append("SAR={}✓".format(psar_dir))
+        else:
+            conf_details.append("SAR={}✗".format(psar_dir))
+
+    # Need at least 2 of 3 confirmations
+    if confirmations < 2:
+        return None
+
+    # === Confidence upgrade ===
+    if confirmations == 3 and adx and adx > 25:
+        confidence = "HIGH"  # All filters agree + strong trend
+    elif confirmations == 3:
+        confidence = "HIGH"
+    else:
+        confidence = scored["confidence"]
+
+    # Build indicator string
+    ind_str = scored["indicators"]
+    ind_str += " | ADX={:.0f}".format(adx if adx else 0)
+    ind_str += " | " + " ".join(conf_details)
+    ind_str += " | {}/3✓".format(confirmations)
+
+    return {
+        "bet_side": bet_side, "bet_odds": scored["bet_odds"],
+        "score": scored["score"] + confirmations, 
+        "total_signals": scored["total_signals"] + 3,
+        "confidence": confidence, "indicators": ind_str,
+        "market_type": scored["market_type"], "sim_payout": scored["sim_payout"],
+    }
+
+
+# ═══════════════════════════════════════════════════════════
 # PAPER 3.3: Bot 3.1 + Distance Calculator — MIXED MODE
 # Uses distance to adjust confidence and can override weak-period pullbacks
 # ═══════════════════════════════════════════════════════════
@@ -6280,6 +6521,105 @@ def _get_15m_candle_pattern(asset, expiry_hour, mins_left):
 
     except Exception:
         return 0, 0, 0, "NONE", 0
+
+
+# ═══════════════════════════════════════════════════════════
+# PAPER 3.7: P3.3 + ADX + RSI + Volume + Parabolic SAR
+# Same filters as P2.7 but applied to P3.3 base strategy
+# ═══════════════════════════════════════════════════════════
+
+def _score_paper37_trade(p, price, indicators=None, ind_macro=None, expiry_minute=None, expiry_hour=None):
+    """Paper 3.7: P3.3 strategy (P3.1 + DIST mixed mode) + additional filters:
+    1. ADX must show trend strength (>20 = trending)
+    2. RSI must confirm direction (>55 for YES, <45 for NO)
+    3. Volume must be above average (vol_ratio > 1.0)
+    4. Parabolic SAR must agree with bet direction
+    
+    GATE: ADX > 20 (required — skip if choppy)
+    BOOST: RSI + Volume + PSAR — need at least 2 of 3
+    """
+    # Get P3.3's decision (P3.1 + DIST mixed mode)
+    scored = _score_paper33_trade(p, price, indicators=indicators, ind_macro=ind_macro,
+                                   expiry_minute=expiry_minute, expiry_hour=expiry_hour)
+    if scored is None:
+        return None
+
+    if scored["market_type"] != "15M":
+        return None
+
+    if not indicators:
+        return None
+
+    bet_side = scored["bet_side"]
+    
+    # === GATE: ADX trend strength ===
+    adx = indicators.get("adx")
+    if adx is not None and adx < 20:
+        return None
+
+    # === CONFIRMATIONS ===
+    confirmations = 0
+    conf_details = []
+
+    # 1. RSI
+    rsi = indicators.get("rsi")
+    rsi_confirms = False
+    if rsi is not None:
+        if bet_side == "YES" and rsi > 55:
+            rsi_confirms = True
+        elif bet_side == "NO" and rsi < 45:
+            rsi_confirms = True
+        elif bet_side == "YES" and rsi > 50:
+            rsi_confirms = True
+        elif bet_side == "NO" and rsi < 50:
+            rsi_confirms = True
+    if rsi_confirms:
+        confirmations += 1
+        conf_details.append("RSI={:.0f}✓".format(rsi))
+    else:
+        conf_details.append("RSI={:.0f}✗".format(rsi if rsi else 0))
+
+    # 2. Volume
+    vol_ratio = indicators.get("vol_ratio")
+    if vol_ratio is not None and vol_ratio >= 1.0:
+        confirmations += 1
+        conf_details.append("VOL={:.1f}x✓".format(vol_ratio))
+    else:
+        conf_details.append("VOL={:.1f}x✗".format(vol_ratio if vol_ratio else 0))
+
+    # 3. Parabolic SAR
+    psar_dir = indicators.get("psar_dir")
+    if psar_dir:
+        if (bet_side == "YES" and psar_dir == "BUY") or (bet_side == "NO" and psar_dir == "SELL"):
+            confirmations += 1
+            conf_details.append("SAR={}✓".format(psar_dir))
+        else:
+            conf_details.append("SAR={}✗".format(psar_dir))
+
+    # Need at least 2 of 3
+    if confirmations < 2:
+        return None
+
+    # Confidence
+    if confirmations == 3 and adx and adx > 25:
+        confidence = "HIGH"
+    elif confirmations == 3:
+        confidence = "HIGH"
+    else:
+        confidence = scored["confidence"]
+
+    ind_str = scored["indicators"]
+    ind_str += " | ADX={:.0f}".format(adx if adx else 0)
+    ind_str += " | " + " ".join(conf_details)
+    ind_str += " | {}/3✓".format(confirmations)
+
+    return {
+        "bet_side": bet_side, "bet_odds": scored["bet_odds"],
+        "score": scored["score"] + confirmations,
+        "total_signals": scored["total_signals"] + 3,
+        "confidence": confidence, "indicators": ind_str,
+        "market_type": scored["market_type"], "sim_payout": scored["sim_payout"],
+    }
 
 
 def _score_paper24_trade(p, price, indicators=None, ind_macro=None, expiry_minute=None, expiry_hour=None):
@@ -7303,6 +7643,16 @@ def run_paper34_scan():
             p36_ids = set(str(row[0]) for row in p36_rows)
         except:
             p36_ids = set()
+        try:
+            p27_rows = conn.run("SELECT market_id FROM paper27_trades WHERE fired_at::timestamptz > NOW() - INTERVAL '30 hours'")
+            p27_ids = set(str(row[0]) for row in p27_rows)
+        except:
+            p27_ids = set()
+        try:
+            p37_rows = conn.run("SELECT market_id FROM paper37_trades WHERE fired_at::timestamptz > NOW() - INTERVAL '30 hours'")
+            p37_ids = set(str(row[0]) for row in p37_rows)
+        except:
+            p37_ids = set()
         # Get Bot 1 and Bot 2 market IDs to avoid overlap
         try:
             bot12_rows = conn.run("""SELECT market_id FROM limitless_predictions WHERE created_at > NOW() - INTERVAL '30 hours'
@@ -7330,6 +7680,8 @@ def run_paper34_scan():
         p35_count = 0
         p26_count = 0
         p36_count = 0
+        p27_count = 0
+        p37_count = 0
 
         for market in markets:
             try:
@@ -7976,11 +8328,65 @@ def run_paper34_scan():
                         except Exception as e:
                             print("Paper36 save error: {}".format(e))
 
+                # ── Paper 2.7 (P2.3 + ADX + RSI + Volume + Parabolic SAR) ──
+                if parsed["market_id"] not in p27_ids:
+                    scored27 = _score_paper27_trade(parsed, price, indicators=ind, ind_macro=ind_macro, expiry_minute=expiry_minute, expiry_hour=expiry_hour)
+                    if scored27:
+                        try:
+                            c27 = get_db()
+                            c27.run(
+                                """INSERT INTO paper27_trades
+                                (market_id, title, asset, direction, baseline, bet_odds, bet_side,
+                                 current_price, hours_left, market_type, indicators, score,
+                                 total_signals, simulated_stake, simulated_payout, status, fired_at, slug)
+                                VALUES (:mid, :ttl, :ast, :dir, :base, :odds, :bs,
+                                        :pr, :hrs, :mt, :ind, :sc, :ts, 1.0, :sp, 'Pending', :now, :slg)""",
+                                mid=parsed["market_id"], ttl=parsed["title"], ast=asset,
+                                dir=parsed["direction"], base=parsed["baseline"],
+                                odds=scored27["bet_odds"], bs=scored27["bet_side"],
+                                pr=price, hrs=round(parsed["hours_left"], 2),
+                                mt=scored27["market_type"],
+                                ind="[{}] {}".format(scored27["confidence"], scored27["indicators"]),
+                                sc=scored27["score"], ts=scored27["total_signals"],
+                                sp=scored27["sim_payout"], now=now, slg=parsed["slug"])
+                            c27.close()
+                            p27_ids.add(parsed["market_id"])
+                            p27_count += 1
+                        except Exception as e:
+                            print("Paper27 save error: {}".format(e))
+
+                # ── Paper 3.7 (P3.3 + ADX + RSI + Volume + Parabolic SAR) ──
+                if parsed["market_id"] not in p37_ids:
+                    scored37 = _score_paper37_trade(parsed, price, indicators=ind, ind_macro=ind_macro, expiry_minute=expiry_minute, expiry_hour=expiry_hour)
+                    if scored37:
+                        try:
+                            c37 = get_db()
+                            c37.run(
+                                """INSERT INTO paper37_trades
+                                (market_id, title, asset, direction, baseline, bet_odds, bet_side,
+                                 current_price, hours_left, market_type, indicators, score,
+                                 total_signals, simulated_stake, simulated_payout, status, fired_at, slug)
+                                VALUES (:mid, :ttl, :ast, :dir, :base, :odds, :bs,
+                                        :pr, :hrs, :mt, :ind, :sc, :ts, 1.0, :sp, 'Pending', :now, :slg)""",
+                                mid=parsed["market_id"], ttl=parsed["title"], ast=asset,
+                                dir=parsed["direction"], base=parsed["baseline"],
+                                odds=scored37["bet_odds"], bs=scored37["bet_side"],
+                                pr=price, hrs=round(parsed["hours_left"], 2),
+                                mt=scored37["market_type"],
+                                ind="[{}] {}".format(scored37["confidence"], scored37["indicators"]),
+                                sc=scored37["score"], ts=scored37["total_signals"],
+                                sp=scored37["sim_payout"], now=now, slg=parsed["slug"])
+                            c37.close()
+                            p37_ids.add(parsed["market_id"])
+                            p37_count += 1
+                        except Exception as e:
+                            print("Paper37 save error: {}".format(e))
+
             except Exception as e:
                 print("Paper345 market error: {}".format(e))
 
-        if p3_count > 0 or p4_count > 0 or p5_count > 0 or p24_count > 0 or p34_count > 0 or p25_count > 0 or p35_count > 0 or p26_count > 0 or p36_count > 0:
-            print("P3:{} P4:{} P5:{} P3.1:{} P2.1:{} P5.1:{} P2.2:{} P3.2:{} P2.3:{} P3.3:{} P2.4:{} P3.4:{} P2.5:{} P3.5:{} P2.6:{} P3.6:{}".format(p3_count, p4_count, p5_count, p31_count, p21_count, p51_count, p22_count, p32_count, p23_count, p33_count, p24_count, p34_count, p25_count, p35_count, p26_count, p36_count))
+        if p3_count > 0 or p4_count > 0 or p5_count > 0 or p24_count > 0 or p34_count > 0 or p25_count > 0 or p35_count > 0 or p26_count > 0 or p36_count > 0 or p27_count > 0 or p37_count > 0:
+            print("P3:{} P4:{} P5:{} P3.1:{} P2.1:{} P5.1:{} P2.2:{} P3.2:{} P2.3:{} P3.3:{} P2.4:{} P3.4:{} P2.5:{} P3.5:{} P2.6:{} P3.6:{} P2.7:{} P3.7:{}".format(p3_count, p4_count, p5_count, p31_count, p21_count, p51_count, p22_count, p32_count, p23_count, p33_count, p24_count, p34_count, p25_count, p35_count, p26_count, p36_count, p27_count, p37_count))
         else:
             # Count how many assets we got indicators for
             ind_ok = sum(1 for v in indicator_cache_local.values() if v is not None)
@@ -8297,6 +8703,8 @@ def resolve_paper34_trades():
     r35 = _resolve_paper_table("paper35_trades")
     r26 = _resolve_paper_table("paper26_trades")
     r36 = _resolve_paper_table("paper36_trades")
+    r27 = _resolve_paper_table("paper27_trades")
+    r37 = _resolve_paper_table("paper37_trades")
     if r3 or r4 or r5 or r24 or r34 or r25 or r35 or r26 or r36:
         print("Resolved: P3={} P4={} P5={} P3.1={} P2.1={} P5.1={} P2.2={} P3.2={} P2.3={} P3.3={} P2.4={} P3.4={} P2.5={} P3.5={} P2.6={} P3.6={}".format(r3, r4, r5, r31, r21, r51, r22, r32, r23, r33, r24, r34, r25, r35, r26, r36))
 
@@ -12645,6 +13053,8 @@ td{padding:8px 12px;border-bottom:1px solid #f4f3ed;color:var(--ink-2)}tr:last-c
     <a href="/app/paper35" class="nav-tab""" + (" active" if nav_active == "paper35" else "") + """">Paper 3.5</a>
     <a href="/app/paper26" class="nav-tab""" + (" active" if nav_active == "paper26" else "") + """">Paper 2.6</a>
     <a href="/app/paper36" class="nav-tab""" + (" active" if nav_active == "paper36" else "") + """">Paper 3.6</a>
+    <a href="/app/paper27" class="nav-tab""" + (" active" if nav_active == "paper27" else "") + """">Paper 2.7</a>
+    <a href="/app/paper37" class="nav-tab""" + (" active" if nav_active == "paper37" else "") + """">Paper 3.7</a>
     <a href="/app/paper4" class="nav-tab""" + (" active" if nav_active == "paper4" else "") + """">Paper 4</a>
     <a href="/app/paper5" class="nav-tab""" + (" active" if nav_active == "paper5" else "") + """">Paper 5</a>
     <a href="/app/paper51" class="nav-tab""" + (" active" if nav_active == "paper51" else "") + """">Paper 5.1</a>
@@ -14439,6 +14849,20 @@ def paper36_page():
         "P3.1 + Candle Position Context — 15M Only",
         "Same as P2.6 but uses P3.1 (7 indicators) for direction. Skips C1, best on C3 and C4.",
         extra_cols=[], nav_active="paper36")
+
+@app.route("/app/paper27")
+def paper27_page():
+    return _build_paper_page("paper27_trades", "Paper 2.7",
+        "P2.3 + ADX + RSI + Volume + Parabolic SAR — 15M Only",
+        "P2.3 strategy (P2.1 + DIST full confidence) filtered through trend strength (ADX>20), momentum confirmation (RSI), volume above average, and Parabolic SAR direction. Needs 2/3 confirmations + ADX gate.",
+        extra_cols=[], nav_active="paper27")
+
+@app.route("/app/paper37")
+def paper37_page():
+    return _build_paper_page("paper37_trades", "Paper 3.7",
+        "P3.3 + ADX + RSI + Volume + Parabolic SAR — 15M Only",
+        "P3.3 strategy (P3.1 + DIST mixed mode) filtered through trend strength (ADX>20), momentum confirmation (RSI), volume above average, and Parabolic SAR direction. Needs 2/3 confirmations + ADX gate.",
+        extra_cols=[], nav_active="paper37")
 
 
 # Start Polymarket threads (defined above)
