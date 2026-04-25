@@ -3472,6 +3472,7 @@ def _fast_trade_scan():
         price_cache = {}
         trades_placed = 0
         _unscored_15m = []  # Markets where first pass found no signal (for second pass)
+        _unscored_1h = []   # 1H markets where first pass found no signal
 
         fresh_count = 0
         skip_count = 0
@@ -3728,6 +3729,10 @@ def _fast_trade_scan():
                     
                     both_hourly = (scored24 and scored34 and scored24["bet_side"] == scored34["bet_side"])
                     
+                    # Track unscored 1H markets for second pass
+                    if not scored24 and not scored34:
+                        _unscored_1h.append((market, parsed, asset, hours_left))
+                    
                     # Save paper trades
                     if scored24 and parsed["market_id"] not in p24_ids:
                         p24_ids.add(parsed["market_id"])
@@ -3929,6 +3934,97 @@ def _fast_trade_scan():
             
             if trades_placed > 0:
                 print("Second pass: {} additional trades placed".format(trades_placed))
+        
+        # ── SECOND PASS FOR 1H: Re-score unscored 1H markets ──
+        if _unscored_1h:
+            print("SECOND PASS 1H: {} unscored 1H markets".format(len(_unscored_1h)))
+            for _us_market, _us_parsed, _us_asset, _us_h_left in _unscored_1h:
+                try:
+                    # Skip XRP on 1H
+                    if _us_asset == "XRP":
+                        continue
+                    
+                    # Force fresh indicators
+                    _indicator_cache.pop("{}_1h".format(_us_asset), None)
+                    _indicator_cache.pop("{}_4h".format(_us_asset), None)
+                    
+                    _fresh_ind = _calculate_indicators(_us_asset, "1h")
+                    if not _fresh_ind:
+                        continue
+                    _fresh_macro = _calculate_indicators(_us_asset, "4h")
+                    _us_price = _fresh_ind.get("current") or get_price(_us_asset)
+                    if not _us_price:
+                        continue
+                    
+                    _us_expiry_minute = _us_parsed["expiry_dt"].minute if _us_parsed.get("expiry_dt") else None
+                    _us_expiry_hour = _us_parsed["expiry_dt"].hour if _us_parsed.get("expiry_dt") else None
+                    
+                    _us_s24 = None
+                    _us_s34 = None
+                    if _us_parsed["market_id"] not in p24_ids:
+                        _us_s24 = _score_paper24_trade(_us_parsed, _us_price, indicators=_fresh_ind, ind_macro=_fresh_macro,
+                                                        expiry_minute=_us_expiry_minute, expiry_hour=_us_expiry_hour)
+                    if _us_parsed["market_id"] not in p34_ids:
+                        _us_s34 = _score_paper34_trade(_us_parsed, _us_price, indicators=_fresh_ind, ind_macro=_fresh_macro,
+                                                        expiry_minute=_us_expiry_minute, expiry_hour=_us_expiry_hour)
+                    
+                    if not _us_s24 and not _us_s34:
+                        continue
+                    
+                    print("SECOND PASS 1H HIT: {} — P2.4={} P3.4={}".format(
+                        _us_asset, _us_s24["bet_side"] if _us_s24 else "skip", _us_s34["bet_side"] if _us_s34 else "skip"))
+                    
+                    for _us_bot_id, _us_scored_val, _us_state, _us_table, _us_id_set in [
+                        ("P2.4", _us_s24, _bot24_state, "paper24_trades", p24_ids),
+                        ("P3.4", _us_s34, _bot34_state, "paper34_trades", p34_ids),
+                    ]:
+                        if not _us_scored_val:
+                            continue
+                        if _us_parsed["market_id"] in _us_id_set:
+                            continue
+                        
+                        # Save paper trade
+                        try:
+                            _us_now = datetime.now(timezone.utc).isoformat()
+                            _us_c = get_db()
+                            _us_c.run("""INSERT INTO {}
+                                (market_id, title, asset, direction, baseline, bet_odds, bet_side,
+                                 current_price, hours_left, market_type, indicators, score,
+                                 total_signals, simulated_stake, simulated_payout, status, fired_at, slug)
+                                VALUES (:mid, :ttl, :ast, :dir, :base, :odds, :bs,
+                                        :pr, :hrs, :mt, :ind, :sc, :ts, 1.0, :sp, 'Pending', :now, :slg)""".format(_us_table),
+                                mid=_us_parsed["market_id"], ttl=_us_parsed["title"], ast=_us_asset,
+                                dir=_us_parsed["direction"], base=_us_parsed["baseline"],
+                                odds=_us_scored_val["bet_odds"], bs=_us_scored_val["bet_side"],
+                                pr=_us_price, hrs=round(_us_h_left, 2),
+                                mt=_us_scored_val["market_type"],
+                                ind="[{}] {}".format(_us_scored_val["confidence"], _us_scored_val["indicators"]),
+                                sc=_us_scored_val["score"], ts=_us_scored_val["total_signals"],
+                                sp=_us_scored_val["sim_payout"], now=_us_now, slg=_us_parsed["slug"])
+                            _us_c.close()
+                            _us_id_set.add(_us_parsed["market_id"])
+                        except:
+                            pass
+                        
+                        # Place live order — BTC/ETH at $1.00, SOL/DOGE at $1.50
+                        _us_floor = _us_state.get("floor_balance", 8)
+                        _us_stake = _us_state.get("fixed_stake", 1.50)
+                        if _us_asset in ("BTC", "ETH"):
+                            _us_stake = 1.00
+                        if _us_state["enabled"] and _us_state["balance"] > _us_floor and _us_stake <= _us_state["balance"] - _us_floor:
+                            _us_snipe = _snipe_place_gtc(_us_market, _us_parsed, _us_scored_val["bet_side"], _us_stake, None)
+                            if _us_snipe:
+                                _us_state["balance"] = round(_us_state["balance"] - _us_stake, 2)
+                                _us_state["trades_today"] = _us_state.get("trades_today", 0) + 1
+                                trades_placed += 1
+                                _active_snipe_orders.append(_us_snipe)
+                                print("2ND PASS {} 1H SNIPE: {} {} ${:.2f} | bal=${:.2f}".format(
+                                    _us_bot_id, _us_scored_val["bet_side"], _us_asset, _us_stake, _us_state["balance"]))
+                                send_telegram("🔄 <b>2ND {} 1H SNIPE</b>\n{} {} ${:.2f}\n{}\nBal: ${:.2f}".format(
+                                    _us_bot_id, _us_scored_val["bet_side"], _us_asset, _us_stake,
+                                    _us_parsed["title"][:40], _us_state["balance"]))
+                except Exception as _us_err:
+                    print("Second pass 1H error {}: {}".format(_us_asset, _us_err))
         
         # MANAGE PHASE: Run in background thread with its OWN copy of orders
         if _active_snipe_orders:
