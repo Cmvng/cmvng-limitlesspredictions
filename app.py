@@ -3774,10 +3774,10 @@ def _fast_trade_scan():
         if trades_placed > 0:
             print("Fast scan: {} live trades placed".format(trades_placed))
         
-        # MANAGE PHASE: Round-robin price management for all blast orders
+        # MANAGE PHASE: Run in background thread so it doesn't block
         if _active_snipe_orders:
-            print("Managing {} active snipe orders...".format(len(_active_snipe_orders)))
-            _manage_snipe_orders()
+            print("Managing {} active snipe orders in background...".format(len(_active_snipe_orders)))
+            threading.Thread(target=_manage_snipe_orders, daemon=True).start()
 
     except Exception as e:
         print("Fast trade scan error: {}".format(e))
@@ -4035,29 +4035,14 @@ def _manage_snipe_orders():
     _active_snipe_orders = []
 
 def _rapid_poll_snipe():
-    """Rapid-poll market sniper for 15M markets.
+    """Rapid-poll market detector for 15M markets.
     Polls /markets/active every 500ms for 8 seconds looking for NEW markets.
-    When a new 15M market appears, immediately places a GTC at cheap price.
-    This gets the bot on the book within 1-2 seconds of market creation."""
+    Only detects and updates _known_market_ids — trading happens in _fast_trade_scan."""
     import requests as req
     global _known_market_ids
     
-    # Quick dedup check
-    try:
-        conn = get_db()
-        p23_rows = conn.run("SELECT market_id FROM paper23_trades WHERE fired_at::timestamptz > NOW() - INTERVAL '30 hours'")
-        p23_ids = set(str(row[0]) for row in p23_rows)
-        p33_rows = conn.run("SELECT market_id FROM paper33_trades WHERE fired_at::timestamptz > NOW() - INTERVAL '30 hours'")
-        p33_ids = set(str(row[0]) for row in p33_rows)
-        conn.close()
-    except:
-        p23_ids = set()
-        p33_ids = set()
-    
-    trades_placed = 0
     new_markets_found = 0
     
-    # Rapid poll: 16 checks × 0.5s = 8 seconds of rapid scanning
     for poll in range(16):
         try:
             r = req.get("{}/markets/active".format(LIMITLESS_API), timeout=5)
@@ -4067,151 +4052,25 @@ def _rapid_poll_snipe():
             markets = r.json().get("data", [])
             
             current_ids = set()
-            new_15m_markets = []
-            
             for market in markets:
                 mid = str(market.get("id", ""))
                 current_ids.add(mid)
-                
-                # Is this a NEW market we haven't seen before?
                 if mid not in _known_market_ids:
-                    parsed = parse_market(market)
-                    if parsed and parsed.get("is_15m_market"):
-                        # Check mins_left — only trade markets with >10 minutes remaining
-                        if parsed.get("mins_left", 0) > 10:
-                            new_15m_markets.append((market, parsed))
-                            new_markets_found += 1
+                    new_markets_found += 1
             
-            # Update known markets
             _known_market_ids = current_ids
             
-            # Process new 15M markets immediately
-            for market, parsed in new_15m_markets:
-                asset = parsed["asset"]
-                
-                # Get price from cache
-                cached_ind = _indicator_cache.get("{}_15m".format(asset))
-                if cached_ind and cached_ind.get("data", {}).get("current"):
-                    price = cached_ind["data"]["current"]
-                    ind = cached_ind["data"]
-                else:
-                    # Cache miss — skip this poll, will catch on next
-                    continue
-                
-                # Macro from cache
-                ind_macro = None
-                macro_cache = _indicator_cache.get("{}_1h".format(asset))
-                if macro_cache:
-                    ind_macro = macro_cache.get("data")
-                
-                expiry_minute = parsed["expiry_dt"].minute if parsed.get("expiry_dt") else None
-                expiry_hour = parsed["expiry_dt"].hour if parsed.get("expiry_dt") else None
-                now_str = datetime.now(timezone.utc).isoformat()
-                
-                # Score P2.3
-                if parsed["market_id"] not in p23_ids:
-                    scored23 = _score_paper23_trade(parsed, price, indicators=ind, ind_macro=ind_macro,
-                                                     expiry_minute=expiry_minute, expiry_hour=expiry_hour)
-                    if scored23:
-                        p23_ids.add(parsed["market_id"])
-                        # Save paper trade
-                        try:
-                            c = get_db()
-                            c.run("""INSERT INTO paper23_trades
-                                (market_id, title, asset, direction, baseline, bet_odds, bet_side,
-                                 current_price, hours_left, market_type, indicators, score,
-                                 total_signals, simulated_stake, simulated_payout, status, fired_at, slug)
-                                VALUES (:mid, :ttl, :ast, :dir, :base, :odds, :bs,
-                                        :pr, :hrs, :mt, :ind, :sc, :ts, 1.0, :sp, 'Pending', :now, :slg)""",
-                                mid=parsed["market_id"], ttl=parsed["title"], ast=asset,
-                                dir=parsed["direction"], base=parsed["baseline"],
-                                odds=scored23["bet_odds"], bs=scored23["bet_side"],
-                                pr=price, hrs=round(parsed["hours_left"], 2),
-                                mt=scored23["market_type"],
-                                ind="[{}] {}".format(scored23["confidence"], scored23["indicators"]),
-                                sc=scored23["score"], ts=scored23["total_signals"],
-                                sp=scored23["sim_payout"], now=now_str, slg=parsed["slug"])
-                            c.close()
-                        except:
-                            pass
-                        # Live trade
-                        floor23 = _bot23_state.get("floor_balance", 0)
-                        if _bot23_state["enabled"] and _bot23_state["balance"] > floor23:
-                            real_stake23 = _calc_autoscale_stake(_bot23_state)
-                            if real_stake23 > 0 and real_stake23 <= _bot23_state["balance"]:
-                                try:
-                                    bal_after23 = round(_bot23_state["balance"] - real_stake23, 2)
-                                    success = execute_trade(parsed, scored23, None, override_stake=real_stake23,
-                                                           bot_name="P2.3", bot_balance_after=bal_after23)
-                                    if success:
-                                        _bot23_state["balance"] = bal_after23
-                                        _bot23_state["trades_today"] += 1
-                                        trades_placed += 1
-                                        print("SNIPE P2.3: {} {} ${:.2f} | bal=${:.2f}".format(
-                                            scored23["bet_side"], asset, real_stake23, _bot23_state["balance"]))
-                                        send_telegram("⚡ <b>SNIPE P2.3</b>\n{} {} ${:.2f}\n{}\nBal: ${:.2f}".format(
-                                            scored23["bet_side"], asset, real_stake23, parsed["title"][:40], _bot23_state["balance"]))
-                                except Exception as te:
-                                    print("Snipe P2.3 error: {}".format(te))
-                
-                # Score P3.3
-                if parsed["market_id"] not in p33_ids:
-                    scored33 = _score_paper33_trade(parsed, price, indicators=ind, ind_macro=ind_macro,
-                                                     expiry_minute=expiry_minute, expiry_hour=expiry_hour)
-                    if scored33:
-                        p33_ids.add(parsed["market_id"])
-                        try:
-                            c = get_db()
-                            c.run("""INSERT INTO paper33_trades
-                                (market_id, title, asset, direction, baseline, bet_odds, bet_side,
-                                 current_price, hours_left, market_type, indicators, score,
-                                 total_signals, simulated_stake, simulated_payout, status, fired_at, slug)
-                                VALUES (:mid, :ttl, :ast, :dir, :base, :odds, :bs,
-                                        :pr, :hrs, :mt, :ind, :sc, :ts, 1.0, :sp, 'Pending', :now, :slg)""",
-                                mid=parsed["market_id"], ttl=parsed["title"], ast=asset,
-                                dir=parsed["direction"], base=parsed["baseline"],
-                                odds=scored33["bet_odds"], bs=scored33["bet_side"],
-                                pr=price, hrs=round(parsed["hours_left"], 2),
-                                mt=scored33["market_type"],
-                                ind="[{}] {}".format(scored33["confidence"], scored33["indicators"]),
-                                sc=scored33["score"], ts=scored33["total_signals"],
-                                sp=scored33["sim_payout"], now=now_str, slg=parsed["slug"])
-                            c.close()
-                        except:
-                            pass
-                        floor33 = _bot33_state.get("floor_balance", 0)
-                        if _bot33_state["enabled"] and _bot33_state["balance"] > floor33:
-                            real_stake33 = _calc_autoscale_stake(_bot33_state)
-                            if real_stake33 > 0 and real_stake33 <= _bot33_state["balance"]:
-                                try:
-                                    bal_after33 = round(_bot33_state["balance"] - real_stake33, 2)
-                                    success = execute_trade(parsed, scored33, None, override_stake=real_stake33,
-                                                           bot_name="P3.3", bot_balance_after=bal_after33)
-                                    if success:
-                                        _bot33_state["balance"] = bal_after33
-                                        _bot33_state["trades_today"] += 1
-                                        trades_placed += 1
-                                        print("SNIPE P3.3: {} {} ${:.2f} | bal=${:.2f}".format(
-                                            scored33["bet_side"], asset, real_stake33, _bot33_state["balance"]))
-                                        send_telegram("⚡ <b>SNIPE P3.3</b>\n{} {} ${:.2f}\n{}\nBal: ${:.2f}".format(
-                                            scored33["bet_side"], asset, real_stake33, parsed["title"][:40], _bot33_state["balance"]))
-                                except Exception as te:
-                                    print("Snipe P3.3 error: {}".format(te))
+            # If we detected new markets, stop polling — fast scan will handle them
+            if new_markets_found > 0:
+                print("Sniper detected {} new markets in poll #{}".format(new_markets_found, poll + 1))
+                return new_markets_found
             
-            # If we found and traded new markets, stop polling early
-            if trades_placed > 0:
-                print("Sniper: {} new markets found, {} trades placed in poll #{}".format(
-                    new_markets_found, trades_placed, poll + 1))
-                return trades_placed
-            
-        except Exception as e:
+        except:
             pass
         
-        time.sleep(0.5)  # 500ms between polls
+        time.sleep(0.5)
     
-    if new_markets_found > 0:
-        print("Sniper: {} new markets found, {} trades placed".format(new_markets_found, trades_placed))
-    return trades_placed
+    return 0
 
 
 def scan_loop():
@@ -7509,26 +7368,8 @@ def run_paper34_scan():
                         except Exception as e:
                             print("Paper22 save error: {}".format(e))
 
-                        # P2.2 LIVE trade
-                        floor22 = _bot22_state.get("floor_balance", 5)
-                        if _bot22_state["enabled"] and _bot22_state["balance"] > floor22 and not _is_volatile_window():
-                            real_stake22 = _calc_autoscale_stake(_bot22_state)
-                            if real_stake22 <= 0:
-                                if _bot22_state["balance"] <= floor22:
-                                    _bot22_state["enabled"] = False
-                                    send_telegram("⚠️ <b>Paper 2.2 stopped — floor reached</b>\nBalance: ${:.2f}".format(_bot22_state["balance"]))
-                            elif real_stake22 <= _bot22_state["balance"]:
-                                try:
-                                    bal_after22 = round(_bot22_state["balance"] - real_stake22, 2)
-                                    success = execute_trade(parsed, scored22, None, override_stake=real_stake22,
-                                                           bot_name="P2.2", bot_balance_after=bal_after22)
-                                    if success:
-                                        _bot22_state["balance"] = bal_after22
-                                        _bot22_state["trades_today"] += 1
-                                        print("P2.2 TRADE: {} {} ${:.2f} on {} | bal=${:.2f}".format(
-                                            scored22["bet_side"], asset, real_stake22, parsed["title"][:30], _bot22_state["balance"]))
-                                except Exception as te:
-                                    print("P2.2 trade error: {}".format(te))
+                        # P2.2 LIVE trade — DISABLED here, handled by fast_trade_scan
+                        # Paper tracking continues above
 
                 # Paper 3.2: Same as P3.1 but 15M ONLY (LIVE trading)
                 if parsed["market_id"] not in p32_ids:
