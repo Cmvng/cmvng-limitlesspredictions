@@ -3449,7 +3449,6 @@ def _fast_trade_scan():
 
                 asset = parsed["asset"]
                 if asset not in price_cache:
-                    # Use cached price from indicators if available
                     cached_ind = _indicator_cache.get("{}_15m".format(asset)) or _indicator_cache.get("{}_1h".format(asset))
                     if cached_ind and cached_ind.get("data", {}).get("current"):
                         price_cache[asset] = cached_ind["data"]["current"]
@@ -3457,6 +3456,7 @@ def _fast_trade_scan():
                         price_cache[asset] = get_price(asset)
                 price = price_cache[asset]
                 if price is None:
+                    print("FAST SKIP {}: price is None".format(asset))
                     continue
 
                 # Use CACHED indicators only — no yfinance calls
@@ -3469,14 +3469,17 @@ def _fast_trade_scan():
 
                 ind_cache = _indicator_cache.get("{}_{}".format(asset, ind_tf))
                 if not ind_cache or not ind_cache.get("data"):
-                    # Cache miss — calculate now (slower but guarantees trade isn't skipped)
+                    # Cache miss — calculate now
                     try:
+                        print("FAST CACHE MISS: {}_{} — calculating fresh".format(asset, ind_tf))
                         fresh_ind = _calculate_indicators(asset, ind_tf)
                         if fresh_ind:
                             ind = fresh_ind
                         else:
+                            print("FAST SKIP {}: _calculate_indicators returned None".format(asset))
                             continue
-                    except:
+                    except Exception as calc_err:
+                        print("FAST SKIP {}: _calculate_indicators error: {}".format(asset, calc_err))
                         continue
                 else:
                     ind = ind_cache["data"]
@@ -4318,7 +4321,7 @@ def _calculate_indicators(asset, timeframe="1h"):
 
     cache_key = "{}_{}".format(asset, timeframe)
     cache = _indicator_cache.get(cache_key)
-    cache_ttl = 60 if timeframe == "5m" else 120 if timeframe == "15m" else 300
+    cache_ttl = 60 if timeframe == "5m" else 600 if timeframe == "15m" else 600
     if cache and (datetime.now(timezone.utc) - cache["updated"]).total_seconds() < cache_ttl:
         return cache["data"]
 
