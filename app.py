@@ -3378,18 +3378,18 @@ _current_cycle_bot1_ids = set()  # Shared between scanners in same cycle
 def _fast_trade_scan():
     """Fast scanner — rapid poll detects new markets, then scores and trades them.
     Uses _known_market_ids (from previous cycle) as baseline.
-    Detects new markets within 1 second of API indexing."""
+    Keeps polling until 15M markets are found or 15 seconds pass."""
     import requests as req
     global _known_market_ids
     try:
         t_start = time.time()
         
-        # Rapid poll: compare against _known_market_ids from previous cycle
-        # New markets won't be in this set — detected instantly
-        new_markets = []
+        # Rapid poll: keep polling until we find 15M markets
+        new_market_ids = set()
         markets = []
+        found_15m = False
         
-        for poll in range(15):  # 15 polls × 1 second = 15 seconds max
+        for poll in range(15):
             try:
                 r = req.get("{}/markets/active".format(LIMITLESS_API), timeout=5)
                 if r.status_code != 200:
@@ -3402,30 +3402,37 @@ def _fast_trade_scan():
                     mid = str(m.get("id", ""))
                     current_ids.add(mid)
                     if mid not in _known_market_ids:
-                        new_markets.append(m)
+                        new_market_ids.add(mid)
+                        # Check if this is a 15M market
+                        stable_slug = m.get("stableSlug", "")
+                        if "15min" in stable_slug or "5min" in stable_slug or "30min" in stable_slug:
+                            found_15m = True
                 
-                # Update known IDs with current set
-                _known_market_ids = current_ids
                 markets = all_markets
                 
-                if new_markets:
-                    print("NEW MARKETS: {} detected in poll #{} ({:.1f}s)".format(
-                        len(new_markets), poll + 1, time.time() - t_start))
+                # Only break when we've found 15M markets (not just hourly/daily)
+                if found_15m:
+                    _known_market_ids = current_ids
+                    print("NEW MARKETS: {} total ({} 15M) in poll #{} ({:.1f}s)".format(
+                        len(new_market_ids), "yes" if found_15m else "no", poll + 1, time.time() - t_start))
                     break
                     
             except Exception as poll_err:
                 print("Poll error: {}".format(poll_err))
             time.sleep(1)
         
+        # Update known IDs even if no 15M found
+        if markets:
+            current_ids = set(str(m.get("id", "")) for m in markets)
+            _known_market_ids = current_ids
+        
         if not markets:
             return
         
-        # If no new markets detected after 15 polls, still process all markets
-        # (handles first cycle after deploy, or markets created before polling started)
-        if not new_markets:
-            print("Fast scan: {} markets, no new detected — scoring all fresh".format(len(markets)))
-        else:
-            print("Fast scan: {} markets, {} new".format(len(markets), len(new_markets)))
+        if not new_market_ids:
+            print("Fast scan: {} markets, no new detected — scoring all".format(len(markets)))
+        elif not found_15m:
+            print("Fast scan: {} markets, {} new but no 15M found".format(len(markets), len(new_market_ids)))
 
         # Quick dedup check
         conn = get_db()
@@ -3633,32 +3640,55 @@ def _fast_trade_scan():
                             pass
                     
                     # ── EXECUTE LIVE TRADES — ALL BOTS MATCH THE ASK ──
-                    # Each bot that scored gets its own sniper order
+                    # Group scored bots by direction, fetch orderbook once per direction
+                    _yes_bots = []
+                    _no_bots = []
                     for _bot_id, _scored, _state in [
                         ("P2.2", scored22, _bot22_state),
                         ("P2.3", scored23, _bot23_state),
                         ("P3.3", scored33, _bot33_state),
                     ]:
-                        if not _scored:
-                            continue
-                        _side = _scored["bet_side"]
-                        _floor = _state.get("floor_balance", 8)
-                        _stake = _state.get("fixed_stake", 2.00)
-                        if not _state["enabled"] or _state["balance"] <= _floor:
-                            continue
-                        if _stake > _state["balance"] - _floor:
+                        if _scored:
+                            if _scored["bet_side"] == "YES":
+                                _yes_bots.append((_bot_id, _scored, _state))
+                            else:
+                                _no_bots.append((_bot_id, _scored, _state))
+                    
+                    for _direction, _bot_list in [("YES", _yes_bots), ("NO", _no_bots)]:
+                        if not _bot_list:
                             continue
                         
-                        snipe_order = _snipe_place_gtc(market, parsed, _side, _stake, None)
-                        if snipe_order:
-                            _state["balance"] = round(_state["balance"] - _stake, 2)
-                            _state["trades_today"] += 1
-                            trades_placed += 1
-                            _active_snipe_orders.append(snipe_order)
-                            print("{} SNIPE: {} {} ${:.2f} | bal=${:.2f}".format(
-                                _bot_id, _side, asset, _stake, _state["balance"]))
-                            send_telegram("⚡ <b>{} SNIPE</b>\n{} {} ${:.2f}\n{}\nBal: ${:.2f}".format(
-                                _bot_id, _side, asset, _stake, parsed["title"][:40], _state["balance"]))
+                        # Fetch orderbook ONCE for this direction
+                        _dir_ask = None
+                        try:
+                            _ob = _fetch_orderbook(parsed.get("slug", ""))
+                            if _ob:
+                                _, _dir_ask, _ = _get_best_prices(_ob, _direction)
+                        except:
+                            pass
+                        
+                        print("FAST 15M: {} {} ask@{} | bots: {}".format(
+                            _direction, asset,
+                            "{:.0f}%".format(_dir_ask * 100) if _dir_ask else "none",
+                            ", ".join(b[0] for b in _bot_list)))
+                        
+                        for _bot_id, _scored, _state in _bot_list:
+                            _floor = _state.get("floor_balance", 5)
+                            _stake = _calc_autoscale_stake(_state)
+                            if not _state["enabled"] or _state["balance"] <= _floor:
+                                continue
+                            if _stake <= 0 or _stake > _state["balance"]:
+                                continue
+                            
+                            snipe_order = _snipe_place_gtc(market, parsed, _direction, _stake, _dir_ask)
+                            if snipe_order:
+                                _state["balance"] = round(_state["balance"] - _stake, 2)
+                                _state["trades_today"] += 1
+                                trades_placed += 1
+                                _active_snipe_orders.append(snipe_order)
+                                send_telegram("⚡ <b>{} SNIPE @{}</b>\n{} {} ${:.2f}\n{}\nBal: ${:.2f}".format(
+                                    _bot_id, "{:.0f}%".format(_dir_ask * 100) if _dir_ask else "66%",
+                                    _direction, asset, _stake, parsed["title"][:40], _state["balance"]))
 
                 # ── P2.4 and P3.4: HOURLY MARKETS ──
                 if parsed.get("is_hourly_market"):
@@ -3719,31 +3749,50 @@ def _fast_trade_scan():
                         except:
                             pass
                     
-                    # Execute hourly trades — ALL SNIPERS
+                    # Execute hourly trades — group by direction, shared orderbook
+                    _h_yes = []
+                    _h_no = []
                     for _bot_id, _scored, _state in [
                         ("P2.4", scored24, _bot24_state),
                         ("P3.4", scored34, _bot34_state),
                     ]:
-                        if not _scored:
-                            continue
-                        _side = _scored["bet_side"]
-                        _floor = _state.get("floor_balance", 5)
-                        _stake = _state.get("fixed_stake", 1.50)
-                        if not _state["enabled"] or _state["balance"] <= _floor:
-                            continue
-                        if _stake > _state["balance"] - _floor:
+                        if _scored:
+                            if _scored["bet_side"] == "YES":
+                                _h_yes.append((_bot_id, _scored, _state))
+                            else:
+                                _h_no.append((_bot_id, _scored, _state))
+                    
+                    for _direction, _bot_list in [("YES", _h_yes), ("NO", _h_no)]:
+                        if not _bot_list:
                             continue
                         
-                        snipe_order = _snipe_place_gtc(market, parsed, _side, _stake, None)
-                        if snipe_order:
-                            _state["balance"] = round(_state["balance"] - _stake, 2)
-                            _state["trades_today"] += 1
-                            trades_placed += 1
-                            _active_snipe_orders.append(snipe_order)
-                            print("{} 1H SNIPE: {} {} ${:.2f} | bal=${:.2f}".format(
-                                _bot_id, _side, asset, _stake, _state["balance"]))
-                            send_telegram("⚡ <b>{} 1H SNIPE</b>\n{} {} ${:.2f}\n{}\nBal: ${:.2f}".format(
-                                _bot_id, _side, asset, _stake, parsed["title"][:40], _state["balance"]))
+                        _h_ask = None
+                        try:
+                            _h_ob = _fetch_orderbook(parsed.get("slug", ""))
+                            if _h_ob:
+                                _, _h_ask, _ = _get_best_prices(_h_ob, _direction)
+                        except:
+                            pass
+                        
+                        for _bot_id, _scored, _state in _bot_list:
+                            _floor = _state.get("floor_balance", 5)
+                            _stake = _calc_autoscale_stake(_state)
+                            if not _state["enabled"] or _state["balance"] <= _floor:
+                                continue
+                            if _stake <= 0 or _stake > _state["balance"]:
+                                continue
+                            
+                            snipe_order = _snipe_place_gtc(market, parsed, _direction, _stake, _h_ask)
+                            if snipe_order:
+                                _state["balance"] = round(_state["balance"] - _stake, 2)
+                                _state["trades_today"] += 1
+                                trades_placed += 1
+                                _active_snipe_orders.append(snipe_order)
+                                print("{} 1H SNIPE: {} {} ${:.2f} | bal=${:.2f}".format(
+                                    _bot_id, _direction, asset, _stake, _state["balance"]))
+                                send_telegram("⚡ <b>{} 1H SNIPE @{}</b>\n{} {} ${:.2f}\n{}\nBal: ${:.2f}".format(
+                                    _bot_id, "{:.0f}%".format(_h_ask * 100) if _h_ask else "66%",
+                                    _direction, asset, _stake, parsed["title"][:40], _state["balance"]))
 
             except Exception as e:
                 continue
@@ -3836,15 +3885,12 @@ def _warm_credentials():
         print("Credential cache error: {}".format(e))
     return False
 
-def _snipe_place_gtc(market_data, parsed, bet_side, stake, _unused):
-    """Smart entry: check orderbook ask, match if within range, otherwise GTC at max.
+def _snipe_place_gtc(market_data, parsed, bet_side, stake, best_ask):
+    """Fast entry: match the ask immediately. No delays.
+    best_ask: pre-fetched from orderbook (shared across bots for same market).
     
-    Logic:
-    1. Check orderbook for best ask
-    2. If ask <= 50%: match immediately (great price)
-    3. If ask 50-66%: place GTC at ask - 2%, wait 5s, then match ask
-    4. If ask > 66%: place GTC at 66% and leave it
-    5. No ask: place GTC at 66% and leave it
+    ask ≤ 66¢ → match at ask price → instant fill
+    ask > 66¢ or None → GTC at 66¢ → sits on book
     
     Returns order tracking dict or None."""
     
@@ -3856,7 +3902,6 @@ def _snipe_place_gtc(market_data, parsed, bet_side, stake, _unused):
     if not slug:
         return None
     
-    # Get token ID from market data
     token_id = None
     tokens = market_data.get("tokens", {})
     if isinstance(tokens, dict):
@@ -3872,22 +3917,14 @@ def _snipe_place_gtc(market_data, parsed, bet_side, stake, _unused):
     fee_bps = _cached_credentials["fee_bps"] or 300
     asset = parsed.get("asset", "?")
     
-    # Check orderbook for best ask
-    best_ask = None
-    try:
-        ob = _fetch_orderbook(slug)
-        if ob:
-            _, best_ask, _ = _get_best_prices(ob, bet_side)
-    except:
-        pass
-    
-    if best_ask and best_ask <= 0.50:
-        # GREAT PRICE: match ask immediately
+    if best_ask and best_ask <= 0.66:
+        # Match the ask — instant fill
         price = round(best_ask, 3)
-        print("SNIPE MATCH: {} {} ask@{:.0f}% — instant fill".format(bet_side, asset, price * 100))
         order_id = _place_gtc_order(slug, bet_side, token_id, stake, price,
                                      exchange_addr, profile_id, fee_bps)
         if order_id:
+            print("SNIPE @{:.0f}%: {} {} ${:.2f} on {}".format(
+                price * 100, bet_side, asset, stake, slug[:30]))
             return {
                 "order_id": order_id, "slug": slug, "bet_side": bet_side,
                 "token_id": token_id, "stake": stake, "asset": asset,
@@ -3895,67 +3932,19 @@ def _snipe_place_gtc(market_data, parsed, bet_side, stake, _unused):
                 "fill_price": None, "exchange_addr": exchange_addr,
                 "profile_id": profile_id, "fee_bps": fee_bps,
             }
-    
-    elif best_ask and best_ask <= 0.66:
-        # DECENT PRICE: try GTC slightly below ask first, then match
-        try_price = round(best_ask - 0.02, 3)
-        print("SNIPE TRY: {} {} ask@{:.0f}% — GTC@{:.0f}% then match".format(
-            bet_side, asset, best_ask * 100, try_price * 100))
-        order_id = _place_gtc_order(slug, bet_side, token_id, stake, try_price,
-                                     exchange_addr, profile_id, fee_bps)
-        if order_id:
-            # Wait 5 seconds for fill
-            time.sleep(5)
-            status = _check_order_filled(order_id)
-            if status == "FILLED":
-                print("SNIPE FILLED: {} {} @{:.0f}% (below ask)".format(bet_side, asset, try_price * 100))
-                return {
-                    "order_id": order_id, "slug": slug, "bet_side": bet_side,
-                    "token_id": token_id, "stake": stake, "asset": asset,
-                    "current_price": try_price, "step_idx": 8, "filled": True,
-                    "fill_price": try_price, "exchange_addr": exchange_addr,
-                    "profile_id": profile_id, "fee_bps": fee_bps,
-                }
-            
-            # Not filled — cancel and match the ask
-            cancel_result = _cancel_order(order_id)
-            if cancel_result == "FILLED":
-                print("SNIPE FILLED: {} {} @{:.0f}% (during cancel)".format(bet_side, asset, try_price * 100))
-                return {
-                    "order_id": order_id, "slug": slug, "bet_side": bet_side,
-                    "token_id": token_id, "stake": stake, "asset": asset,
-                    "current_price": try_price, "step_idx": 8, "filled": True,
-                    "fill_price": try_price, "exchange_addr": exchange_addr,
-                    "profile_id": profile_id, "fee_bps": fee_bps,
-                }
-            
-            time.sleep(0.3)
-            
-            # Match the ask directly
-            match_price = round(best_ask, 3)
-            print("SNIPE MATCH: {} {} @{:.0f}% — matching ask".format(bet_side, asset, match_price * 100))
-            order_id2 = _place_gtc_order(slug, bet_side, token_id, stake, match_price,
-                                          exchange_addr, profile_id, fee_bps)
-            if order_id2:
-                return {
-                    "order_id": order_id2, "slug": slug, "bet_side": bet_side,
-                    "token_id": token_id, "stake": stake, "asset": asset,
-                    "current_price": match_price, "step_idx": 8, "filled": False,
-                    "fill_price": None, "exchange_addr": exchange_addr,
-                    "profile_id": profile_id, "fee_bps": fee_bps,
-                }
-    
     else:
-        # NO ASK or ASK > 66%: place GTC at 66% max and leave it
-        max_price = 0.66
-        print("SNIPE MAX: {} {} no ask or ask>{:.0f}% — GTC@66%".format(bet_side, asset, 66))
-        order_id = _place_gtc_order(slug, bet_side, token_id, stake, max_price,
+        # No ask or too expensive — GTC at 66% max
+        price = 0.66
+        order_id = _place_gtc_order(slug, bet_side, token_id, stake, price,
                                      exchange_addr, profile_id, fee_bps)
         if order_id:
+            print("SNIPE MAX @66%: {} {} ${:.2f} on {} (ask={})".format(
+                bet_side, asset, stake, slug[:30],
+                "{:.0f}%".format(best_ask * 100) if best_ask else "none"))
             return {
                 "order_id": order_id, "slug": slug, "bet_side": bet_side,
                 "token_id": token_id, "stake": stake, "asset": asset,
-                "current_price": max_price, "step_idx": 8, "filled": False,
+                "current_price": price, "step_idx": 8, "filled": False,
                 "fill_price": None, "exchange_addr": exchange_addr,
                 "profile_id": profile_id, "fee_bps": fee_bps,
             }
@@ -12561,38 +12550,29 @@ try:
         _bot_state_ref["balance"] = 14.0
         _bot_state_ref["peak_balance"] = 14.0
         _bot_state_ref["enabled"] = False
-    # All live bots at $20 for now — user will set final balances
     _bot23_state["balance"] = 20.0
     _bot23_state["peak_balance"] = 20.0
     _bot23_state["starting_balance"] = 20.0
-    _bot23_state["floor_balance"] = 5.0
-    _bot23_state["fixed_stake"] = 2.00
     _bot23_state["enabled"] = True
     _bot22_state["balance"] = 20.0
     _bot22_state["peak_balance"] = 20.0
     _bot22_state["starting_balance"] = 20.0
-    _bot22_state["floor_balance"] = 5.0
-    _bot22_state["fixed_stake"] = 2.00
     _bot22_state["enabled"] = True
     _bot33_state["balance"] = 20.0
     _bot33_state["peak_balance"] = 20.0
     _bot33_state["starting_balance"] = 20.0
-    _bot33_state["floor_balance"] = 5.0
-    _bot33_state["fixed_stake"] = 2.00
     _bot33_state["enabled"] = True
     _bot24_state["enabled"] = True
     _bot24_state["balance"] = 20.0
     _bot24_state["peak_balance"] = 20.0
     _bot24_state["starting_balance"] = 20.0
     _bot24_state["floor_balance"] = 5.0
-    _bot24_state["fixed_stake"] = 1.50
     _bot34_state["enabled"] = True
     _bot34_state["balance"] = 20.0
     _bot34_state["peak_balance"] = 20.0
     _bot34_state["starting_balance"] = 20.0
     _bot34_state["floor_balance"] = 5.0
-    _bot34_state["fixed_stake"] = 1.50
-    print("Limitless LIVE: P2.2=$20 P2.3=$20 P3.3=$20 P2.4=$20 P3.4=$20 | ALL ASK-MATCH")
+    print("Limitless LIVE: P2.2=$20 P2.3=$20 P3.3=$20 P2.4=$20 P3.4=$20")
     # Warm trading credentials for sniper
     threading.Thread(target=_warm_credentials, daemon=True).start()
     # One-time correction of historical paper trade resolutions
