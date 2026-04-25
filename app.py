@@ -3435,20 +3435,15 @@ def _fast_trade_scan():
                 if not parsed:
                     continue
                 
-                # Only trade FRESH markets
+                # Skip daily markets — only trade 15M and 1H
+                if not parsed.get("is_15m_market") and not parsed.get("is_hourly_market"):
+                    continue
+                
+                # Skip nearly expired markets (less than 3 minutes left)
                 hours_left = parsed.get("hours_left", 0)
-                if parsed.get("is_15m_market"):
-                    # 15M markets have 0.25 hours total. Fresh = more than 0.20 hours left (12 min)
-                    if hours_left < 0.20:
-                        skip_count += 1
-                        continue
-                elif parsed.get("is_hourly_market"):
-                    # 1H markets have 1.0 hours total. Fresh = more than 0.92 hours left (55 min)
-                    if hours_left < 0.92:
-                        skip_count += 1
-                        continue
-                else:
-                    continue  # Skip daily/other
+                if hours_left < 0.05:
+                    skip_count += 1
+                    continue
                 
                 fresh_count += 1
 
@@ -3507,7 +3502,9 @@ def _fast_trade_scan():
                 scored33 = None
                 
                 if parsed.get("is_15m_market"):
-                    print("FAST scoring 15M: {} {} mins_left={:.1f}".format(asset, parsed.get("title", "")[:30], mins_left))
+                    print("FAST 15M: {} {} h_left={:.3f} dedup: p22={} p23={} p33={}".format(
+                        asset, parsed.get("title", "")[:30], hours_left,
+                        parsed["market_id"] in p22_ids, parsed["market_id"] in p23_ids, parsed["market_id"] in p33_ids))
                     if parsed["market_id"] not in p22_ids:
                         scored22 = _score_paper21_trade(parsed, price, indicators=ind, ind_macro=ind_macro,
                                                          expiry_minute=expiry_minute, expiry_hour=expiry_hour)
@@ -4242,12 +4239,22 @@ def scan_loop():
         pass
     
     while True:
-        # ── STEP 1: FAST TRADE SCAN (runs at boundary + 1 second) ──
-        # Scores and places GTC blast orders on fresh markets
-        try:
-            _fast_trade_scan()
-        except Exception as e:
-            print("Fast scan error: {}".format(e))
+        # Check if this is a 15M boundary (:00, :15, :30, :45)
+        now_utc = datetime.now(timezone.utc)
+        current_minute = now_utc.minute
+        is_15m_boundary = current_minute in (0, 1, 15, 16, 30, 31, 45, 46)
+        is_hourly_boundary = current_minute in (0, 1, 2)
+        
+        # ── STEP 1: FAST TRADE SCAN (only at 15M boundaries) ──
+        if is_15m_boundary or is_hourly_boundary:
+            try:
+                print("=== FAST SCAN at :{:02d} (15M={} 1H={}) ===".format(
+                    current_minute, is_15m_boundary, is_hourly_boundary))
+                _fast_trade_scan()
+            except Exception as e:
+                print("Fast scan error: {}".format(e))
+        else:
+            print("Skip fast scan at :{:02d} (not a 15M boundary)".format(current_minute))
 
         # ── STEP 3: SLOW SCAN (paper tracking, Bot 1, Bot 2) ──
         global _current_cycle_bot1_ids
