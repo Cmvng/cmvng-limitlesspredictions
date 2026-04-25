@@ -2070,8 +2070,9 @@ def _get_best_prices(orderbook, bet_side):
 def _place_gtc_order(slug, bet_side, token_id, stake, price_per_share, exchange_addr, profile_id, fee_bps):
     """Place a GTC limit order. Returns order_id on success, None on failure.
     price_per_share: the price for the SIDE being bet (YES or NO).
-    Limitless API always uses YES-side pricing internally.
-    For NO bets: API price = 1 - NO_price (convert to YES equivalent).
+    Limitless API takes the price as the TOKEN price directly.
+    YES bet: price = YES token price. NO bet: price = NO token price.
+    NO INVERSION NEEDED — the API handles it based on the token_id.
     """
     import requests as req
     from web3 import Web3
@@ -2081,16 +2082,9 @@ def _place_gtc_order(slug, bet_side, token_id, stake, price_per_share, exchange_
     account = Account.from_key(LIMITLESS_PRIV_KEY)
     wallet_addr = account.address
 
-    # The price we want to pay per share of our side
+    # The price we want to pay per share — sent directly to API
     our_price = round(price_per_share, 3)
-    
-    # Limitless API price field: always in YES token terms
-    # For YES bets: api_price = our_price (we're buying YES at this price)
-    # For NO bets: api_price = 1 - our_price (the YES price equivalent)
-    if bet_side == "NO":
-        api_price = round(1.0 - our_price, 3)
-    else:
-        api_price = our_price
+    api_price = our_price  # NO INVERSION — API takes token price directly
 
     # For GTC: makerAmount = collateral, takerAmount = contracts
     # API validates: makerAmount = api_price × contracts / 1000
