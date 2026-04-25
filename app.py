@@ -3472,6 +3472,19 @@ def _fast_trade_scan():
                 if not parsed:
                     continue
                 
+                # Debug: log market type for all 15M/1H markets
+                _mid = parsed.get("market_id", "")
+                _is_new = str(_mid) in new_market_ids
+                _is_15m = parsed.get("is_15m_market", False)
+                _is_1h = parsed.get("is_hourly_market", False)
+                _h_left = parsed.get("hours_left", 0)
+                _asset = parsed.get("asset", "?")
+                
+                if _is_new:
+                    print("MARKET DEBUG: {} {} 15m={} 1h={} h_left={:.3f} slug={}".format(
+                        _asset, parsed.get("title","")[:30], _is_15m, _is_1h, _h_left,
+                        market.get("stableSlug","")[:40]))
+                
                 # Skip daily markets — only trade 15M and 1H
                 if not parsed.get("is_15m_market") and not parsed.get("is_hourly_market"):
                     continue
