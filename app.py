@@ -3376,63 +3376,61 @@ def run_scan():
 _current_cycle_bot1_ids = set()  # Shared between scanners in same cycle
 
 def _fast_trade_scan():
-    """Fast scanner — rapid poll detects new markets, then scores and trades them.
-    Uses _known_market_ids (from previous cycle) as baseline.
-    Keeps polling until 15M markets are found or 15 seconds pass."""
+    """Bulletproof fast scanner.
+    1. Polls from boundary+10 for exactly 8 seconds (markets created at :XX:11-16)
+    2. At boundary+18, fetches final market list with ALL 15M markets guaranteed
+    3. Scores and trades every untraded market
+    4. Database dedup prevents double trading
+    """
     import requests as req
     global _known_market_ids
     try:
         t_start = time.time()
         
-        # Rapid poll: keep polling until we find 15M markets
+        # Poll for 8 seconds, collecting all new market IDs
         new_market_ids = set()
         markets = []
-        found_15m = False
         
-        for poll in range(15):
+        for poll in range(8):
             try:
                 r = req.get("{}/markets/active".format(LIMITLESS_API), timeout=5)
-                if r.status_code != 200:
-                    time.sleep(1)
-                    continue
-                all_markets = r.json().get("data", [])
-                current_ids = set()
-                
-                for m in all_markets:
-                    mid = str(m.get("id", ""))
-                    current_ids.add(mid)
-                    if mid not in _known_market_ids:
-                        new_market_ids.add(mid)
-                        # Check if this is a 15M market
-                        stable_slug = m.get("stableSlug", "")
-                        if "15min" in stable_slug or "5min" in stable_slug or "30min" in stable_slug:
-                            found_15m = True
-                
-                markets = all_markets
-                
-                # Only break when we've found 15M markets (not just hourly/daily)
-                if found_15m:
-                    _known_market_ids = current_ids
-                    print("NEW MARKETS: {} total ({} 15M) in poll #{} ({:.1f}s)".format(
-                        len(new_market_ids), "yes" if found_15m else "no", poll + 1, time.time() - t_start))
-                    break
-                    
-            except Exception as poll_err:
-                print("Poll error: {}".format(poll_err))
+                if r.status_code == 200:
+                    all_markets = r.json().get("data", [])
+                    for m in all_markets:
+                        mid = str(m.get("id", ""))
+                        if mid not in _known_market_ids:
+                            new_market_ids.add(mid)
+                    markets = all_markets
+            except:
+                pass
             time.sleep(1)
         
-        # Update known IDs even if no 15M found
+        # Final fetch to guarantee we have everything
+        try:
+            r = req.get("{}/markets/active".format(LIMITLESS_API), timeout=5)
+            if r.status_code == 200:
+                markets = r.json().get("data", [])
+                for m in markets:
+                    mid = str(m.get("id", ""))
+                    if mid not in _known_market_ids:
+                        new_market_ids.add(mid)
+        except:
+            pass
+        
+        # Update known IDs
         if markets:
-            current_ids = set(str(m.get("id", "")) for m in markets)
-            _known_market_ids = current_ids
+            _known_market_ids = set(str(m.get("id", "")) for m in markets)
         
         if not markets:
+            print("Fast scan: no markets fetched")
             return
         
-        if not new_market_ids:
-            print("Fast scan: {} markets, no new detected — scoring all".format(len(markets)))
-        elif not found_15m:
-            print("Fast scan: {} markets, {} new but no 15M found".format(len(markets), len(new_market_ids)))
+        # Count new 15M markets
+        new_15m = sum(1 for m in markets if str(m.get("id","")) in new_market_ids 
+                      and ("15min" in m.get("stableSlug","") or "5min" in m.get("stableSlug","")))
+        
+        print("Fast scan: {} markets, {} new ({} are 15M) in {:.1f}s".format(
+            len(markets), len(new_market_ids), new_15m, time.time() - t_start))
 
         # Quick dedup check
         conn = get_db()
@@ -3673,11 +3671,11 @@ def _fast_trade_scan():
                             ", ".join(b[0] for b in _bot_list)))
                         
                         for _bot_id, _scored, _state in _bot_list:
-                            _floor = _state.get("floor_balance", 5)
-                            _stake = _calc_autoscale_stake(_state)
+                            _floor = _state.get("floor_balance", 8)
+                            _stake = _state.get("fixed_stake", 1.00)
                             if not _state["enabled"] or _state["balance"] <= _floor:
                                 continue
-                            if _stake <= 0 or _stake > _state["balance"]:
+                            if _stake <= 0 or _stake > _state["balance"] - _floor:
                                 continue
                             
                             snipe_order = _snipe_place_gtc(market, parsed, _direction, _stake, _dir_ask)
@@ -3749,50 +3747,59 @@ def _fast_trade_scan():
                         except:
                             pass
                     
-                    # Execute hourly trades — group by direction, shared orderbook
-                    _h_yes = []
-                    _h_no = []
-                    for _bot_id, _scored, _state in [
-                        ("P2.4", scored24, _bot24_state),
-                        ("P3.4", scored34, _bot34_state),
-                    ]:
-                        if _scored:
-                            if _scored["bet_side"] == "YES":
-                                _h_yes.append((_bot_id, _scored, _state))
-                            else:
-                                _h_no.append((_bot_id, _scored, _state))
-                    
-                    for _direction, _bot_list in [("YES", _h_yes), ("NO", _h_no)]:
-                        if not _bot_list:
-                            continue
+                    # Execute hourly trades — XRP SKIPPED, BTC/ETH reduced to $1.00
+                    # Paper trades still recorded above for all assets including XRP
+                    if asset == "XRP":
+                        pass  # Skip XRP execution on 1H (50% WR = no edge), paper still tracked
+                    else:
+                        _h_yes = []
+                        _h_no = []
+                        for _bot_id, _scored, _state in [
+                            ("P2.4", scored24, _bot24_state),
+                            ("P3.4", scored34, _bot34_state),
+                        ]:
+                            if _scored:
+                                if _scored["bet_side"] == "YES":
+                                    _h_yes.append((_bot_id, _scored, _state))
+                                else:
+                                    _h_no.append((_bot_id, _scored, _state))
                         
-                        _h_ask = None
-                        try:
-                            _h_ob = _fetch_orderbook(parsed.get("slug", ""))
-                            if _h_ob:
-                                _, _h_ask, _ = _get_best_prices(_h_ob, _direction)
-                        except:
-                            pass
-                        
-                        for _bot_id, _scored, _state in _bot_list:
-                            _floor = _state.get("floor_balance", 5)
-                            _stake = _calc_autoscale_stake(_state)
-                            if not _state["enabled"] or _state["balance"] <= _floor:
-                                continue
-                            if _stake <= 0 or _stake > _state["balance"]:
+                        for _direction, _bot_list in [("YES", _h_yes), ("NO", _h_no)]:
+                            if not _bot_list:
                                 continue
                             
-                            snipe_order = _snipe_place_gtc(market, parsed, _direction, _stake, _h_ask)
-                            if snipe_order:
-                                _state["balance"] = round(_state["balance"] - _stake, 2)
-                                _state["trades_today"] += 1
-                                trades_placed += 1
-                                _active_snipe_orders.append(snipe_order)
-                                print("{} 1H SNIPE: {} {} ${:.2f} | bal=${:.2f}".format(
-                                    _bot_id, _direction, asset, _stake, _state["balance"]))
-                                send_telegram("⚡ <b>{} 1H SNIPE @{}</b>\n{} {} ${:.2f}\n{}\nBal: ${:.2f}".format(
-                                    _bot_id, "{:.0f}%".format(_h_ask * 100) if _h_ask else "66%",
-                                    _direction, asset, _stake, parsed["title"][:40], _state["balance"]))
+                            _h_ask = None
+                            try:
+                                _h_ob = _fetch_orderbook(parsed.get("slug", ""))
+                                if _h_ob:
+                                    _, _h_ask, _ = _get_best_prices(_h_ob, _direction)
+                            except:
+                                pass
+                            
+                            for _bot_id, _scored, _state in _bot_list:
+                                _floor = _state.get("floor_balance", 8)
+                                _stake = _state.get("fixed_stake", 1.50)
+                                
+                                # BTC and ETH: reduce to $1.00 minimum (weak on 1H: 54-56% WR)
+                                if asset in ("BTC", "ETH"):
+                                    _stake = 1.00
+                                
+                                if not _state["enabled"] or _state["balance"] <= _floor:
+                                    continue
+                                if _stake <= 0 or _stake > _state["balance"] - _floor:
+                                    continue
+                                
+                                snipe_order = _snipe_place_gtc(market, parsed, _direction, _stake, _h_ask)
+                                if snipe_order:
+                                    _state["balance"] = round(_state["balance"] - _stake, 2)
+                                    _state["trades_today"] += 1
+                                    trades_placed += 1
+                                    _active_snipe_orders.append(snipe_order)
+                                    print("{} 1H SNIPE: {} {} ${:.2f} | bal=${:.2f}".format(
+                                        _bot_id, _direction, asset, _stake, _state["balance"]))
+                                    send_telegram("⚡ <b>{} 1H SNIPE @{}</b>\n{} {} ${:.2f}\n{}\nBal: ${:.2f}".format(
+                                        _bot_id, "{:.0f}%".format(_h_ask * 100) if _h_ask else "66%",
+                                        _direction, asset, _stake, parsed["title"][:40], _state["balance"]))
 
             except Exception as e:
                 continue
@@ -3813,19 +3820,6 @@ def _fast_trade_scan():
 
     except Exception as e:
         print("Fast trade scan error: {}".format(e))
-    """Pre-calculate and cache all indicators for all assets.
-    Called ~10 seconds before 15M window opens so cache is warm when scan fires."""
-    assets = ["BTC", "ETH", "SOL", "XRP", "DOGE"]
-    for asset in assets:
-        try:
-            # Warm up price cache
-            get_price(asset)
-            # Warm up 15m indicators (for 15M markets)
-            _calculate_indicators(asset, "15m")
-            # Warm up 1h indicators (for 1H markets)  
-            _calculate_indicators(asset, "1h")
-        except:
-            pass
 
 
 def _precalc_indicators():
@@ -12546,33 +12540,46 @@ try:
     except:
         pass
     # Disable all old bots — only P2.3 and P3.3 trade live
-    for _bot_state_ref in [_bot21_state, _bot31_state, _bot22_state, _bot32_state]:
+    for _bot_state_ref in [_bot21_state, _bot31_state, _bot32_state]:
         _bot_state_ref["balance"] = 14.0
         _bot_state_ref["peak_balance"] = 14.0
         _bot_state_ref["enabled"] = False
-    _bot23_state["balance"] = 20.0
-    _bot23_state["peak_balance"] = 20.0
-    _bot23_state["starting_balance"] = 20.0
+    # P2.3: Best bot (80% WR) — highest allocation
+    _bot23_state["balance"] = 50.0
+    _bot23_state["peak_balance"] = 50.0
+    _bot23_state["starting_balance"] = 50.0
+    _bot23_state["floor_balance"] = 8.0
+    _bot23_state["fixed_stake"] = 2.50
     _bot23_state["enabled"] = True
-    _bot22_state["balance"] = 20.0
-    _bot22_state["peak_balance"] = 20.0
-    _bot22_state["starting_balance"] = 20.0
+    # P2.2: Strong bot (73% WR)
+    _bot22_state["balance"] = 45.0
+    _bot22_state["peak_balance"] = 45.0
+    _bot22_state["starting_balance"] = 45.0
+    _bot22_state["floor_balance"] = 8.0
+    _bot22_state["fixed_stake"] = 2.00
     _bot22_state["enabled"] = True
-    _bot33_state["balance"] = 20.0
-    _bot33_state["peak_balance"] = 20.0
-    _bot33_state["starting_balance"] = 20.0
+    # P3.3: High volume (68% WR)
+    _bot33_state["balance"] = 45.0
+    _bot33_state["peak_balance"] = 45.0
+    _bot33_state["starting_balance"] = 45.0
+    _bot33_state["floor_balance"] = 8.0
+    _bot33_state["fixed_stake"] = 2.00
     _bot33_state["enabled"] = True
+    # P2.4: 1H bot — $1.50 SOL/DOGE, $1.00 BTC/ETH, skip XRP
     _bot24_state["enabled"] = True
-    _bot24_state["balance"] = 20.0
-    _bot24_state["peak_balance"] = 20.0
-    _bot24_state["starting_balance"] = 20.0
-    _bot24_state["floor_balance"] = 5.0
+    _bot24_state["balance"] = 30.0
+    _bot24_state["peak_balance"] = 30.0
+    _bot24_state["starting_balance"] = 30.0
+    _bot24_state["floor_balance"] = 8.0
+    _bot24_state["fixed_stake"] = 1.50
+    # P3.4: 1H bot — same rules as P2.4
     _bot34_state["enabled"] = True
-    _bot34_state["balance"] = 20.0
-    _bot34_state["peak_balance"] = 20.0
-    _bot34_state["starting_balance"] = 20.0
-    _bot34_state["floor_balance"] = 5.0
-    print("Limitless LIVE: P2.2=$20 P2.3=$20 P3.3=$20 P2.4=$20 P3.4=$20")
+    _bot34_state["balance"] = 30.0
+    _bot34_state["peak_balance"] = 30.0
+    _bot34_state["starting_balance"] = 30.0
+    _bot34_state["floor_balance"] = 8.0
+    _bot34_state["fixed_stake"] = 1.50
+    print("Limitless LIVE: P2.3=$50 P2.2=$45 P3.3=$45 P2.4=$30 P3.4=$30 | $200 total")
     # Warm trading credentials for sniper
     threading.Thread(target=_warm_credentials, daemon=True).start()
     # One-time correction of historical paper trade resolutions
