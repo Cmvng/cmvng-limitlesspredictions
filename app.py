@@ -3432,6 +3432,13 @@ def _fast_trade_scan():
                 parsed = parse_market(market)
                 if not parsed:
                     continue
+                
+                # Only trade FRESH markets (less than 3 minutes old)
+                mins_left = parsed.get("mins_left", 0)
+                if parsed.get("is_15m_market") and mins_left < 12:
+                    continue  # 15M market more than 3 min old
+                if parsed.get("is_hourly_market") and mins_left < 55:
+                    continue  # Hourly more than 5 min old
 
                 asset = parsed["asset"]
                 if asset not in price_cache:
@@ -3488,6 +3495,7 @@ def _fast_trade_scan():
                 scored33 = None
                 
                 if parsed.get("is_15m_market"):
+                    print("FAST scoring 15M: {} {} mins_left={:.1f}".format(asset, parsed.get("title", "")[:30], mins_left))
                     if parsed["market_id"] not in p22_ids:
                         scored22 = _score_paper21_trade(parsed, price, indicators=ind, ind_macro=ind_macro,
                                                          expiry_minute=expiry_minute, expiry_hour=expiry_hour)
