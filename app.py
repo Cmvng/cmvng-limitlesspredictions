@@ -1076,6 +1076,15 @@ def init_db():
 def send_telegram(message):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         return
+    # FILTER: Only send Alpha notifications and critical system alerts
+    _allowed = any(k in message for k in [
+        "ALPHA", "Alpha", "alpha",           # All Alpha trade/resolution messages
+        "Auto-trading", "Kill switch",        # System control alerts
+        "Auto-redeemed", "Redeemed",          # Redemption confirmations
+        "Bot v4", "LIVE",                     # Startup message
+    ])
+    if not _allowed:
+        return
     def _send():
         try:
             import requests
@@ -3691,16 +3700,9 @@ def _fast_trade_scan():
                     scored_list = [s for s in [scored22, scored23, scored33] if s]
                     
                     # Track unscored 15M markets for second pass with fresh indicators
-                    # ALSO retry markets where engines scored but Alpha rejected (DIST_ONLY, asset filter)
-                    if not scored_list and parsed.get("is_15m_market"):
+                    # ALWAYS retry if Alpha didn't fire — cached indicators may have missed P2.3
+                    if parsed.get("is_15m_market") and parsed["market_id"] not in _alpha_traded_markets:
                         _unscored_15m.append((market, parsed, asset, hours_left))
-                    elif scored_list and parsed.get("is_15m_market") and \
-                         parsed["market_id"] not in _alpha_traded_markets:
-                        # Engines scored but Alpha may have rejected (DIST_ONLY, DOGE, XRP)
-                        _tier_check = _alpha_get_tier(scored22, scored23, scored33, asset)
-                        if not _tier_check:
-                            _unscored_15m.append((market, parsed, asset, hours_left))
-                            print("ALPHA RETRY: {} scored but no tier — queued for fresh indicators".format(asset))
                     if len(scored_list) >= 2:
                         # Check if all scored bots agree on direction
                         sides = set(s["bet_side"] for s in scored_list)
