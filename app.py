@@ -229,6 +229,114 @@ _bot34_state = {
 
 FAVOURITE_HOURLY = ["ADA", "BNB", "DOGE"]
 
+# ─── ALPHA UNIFIED TRADING SYSTEM ───
+# One pool, tiered staking by multi-bot agreement
+_alpha_state = {
+    "enabled": True,
+    "balance": 200.0,
+    "peak_balance": 200.0,
+    "starting_balance": 200.0,
+    "floor_balance": 80.0,  # Emergency stop
+    "trades_today": 0,
+    "wins_today": 0,
+    "losses_today": 0,
+    "profit_today": 0.0,
+}
+_alpha_traded_markets = set()  # Dedup per cycle
+
+
+def _alpha_get_tier(scored22, scored23, scored33, asset, is_hourly=False):
+    """Determine Alpha tier based on multi-bot agreement.
+    Returns (tier_tag, base_stake, max_fill, bet_side) or None to skip."""
+
+    if is_hourly:
+        # 1H: only SOL and DOGE
+        if asset == "SOL":
+            return None  # handled separately with P2.4 scoring
+        elif asset == "DOGE":
+            return None  # handled separately
+        else:
+            return None  # Skip BTC/ETH/XRP on 1H
+
+    # ── 15M tier logic ──
+    # Skip DOGE on 15M (50-60% WR = no edge)
+    if asset == "DOGE":
+        return None
+
+    s23 = scored23 is not None
+    s22 = scored22 is not None
+    s33 = scored33 is not None
+
+    # P3.3 fix 1: Disable DIST_ONLY trades (50% WR coin flips)
+    if s33 and "DIST_ONLY" in (scored33.get("indicators") or ""):
+        s33 = False
+        scored33 = None
+
+    # P3.3 fix 2: Skip XRP on P3.3 (57.5% WR)
+    if s33 and asset == "XRP":
+        s33 = False
+        scored33 = None
+
+    # Determine bet direction from the strongest signal
+    bet_side = None
+    if s23:
+        bet_side = scored23["bet_side"]
+    elif s33:
+        bet_side = scored33["bet_side"]
+    elif s22:
+        bet_side = scored22["bet_side"]
+
+    if bet_side is None:
+        return None
+
+    # Check agreement and assign tier
+    # T1: P2.3 + P3.3 agree on same direction
+    if s23 and s33 and scored23["bet_side"] == scored33["bet_side"]:
+        return ("T1", 4.00, 0.72, bet_side)
+
+    # T2: P2.3 signals (P2.2 always agrees when P2.3 does)
+    if s23:
+        return ("T2", 2.50, 0.68, bet_side)
+
+    # T3: P3.3 alone (fixed - no DIST_ONLY, no XRP)
+    if s33:
+        # XRP on T3 = skip (already filtered above for P3.3)
+        if asset == "XRP":
+            return None
+        return ("T3", 1.50, 0.66, scored33["bet_side"])
+
+    # T3: P2.2 alone (P2.3 didn't confirm via DIST)
+    if s22:
+        # Skip XRP on T3-P2.2 alone
+        if asset == "XRP":
+            return None
+        return ("T3", 1.50, 0.64, scored22["bet_side"])
+
+    return None
+
+
+def _alpha_calc_stake(base_stake, asset, pool_balance):
+    """Calculate final stake with asset bonus and auto-scaling."""
+    scale = max(pool_balance / 200.0, 0.5)  # Scale relative to $200 baseline
+    stake = round(base_stake * scale, 2)
+
+    # Asset bonuses (scaled)
+    if asset == "ETH":
+        stake = round(stake + 1.00 * scale, 2)
+    elif asset == "BTC":
+        stake = round(stake + 0.50 * scale, 2)
+    elif asset == "XRP":
+        stake = max(round(stake - 0.50 * scale, 2), 1.00)
+
+    # Cap at 2.5% of pool
+    max_trade = round(pool_balance * 0.025, 2)
+    stake = min(stake, max_trade)
+
+    # Minimum $1.00
+    stake = max(stake, 1.00)
+
+    return stake
+
 # ─── Polymarket LIVE trading bot states ───
 _poly_live_p23 = {
     "enabled": False,
@@ -950,6 +1058,27 @@ def init_db():
             simulated_stake REAL DEFAULT 1.0, simulated_payout REAL,
             status TEXT DEFAULT 'Pending', outcome TEXT,
             fired_at TEXT, resolved_at TEXT, slug TEXT
+        )
+    """)
+    # ─── ALPHA unified trading system table ───
+    conn.run("""
+        CREATE TABLE IF NOT EXISTS alpha_trades (
+            id SERIAL PRIMARY KEY,
+            market_id TEXT,
+            title TEXT,
+            asset TEXT,
+            bet_side TEXT,
+            tier TEXT,
+            stake REAL,
+            fill_price REAL,
+            engines TEXT,
+            pool_after REAL,
+            payout REAL,
+            status TEXT DEFAULT 'Pending',
+            outcome TEXT,
+            fired_at TEXT,
+            resolved_at TEXT,
+            slug TEXT
         )
     """)
     # Polymarket paper trades — single table for all sections/strategies
@@ -3686,56 +3815,75 @@ def _fast_trade_scan():
                         except:
                             pass
                     
-                    # ── EXECUTE LIVE TRADES — ALL BOTS MATCH THE ASK ──
-                    # Group scored bots by direction, fetch orderbook once per direction
-                    _yes_bots = []
-                    _no_bots = []
-                    for _bot_id, _scored, _state in [
-                        ("P2.2", scored22, _bot22_state),
-                        ("P2.3", scored23, _bot23_state),
-                        ("P3.3", scored33, _bot33_state),
-                    ]:
-                        if _scored:
-                            if _scored["bet_side"] == "YES":
-                                _yes_bots.append((_bot_id, _scored, _state))
-                            else:
-                                _no_bots.append((_bot_id, _scored, _state))
-                    
-                    for _direction, _bot_list in [("YES", _yes_bots), ("NO", _no_bots)]:
-                        if not _bot_list:
-                            continue
-                        
-                        # Fetch orderbook ONCE for this direction
-                        _dir_ask = None
-                        try:
-                            _ob = _fetch_orderbook(parsed.get("slug", ""))
-                            if _ob:
-                                _, _dir_ask, _ = _get_best_prices(_ob, _direction)
-                        except:
-                            pass
-                        
-                        print("FAST 15M: {} {} ask@{} | bots: {}".format(
-                            _direction, asset,
-                            "{:.0f}%".format(_dir_ask * 100) if _dir_ask else "none",
-                            ", ".join(b[0] for b in _bot_list)))
-                        
-                        for _bot_id, _scored, _state in _bot_list:
-                            _floor = _state.get("floor_balance", 8)
-                            _stake = _state.get("fixed_stake", 1.00)
-                            if not _state["enabled"] or _state["balance"] <= _floor:
-                                continue
-                            if _stake <= 0 or _stake > _state["balance"] - _floor:
-                                continue
+                    # ── ALPHA: UNIFIED LIVE TRADE — ONE ORDER PER MARKET ──
+                    if parsed["market_id"] not in _alpha_traded_markets and _alpha_state["enabled"]:
+                        _tier_info = _alpha_get_tier(scored22, scored23, scored33, asset)
+                        if _tier_info:
+                            _a_tier, _a_base, _a_max_fill, _a_side = _tier_info
+                            _a_stake = _alpha_calc_stake(_a_base, asset, _alpha_state["balance"])
                             
-                            snipe_order = _snipe_place_gtc(market, parsed, _direction, _stake, _dir_ask)
-                            if snipe_order:
-                                _state["balance"] = round(_state["balance"] - _stake, 2)
-                                _state["trades_today"] += 1
-                                trades_placed += 1
-                                _active_snipe_orders.append(snipe_order)
-                                send_telegram("⚡ <b>{} SNIPE @{}</b>\n{} {} ${:.2f}\n{}\nBal: ${:.2f}".format(
-                                    _bot_id, "{:.0f}%".format(_dir_ask * 100) if _dir_ask else "66%",
-                                    _direction, asset, _stake, parsed["title"][:40], _state["balance"]))
+                            # Safety: pool above floor and stake fits
+                            if _alpha_state["balance"] > _alpha_state["floor_balance"] and \
+                               _a_stake <= _alpha_state["balance"] - _alpha_state["floor_balance"]:
+                                
+                                # Fetch orderbook once
+                                _a_ask = None
+                                try:
+                                    _a_ob = _fetch_orderbook(parsed.get("slug", ""))
+                                    if _a_ob:
+                                        _, _a_ask, _ = _get_best_prices(_a_ob, _a_side)
+                                except:
+                                    pass
+                                
+                                # Use tier max fill price instead of hardcoded 66%
+                                _a_fill = _a_ask if (_a_ask and _a_ask <= _a_max_fill) else _a_max_fill
+                                
+                                print("ALPHA {}: {} {} ${:.2f} fill@{:.0f}% (ask={}) | P2.3={} P2.2={} P3.3={}".format(
+                                    _a_tier, _a_side, asset, _a_stake,
+                                    _a_fill * 100,
+                                    "{:.0f}%".format(_a_ask * 100) if _a_ask else "none",
+                                    "Y" if scored23 else "N",
+                                    "Y" if scored22 else "N",
+                                    "Y" if scored33 else "N"))
+                                
+                                snipe_order = _snipe_place_gtc(market, parsed, _a_side, _a_stake, _a_ask, max_price=_a_max_fill)
+                                if snipe_order:
+                                    snipe_order["alpha_tier"] = _a_tier
+                                    snipe_order["alpha_asset_bonus"] = asset
+                                    _alpha_state["balance"] = round(_alpha_state["balance"] - _a_stake, 2)
+                                    _alpha_state["trades_today"] += 1
+                                    trades_placed += 1
+                                    _active_snipe_orders.append(snipe_order)
+                                    _alpha_traded_markets.add(parsed["market_id"])
+                                    
+                                    # Track which engines agreed for logging
+                                    _engines = []
+                                    if scored23: _engines.append("P2.3")
+                                    if scored22: _engines.append("P2.2")
+                                    if scored33: _engines.append("P3.3")
+                                    
+                                    # Save to alpha_trades table
+                                    try:
+                                        _ac = get_db()
+                                        _ac.run("""INSERT INTO alpha_trades
+                                            (market_id, title, asset, bet_side, tier, stake, fill_price,
+                                             engines, pool_after, status, fired_at, slug)
+                                            VALUES (:mid, :ttl, :ast, :bs, :tier, :stake, :fill,
+                                                    :eng, :pool, 'Pending', :now, :slg)""",
+                                            mid=parsed["market_id"], ttl=parsed["title"], ast=asset,
+                                            bs=_a_side, tier=_a_tier, stake=_a_stake,
+                                            fill=round(_a_fill, 3), eng="+".join(_engines),
+                                            pool=_alpha_state["balance"],
+                                            now=datetime.now(timezone.utc).isoformat(),
+                                            slg=parsed["slug"])
+                                        _ac.close()
+                                    except Exception as _ae:
+                                        print("Alpha DB save error: {}".format(_ae))
+                                    
+                                    send_telegram("⚡ <b>ALPHA {}</b>\n{} {} ${:.2f} @{:.0f}%\nEngines: {}\n{}\nPool: ${:.2f}".format(
+                                        _a_tier, _a_side, asset, _a_stake,
+                                        _a_fill * 100, "+".join(_engines),
+                                        parsed["title"][:40], _alpha_state["balance"]))
 
                 # ── P2.4 and P3.4: HOURLY MARKETS ──
                 if parsed.get("is_hourly_market"):
@@ -3800,59 +3948,65 @@ def _fast_trade_scan():
                         except:
                             pass
                     
-                    # Execute hourly trades — XRP SKIPPED, BTC/ETH reduced to $1.00
-                    # Paper trades still recorded above for all assets including XRP
-                    if asset == "XRP":
-                        pass  # Skip XRP execution on 1H (50% WR = no edge), paper still tracked
-                    else:
-                        _h_yes = []
-                        _h_no = []
-                        for _bot_id, _scored, _state in [
-                            ("P2.4", scored24, _bot24_state),
-                            ("P3.4", scored34, _bot34_state),
-                        ]:
-                            if _scored:
-                                if _scored["bet_side"] == "YES":
-                                    _h_yes.append((_bot_id, _scored, _state))
-                                else:
-                                    _h_no.append((_bot_id, _scored, _state))
-                        
-                        for _direction, _bot_list in [("YES", _h_yes), ("NO", _h_no)]:
-                            if not _bot_list:
-                                continue
+                    # ── ALPHA 1H: SOL and DOGE only ──
+                    # Paper trades still recorded above for all assets
+                    if asset in ("SOL", "DOGE") and parsed["market_id"] not in _alpha_traded_markets and _alpha_state["enabled"]:
+                        # Use P2.4 signal as primary (better 1H results)
+                        _h_scored = scored24 or scored34
+                        if _h_scored:
+                            _h_side = _h_scored["bet_side"]
+                            _h_base = 2.00 if asset == "SOL" else 1.50
+                            _h_tier = "T2H" if asset == "SOL" else "T3H"
+                            _h_max_fill = 0.68 if asset == "SOL" else 0.64
+                            _h_scale = max(_alpha_state["balance"] / 200.0, 0.5)
+                            _h_stake = round(min(_h_base * _h_scale, _alpha_state["balance"] * 0.025), 2)
+                            _h_stake = max(_h_stake, 1.00)
                             
-                            _h_ask = None
-                            try:
-                                _h_ob = _fetch_orderbook(parsed.get("slug", ""))
-                                if _h_ob:
-                                    _, _h_ask, _ = _get_best_prices(_h_ob, _direction)
-                            except:
-                                pass
-                            
-                            for _bot_id, _scored, _state in _bot_list:
-                                _floor = _state.get("floor_balance", 8)
-                                _stake = _state.get("fixed_stake", 1.50)
+                            if _alpha_state["balance"] > _alpha_state["floor_balance"] and \
+                               _h_stake <= _alpha_state["balance"] - _alpha_state["floor_balance"]:
                                 
-                                # BTC and ETH: reduce to $1.00 minimum (weak on 1H: 54-56% WR)
-                                if asset in ("BTC", "ETH"):
-                                    _stake = 1.00
+                                _h_ask = None
+                                try:
+                                    _h_ob = _fetch_orderbook(parsed.get("slug", ""))
+                                    if _h_ob:
+                                        _, _h_ask, _ = _get_best_prices(_h_ob, _h_side)
+                                except:
+                                    pass
                                 
-                                if not _state["enabled"] or _state["balance"] <= _floor:
-                                    continue
-                                if _stake <= 0 or _stake > _state["balance"] - _floor:
-                                    continue
+                                _h_fill = _h_ask if (_h_ask and _h_ask <= _h_max_fill) else _h_max_fill
                                 
-                                snipe_order = _snipe_place_gtc(market, parsed, _direction, _stake, _h_ask)
+                                snipe_order = _snipe_place_gtc(market, parsed, _h_side, _h_stake, _h_ask, max_price=_h_max_fill)
                                 if snipe_order:
-                                    _state["balance"] = round(_state["balance"] - _stake, 2)
-                                    _state["trades_today"] += 1
+                                    snipe_order["alpha_tier"] = _h_tier
+                                    _alpha_state["balance"] = round(_alpha_state["balance"] - _h_stake, 2)
+                                    _alpha_state["trades_today"] += 1
                                     trades_placed += 1
                                     _active_snipe_orders.append(snipe_order)
-                                    print("{} 1H SNIPE: {} {} ${:.2f} | bal=${:.2f}".format(
-                                        _bot_id, _direction, asset, _stake, _state["balance"]))
-                                    send_telegram("⚡ <b>{} 1H SNIPE @{}</b>\n{} {} ${:.2f}\n{}\nBal: ${:.2f}".format(
-                                        _bot_id, "{:.0f}%".format(_h_ask * 100) if _h_ask else "66%",
-                                        _direction, asset, _stake, parsed["title"][:40], _state["balance"]))
+                                    _alpha_traded_markets.add(parsed["market_id"])
+                                    
+                                    try:
+                                        _hc = get_db()
+                                        _hc.run("""INSERT INTO alpha_trades
+                                            (market_id, title, asset, bet_side, tier, stake, fill_price,
+                                             engines, pool_after, status, fired_at, slug)
+                                            VALUES (:mid, :ttl, :ast, :bs, :tier, :stake, :fill,
+                                                    :eng, :pool, 'Pending', :now, :slg)""",
+                                            mid=parsed["market_id"], ttl=parsed["title"], ast=asset,
+                                            bs=_h_side, tier=_h_tier, stake=_h_stake,
+                                            fill=round(_h_fill, 3),
+                                            eng="P2.4" if scored24 else "P3.4",
+                                            pool=_alpha_state["balance"],
+                                            now=datetime.now(timezone.utc).isoformat(),
+                                            slg=parsed["slug"])
+                                        _hc.close()
+                                    except:
+                                        pass
+                                    
+                                    print("ALPHA {} 1H: {} {} ${:.2f} | pool=${:.2f}".format(
+                                        _h_tier, _h_side, asset, _h_stake, _alpha_state["balance"]))
+                                    send_telegram("⚡ <b>ALPHA {} 1H</b>\n{} {} ${:.2f}\n{}\nPool: ${:.2f}".format(
+                                        _h_tier, _h_side, asset, _h_stake,
+                                        parsed["title"][:40], _alpha_state["balance"]))
 
             except Exception as e:
                 continue
@@ -3936,21 +4090,27 @@ def _fast_trade_scan():
                         except:
                             pass
                         
-                        # Place live order
-                        _us_floor = _us_state.get("floor_balance", 8)
-                        _us_stake = _us_state.get("fixed_stake", 1.00)
-                        if _us_state["enabled"] and _us_state["balance"] > _us_floor and _us_stake <= _us_state["balance"] - _us_floor:
-                            _us_snipe = _snipe_place_gtc(_us_market, _us_parsed, _us_scored_val["bet_side"], _us_stake, None)
-                            if _us_snipe:
-                                _us_state["balance"] = round(_us_state["balance"] - _us_stake, 2)
-                                _us_state["trades_today"] = _us_state.get("trades_today", 0) + 1
-                                trades_placed += 1
-                                _active_snipe_orders.append(_us_snipe)
-                                print("2ND PASS {} SNIPE: {} {} ${:.2f} | bal=${:.2f}".format(
-                                    _us_bot_id, _us_scored_val["bet_side"], _us_asset, _us_stake, _us_state["balance"]))
-                                send_telegram("🔄 <b>2ND PASS {} SNIPE</b>\n{} {} ${:.2f}\n{}\nBal: ${:.2f}".format(
-                                    _us_bot_id, _us_scored_val["bet_side"], _us_asset, _us_stake,
-                                    _us_parsed["title"][:40], _us_state["balance"]))
+                        # Place Alpha live order (second pass)
+                        if _us_parsed["market_id"] not in _alpha_traded_markets and _alpha_state["enabled"]:
+                            _us_tier_info = _alpha_get_tier(_us_s22, _us_s23, _us_s33, _us_asset)
+                            if _us_tier_info:
+                                _us_a_tier, _us_a_base, _us_a_max, _us_a_side = _us_tier_info
+                                _us_a_stake = _alpha_calc_stake(_us_a_base, _us_asset, _alpha_state["balance"])
+                                if _alpha_state["balance"] > _alpha_state["floor_balance"] and \
+                                   _us_a_stake <= _alpha_state["balance"] - _alpha_state["floor_balance"]:
+                                    _us_snipe = _snipe_place_gtc(_us_market, _us_parsed, _us_a_side, _us_a_stake, None, max_price=_us_a_max)
+                                    if _us_snipe:
+                                        _us_snipe["alpha_tier"] = _us_a_tier
+                                        _alpha_state["balance"] = round(_alpha_state["balance"] - _us_a_stake, 2)
+                                        _alpha_state["trades_today"] += 1
+                                        trades_placed += 1
+                                        _active_snipe_orders.append(_us_snipe)
+                                        _alpha_traded_markets.add(_us_parsed["market_id"])
+                                        print("2ND PASS ALPHA {}: {} {} ${:.2f} | pool=${:.2f}".format(
+                                            _us_a_tier, _us_a_side, _us_asset, _us_a_stake, _alpha_state["balance"]))
+                                        send_telegram("🔄 <b>2ND ALPHA {}</b>\n{} {} ${:.2f}\n{}\nPool: ${:.2f}".format(
+                                            _us_a_tier, _us_a_side, _us_asset, _us_a_stake,
+                                            _us_parsed["title"][:40], _alpha_state["balance"]))
                 except Exception as _us_err:
                     print("Second pass error {}: {}".format(_us_asset, _us_err))
             
@@ -4028,23 +4188,26 @@ def _fast_trade_scan():
                         except:
                             pass
                         
-                        # Place live order — BTC/ETH at $1.00, SOL/DOGE at $1.50
-                        _us_floor = _us_state.get("floor_balance", 8)
-                        _us_stake = _us_state.get("fixed_stake", 1.50)
-                        if _us_asset in ("BTC", "ETH"):
-                            _us_stake = 1.00
-                        if _us_state["enabled"] and _us_state["balance"] > _us_floor and _us_stake <= _us_state["balance"] - _us_floor:
-                            _us_snipe = _snipe_place_gtc(_us_market, _us_parsed, _us_scored_val["bet_side"], _us_stake, None)
-                            if _us_snipe:
-                                _us_state["balance"] = round(_us_state["balance"] - _us_stake, 2)
-                                _us_state["trades_today"] = _us_state.get("trades_today", 0) + 1
-                                trades_placed += 1
-                                _active_snipe_orders.append(_us_snipe)
-                                print("2ND PASS {} 1H SNIPE: {} {} ${:.2f} | bal=${:.2f}".format(
-                                    _us_bot_id, _us_scored_val["bet_side"], _us_asset, _us_stake, _us_state["balance"]))
-                                send_telegram("🔄 <b>2ND {} 1H SNIPE</b>\n{} {} ${:.2f}\n{}\nBal: ${:.2f}".format(
-                                    _us_bot_id, _us_scored_val["bet_side"], _us_asset, _us_stake,
-                                    _us_parsed["title"][:40], _us_state["balance"]))
+                        # Place Alpha 1H live order — SOL and DOGE only
+                        if _us_asset in ("SOL", "DOGE") and _us_parsed["market_id"] not in _alpha_traded_markets and _alpha_state["enabled"]:
+                            _us_h_base = 2.00 if _us_asset == "SOL" else 1.50
+                            _us_h_tier = "T2H" if _us_asset == "SOL" else "T3H"
+                            _us_h_max_fill = 0.68 if _us_asset == "SOL" else 0.64
+                            _us_h_scale = max(_alpha_state["balance"] / 200.0, 0.5)
+                            _us_h_stake = round(min(_us_h_base * _us_h_scale, _alpha_state["balance"] * 0.025), 2)
+                            _us_h_stake = max(_us_h_stake, 1.00)
+                            if _alpha_state["balance"] > _alpha_state["floor_balance"] and \
+                               _us_h_stake <= _alpha_state["balance"] - _alpha_state["floor_balance"]:
+                                _us_snipe = _snipe_place_gtc(_us_market, _us_parsed, _us_scored_val["bet_side"], _us_h_stake, None, max_price=_us_h_max_fill)
+                                if _us_snipe:
+                                    _us_snipe["alpha_tier"] = _us_h_tier
+                                    _alpha_state["balance"] = round(_alpha_state["balance"] - _us_h_stake, 2)
+                                    _alpha_state["trades_today"] += 1
+                                    trades_placed += 1
+                                    _active_snipe_orders.append(_us_snipe)
+                                    _alpha_traded_markets.add(_us_parsed["market_id"])
+                                    print("2ND ALPHA {} 1H: {} {} ${:.2f} | pool=${:.2f}".format(
+                                        _us_h_tier, _us_scored_val["bet_side"], _us_asset, _us_h_stake, _alpha_state["balance"]))
                 except Exception as _us_err:
                     print("Second pass 1H error {}: {}".format(_us_asset, _us_err))
         
@@ -4076,42 +4239,69 @@ def _precalc_indicators():
             pass
 
 def _backup_live_snipe(bot_id, bot_state, scored, parsed, market, asset):
-    """Backup live order — called from paper scan when fast scan missed a signal.
-    Returns True if order placed."""
+    """Alpha backup live order — called from paper scan when fast scan missed.
+    Uses Alpha unified pool instead of individual bot balances.
+    Only fires once per market (deduped by _alpha_traded_markets)."""
     if not _cached_credentials["ready"]:
         return False
-    floor = bot_state.get("floor_balance", 8)
-    stake = bot_state.get("fixed_stake", 1.00)
-    
-    # P2.4/P3.4: skip XRP on 1H, reduce BTC/ETH
-    if bot_id in ("P2.4", "P3.4") and parsed.get("is_hourly_market"):
-        if asset == "XRP":
+    if not _alpha_state["enabled"]:
+        return False
+    if parsed.get("market_id") in _alpha_traded_markets:
+        return False  # Already traded this market
+
+    # For 15M: use Alpha tier logic
+    if parsed.get("is_15m_market"):
+        # We only have this one bot's score, but we can still use it
+        # Build a minimal tier check
+        _bk_s22 = scored if bot_id == "P2.2" else None
+        _bk_s23 = scored if bot_id == "P2.3" else None
+        _bk_s33 = scored if bot_id == "P3.3" else None
+
+        _bk_tier = _alpha_get_tier(_bk_s22, _bk_s23, _bk_s33, asset)
+        if not _bk_tier:
             return False
-        if asset in ("BTC", "ETH"):
-            stake = 1.00
-    
-    if not bot_state["enabled"] or bot_state["balance"] <= floor:
+
+        _bk_tag, _bk_base, _bk_max_fill, _bk_side = _bk_tier
+        _bk_stake = _alpha_calc_stake(_bk_base, asset, _alpha_state["balance"])
+
+    elif parsed.get("is_hourly_market"):
+        # 1H: only SOL and DOGE
+        if asset not in ("SOL", "DOGE"):
+            return False
+        _bk_side = scored["bet_side"]
+        _bk_base = 2.00 if asset == "SOL" else 1.50
+        _bk_tag = "T2H" if asset == "SOL" else "T3H"
+        _bk_max_fill = 0.68 if asset == "SOL" else 0.64
+        _bk_scale = max(_alpha_state["balance"] / 200.0, 0.5)
+        _bk_stake = round(min(_bk_base * _bk_scale, _alpha_state["balance"] * 0.025), 2)
+        _bk_stake = max(_bk_stake, 1.00)
+    else:
         return False
-    if stake <= 0 or stake > bot_state["balance"] - floor:
+
+    # Safety checks
+    if _alpha_state["balance"] <= _alpha_state["floor_balance"]:
         return False
-    
-    # Check market has enough time (>3 min for 15M, >15 min for 1H)
+    if _bk_stake > _alpha_state["balance"] - _alpha_state["floor_balance"]:
+        return False
+
+    # Check time remaining
     h_left = parsed.get("hours_left", 0)
     if parsed.get("is_15m_market") and h_left < 0.05:
         return False
     if parsed.get("is_hourly_market") and h_left < 0.25:
         return False
-    
-    side = scored["bet_side"]
-    snipe_order = _snipe_place_gtc(market, parsed, side, stake, None)
+
+    snipe_order = _snipe_place_gtc(market, parsed, _bk_side, _bk_stake, None, max_price=_bk_max_fill)
     if snipe_order:
-        bot_state["balance"] = round(bot_state["balance"] - stake, 2)
-        bot_state["trades_today"] = bot_state.get("trades_today", 0) + 1
+        snipe_order["alpha_tier"] = _bk_tag
+        _alpha_state["balance"] = round(_alpha_state["balance"] - _bk_stake, 2)
+        _alpha_state["trades_today"] += 1
         _active_snipe_orders.append(snipe_order)
-        print("BACKUP {} SNIPE: {} {} ${:.2f} | bal=${:.2f}".format(
-            bot_id, side, asset, stake, bot_state["balance"]))
-        send_telegram("🔄 <b>BACKUP {} SNIPE</b>\n{} {} ${:.2f}\n{}\nBal: ${:.2f}".format(
-            bot_id, side, asset, stake, parsed["title"][:40], bot_state["balance"]))
+        _alpha_traded_markets.add(parsed["market_id"])
+        print("BACKUP ALPHA {}: {} {} ${:.2f} | pool=${:.2f}".format(
+            _bk_tag, _bk_side, asset, _bk_stake, _alpha_state["balance"]))
+        send_telegram("🔄 <b>BACKUP ALPHA {}</b>\n{} {} ${:.2f}\n{}\nPool: ${:.2f}".format(
+            _bk_tag, _bk_side, asset, _bk_stake, parsed["title"][:40], _alpha_state["balance"]))
         return True
     return False
 
@@ -4160,12 +4350,13 @@ def _warm_credentials():
         print("Credential cache error: {}".format(e))
     return False
 
-def _snipe_place_gtc(market_data, parsed, bet_side, stake, best_ask):
+def _snipe_place_gtc(market_data, parsed, bet_side, stake, best_ask, max_price=0.66):
     """Fast entry: match the ask immediately. No delays.
     best_ask: pre-fetched from orderbook (shared across bots for same market).
+    max_price: maximum fill price (default 66¢, Alpha tiers use higher).
     
-    ask ≤ 66¢ → match at ask price → instant fill
-    ask > 66¢ or None → GTC at 66¢ → sits on book
+    ask ≤ max_price → match at ask price → instant fill
+    ask > max_price or None → GTC at max_price → sits on book
     
     Returns order tracking dict or None."""
     
@@ -4192,7 +4383,7 @@ def _snipe_place_gtc(market_data, parsed, bet_side, stake, best_ask):
     fee_bps = _cached_credentials["fee_bps"] or 300
     asset = parsed.get("asset", "?")
     
-    if best_ask and best_ask <= 0.66:
+    if best_ask and best_ask <= max_price:
         # Match the ask — instant fill
         price = round(best_ask, 3)
         order_id = _place_gtc_order(slug, bet_side, token_id, stake, price,
@@ -4208,13 +4399,13 @@ def _snipe_place_gtc(market_data, parsed, bet_side, stake, best_ask):
                 "profile_id": profile_id, "fee_bps": fee_bps,
             }
     else:
-        # No ask or too expensive — GTC at 66% max
-        price = 0.66
+        # No ask or too expensive — GTC at max_price
+        price = max_price
         order_id = _place_gtc_order(slug, bet_side, token_id, stake, price,
                                      exchange_addr, profile_id, fee_bps)
         if order_id:
-            print("SNIPE MAX @66%: {} {} ${:.2f} on {} (ask={})".format(
-                bet_side, asset, stake, slug[:30],
+            print("SNIPE MAX @{:.0f}%: {} {} ${:.2f} on {} (ask={})".format(
+                price * 100, bet_side, asset, stake, slug[:30],
                 "{:.0f}%".format(best_ask * 100) if best_ask else "none"))
             return {
                 "order_id": order_id, "slug": slug, "bet_side": bet_side,
@@ -4239,7 +4430,10 @@ def _manage_snipe_orders():
         return
     
     price_steps = [0.45, 0.48, 0.50, 0.52, 0.55, 0.58, 0.60, 0.62, 0.66]
-    max_rounds = 9  # Maximum escalation steps
+    # Extended steps for Alpha T1/T2 (higher max fill allowed)
+    price_steps_t1 = [0.45, 0.48, 0.50, 0.52, 0.55, 0.58, 0.60, 0.62, 0.66, 0.68, 0.72]
+    price_steps_t2 = [0.45, 0.48, 0.50, 0.52, 0.55, 0.58, 0.60, 0.62, 0.66, 0.68]
+    max_rounds = 11  # Maximum escalation steps
     
     for round_num in range(max_rounds):
         if not _active_snipe_orders:
@@ -4255,6 +4449,16 @@ def _manage_snipe_orders():
             step_idx = order["step_idx"]
             slug = order["slug"]
             
+            # Select price steps based on Alpha tier
+            _o_tier = order.get("alpha_tier", "")
+            if _o_tier == "T1":
+                _o_steps = price_steps_t1
+            elif _o_tier in ("T2", "T2H"):
+                _o_steps = price_steps_t2
+            else:
+                _o_steps = price_steps
+            _o_max = _o_steps[-1]
+            
             # Check if current order filled
             status = _check_order_filled(order_id)
             if status == "FILLED":
@@ -4265,30 +4469,30 @@ def _manage_snipe_orders():
                 continue
             
             # Already at max price — leave it sitting
-            if step_idx >= len(price_steps) - 1:
+            if step_idx >= len(_o_steps) - 1:
                 print("SNIPE @{:.0f}% sitting on book for {}".format(
-                    price_steps[-1] * 100, slug[:25]))
+                    _o_steps[-1] * 100, slug[:25]))
                 continue
             
             # Determine next price
             next_idx = step_idx + 1
-            next_price = price_steps[next_idx]
+            next_price = _o_steps[next_idx]
             
             # Check orderbook for asks to match within range
             try:
                 ob = _fetch_orderbook(slug)
                 if ob:
                     _, best_ask, _ = _get_best_prices(ob, order["bet_side"])
-                    if best_ask and best_ask <= 0.66 and best_ask > order["current_price"]:
+                    if best_ask and best_ask <= _o_max and best_ask > order["current_price"]:
                         # Match the ask directly
                         next_price = round(best_ask, 3)
                         # Find the matching step index
-                        for si, sp in enumerate(price_steps):
+                        for si, sp in enumerate(_o_steps):
                             if sp >= next_price:
                                 next_idx = si
                                 break
                         else:
-                            next_idx = len(price_steps) - 1
+                            next_idx = len(_o_steps) - 1
                         print("SNIPE matching ask ${:.3f} for {}".format(next_price, slug[:25]))
             except:
                 pass
@@ -4328,7 +4532,12 @@ def _manage_snipe_orders():
             
             time.sleep(0.3)  # Rate limit safety between markets
         
-        _active_snipe_orders = [o for o in _active_snipe_orders if not o["filled"] and o["step_idx"] < len(price_steps) - 1]
+        def _max_steps(o):
+            t = o.get("alpha_tier", "")
+            if t == "T1": return len(price_steps_t1)
+            if t in ("T2", "T2H"): return len(price_steps_t2)
+            return len(price_steps)
+        _active_snipe_orders = [o for o in _active_snipe_orders if not o["filled"] and o["step_idx"] < _max_steps(o) - 1]
         
         if not _active_snipe_orders:
             break
@@ -4428,6 +4637,21 @@ def scan_loop():
                 _fast_trade_scan()
             except Exception as e:
                 print("Fast scan error: {}".format(e))
+            
+            # ── ALPHA CLEANUP: Prevent memory leak ──
+            if is_hourly_boundary:
+                # Clear traded markets set (markets expire, can't be re-traded)
+                _old_size = len(_alpha_traded_markets)
+                _alpha_traded_markets.clear()
+                # Reset daily stats at midnight UTC
+                if now_utc.hour == 0:
+                    _alpha_state["trades_today"] = 0
+                    _alpha_state["wins_today"] = 0
+                    _alpha_state["losses_today"] = 0
+                    _alpha_state["profit_today"] = 0.0
+                    print("ALPHA daily stats reset")
+                if _old_size > 0:
+                    print("ALPHA cleared {} traded market IDs".format(_old_size))
         else:
             print("Skip fast scan at :{:02d} (not a 15M boundary)".format(current_minute))
 
@@ -4454,6 +4678,8 @@ def scan_loop():
                               ("p24", _bot24_state), ("p34", _bot34_state),
                               ("p23", _bot23_state), ("p33", _bot33_state)]:
                 _save_bot_balance(_bn, _bs)
+            # Save Alpha pool state
+            _save_bot_balance("alpha", _alpha_state)
         except Exception as e:
             print("Balance save error: {}".format(e))
         
@@ -7994,6 +8220,11 @@ def run_paper34_scan():
                         except Exception as e:
                             print("Paper51 save error: {}".format(e))
 
+                # ── ALPHA BACKUP: Collect all 3 engine scores, then fire ONE unified backup ──
+                _bk_scored22 = None
+                _bk_scored23 = None
+                _bk_scored33 = None
+
                 # Paper 2.2: Same as P2.1 but 15M ONLY (LIVE trading)
                 if parsed["market_id"] not in p22_ids:
                     scored22 = _score_paper21_trade(parsed, price, indicators=ind, ind_macro=ind_macro, expiry_minute=expiry_minute, expiry_hour=expiry_hour)
@@ -8023,11 +8254,9 @@ def run_paper34_scan():
                         except Exception as e:
                             print("Paper22 save error: {}".format(e))
 
-                        # P2.2 BACKUP live trade (if fast scan missed this signal)
-                        try:
-                            _backup_live_snipe("P2.2", _bot22_state, scored22, parsed, market, asset)
-                        except Exception as _e22:
-                            print("P2.2 backup error: {}".format(_e22))
+                        # P2.2 BACKUP: collect score for unified Alpha backup (below)
+                        # Don't fire individually — wait for all 3 engines
+                        _bk_scored22 = scored22
                         # Paper tracking continues above
 
                 # Paper 3.2: Same as P3.1 but 15M ONLY (LIVE trading)
@@ -8109,11 +8338,8 @@ def run_paper34_scan():
                         except Exception as e:
                             print("Paper23 save error: {}".format(e))
 
-                        # P2.3 BACKUP live trade (if fast scan missed this signal)
-                        try:
-                            _backup_live_snipe("P2.3", _bot23_state, scored23, parsed, market, asset)
-                        except Exception as _e23:
-                            print("P2.3 backup error: {}".format(_e23))
+                        # P2.3 BACKUP: collect score for unified Alpha backup
+                        _bk_scored23 = scored23
 
                 # Paper 3.3: P3.1 + Distance Math (mixed mode, 15M only)
                 if parsed["market_id"] not in p33_ids:
@@ -8144,11 +8370,59 @@ def run_paper34_scan():
                         except Exception as e:
                             print("Paper33 save error: {}".format(e))
 
-                        # P3.3 BACKUP live trade (if fast scan missed this signal)
-                        try:
-                            _backup_live_snipe("P3.3", _bot33_state, scored33, parsed, market, asset)
-                        except Exception as _e33:
-                            print("P3.3 backup error: {}".format(_e33))
+                        # P3.3 BACKUP: collect score for unified Alpha backup
+                        _bk_scored33 = scored33
+
+                # ── ALPHA UNIFIED BACKUP: All 3 engines scored, now fire ONE order ──
+                if (_bk_scored22 or _bk_scored23 or _bk_scored33) and \
+                   parsed.get("market_id") not in _alpha_traded_markets and \
+                   parsed.get("is_15m_market") and _alpha_state["enabled"]:
+                    try:
+                        _bk_tier = _alpha_get_tier(_bk_scored22, _bk_scored23, _bk_scored33, asset)
+                        if _bk_tier:
+                            _bk_tag, _bk_base, _bk_max_fill, _bk_side = _bk_tier
+                            _bk_stake = _alpha_calc_stake(_bk_base, asset, _alpha_state["balance"])
+                            if _alpha_state["balance"] > _alpha_state["floor_balance"] and \
+                               _bk_stake <= _alpha_state["balance"] - _alpha_state["floor_balance"]:
+                                h_left = parsed.get("hours_left", 0)
+                                if h_left >= 0.05:
+                                    _bk_snipe = _snipe_place_gtc(market, parsed, _bk_side, _bk_stake, None, max_price=_bk_max_fill)
+                                    if _bk_snipe:
+                                        _bk_snipe["alpha_tier"] = _bk_tag
+                                        _alpha_state["balance"] = round(_alpha_state["balance"] - _bk_stake, 2)
+                                        _alpha_state["trades_today"] += 1
+                                        _active_snipe_orders.append(_bk_snipe)
+                                        _alpha_traded_markets.add(parsed["market_id"])
+                                        _bk_engines = []
+                                        if _bk_scored23: _bk_engines.append("P2.3")
+                                        if _bk_scored22: _bk_engines.append("P2.2")
+                                        if _bk_scored33: _bk_engines.append("P3.3")
+                                        print("BACKUP ALPHA {}: {} {} ${:.2f} [{}] | pool=${:.2f}".format(
+                                            _bk_tag, _bk_side, asset, _bk_stake,
+                                            "+".join(_bk_engines), _alpha_state["balance"]))
+                                        send_telegram("🔄 <b>BACKUP ALPHA {}</b>\n{} {} ${:.2f}\nEngines: {}\n{}\nPool: ${:.2f}".format(
+                                            _bk_tag, _bk_side, asset, _bk_stake,
+                                            "+".join(_bk_engines), parsed["title"][:35],
+                                            _alpha_state["balance"]))
+                                        # Save to alpha_trades
+                                        try:
+                                            _bkc = get_db()
+                                            _bkc.run("""INSERT INTO alpha_trades
+                                                (market_id, title, asset, bet_side, tier, stake, fill_price,
+                                                 engines, pool_after, status, fired_at, slug)
+                                                VALUES (:mid, :ttl, :ast, :bs, :tier, :stake, :fill,
+                                                        :eng, :pool, 'Pending', :now, :slg)""",
+                                                mid=parsed["market_id"], ttl=parsed["title"], ast=asset,
+                                                bs=_bk_side, tier=_bk_tag, stake=_bk_stake,
+                                                fill=round(_bk_max_fill, 3), eng="+".join(_bk_engines),
+                                                pool=_alpha_state["balance"],
+                                                now=datetime.now(timezone.utc).isoformat(),
+                                                slg=parsed["slug"])
+                                            _bkc.close()
+                                        except:
+                                            pass
+                    except Exception as _bk_err:
+                        print("Alpha backup error: {}".format(_bk_err))
 
                 # Paper 2.4: P2.1 + Distance + 15M Candle Pattern (1H ONLY)
                 if parsed["market_id"] not in p24_ids:
@@ -8527,7 +8801,7 @@ def _resolve_paper_table(table_name):
                 # Update Paper 2.2 balance
                 if table_name == "paper22_trades":
                     fired = p.get("fired_at") or ""
-                    is_live_trade = fired >= "2026-04-23T03:30"
+                    is_live_trade = fired >= "2026-04-23T03:30" and fired < "2026-04-26T10:00"
                     if is_live_trade:
                         if won:
                             _bot22_state["balance"] = round(_bot22_state["balance"] + payout, 2)
@@ -8563,10 +8837,10 @@ def _resolve_paper_table(table_name):
                         print("P3.2 #{} {}: stake=${:.2f} payout=${:.2f} bal=${:.2f}".format(
                             p["id"], "WIN" if won else "LOSS", stake, payout, _bot32_state["balance"]))
 
-                # Update Paper 2.3 balance
+                # Update Paper 2.3 balance — SKIP if Alpha is handling live trades
                 if table_name == "paper23_trades":
                     fired = p.get("fired_at") or ""
-                    is_live_trade = fired >= "2026-04-24T05:00"
+                    is_live_trade = fired >= "2026-04-24T05:00" and fired < "2026-04-26T10:00"
                     if is_live_trade:
                         if won:
                             _bot23_state["balance"] = round(_bot23_state["balance"] + payout, 2)
@@ -8584,10 +8858,10 @@ def _resolve_paper_table(table_name):
                             _emoji23, "WIN" if won else "LOSS", p["id"], _pnl23,
                             p.get("title", "")[:30], _bot23_state["balance"]))
 
-                # Update Paper 3.3 balance
+                # Update Paper 3.3 balance — SKIP if Alpha is handling live trades
                 if table_name == "paper33_trades":
                     fired = p.get("fired_at") or ""
-                    is_live_trade = fired >= "2026-04-24T05:00"
+                    is_live_trade = fired >= "2026-04-24T05:00" and fired < "2026-04-26T10:00"
                     if is_live_trade:
                         if won:
                             _bot33_state["balance"] = round(_bot33_state["balance"] + payout, 2)
@@ -8605,10 +8879,10 @@ def _resolve_paper_table(table_name):
                             _emoji33, "WIN" if won else "LOSS", p["id"], _pnl33, 
                             p.get("title", "")[:30], _bot33_state["balance"]))
 
-                # Update Paper 2.4 balance
+                # Update Paper 2.4 balance — SKIP if Alpha is handling live trades
                 if table_name == "paper24_trades":
                     fired = p.get("fired_at") or ""
-                    is_live_trade = fired >= "2026-04-25T12:00"
+                    is_live_trade = fired >= "2026-04-25T12:00" and fired < "2026-04-26T10:00"
                     if is_live_trade:
                         if won:
                             _bot24_state["balance"] = round(_bot24_state["balance"] + payout, 2)
@@ -8626,10 +8900,10 @@ def _resolve_paper_table(table_name):
                             _emoji24, "WIN" if won else "LOSS", p["id"], _pnl24,
                             p.get("title", "")[:30], _bot24_state["balance"]))
 
-                # Update Paper 3.4 balance
+                # Update Paper 3.4 balance — SKIP if Alpha is handling live trades
                 if table_name == "paper34_trades":
                     fired = p.get("fired_at") or ""
-                    is_live_trade = fired >= "2026-04-25T12:00"
+                    is_live_trade = fired >= "2026-04-25T12:00" and fired < "2026-04-26T10:00"
                     if is_live_trade:
                         if won:
                             _bot34_state["balance"] = round(_bot34_state["balance"] + payout, 2)
@@ -8705,8 +8979,133 @@ def resolve_paper34_trades():
     r36 = _resolve_paper_table("paper36_trades")
     r27 = _resolve_paper_table("paper27_trades")
     r37 = _resolve_paper_table("paper37_trades")
-    if r3 or r4 or r5 or r24 or r34 or r25 or r35 or r26 or r36:
-        print("Resolved: P3={} P4={} P5={} P3.1={} P2.1={} P5.1={} P2.2={} P3.2={} P2.3={} P3.3={} P2.4={} P3.4={} P2.5={} P3.5={} P2.6={} P3.6={}".format(r3, r4, r5, r31, r21, r51, r22, r32, r23, r33, r24, r34, r25, r35, r26, r36))
+    ra = _resolve_alpha_trades()
+    if r3 or r4 or r5 or r24 or r34 or r25 or r35 or r26 or r36 or ra:
+        print("Resolved: P3={} P4={} P5={} P3.1={} P2.1={} P5.1={} P2.2={} P3.2={} P2.3={} P3.3={} P2.4={} P3.4={} P2.5={} P3.5={} P2.6={} P3.6={} ALPHA={}".format(r3, r4, r5, r31, r21, r51, r22, r32, r23, r33, r24, r34, r25, r35, r26, r36, ra))
+
+
+def _resolve_alpha_trades():
+    """Resolve Alpha unified trades and update pool balance."""
+    import requests as req
+    try:
+        conn = get_db()
+        rows = conn.run("SELECT * FROM alpha_trades WHERE status='Pending'")
+        cols = [c['name'] for c in conn.columns]
+        items = [dict(zip(cols, r)) for r in rows]
+        conn.close()
+
+        if not items:
+            return 0
+
+        now = datetime.now(timezone.utc)
+        resolved = 0
+        for p in items:
+            try:
+                if not p.get("fired_at") or not p.get("asset"):
+                    continue
+
+                fired = datetime.fromisoformat(p["fired_at"])
+                if fired.tzinfo is None:
+                    fired = fired.replace(tzinfo=timezone.utc)
+
+                # Determine expiry based on tier
+                tier = p.get("tier", "T1")
+                if tier in ("T2H", "T3H"):
+                    hours_left = 1.0
+                else:
+                    hours_left = 0.25
+
+                expiry = fired + timedelta(hours=hours_left)
+                if now < expiry + timedelta(minutes=2):
+                    continue
+
+                # Try Limitless API first
+                slug = p.get("slug")
+                won = None
+                if slug:
+                    try:
+                        mr = req.get("{}/markets/{}".format(LIMITLESS_API, slug), timeout=10)
+                        if mr.status_code == 200:
+                            mdata = mr.json()
+                            wi = mdata.get("winningOutcomeIndex")
+                            if wi is not None:
+                                market_resolved_yes = (wi == 0)
+                                bet_side = p.get("bet_side") or "YES"
+                                won = market_resolved_yes if bet_side == "YES" else not market_resolved_yes
+                    except:
+                        pass
+
+                # Fallback: current price
+                if won is None:
+                    # Parse title for baseline
+                    title = p.get("title", "")
+                    current_price = get_price(p["asset"])
+                    if current_price is None:
+                        continue
+                    # Try to extract baseline from title
+                    import re
+                    _bm = re.search(r'[\$]?([\d,]+\.?\d*)', title.split("above")[-1].split("below")[-1])
+                    if _bm:
+                        try:
+                            baseline = float(_bm.group(1).replace(",", ""))
+                            direction = "above" if "above" in title.lower() else "below"
+                            market_resolved_true = (current_price > baseline) if direction == "above" else (current_price < baseline)
+                            bet_side = p.get("bet_side") or "YES"
+                            won = market_resolved_true if bet_side == "YES" else not market_resolved_true
+                        except:
+                            continue
+                    else:
+                        continue
+
+                outcome = "WIN" if won else "LOSS"
+                status = "✅ Won" if won else "❌ Lost"
+                stake = float(p.get("stake") or 1.0)
+                fill = float(p.get("fill_price") or 0.66)
+                payout = round(stake / fill, 4) if won else 0
+
+                conn2 = get_db()
+                conn2.run(
+                    "UPDATE alpha_trades SET status=:s, outcome=:o, resolved_at=:r, payout=:p WHERE id=:i",
+                    s=status, o=outcome, r=now.isoformat(), p=payout, i=p["id"]
+                )
+                conn2.close()
+                resolved += 1
+
+                # Update Alpha pool balance
+                if won:
+                    _alpha_state["balance"] = round(_alpha_state["balance"] + payout, 2)
+                    _alpha_state["wins_today"] += 1
+                    _alpha_state["profit_today"] = round(_alpha_state["profit_today"] + (payout - stake), 2)
+                else:
+                    _alpha_state["losses_today"] += 1
+                    _alpha_state["profit_today"] = round(_alpha_state["profit_today"] - stake, 2)
+
+                # Update peak
+                if _alpha_state["balance"] > _alpha_state["peak_balance"]:
+                    _alpha_state["peak_balance"] = _alpha_state["balance"]
+
+                # Floor check
+                if _alpha_state["balance"] <= _alpha_state["floor_balance"]:
+                    _alpha_state["enabled"] = False
+                    send_telegram("🚨 <b>ALPHA STOPPED — Floor reached</b>\nPool: ${:.2f}".format(
+                        _alpha_state["balance"]))
+
+                _emoji = "✅" if won else "❌"
+                _pnl = "+${:.2f}".format(payout - stake) if won else "-${:.2f}".format(stake)
+                print("ALPHA #{} {} {}: ${:.2f} → {} | pool=${:.2f}".format(
+                    p["id"], p.get("tier", "?"), outcome, stake, _pnl, _alpha_state["balance"]))
+                send_telegram("{} <b>ALPHA {} {}</b>\n{} {} ${:.2f}\n{}\nPool: ${:.2f}".format(
+                    _emoji, p.get("tier", "?"), outcome, _pnl, p.get("asset", "?"),
+                    stake, p.get("title", "")[:35], _alpha_state["balance"]))
+
+            except Exception as e:
+                print("Alpha resolve error #{}: {}".format(p.get("id"), e))
+                continue
+
+        return resolved
+    except Exception as e:
+        print("Alpha resolve error: {}".format(e))
+        return 0
 
 def _score_paper_trade(p, price):
     """Score a market for paper trading. Accepts 40-72% odds when ALL trends agree.
@@ -13278,10 +13677,19 @@ def paper5_page():
 
 try:
     init_db()
-    # Reset bot balances on deploy
+    # Restore Alpha balance from DB if it exists (survives restarts)
+    _saved_balances = _load_bot_balances()
+    _saved_alpha = _saved_balances.get("alpha", {})
+    _alpha_restored = False
+    if _saved_alpha and _saved_alpha.get("balance", 0) > 0:
+        _alpha_state["balance"] = _saved_alpha["balance"]
+        _alpha_state["peak_balance"] = _saved_alpha.get("peak_balance", _saved_alpha["balance"])
+        _alpha_restored = True
+    
+    # Clear old bot balances (not Alpha)
     try:
         _rc = get_db()
-        _rc.run("DELETE FROM bot_balances")
+        _rc.run("DELETE FROM bot_balances WHERE bot_name != 'alpha'")
         _rc.close()
     except:
         pass
@@ -13290,42 +13698,47 @@ try:
         _bot_state_ref["balance"] = 14.0
         _bot_state_ref["peak_balance"] = 14.0
         _bot_state_ref["enabled"] = False
-    # P2.3: Best bot (80% WR) — highest allocation
+    # ─── ALPHA UNIFIED POOL: $200 ───
+    # Individual bot states kept for paper tracking but NOT used for live trading
     _bot23_state["balance"] = 50.0
     _bot23_state["peak_balance"] = 50.0
     _bot23_state["starting_balance"] = 50.0
-    _bot23_state["floor_balance"] = 8.0
+    _bot23_state["floor_balance"] = 0.0  # No floor — Alpha controls live balance
     _bot23_state["fixed_stake"] = 2.50
-    _bot23_state["enabled"] = True
-    # P2.2: Strong bot (73% WR)
+    _bot23_state["enabled"] = False  # Disabled for individual live trading
     _bot22_state["balance"] = 45.0
     _bot22_state["peak_balance"] = 45.0
     _bot22_state["starting_balance"] = 45.0
-    _bot22_state["floor_balance"] = 8.0
+    _bot22_state["floor_balance"] = 0.0
     _bot22_state["fixed_stake"] = 2.00
-    _bot22_state["enabled"] = True
-    # P3.3: High volume (68% WR)
+    _bot22_state["enabled"] = False  # Disabled for individual live trading
     _bot33_state["balance"] = 45.0
     _bot33_state["peak_balance"] = 45.0
     _bot33_state["starting_balance"] = 45.0
-    _bot33_state["floor_balance"] = 8.0
+    _bot33_state["floor_balance"] = 0.0
     _bot33_state["fixed_stake"] = 2.00
-    _bot33_state["enabled"] = True
-    # P2.4: 1H bot — $1.50 SOL/DOGE, $1.00 BTC/ETH, skip XRP
-    _bot24_state["enabled"] = True
+    _bot33_state["enabled"] = False  # Disabled for individual live trading
+    _bot24_state["enabled"] = False  # Disabled — Alpha handles 1H via SOL/DOGE only
     _bot24_state["balance"] = 30.0
     _bot24_state["peak_balance"] = 30.0
     _bot24_state["starting_balance"] = 30.0
-    _bot24_state["floor_balance"] = 8.0
+    _bot24_state["floor_balance"] = 0.0
     _bot24_state["fixed_stake"] = 1.50
-    # P3.4: 1H bot — same rules as P2.4
-    _bot34_state["enabled"] = True
+    _bot34_state["enabled"] = False  # Disabled — Alpha handles 1H
     _bot34_state["balance"] = 30.0
     _bot34_state["peak_balance"] = 30.0
     _bot34_state["starting_balance"] = 30.0
-    _bot34_state["floor_balance"] = 8.0
+    _bot34_state["floor_balance"] = 0.0
     _bot34_state["fixed_stake"] = 1.50
-    print("Limitless LIVE: P2.3=$50 P2.2=$45 P3.3=$45 P2.4=$30 P3.4=$30 | $200 total")
+    # Alpha unified pool — restore from DB or start at $200
+    if not _alpha_restored:
+        _alpha_state["balance"] = 200.0
+        _alpha_state["peak_balance"] = 200.0
+    _alpha_state["starting_balance"] = 200.0
+    _alpha_state["floor_balance"] = 80.0
+    _alpha_state["enabled"] = True
+    print("ALPHA LIVE: ${:.2f} pool{} | T1=$4 T2=$2.50 T3=$1.50 | Floor=$80".format(
+        _alpha_state["balance"], " (restored)" if _alpha_restored else " (fresh)"))
     # Warm trading credentials for sniper
     threading.Thread(target=_warm_credentials, daemon=True).start()
     # One-time correction of historical paper trade resolutions
@@ -14863,6 +15276,145 @@ def paper37_page():
         "P3.3 + ADX + RSI + Volume + Parabolic SAR — 15M Only",
         "P3.3 strategy (P3.1 + DIST mixed mode) filtered through trend strength (ADX>20), momentum confirmation (RSI), volume above average, and Parabolic SAR direction. Needs 2/3 confirmations + ADX gate.",
         extra_cols=[], nav_active="paper37")
+
+
+@app.route("/app/alpha")
+def alpha_page():
+    """Alpha unified trading dashboard."""
+    try:
+        conn = get_db()
+        all_rows = conn.run("SELECT * FROM alpha_trades ORDER BY id DESC LIMIT 200")
+        cols = [c['name'] for c in conn.columns]
+        trades = [dict(zip(cols, r)) for r in all_rows]
+        conn.close()
+    except:
+        trades = []
+
+    total = len(trades)
+    wins = sum(1 for t in trades if t.get("outcome") == "WIN")
+    losses = sum(1 for t in trades if t.get("outcome") == "LOSS")
+    pending = sum(1 for t in trades if t.get("status") == "Pending")
+    resolved = wins + losses
+    wr = round(wins / resolved * 100, 1) if resolved > 0 else 0
+
+    total_pnl = 0
+    for t in trades:
+        if t.get("outcome") == "WIN":
+            total_pnl += float(t.get("payout") or 0) - float(t.get("stake") or 1)
+        elif t.get("outcome") == "LOSS":
+            total_pnl -= float(t.get("stake") or 1)
+
+    # Tier stats
+    tier_stats = {}
+    for t in trades:
+        tier = t.get("tier") or "?"
+        if tier not in tier_stats:
+            tier_stats[tier] = {"w": 0, "l": 0, "pnl": 0.0}
+        if t.get("outcome") == "WIN":
+            tier_stats[tier]["w"] += 1
+            tier_stats[tier]["pnl"] += float(t.get("payout") or 0) - float(t.get("stake") or 1)
+        elif t.get("outcome") == "LOSS":
+            tier_stats[tier]["l"] += 1
+            tier_stats[tier]["pnl"] -= float(t.get("stake") or 1)
+
+    # Asset stats
+    asset_stats = {}
+    for t in trades:
+        a = t.get("asset") or "?"
+        if a not in asset_stats:
+            asset_stats[a] = {"w": 0, "l": 0, "pnl": 0.0}
+        if t.get("outcome") == "WIN":
+            asset_stats[a]["w"] += 1
+            asset_stats[a]["pnl"] += float(t.get("payout") or 0) - float(t.get("stake") or 1)
+        elif t.get("outcome") == "LOSS":
+            asset_stats[a]["l"] += 1
+            asset_stats[a]["pnl"] -= float(t.get("stake") or 1)
+
+    tier_html = ""
+    for tier in ["T1", "T2", "T3", "T2H", "T3H"]:
+        s = tier_stats.get(tier, {"w": 0, "l": 0, "pnl": 0.0})
+        tr = s["w"] + s["l"]
+        twr = round(s["w"] / tr * 100, 1) if tr > 0 else 0
+        color = "#1a7046" if s["pnl"] >= 0 else "#b4322e"
+        tier_html += "<tr><td><b>{}</b></td><td>{}W/{}L</td><td>{}%</td><td style='color:{}'>${:.2f}</td></tr>".format(
+            tier, s["w"], s["l"], twr, color, s["pnl"])
+
+    asset_html = ""
+    for a in ["ETH", "BTC", "SOL", "XRP", "DOGE"]:
+        s = asset_stats.get(a, {"w": 0, "l": 0, "pnl": 0.0})
+        tr = s["w"] + s["l"]
+        awr = round(s["w"] / tr * 100, 1) if tr > 0 else 0
+        color = "#1a7046" if s["pnl"] >= 0 else "#b4322e"
+        asset_html += "<tr><td><b>{}</b></td><td>{}W/{}L</td><td>{}%</td><td style='color:{}'>${:.2f}</td></tr>".format(
+            a, s["w"], s["l"], awr, color, s["pnl"])
+
+    trade_rows = ""
+    for t in trades[:100]:
+        status = t.get("status", "Pending")
+        emoji = "✅" if "Won" in status else "❌" if "Lost" in status else "⏳"
+        pnl_str = ""
+        if t.get("outcome") == "WIN":
+            pnl_str = "<span style='color:#1a7046'>+${:.2f}</span>".format(
+                float(t.get("payout") or 0) - float(t.get("stake") or 1))
+        elif t.get("outcome") == "LOSS":
+            pnl_str = "<span style='color:#b4322e'>-${:.2f}</span>".format(float(t.get("stake") or 1))
+        else:
+            pnl_str = "<span style='color:#8a6a2f'>pending</span>"
+
+        trade_rows += "<tr><td>{}</td><td>{}</td><td><b>{}</b></td><td>{}</td><td>${:.2f}</td><td>{}</td><td>{}</td><td>${:.2f}</td></tr>".format(
+            t.get("id", ""), emoji, t.get("tier", "?"), t.get("asset", "?"),
+            float(t.get("stake") or 0), t.get("bet_side", "?"),
+            pnl_str, float(t.get("pool_after") or 0))
+
+    pool_color = "#1a7046" if _alpha_state["balance"] >= _alpha_state["starting_balance"] else "#b4322e"
+    pnl_color = "#1a7046" if total_pnl >= 0 else "#b4322e"
+
+    html = """<!DOCTYPE html><html><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ALPHA — Limitless CMVNG</title>
+<style>
+body{font-family:system-ui;background:#fafaf7;color:#1a1a17;margin:0;padding:20px}
+.c{max-width:1200px;margin:0 auto}
+h1{font-size:28px;margin-bottom:4px}
+.sub{color:#6b6b64;margin-bottom:20px}
+.stats{display:flex;gap:16px;flex-wrap:wrap;margin-bottom:24px}
+.stat{background:#fff;border:1px solid #ececea;border-radius:12px;padding:16px 20px;min-width:140px}
+.stat .label{font-size:12px;color:#6b6b64;text-transform:uppercase;letter-spacing:0.5px}
+.stat .value{font-size:24px;font-weight:600;margin-top:4px}
+table{width:100%;border-collapse:collapse;background:#fff;border-radius:12px;overflow:hidden;border:1px solid #ececea;margin-bottom:24px}
+th{background:#f5f5f0;text-align:left;padding:10px 14px;font-size:12px;text-transform:uppercase;color:#6b6b64}
+td{padding:8px 14px;border-top:1px solid #ececea;font-size:13px}
+.g{display:grid;grid-template-columns:1fr 1fr;gap:20px;margin-bottom:24px}
+@media(max-width:700px){.g{grid-template-columns:1fr}.stats{flex-direction:column}}
+</style></head><body>
+<div class="c">
+<h1>ALPHA Unified Trading</h1>
+<p class="sub">Multi-signal agreement + asset weighting + auto-scaling | <a href="/app/dashboard">Back</a></p>
+
+<div class="stats">
+<div class="stat"><div class="label">Pool balance</div><div class="value" style="color:""" + pool_color + """">$""" + "{:.2f}".format(_alpha_state["balance"]) + """</div></div>
+<div class="stat"><div class="label">Win rate</div><div class="value">""" + str(wr) + """%</div></div>
+<div class="stat"><div class="label">Trades</div><div class="value">""" + str(resolved) + """ <span style="font-size:14px;color:#6b6b64">(""" + str(pending) + """ pending)</span></div></div>
+<div class="stat"><div class="label">P&L</div><div class="value" style="color:""" + pnl_color + """">$""" + "{:.2f}".format(total_pnl) + """</div></div>
+<div class="stat"><div class="label">Peak</div><div class="value">$""" + "{:.2f}".format(_alpha_state["peak_balance"]) + """</div></div>
+<div class="stat"><div class="label">Today</div><div class="value">""" + str(_alpha_state["trades_today"]) + """T """ + str(_alpha_state["wins_today"]) + """W """ + str(_alpha_state["losses_today"]) + """L</div></div>
+</div>
+
+<div class="g">
+<div>
+<h3 style="margin-bottom:8px">By tier</h3>
+<table><tr><th>Tier</th><th>Record</th><th>WR</th><th>P&L</th></tr>""" + tier_html + """</table>
+</div>
+<div>
+<h3 style="margin-bottom:8px">By asset</h3>
+<table><tr><th>Asset</th><th>Record</th><th>WR</th><th>P&L</th></tr>""" + asset_html + """</table>
+</div>
+</div>
+
+<h3 style="margin-bottom:8px">Trade history</h3>
+<table><tr><th>#</th><th></th><th>Tier</th><th>Asset</th><th>Stake</th><th>Side</th><th>P&L</th><th>Pool</th></tr>""" + trade_rows + """</table>
+</div></body></html>"""
+    return html
 
 
 # Start Polymarket threads (defined above)
