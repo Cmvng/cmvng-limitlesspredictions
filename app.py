@@ -1248,10 +1248,73 @@ def _correct_historical_resolutions():
         send_telegram("📊 <b>Resolution correction</b>\nChecked: {}\nCorrected: {}".format(checked, corrected))
 
 # ═══════════════════════════════════════════════════════════
-# YAHOO FINANCE
+# BINANCE DATA (fast crypto candles — replaces yfinance)
+# ═══════════════════════════════════════════════════════════
+
+BINANCE_MAP = {
+    "BTC": "BTCUSDT", "ETH": "ETHUSDT", "SOL": "SOLUSDT",
+    "XRP": "XRPUSDT", "DOGE": "DOGEUSDT", "ADA": "ADAUSDT",
+    "BNB": "BNBUSDT", "AVAX": "AVAXUSDT", "LINK": "LINKUSDT",
+    "DOT": "DOTUSDT", "LTC": "LTCUSDT", "BCH": "BCHUSDT",
+    "XLM": "XLMUSDT", "UNI": "UNIUSDT", "ATOM": "ATOMUSDT",
+    "NEAR": "NEARUSDT", "OP": "OPUSDT", "ARB": "ARBUSDT",
+    "TRX": "TRXUSDT", "TON": "TONUSDT", "ONDO": "ONDOUSDT",
+    "XMR": "XMRUSDT", "ZEC": "ZECUSDT", "APT": "APTUSDT",
+    "HYPE": "HYPEUSDT", "MNT": "MNTUSDT",
+}
+
+def _fetch_binance_candles(asset, interval="15m", limit=100):
+    """Fetch OHLCV candles from Binance. Returns (opens, highs, lows, closes, volumes) as lists.
+    ~100-200ms per call vs 2-4 seconds for yfinance."""
+    import requests as req
+    symbol = BINANCE_MAP.get(asset.upper())
+    if not symbol:
+        return None
+    try:
+        r = req.get("https://api.binance.com/api/v3/klines",
+                     params={"symbol": symbol, "interval": interval, "limit": limit},
+                     timeout=5)
+        if r.status_code != 200:
+            return None
+        klines = r.json()
+        if not klines or len(klines) < 20:
+            return None
+        # Binance kline format: [openTime, open, high, low, close, volume, closeTime, ...]
+        opens = [float(k[1]) for k in klines]
+        highs = [float(k[2]) for k in klines]
+        lows = [float(k[3]) for k in klines]
+        closes = [float(k[4]) for k in klines]
+        volumes = [float(k[5]) for k in klines]
+        return opens, highs, lows, closes, volumes
+    except Exception as e:
+        print("Binance error {} {}: {}".format(asset, interval, e))
+        return None
+
+def _get_binance_price(asset):
+    """Get current price from Binance — instant, no overhead."""
+    import requests as req
+    symbol = BINANCE_MAP.get(asset.upper())
+    if not symbol:
+        return None
+    try:
+        r = req.get("https://api.binance.com/api/v3/ticker/price",
+                     params={"symbol": symbol}, timeout=3)
+        if r.status_code == 200:
+            return float(r.json().get("price", 0))
+    except:
+        pass
+    return None
+
+# ═══════════════════════════════════════════════════════════
+# YAHOO FINANCE (fallback only)
 # ═══════════════════════════════════════════════════════════
 
 def get_price(asset):
+    # Try Binance first (instant)
+    bp = _get_binance_price(asset)
+    if bp and bp > 0:
+        return bp
+    # Fallback to yfinance
     import yfinance as yf
     symbol = YAHOO_MAP.get(asset.upper())
     if not symbol:
@@ -1273,6 +1336,24 @@ def get_price(asset):
         return None
 
 def get_btc_trend():
+    # Try Binance first (fast)
+    try:
+        candles = _fetch_binance_candles("BTC", "1h", 24)
+        if candles:
+            _, _, _, closes, _ = candles
+            if len(closes) >= 10:
+                current = closes[-1]
+                sma10 = sum(closes[-10:]) / 10
+                trend = "BUY" if current > sma10 else "SELL"
+                _btc_trend_cache["trend"] = trend
+                _btc_trend_cache["price"] = current
+                _btc_trend_cache["sma10"] = sma10
+                _btc_trend_cache["updated"] = datetime.now(timezone.utc).isoformat()
+                print("BTC: {} price={:.0f} sma10={:.0f}".format(trend, current, sma10))
+                return trend
+    except:
+        pass
+    # Fallback to yfinance
     import yfinance as yf
     try:
         btc = yf.Ticker("BTC-USD")
@@ -1295,6 +1376,23 @@ def get_btc_trend():
 
 def get_pair_sma_trend(asset):
     """Calculate SMA10 trend for any individual asset (not just BTC)."""
+    # Try Binance first
+    try:
+        candles = _fetch_binance_candles(asset, "1h", 24)
+        if candles:
+            _, _, _, closes, _ = candles
+            if len(closes) >= 10:
+                current = closes[-1]
+                sma10 = sum(closes[-10:]) / 10
+                trend = "BUY" if current > sma10 else "SELL"
+                _pair_sma_cache[asset.upper()] = {
+                    "trend": trend, "price": current, "sma10": sma10,
+                    "updated": datetime.now(timezone.utc).isoformat()
+                }
+                return trend
+    except:
+        pass
+    # Fallback to yfinance
     import yfinance as yf
     symbol = YAHOO_MAP.get(asset.upper())
     if not symbol:
@@ -4754,8 +4852,8 @@ _indicator_cache = {}  # {"BTC": {"data": {...}, "updated": datetime}}
 def _calculate_indicators(asset, timeframe="1h"):
     """Calculate all technical indicators for an asset.
     Timeframe: '15m' for 15-min markets, '1h' for hourly, '1d' for daily.
-    Uses matching candle data for accurate readings."""
-    import yfinance as yf
+    Uses Binance for fast candle data (~200ms), falls back to yfinance."""
+    import numpy as np
 
     cache_key = "{}_{}".format(asset, timeframe)
     cache = _indicator_cache.get(cache_key)
@@ -4763,60 +4861,84 @@ def _calculate_indicators(asset, timeframe="1h"):
     if cache and (datetime.now(timezone.utc) - cache["updated"]).total_seconds() < cache_ttl:
         return cache["data"]
 
-    yahoo_map = {
-        "BTC": "BTC-USD", "ETH": "ETH-USD", "SOL": "SOL-USD",
-        "XRP": "XRP-USD", "DOGE": "DOGE-USD", "ADA": "ADA-USD",
-        "BNB": "BNB-USD", "AVAX": "AVAX-USD", "LINK": "LINK-USD",
-        "DOT": "DOT-USD", "LTC": "LTC-USD", "BCH": "BCH-USD",
-        "XLM": "XLM-USD", "UNI": "UNI-USD", "ATOM": "ATOM-USD",
-        "NEAR": "NEAR-USD", "OP": "OP-USD", "ARB": "ARB-USD",
-        "TRX": "TRX-USD", "TON": "TON11419-USD", "ONDO": "ONDO-USD",
-        "XMR": "XMR-USD", "ZEC": "ZEC-USD", "APT": "APT-USD",
-    }
+    closes = highs = lows = opens = volumes = None
 
-    ticker = yahoo_map.get(asset)
-    if not ticker:
+    # ── TRY BINANCE FIRST (fast: ~200ms) ──
+    try:
+        _b_interval = timeframe  # Binance uses same interval names: 5m, 15m, 1h, 4h, 1d
+        _b_limit = 100
+        if timeframe == "5m":
+            _b_limit = 200
+        elif timeframe == "1d":
+            _b_limit = 30
+        
+        candles = _fetch_binance_candles(asset, _b_interval, _b_limit)
+        if candles and len(candles[3]) >= 20:
+            opens = np.array(candles[0])
+            highs = np.array(candles[1])
+            lows = np.array(candles[2])
+            closes = np.array(candles[3])
+            volumes = np.array(candles[4])
+    except Exception as _be:
+        print("Binance candles failed {} {}: {}".format(asset, timeframe, _be))
+
+    # ── FALLBACK TO YFINANCE (slow: 2-4s) ──
+    if closes is None or len(closes) < 20:
+        try:
+            import yfinance as yf
+            yahoo_map = {
+                "BTC": "BTC-USD", "ETH": "ETH-USD", "SOL": "SOL-USD",
+                "XRP": "XRP-USD", "DOGE": "DOGE-USD", "ADA": "ADA-USD",
+                "BNB": "BNB-USD", "AVAX": "AVAX-USD", "LINK": "LINK-USD",
+                "DOT": "DOT-USD", "LTC": "LTC-USD", "BCH": "BCH-USD",
+                "XLM": "XLM-USD", "UNI": "UNI-USD", "ATOM": "ATOM-USD",
+                "NEAR": "NEAR-USD", "OP": "OP-USD", "ARB": "ARB-USD",
+                "TRX": "TRX-USD", "TON": "TON11419-USD", "ONDO": "ONDO-USD",
+                "XMR": "XMR-USD", "ZEC": "ZEC-USD", "APT": "APT-USD",
+            }
+            ticker = yahoo_map.get(asset)
+            if not ticker:
+                return None
+
+            if timeframe == "5m":
+                df = yf.download(ticker, period="5d", interval="5m", progress=False)
+                if df is None or len(df) < 20:
+                    df = yf.download(ticker, period="5d", interval="15m", progress=False)
+            elif timeframe == "15m":
+                df = yf.download(ticker, period="5d", interval="15m", progress=False)
+            elif timeframe == "1d":
+                df = yf.download(ticker, period="30d", interval="1d", progress=False)
+            elif timeframe == "4h":
+                df_1h = yf.download(ticker, period="10d", interval="1h", progress=False)
+                if df_1h is None or len(df_1h) < 20:
+                    return None
+                if hasattr(df_1h.columns, 'nlevels') and df_1h.columns.nlevels > 1:
+                    df_1h.columns = [c[0] if isinstance(c, tuple) else c for c in df_1h.columns]
+                df = df_1h.resample("4h").agg({
+                    "Open": "first", "High": "max", "Low": "min",
+                    "Close": "last", "Volume": "sum"
+                }).dropna()
+            else:
+                df = yf.download(ticker, period="5d", interval="1h", progress=False)
+
+            if df is None or len(df) < 20:
+                return None
+            if hasattr(df.columns, 'nlevels') and df.columns.nlevels > 1:
+                df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
+
+            closes = df["Close"].values.flatten()
+            highs = df["High"].values.flatten()
+            lows = df["Low"].values.flatten()
+            opens = df["Open"].values.flatten()
+            volumes = df["Volume"].values.flatten() if "Volume" in df.columns else None
+        except Exception as _yfe:
+            print("yfinance fallback failed {} {}: {}".format(asset, timeframe, _yfe))
+            return None
+
+    if closes is None or len(closes) < 20:
         return None
 
     try:
-        if timeframe == "5m":
-            df = yf.download(ticker, period="5d", interval="5m", progress=False)
-            # Fallback: if 5m fails, use 15m candles (still works for scoring)
-            if df is None or len(df) < 20:
-                df = yf.download(ticker, period="5d", interval="15m", progress=False)
-        elif timeframe == "15m":
-            df = yf.download(ticker, period="5d", interval="15m", progress=False)
-        elif timeframe == "1d":
-            df = yf.download(ticker, period="30d", interval="1d", progress=False)
-        elif timeframe == "4h":
-            # Build 4H candles from 1H data
-            df_1h = yf.download(ticker, period="10d", interval="1h", progress=False)
-            if df_1h is None or len(df_1h) < 20:
-                return None
-            # Flatten MultiIndex columns if present
-            if hasattr(df_1h.columns, 'nlevels') and df_1h.columns.nlevels > 1:
-                df_1h.columns = [c[0] if isinstance(c, tuple) else c for c in df_1h.columns]
-            # Resample 1H to 4H: group by 4-hour blocks (00,04,08,12,16,20)
-            df = df_1h.resample("4h").agg({
-                "Open": "first", "High": "max", "Low": "min",
-                "Close": "last", "Volume": "sum"
-            }).dropna()
-        else:
-            df = yf.download(ticker, period="5d", interval="1h", progress=False)
-
-        if df is None or len(df) < 20:
-            return None
-
-        # Flatten MultiIndex columns (yfinance sometimes returns ("Close", "BTC-USD"))
-        if hasattr(df.columns, 'nlevels') and df.columns.nlevels > 1:
-            df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
-
-        closes = df["Close"].values.flatten()
-        highs = df["High"].values.flatten()
-        lows = df["Low"].values.flatten()
-        opens = df["Open"].values.flatten()
-        volumes = df["Volume"].values.flatten() if "Volume" in df.columns else None
-
         n = len(closes)
         current = float(closes[-1])
         candle_open = float(opens[-1]) if len(opens) > 0 else current
