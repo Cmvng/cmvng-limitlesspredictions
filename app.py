@@ -1074,6 +1074,8 @@ def init_db():
             engines TEXT,
             pool_after REAL,
             payout REAL,
+            order_id TEXT,
+            filled BOOLEAN DEFAULT FALSE,
             status TEXT DEFAULT 'Pending',
             outcome TEXT,
             fired_at TEXT,
@@ -3735,8 +3737,16 @@ def _fast_trade_scan():
                     scored_list = [s for s in [scored22, scored23, scored33] if s]
                     
                     # Track unscored 15M markets for second pass with fresh indicators
+                    # ALSO retry markets where engines scored but Alpha rejected (DIST_ONLY, asset filter)
                     if not scored_list and parsed.get("is_15m_market"):
                         _unscored_15m.append((market, parsed, asset, hours_left))
+                    elif scored_list and parsed.get("is_15m_market") and \
+                         parsed["market_id"] not in _alpha_traded_markets:
+                        # Engines scored but Alpha may have rejected (DIST_ONLY, DOGE, XRP)
+                        _tier_check = _alpha_get_tier(scored22, scored23, scored33, asset)
+                        if not _tier_check:
+                            _unscored_15m.append((market, parsed, asset, hours_left))
+                            print("ALPHA RETRY: {} scored but no tier — queued for fresh indicators".format(asset))
                     if len(scored_list) >= 2:
                         # Check if all scored bots agree on direction
                         sides = set(s["bet_side"] for s in scored_list)
@@ -3867,13 +3877,14 @@ def _fast_trade_scan():
                                         _ac = get_db()
                                         _ac.run("""INSERT INTO alpha_trades
                                             (market_id, title, asset, bet_side, tier, stake, fill_price,
-                                             engines, pool_after, status, fired_at, slug)
+                                             engines, pool_after, order_id, status, fired_at, slug)
                                             VALUES (:mid, :ttl, :ast, :bs, :tier, :stake, :fill,
-                                                    :eng, :pool, 'Pending', :now, :slg)""",
+                                                    :eng, :pool, :oid, 'Pending', :now, :slg)""",
                                             mid=parsed["market_id"], ttl=parsed["title"], ast=asset,
                                             bs=_a_side, tier=_a_tier, stake=_a_stake,
                                             fill=round(_a_fill, 3), eng="+".join(_engines),
                                             pool=_alpha_state["balance"],
+                                            oid=snipe_order.get("order_id"),
                                             now=datetime.now(timezone.utc).isoformat(),
                                             slg=parsed["slug"])
                                         _ac.close()
@@ -3988,14 +3999,15 @@ def _fast_trade_scan():
                                         _hc = get_db()
                                         _hc.run("""INSERT INTO alpha_trades
                                             (market_id, title, asset, bet_side, tier, stake, fill_price,
-                                             engines, pool_after, status, fired_at, slug)
+                                             engines, pool_after, order_id, status, fired_at, slug)
                                             VALUES (:mid, :ttl, :ast, :bs, :tier, :stake, :fill,
-                                                    :eng, :pool, 'Pending', :now, :slg)""",
+                                                    :eng, :pool, :oid, 'Pending', :now, :slg)""",
                                             mid=parsed["market_id"], ttl=parsed["title"], ast=asset,
                                             bs=_h_side, tier=_h_tier, stake=_h_stake,
                                             fill=round(_h_fill, 3),
                                             eng="P2.4" if scored24 else "P3.4",
                                             pool=_alpha_state["balance"],
+                                            oid=snipe_order.get("order_id"),
                                             now=datetime.now(timezone.utc).isoformat(),
                                             slg=parsed["slug"])
                                         _hc.close()
@@ -8409,13 +8421,14 @@ def run_paper34_scan():
                                             _bkc = get_db()
                                             _bkc.run("""INSERT INTO alpha_trades
                                                 (market_id, title, asset, bet_side, tier, stake, fill_price,
-                                                 engines, pool_after, status, fired_at, slug)
+                                                 engines, pool_after, order_id, status, fired_at, slug)
                                                 VALUES (:mid, :ttl, :ast, :bs, :tier, :stake, :fill,
-                                                        :eng, :pool, 'Pending', :now, :slg)""",
+                                                        :eng, :pool, :oid, 'Pending', :now, :slg)""",
                                                 mid=parsed["market_id"], ttl=parsed["title"], ast=asset,
                                                 bs=_bk_side, tier=_bk_tag, stake=_bk_stake,
                                                 fill=round(_bk_max_fill, 3), eng="+".join(_bk_engines),
                                                 pool=_alpha_state["balance"],
+                                                oid=_bk_snipe.get("order_id") if _bk_snipe else None,
                                                 now=datetime.now(timezone.utc).isoformat(),
                                                 slg=parsed["slug"])
                                             _bkc.close()
@@ -8985,10 +8998,17 @@ def resolve_paper34_trades():
 
 
 def _resolve_alpha_trades():
-    """Resolve Alpha unified trades and update pool balance."""
+    """Resolve Alpha unified trades and update pool balance.
+    Checks fill status first — unfilled orders get stake returned."""
     import requests as req
     try:
         conn = get_db()
+        # Add columns if they don't exist (migration for existing table)
+        try:
+            conn.run("ALTER TABLE alpha_trades ADD COLUMN IF NOT EXISTS order_id TEXT")
+            conn.run("ALTER TABLE alpha_trades ADD COLUMN IF NOT EXISTS filled BOOLEAN DEFAULT FALSE")
+        except:
+            pass
         rows = conn.run("SELECT * FROM alpha_trades WHERE status='Pending'")
         cols = [c['name'] for c in conn.columns]
         items = [dict(zip(cols, r)) for r in rows]
@@ -9019,6 +9039,41 @@ def _resolve_alpha_trades():
                 if now < expiry + timedelta(minutes=2):
                     continue
 
+                stake = float(p.get("stake") or 1.0)
+
+                # ── CHECK FILL STATUS via order API ──
+                order_id = p.get("order_id")
+                order_filled = p.get("filled", False)
+                if order_id and not order_filled:
+                    try:
+                        fill_status = _check_order_filled(order_id)
+                        if fill_status == "FILLED":
+                            order_filled = True
+                            try:
+                                _fc = get_db()
+                                _fc.run("UPDATE alpha_trades SET filled=TRUE WHERE id=:i", i=p["id"])
+                                _fc.close()
+                            except:
+                                pass
+                        else:
+                            # Order never filled — return stake to pool
+                            _alpha_state["balance"] = round(_alpha_state["balance"] + stake, 2)
+                            conn2 = get_db()
+                            conn2.run(
+                                "UPDATE alpha_trades SET status=:s, outcome=:o, resolved_at=:r, payout=0 WHERE id=:i",
+                                s="⏭ Unfilled", o="UNFILLED", r=now.isoformat(), i=p["id"]
+                            )
+                            conn2.close()
+                            resolved += 1
+                            print("ALPHA #{} UNFILLED: ${:.2f} returned to pool | pool=${:.2f}".format(
+                                p["id"], stake, _alpha_state["balance"]))
+                            continue
+                    except Exception as _fe:
+                        # If we can't check, assume filled (safer — don't double-credit)
+                        print("Alpha fill check error #{}: {}".format(p["id"], _fe))
+                        order_filled = True
+
+                # ── RESOLVE OUTCOME (only for filled orders) ──
                 # Try Limitless API first
                 slug = p.get("slug")
                 won = None
@@ -9065,7 +9120,7 @@ def _resolve_alpha_trades():
 
                 conn2 = get_db()
                 conn2.run(
-                    "UPDATE alpha_trades SET status=:s, outcome=:o, resolved_at=:r, payout=:p WHERE id=:i",
+                    "UPDATE alpha_trades SET status=:s, outcome=:o, resolved_at=:r, payout=:p, filled=TRUE WHERE id=:i",
                     s=status, o=outcome, r=now.isoformat(), p=payout, i=p["id"]
                 )
                 conn2.close()
