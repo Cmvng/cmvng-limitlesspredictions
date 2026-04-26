@@ -1273,7 +1273,7 @@ def _fetch_binance_candles(asset, interval="15m", limit=100):
     try:
         r = req.get("https://api.binance.com/api/v3/klines",
                      params={"symbol": symbol, "interval": interval, "limit": limit},
-                     timeout=5)
+                     timeout=2)
         if r.status_code != 200:
             return None
         klines = r.json()
@@ -1298,7 +1298,7 @@ def _get_binance_price(asset):
         return None
     try:
         r = req.get("https://api.binance.com/api/v3/ticker/price",
-                     params={"symbol": symbol}, timeout=3)
+                     params={"symbol": symbol}, timeout=2)
         if r.status_code == 200:
             return float(r.json().get("price", 0))
     except:
@@ -13947,10 +13947,29 @@ try:
     _saved_balances = _load_bot_balances()
     _saved_alpha = _saved_balances.get("alpha", {})
     _alpha_restored = False
-    if _saved_alpha and _saved_alpha.get("balance", 0) > 0:
-        _alpha_state["balance"] = _saved_alpha["balance"]
-        _alpha_state["peak_balance"] = _saved_alpha.get("peak_balance", _saved_alpha["balance"])
-        _alpha_restored = True
+    # ONE-TIME STRATEGY F RESET: Clean slate, IDs start from 1
+    try:
+        _check_db = get_db()
+        _old_count = _check_db.run("SELECT COUNT(*) FROM alpha_trades WHERE tier='T3' OR pool_after > 150")
+        _has_old = _old_count and _old_count[0][0] > 0
+        _check_db.close()
+        if _has_old or (_saved_alpha and _saved_alpha.get("balance", 0) > 130):
+            _reset_db = get_db()
+            _reset_db.run("TRUNCATE alpha_trades RESTART IDENTITY")
+            _reset_db.run("DELETE FROM bot_balances WHERE bot_name='alpha'")
+            _reset_db.close()
+            _alpha_restored = False
+            print("ALPHA RESET: TRUNCATED alpha_trades — fresh start, IDs from 1")
+        elif _saved_alpha and _saved_alpha.get("balance", 0) > 0:
+            _alpha_state["balance"] = _saved_alpha["balance"]
+            _alpha_state["peak_balance"] = _saved_alpha.get("peak_balance", _saved_alpha["balance"])
+            _alpha_restored = True
+    except Exception as _re:
+        print("Alpha reset check: {}".format(_re))
+        if _saved_alpha and _saved_alpha.get("balance", 0) > 0:
+            _alpha_state["balance"] = _saved_alpha["balance"]
+            _alpha_state["peak_balance"] = _saved_alpha.get("peak_balance", _saved_alpha["balance"])
+            _alpha_restored = True
     
     # Clear old bot balances (not Alpha)
     try:
@@ -15630,10 +15649,19 @@ def alpha_page():
         else:
             pnl_str = "<span style='color:#8a6a2f'>pending</span>"
 
-        trade_rows += "<tr><td>{}</td><td>{}</td><td><b>{}</b></td><td>{}</td><td>${:.2f}</td><td>{}</td><td>{}</td><td>${:.2f}</td></tr>".format(
+        # Format time from fired_at
+        _fired_raw = t.get("fired_at", "")
+        _fired_time = ""
+        if _fired_raw and len(_fired_raw) >= 16:
+            try:
+                _fired_time = _fired_raw[11:16]  # "HH:MM" from ISO format
+            except:
+                _fired_time = ""
+
+        trade_rows += "<tr><td>{}</td><td>{}</td><td><b>{}</b></td><td>{}</td><td>${:.2f}</td><td>{}</td><td>{}</td><td>{}</td><td>${:.2f}</td></tr>".format(
             t.get("id", ""), emoji, t.get("tier", "?"), t.get("asset", "?"),
             float(t.get("stake") or 0), t.get("bet_side", "?"),
-            pnl_str, float(t.get("pool_after") or 0))
+            _fired_time, pnl_str, float(t.get("pool_after") or 0))
 
     pool_color = "#1a7046" if _alpha_state["balance"] >= _alpha_state["starting_balance"] else "#b4322e"
     pnl_color = "#1a7046" if total_pnl >= 0 else "#b4322e"
@@ -15681,7 +15709,7 @@ td{padding:8px 14px;border-top:1px solid #ececea;font-size:13px}
 </div>
 
 <h3 style="margin-bottom:8px">Trade history</h3>
-<table><tr><th>#</th><th></th><th>Tier</th><th>Asset</th><th>Stake</th><th>Side</th><th>P&L</th><th>Pool</th></tr>""" + trade_rows + """</table>
+<table><tr><th>#</th><th></th><th>Tier</th><th>Asset</th><th>Stake</th><th>Side</th><th>Time</th><th>P&L</th><th>Pool</th></tr>""" + trade_rows + """</table>
 </div></body></html>"""
     return html
 
