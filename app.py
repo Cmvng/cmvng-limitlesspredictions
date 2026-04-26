@@ -13788,10 +13788,16 @@ try:
     _saved_balances = _load_bot_balances()
     _saved_alpha = _saved_balances.get("alpha", {})
     _alpha_restored = False
-    if _saved_alpha and _saved_alpha.get("balance", 0) > 0:
-        _alpha_state["balance"] = _saved_alpha["balance"]
-        _alpha_state["peak_balance"] = _saved_alpha.get("peak_balance", _saved_alpha["balance"])
-        _alpha_restored = True
+    # STRATEGY F RESET: Force $100 pool — clear old $200 era data
+    try:
+        _reset_db = get_db()
+        _reset_db.run("DELETE FROM bot_balances WHERE bot_name='alpha'")
+        _reset_db.run("DELETE FROM alpha_trades")  # Clear old T3 garbage trades
+        _reset_db.close()
+        _alpha_restored = False
+        print("ALPHA RESET: Cleared old trades + balance — starting fresh at $100")
+    except:
+        pass
     
     # Clear old bot balances (not Alpha)
     try:
