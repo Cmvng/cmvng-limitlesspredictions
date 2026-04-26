@@ -4440,6 +4440,19 @@ def _snipe_place_gtc(market_data, parsed, bet_side, stake, best_ask, max_price=0
 # Active snipe orders being managed
 _active_snipe_orders = []
 
+def _mark_alpha_filled(slug, order_id, fill_price):
+    """When escalation loop detects a fill, write it to alpha_trades immediately.
+    Resolution function reads this — no guessing needed."""
+    try:
+        _mf = get_db()
+        _mf.run(
+            "UPDATE alpha_trades SET filled=TRUE, fill_price=:fp, order_id=:oid WHERE slug=:slg AND status='Pending'",
+            fp=round(fill_price, 4), oid=order_id, slg=slug)
+        _mf.close()
+        print("ALPHA DB: marked filled @{:.0f}% for {}".format(fill_price * 100, slug[:30]))
+    except Exception as e:
+        print("ALPHA DB fill update error: {}".format(e))
+
 def _manage_snipe_orders():
     """MANAGE PHASE: Round-robin price management across all active snipe orders.
     Tops up each order every cycle until filled or max price (66¢) reached.
@@ -4484,6 +4497,7 @@ def _manage_snipe_orders():
             if status == "FILLED":
                 order["filled"] = True
                 order["fill_price"] = order["current_price"]
+                _mark_alpha_filled(slug, order_id, order["current_price"])
                 print("SNIPE FILLED: {} {} @{:.0f}% on {}".format(
                     order["bet_side"], order["asset"], order["current_price"] * 100, slug[:25]))
                 continue
@@ -4522,6 +4536,7 @@ def _manage_snipe_orders():
             if cancel_result == "FILLED":
                 order["filled"] = True
                 order["fill_price"] = order["current_price"]
+                _mark_alpha_filled(slug, order_id, order["current_price"])
                 print("SNIPE FILLED during cancel: {} {} @{:.0f}%".format(
                     order["bet_side"], order["asset"], order["current_price"] * 100))
                 continue
@@ -4531,6 +4546,7 @@ def _manage_snipe_orders():
                 if recheck == "FILLED":
                     order["filled"] = True
                     order["fill_price"] = order["current_price"]
+                    _mark_alpha_filled(slug, order_id, order["current_price"])
                     continue
                 # Stop managing this order to avoid double fill
                 continue
@@ -4572,6 +4588,7 @@ def _manage_snipe_orders():
             if status == "FILLED":
                 order["filled"] = True
                 order["fill_price"] = order["current_price"]
+                _mark_alpha_filled(order["slug"], order["order_id"], order["current_price"])
                 print("SNIPE FILLED final check: {} {} @{:.0f}%".format(
                     order["bet_side"], order["asset"], order["current_price"] * 100))
             else:
@@ -9034,12 +9051,19 @@ def _resolve_alpha_trades():
                 stake = float(p.get("stake") or 1.0)
                 age_hours = (now - fired).total_seconds() / 3600
 
-                # ── CHECK FILL STATUS via order API ──
+                # ── CHECK FILL STATUS ──
+                # The escalation loop writes filled=TRUE to DB when it detects a fill.
+                # Resolution just reads that — no guessing.
                 order_id = p.get("order_id")
                 order_filled = p.get("filled", False)
-                if order_id and not order_filled:
+                market_expired = now > expiry  # Market has already ended
+                
+                if not order_filled and order_id:
+                    # One more check via API in case escalation loop missed it
                     try:
                         fill_status = _check_order_filled(order_id)
+                        print("ALPHA #{} fill check: '{}' expired={} age={:.1f}h".format(
+                            p["id"], fill_status, market_expired, age_hours))
                         if fill_status == "FILLED":
                             order_filled = True
                             try:
@@ -9049,7 +9073,7 @@ def _resolve_alpha_trades():
                             except:
                                 pass
                         elif fill_status in ("CANCELLED", "EXPIRED"):
-                            # Order was cancelled/expired — return stake
+                            # Definitively not filled — return stake
                             _alpha_state["balance"] = round(_alpha_state["balance"] + stake, 2)
                             conn2 = get_db()
                             conn2.run(
@@ -9058,53 +9082,64 @@ def _resolve_alpha_trades():
                             )
                             conn2.close()
                             resolved += 1
-                            print("ALPHA #{} UNFILLED ({}): ${:.2f} returned to pool | pool=${:.2f}".format(
+                            print("ALPHA #{} UNFILLED ({}): ${:.2f} returned | pool=${:.2f}".format(
                                 p["id"], fill_status, stake, _alpha_state["balance"]))
                             continue
-                        elif fill_status == "LIVE" and age_hours > 2:
-                            # Still live after 2+ hours — market gone, cancel and return
+                        elif market_expired:
+                            # Market is done. Order status is LIVE or UNKNOWN.
+                            # LIVE on an expired market = never filled. Return stake.
+                            # UNKNOWN on an expired market = API can't tell us.
+                            #   But the escalation loop ran during the market and would have
+                            #   written filled=TRUE if it saw a fill. Since it didn't → not filled.
                             _alpha_state["balance"] = round(_alpha_state["balance"] + stake, 2)
                             conn2 = get_db()
                             conn2.run(
                                 "UPDATE alpha_trades SET status=:s, outcome=:o, resolved_at=:r, payout=0 WHERE id=:i",
-                                s="⏭ Expired", o="UNFILLED", r=now.isoformat(), i=p["id"]
+                                s="⏭ Unfilled", o="UNFILLED", r=now.isoformat(), i=p["id"]
                             )
                             conn2.close()
                             resolved += 1
-                            print("ALPHA #{} EXPIRED (live {}h): ${:.2f} returned | pool=${:.2f}".format(
-                                p["id"], round(age_hours, 1), stake, _alpha_state["balance"]))
+                            print("ALPHA #{} UNFILLED ({}+expired): ${:.2f} returned | pool=${:.2f}".format(
+                                p["id"], fill_status, stake, _alpha_state["balance"]))
                             continue
                         else:
-                            if age_hours < 2:
-                                continue  # Give it more time
-                            # Unknown status after 2h — assume filled to avoid double credit
-                            print("ALPHA #{} fill status '{}' after {:.1f}h — assuming filled".format(
-                                p["id"], fill_status, age_hours))
-                            order_filled = True
+                            # Market still active, order still live — check next cycle
+                            continue
                     except Exception as _fe:
                         print("Alpha fill check error #{}: {}".format(p["id"], _fe))
-                        if age_hours > 2:
-                            order_filled = True  # Assume filled after 2h
+                        if market_expired:
+                            # Can't check and market is done — treat as unfilled
+                            _alpha_state["balance"] = round(_alpha_state["balance"] + stake, 2)
+                            conn2 = get_db()
+                            conn2.run(
+                                "UPDATE alpha_trades SET status=:s, outcome=:o, resolved_at=:r, payout=0 WHERE id=:i",
+                                s="⏭ Check failed", o="UNFILLED", r=now.isoformat(), i=p["id"]
+                            )
+                            conn2.close()
+                            resolved += 1
+                            print("ALPHA #{} CHECK FAILED (expired): ${:.2f} returned | pool=${:.2f}".format(
+                                p["id"], stake, _alpha_state["balance"]))
+                            continue
                         else:
                             continue
-
-                # No order_id at all — old trade or backup, assume filled
-                if not order_id:
-                    order_filled = True
-
-                # ── FORCE-EXPIRE: trades older than 3 hours still pending ──
-                if age_hours > 3 and not order_filled:
-                    _alpha_state["balance"] = round(_alpha_state["balance"] + stake, 2)
-                    conn2 = get_db()
-                    conn2.run(
-                        "UPDATE alpha_trades SET status=:s, outcome=:o, resolved_at=:r, payout=0 WHERE id=:i",
-                        s="⏭ Force-expired", o="UNFILLED", r=now.isoformat(), i=p["id"]
-                    )
-                    conn2.close()
-                    resolved += 1
-                    print("ALPHA #{} FORCE-EXPIRED ({:.1f}h old): ${:.2f} returned | pool=${:.2f}".format(
-                        p["id"], age_hours, stake, _alpha_state["balance"]))
-                    continue
+                
+                if not order_filled and not order_id:
+                    if market_expired:
+                        # No order_id and expired — can't track, return stake
+                        _alpha_state["balance"] = round(_alpha_state["balance"] + stake, 2)
+                        conn2 = get_db()
+                        conn2.run(
+                            "UPDATE alpha_trades SET status=:s, outcome=:o, resolved_at=:r, payout=0 WHERE id=:i",
+                            s="⏭ No order", o="UNFILLED", r=now.isoformat(), i=p["id"]
+                        )
+                        conn2.close()
+                        resolved += 1
+                        continue
+                    else:
+                        continue
+                
+                if not order_filled:
+                    continue  # Not filled yet, skip
 
                 # ── RESOLVE OUTCOME (only for filled orders) ──
                 # Try Limitless API first
@@ -13788,16 +13823,10 @@ try:
     _saved_balances = _load_bot_balances()
     _saved_alpha = _saved_balances.get("alpha", {})
     _alpha_restored = False
-    # STRATEGY F RESET: Force $100 pool — clear old $200 era data
-    try:
-        _reset_db = get_db()
-        _reset_db.run("DELETE FROM bot_balances WHERE bot_name='alpha'")
-        _reset_db.run("DELETE FROM alpha_trades")  # Clear old T3 garbage trades
-        _reset_db.close()
-        _alpha_restored = False
-        print("ALPHA RESET: Cleared old trades + balance — starting fresh at $100")
-    except:
-        pass
+    if _saved_alpha and _saved_alpha.get("balance", 0) > 0:
+        _alpha_state["balance"] = _saved_alpha["balance"]
+        _alpha_state["peak_balance"] = _saved_alpha.get("peak_balance", _saved_alpha["balance"])
+        _alpha_restored = True
     
     # Clear old bot balances (not Alpha)
     try:
