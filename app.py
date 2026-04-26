@@ -8835,11 +8835,8 @@ def _resolve_paper_table(table_name):
                             send_telegram("⚠️ <b>Paper 2.2 stopped — floor reached</b>\nBalance: ${:.2f}".format(_bot22_state["balance"]))
                         print("P2.2 #{} {}: stake=${:.2f} payout=${:.2f} bal=${:.2f}".format(
                             p["id"], "WIN" if won else "LOSS", stake, payout, _bot22_state["balance"]))
-                        _emoji22 = "✅" if won else "❌"
-                        _pnl22 = "+${:.2f}".format(payout - stake) if won else "-${:.2f}".format(stake)
-                        send_telegram("{} <b>P2.2 {}</b> #{}\n{} {}\nBal: ${:.2f}".format(
-                            _emoji22, "WIN" if won else "LOSS", p["id"], _pnl22,
-                            p.get("title", "")[:30], _bot22_state["balance"]))
+                        # Paper bot Telegram disabled — Alpha only
+                        pass
 
                 # Update Paper 3.2 balance
                 if table_name == "paper32_trades":
@@ -8873,11 +8870,8 @@ def _resolve_paper_table(table_name):
                             send_telegram("⚠️ <b>Paper 2.3 stopped — floor reached</b>\nBalance: ${:.2f}".format(_bot23_state["balance"]))
                         print("P2.3 #{} {}: stake=${:.2f} payout=${:.2f} bal=${:.2f}".format(
                             p["id"], "WIN" if won else "LOSS", stake, payout, _bot23_state["balance"]))
-                        _emoji23 = "✅" if won else "❌"
-                        _pnl23 = "+${:.2f}".format(payout - stake) if won else "-${:.2f}".format(stake)
-                        send_telegram("{} <b>P2.3 {}</b> #{}\n{} {}\nBal: ${:.2f}".format(
-                            _emoji23, "WIN" if won else "LOSS", p["id"], _pnl23,
-                            p.get("title", "")[:30], _bot23_state["balance"]))
+                        # Paper bot Telegram disabled — Alpha only
+                        pass
 
                 # Update Paper 3.3 balance — SKIP if Alpha is handling live trades
                 if table_name == "paper33_trades":
@@ -8892,13 +8886,8 @@ def _resolve_paper_table(table_name):
                         if _bot33_state["balance"] <= floor33:
                             _bot33_state["enabled"] = False
                             send_telegram("⚠️ <b>Paper 3.3 stopped — floor reached</b>\nBalance: ${:.2f}".format(_bot33_state["balance"]))
-                        _emoji33 = "✅" if won else "❌"
-                        _pnl33 = "+${:.2f}".format(payout - stake) if won else "-${:.2f}".format(stake)
-                        print("P3.3 #{} {}: stake=${:.2f} payout=${:.2f} bal=${:.2f}".format(
-                            p["id"], "WIN" if won else "LOSS", stake, payout, _bot33_state["balance"]))
-                        send_telegram("{} <b>P3.3 {}</b> #{}\n{} {}\nBal: ${:.2f}".format(
-                            _emoji33, "WIN" if won else "LOSS", p["id"], _pnl33, 
-                            p.get("title", "")[:30], _bot33_state["balance"]))
+                        # Paper bot Telegram disabled — Alpha only
+                        pass
 
                 # Update Paper 2.4 balance — SKIP if Alpha is handling live trades
                 if table_name == "paper24_trades":
@@ -8917,9 +8906,6 @@ def _resolve_paper_table(table_name):
                         _pnl24 = "+${:.2f}".format(payout - stake) if won else "-${:.2f}".format(stake)
                         print("P2.4 #{} {}: stake=${:.2f} payout=${:.2f} bal=${:.2f}".format(
                             p["id"], "WIN" if won else "LOSS", stake, payout, _bot24_state["balance"]))
-                        send_telegram("{} <b>P2.4 {}</b> #{}\n{} {}\nBal: ${:.2f}".format(
-                            _emoji24, "WIN" if won else "LOSS", p["id"], _pnl24,
-                            p.get("title", "")[:30], _bot24_state["balance"]))
 
                 # Update Paper 3.4 balance — SKIP if Alpha is handling live trades
                 if table_name == "paper34_trades":
@@ -8938,9 +8924,6 @@ def _resolve_paper_table(table_name):
                         _pnl34 = "+${:.2f}".format(payout - stake) if won else "-${:.2f}".format(stake)
                         print("P3.4 #{} {}: stake=${:.2f} payout=${:.2f} bal=${:.2f}".format(
                             p["id"], "WIN" if won else "LOSS", stake, payout, _bot34_state["balance"]))
-                        send_telegram("{} <b>P3.4 {}</b> #{}\n{} {}\nBal: ${:.2f}".format(
-                            _emoji34, "WIN" if won else "LOSS", p["id"], _pnl34,
-                            p.get("title", "")[:30], _bot34_state["balance"]))
 
                 # SKIP duplicate Bot 3 balance update below
                 if False and table_name == "paper3_trades":
@@ -9030,6 +9013,7 @@ def _resolve_alpha_trades():
         for p in items:
             try:
                 if not p.get("fired_at") or not p.get("asset"):
+                    print("ALPHA RESOLVE SKIP #{}: missing fired_at or asset".format(p.get("id")))
                     continue
 
                 fired = datetime.fromisoformat(p["fired_at"])
@@ -9045,9 +9029,10 @@ def _resolve_alpha_trades():
 
                 expiry = fired + timedelta(hours=hours_left)
                 if now < expiry + timedelta(minutes=2):
-                    continue
+                    continue  # Not expired yet — normal skip
 
                 stake = float(p.get("stake") or 1.0)
+                age_hours = (now - fired).total_seconds() / 3600
 
                 # ── CHECK FILL STATUS via order API ──
                 order_id = p.get("order_id")
@@ -9063,8 +9048,8 @@ def _resolve_alpha_trades():
                                 _fc.close()
                             except:
                                 pass
-                        else:
-                            # Order never filled — return stake to pool
+                        elif fill_status in ("CANCELLED", "EXPIRED"):
+                            # Order was cancelled/expired — return stake
                             _alpha_state["balance"] = round(_alpha_state["balance"] + stake, 2)
                             conn2 = get_db()
                             conn2.run(
@@ -9073,13 +9058,53 @@ def _resolve_alpha_trades():
                             )
                             conn2.close()
                             resolved += 1
-                            print("ALPHA #{} UNFILLED: ${:.2f} returned to pool | pool=${:.2f}".format(
-                                p["id"], stake, _alpha_state["balance"]))
+                            print("ALPHA #{} UNFILLED ({}): ${:.2f} returned to pool | pool=${:.2f}".format(
+                                p["id"], fill_status, stake, _alpha_state["balance"]))
                             continue
+                        elif fill_status == "LIVE" and age_hours > 2:
+                            # Still live after 2+ hours — market gone, cancel and return
+                            _alpha_state["balance"] = round(_alpha_state["balance"] + stake, 2)
+                            conn2 = get_db()
+                            conn2.run(
+                                "UPDATE alpha_trades SET status=:s, outcome=:o, resolved_at=:r, payout=0 WHERE id=:i",
+                                s="⏭ Expired", o="UNFILLED", r=now.isoformat(), i=p["id"]
+                            )
+                            conn2.close()
+                            resolved += 1
+                            print("ALPHA #{} EXPIRED (live {}h): ${:.2f} returned | pool=${:.2f}".format(
+                                p["id"], round(age_hours, 1), stake, _alpha_state["balance"]))
+                            continue
+                        else:
+                            if age_hours < 2:
+                                continue  # Give it more time
+                            # Unknown status after 2h — assume filled to avoid double credit
+                            print("ALPHA #{} fill status '{}' after {:.1f}h — assuming filled".format(
+                                p["id"], fill_status, age_hours))
+                            order_filled = True
                     except Exception as _fe:
-                        # If we can't check, assume filled (safer — don't double-credit)
                         print("Alpha fill check error #{}: {}".format(p["id"], _fe))
-                        order_filled = True
+                        if age_hours > 2:
+                            order_filled = True  # Assume filled after 2h
+                        else:
+                            continue
+
+                # No order_id at all — old trade or backup, assume filled
+                if not order_id:
+                    order_filled = True
+
+                # ── FORCE-EXPIRE: trades older than 3 hours still pending ──
+                if age_hours > 3 and not order_filled:
+                    _alpha_state["balance"] = round(_alpha_state["balance"] + stake, 2)
+                    conn2 = get_db()
+                    conn2.run(
+                        "UPDATE alpha_trades SET status=:s, outcome=:o, resolved_at=:r, payout=0 WHERE id=:i",
+                        s="⏭ Force-expired", o="UNFILLED", r=now.isoformat(), i=p["id"]
+                    )
+                    conn2.close()
+                    resolved += 1
+                    print("ALPHA #{} FORCE-EXPIRED ({:.1f}h old): ${:.2f} returned | pool=${:.2f}".format(
+                        p["id"], age_hours, stake, _alpha_state["balance"]))
+                    continue
 
                 # ── RESOLVE OUTCOME (only for filled orders) ──
                 # Try Limitless API first
@@ -9095,15 +9120,31 @@ def _resolve_alpha_trades():
                                 market_resolved_yes = (wi == 0)
                                 bet_side = p.get("bet_side") or "YES"
                                 won = market_resolved_yes if bet_side == "YES" else not market_resolved_yes
-                    except:
-                        pass
+                            else:
+                                print("ALPHA #{} API ok but no winningOutcomeIndex (slug={})".format(p["id"], slug[:30]))
+                        else:
+                            print("ALPHA #{} API returned {} for slug={}".format(p["id"], mr.status_code, slug[:30]))
+                    except Exception as _api_err:
+                        print("ALPHA #{} API error: {}".format(p["id"], _api_err))
 
-                # Fallback: current price
+                # Fallback: current price vs baseline from title
                 if won is None:
-                    # Parse title for baseline
                     title = p.get("title", "")
                     current_price = get_price(p["asset"])
                     if current_price is None:
+                        print("ALPHA #{} price fallback failed: get_price({}) returned None".format(p["id"], p["asset"]))
+                        # Force-resolve old trades with no price data
+                        if age_hours > 2:
+                            _alpha_state["balance"] = round(_alpha_state["balance"] + stake, 2)
+                            conn2 = get_db()
+                            conn2.run(
+                                "UPDATE alpha_trades SET status=:s, outcome=:o, resolved_at=:r, payout=0 WHERE id=:i",
+                                s="⏭ No data", o="UNFILLED", r=now.isoformat(), i=p["id"]
+                            )
+                            conn2.close()
+                            resolved += 1
+                            print("ALPHA #{} NO DATA ({:.1f}h): ${:.2f} returned | pool=${:.2f}".format(
+                                p["id"], age_hours, stake, _alpha_state["balance"]))
                         continue
                     # Try to extract baseline from title
                     import re
@@ -9116,8 +9157,20 @@ def _resolve_alpha_trades():
                             bet_side = p.get("bet_side") or "YES"
                             won = market_resolved_true if bet_side == "YES" else not market_resolved_true
                         except:
+                            print("ALPHA #{} baseline parse failed: title={}".format(p["id"], title[:40]))
                             continue
                     else:
+                        print("ALPHA #{} regex failed on title: {}".format(p["id"], title[:50]))
+                        # Force-resolve if old enough
+                        if age_hours > 2:
+                            _alpha_state["balance"] = round(_alpha_state["balance"] + stake, 2)
+                            conn2 = get_db()
+                            conn2.run(
+                                "UPDATE alpha_trades SET status=:s, outcome=:o, resolved_at=:r, payout=0 WHERE id=:i",
+                                s="⏭ Parse fail", o="UNFILLED", r=now.isoformat(), i=p["id"]
+                            )
+                            conn2.close()
+                            resolved += 1
                         continue
 
                 outcome = "WIN" if won else "LOSS"
@@ -9587,20 +9640,7 @@ def resolve_paper_trades():
                 # if not _bot2_state["enabled"] and _bot2_state["balance"] > floor2 + _bot2_state["min_stake"]:
                 #     _bot2_state["enabled"] = True
 
-                # Telegram notification for Bot 2 trades
-                emoji = "✅" if won else "❌"
-                profit_str = "+${:.2f}".format(payout - stake) if won else "-${:.2f}".format(stake)
-                send_telegram(
-                    "{} <b>BOT 2 {}</b>\n"
-                    "──────────────────────────\n"
-                    "📌 {}\n"
-                    "<b>Stake:</b> ${:.2f}\n"
-                    "<b>Payout:</b> ${:.2f}\n"
-                    "<b>P&L:</b> {}\n"
-                    "<b>Balance:</b> ${:.2f}\n"
-                    "──────────────────────────".format(
-                        emoji, outcome, (p.get("title") or "")[:50],
-                        stake, payout, profit_str, _bot2_state["balance"]))
+                # Bot2 Telegram disabled — Alpha only
                 print("Bot2 #{} {}: stake=${:.2f} payout=${:.2f} bal=${:.2f}".format(
                     p["id"], outcome, stake, payout, _bot2_state["balance"]))
             except Exception as e:
@@ -15360,6 +15400,7 @@ def alpha_page():
     total = len(trades)
     wins = sum(1 for t in trades if t.get("outcome") == "WIN")
     losses = sum(1 for t in trades if t.get("outcome") == "LOSS")
+    unfilled = sum(1 for t in trades if t.get("outcome") == "UNFILLED")
     pending = sum(1 for t in trades if t.get("status") == "Pending")
     resolved = wins + losses
     wr = round(wins / resolved * 100, 1) if resolved > 0 else 0
@@ -15418,13 +15459,15 @@ def alpha_page():
     trade_rows = ""
     for t in trades[:100]:
         status = t.get("status", "Pending")
-        emoji = "✅" if "Won" in status else "❌" if "Lost" in status else "⏳"
+        emoji = "✅" if "Won" in status else "❌" if "Lost" in status else "⏭" if "Unfilled" in status or "Expired" in status or "No data" in status or "Parse" in status else "⏳"
         pnl_str = ""
         if t.get("outcome") == "WIN":
             pnl_str = "<span style='color:#1a7046'>+${:.2f}</span>".format(
                 float(t.get("payout") or 0) - float(t.get("stake") or 1))
         elif t.get("outcome") == "LOSS":
             pnl_str = "<span style='color:#b4322e'>-${:.2f}</span>".format(float(t.get("stake") or 1))
+        elif t.get("outcome") == "UNFILLED":
+            pnl_str = "<span style='color:#666'>returned</span>"
         else:
             pnl_str = "<span style='color:#8a6a2f'>pending</span>"
 
