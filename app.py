@@ -2451,9 +2451,32 @@ def _check_order_filled(order_id):
                         elif status in ("LIVE", "OPEN", "ACTIVE"):
                             return "LIVE"
                         return status
+        else:
+            print("Order status API returned {}: {}".format(r.status_code, r.text[:100]))
     except Exception as e:
         print("Order status check error: {}".format(e))
     return "UNKNOWN"
+
+def _check_has_position(slug):
+    """Check if user has a position on a market by checking portfolio.
+    Non-destructive — no cancelling needed. Returns True if position exists."""
+    import requests as req
+    try:
+        path = "/portfolio/positions"
+        headers = _hmac_headers("GET", path)
+        r = req.get("{}{}".format(LIMITLESS_API, path), headers=headers, timeout=5)
+        if r.status_code == 200:
+            positions = r.json()
+            clob_positions = positions.get("clob", []) if isinstance(positions, dict) else []
+            for pos in clob_positions:
+                market = pos.get("market", {})
+                pos_slug = market.get("slug", "") or market.get("stableSlug", "")
+                if pos_slug == slug:
+                    # User has a position on this market → order filled
+                    return True
+    except Exception as e:
+        print("Position check error: {}".format(e))
+    return False
 
 def _place_fok_order(slug, bet_side, token_id, stake, exchange_addr, profile_id, fee_bps):
     """Place a FOK market order (immediate fill at best ask). Returns True if successful."""
@@ -4602,28 +4625,17 @@ def _manage_snipe_orders():
                     order["bet_side"], order["asset"], order["current_price"] * 100, slug[:25]))
                 continue
             
-            # Already at max price — try cancel to detect fill
+            # Already at max price — check fill via position (no cancel risk)
             if step_idx >= len(_o_steps) - 1:
-                # Try cancel — if order filled, cancel returns "FILLED" (400 response)
-                _sit_cancel = _cancel_order(order_id)
-                if _sit_cancel == "FILLED":
+                # Check portfolio for position on this market
+                if _check_has_position(slug):
                     order["filled"] = True
                     order["fill_price"] = order["current_price"]
                     _mark_alpha_filled(slug, order_id, order["current_price"])
-                    print("SNIPE FILLED via cancel: {} {} @{:.0f}%".format(
+                    print("SNIPE FILLED (position found): {} {} @{:.0f}%".format(
                         order["bet_side"], order["asset"], order["current_price"] * 100))
-                elif _sit_cancel == True:
-                    # Cancel succeeded — order was NOT filled, re-place at same price
-                    time.sleep(0.3)
-                    new_oid = _place_gtc_order(
-                        slug, order["bet_side"], order["token_id"], order["stake"],
-                        order["current_price"], order["exchange_addr"], order["profile_id"], order["fee_bps"])
-                    if new_oid:
-                        order["order_id"] = new_oid
-                        still_active.append(order)
-                        print("SNIPE re-placed @{:.0f}% on {}".format(order["current_price"] * 100, slug[:25]))
                 else:
-                    # Cancel returned unclear — keep order, check next round
+                    # No position yet — order still sitting on book, leave it
                     still_active.append(order)
                 continue
             
@@ -4700,7 +4712,7 @@ def _manage_snipe_orders():
         # Wait between rounds (all markets get one step per round)
         time.sleep(2)
     
-    # Final check on remaining orders — use cancel to reliably detect fills
+    # Final check on remaining orders — use position check (non-destructive)
     for order in _active_snipe_orders:
         if not order["filled"]:
             # Try API check first
@@ -4712,20 +4724,15 @@ def _manage_snipe_orders():
                 print("SNIPE FILLED final check: {} {} @{:.0f}%".format(
                     order["bet_side"], order["asset"], order["current_price"] * 100))
             else:
-                # API returned UNKNOWN/LIVE — try cancel to confirm
-                _fc_cancel = _cancel_order(order["order_id"])
-                if _fc_cancel == "FILLED":
+                # API returned UNKNOWN — check portfolio for position
+                if _check_has_position(order["slug"]):
                     order["filled"] = True
                     order["fill_price"] = order["current_price"]
                     _mark_alpha_filled(order["slug"], order["order_id"], order["current_price"])
-                    print("SNIPE FILLED final cancel: {} {} @{:.0f}%".format(
+                    print("SNIPE FILLED final position: {} {} @{:.0f}%".format(
                         order["bet_side"], order["asset"], order["current_price"] * 100))
-                elif _fc_cancel == True:
-                    # Cancelled — was not filled. Leave it, resolution will return stake.
-                    print("SNIPE CANCELLED final: {} {} — not filled".format(
-                        order["asset"], order["slug"][:25]))
                 else:
-                    print("SNIPE left on book: {} {} @{:.0f}%".format(
+                    print("SNIPE on book (no position): {} {} @{:.0f}%".format(
                         order["asset"], order["slug"][:25], order["current_price"] * 100))
     
     filled_count = sum(1 for o in _active_snipe_orders if o["filled"])
@@ -9243,40 +9250,50 @@ def _resolve_alpha_trades():
                                 p["id"], fill_status, stake, _alpha_state["balance"]))
                             continue
                         elif market_expired:
-                            # Market is done. Order status is LIVE or UNKNOWN.
-                            # LIVE on an expired market = never filled. Return stake.
-                            # UNKNOWN on an expired market = API can't tell us.
-                            #   But the escalation loop ran during the market and would have
-                            #   written filled=TRUE if it saw a fill. Since it didn't → not filled.
-                            _alpha_state["balance"] = round(_alpha_state["balance"] + stake, 2)
-                            conn2 = get_db()
-                            conn2.run(
-                                "UPDATE alpha_trades SET status=:s, outcome=:o, resolved_at=:r, payout=0 WHERE id=:i",
-                                s="⏭ Unfilled", o="UNFILLED", r=now.isoformat(), i=p["id"]
-                            )
-                            conn2.close()
-                            resolved += 1
-                            print("ALPHA #{} UNFILLED ({}+expired): ${:.2f} returned | pool=${:.2f}".format(
-                                p["id"], fill_status, stake, _alpha_state["balance"]))
-                            continue
+                            # Market is done. API can't tell us fill status.
+                            # Check portfolio for position — definitive proof of fill
+                            _has_pos = _check_has_position(p.get("slug", ""))
+                            if _has_pos:
+                                order_filled = True
+                                print("ALPHA #{} FILLED (position found on expired market)".format(p["id"]))
+                                try:
+                                    _fc2 = get_db()
+                                    _fc2.run("UPDATE alpha_trades SET filled=TRUE WHERE id=:i", i=p["id"])
+                                    _fc2.close()
+                                except:
+                                    pass
+                            else:
+                                # No position on expired market — genuinely unfilled
+                                _alpha_state["balance"] = round(_alpha_state["balance"] + stake, 2)
+                                conn2 = get_db()
+                                conn2.run(
+                                    "UPDATE alpha_trades SET status=:s, outcome=:o, resolved_at=:r, payout=0 WHERE id=:i",
+                                    s="⏭ Unfilled", o="UNFILLED", r=now.isoformat(), i=p["id"]
+                                )
+                                conn2.close()
+                                resolved += 1
+                                print("ALPHA #{} UNFILLED (no position): ${:.2f} returned | pool=${:.2f}".format(
+                                    p["id"], stake, _alpha_state["balance"]))
+                                continue
                         else:
                             # Market still active, order still live — check next cycle
                             continue
                     except Exception as _fe:
                         print("Alpha fill check error #{}: {}".format(p["id"], _fe))
                         if market_expired:
-                            # Can't check and market is done — treat as unfilled
-                            _alpha_state["balance"] = round(_alpha_state["balance"] + stake, 2)
-                            conn2 = get_db()
-                            conn2.run(
-                                "UPDATE alpha_trades SET status=:s, outcome=:o, resolved_at=:r, payout=0 WHERE id=:i",
-                                s="⏭ Check failed", o="UNFILLED", r=now.isoformat(), i=p["id"]
-                            )
-                            conn2.close()
-                            resolved += 1
-                            print("ALPHA #{} CHECK FAILED (expired): ${:.2f} returned | pool=${:.2f}".format(
-                                p["id"], stake, _alpha_state["balance"]))
-                            continue
+                            # API error on expired market — check position as last resort
+                            if _check_has_position(p.get("slug", "")):
+                                order_filled = True
+                            else:
+                                _alpha_state["balance"] = round(_alpha_state["balance"] + stake, 2)
+                                conn2 = get_db()
+                                conn2.run(
+                                    "UPDATE alpha_trades SET status=:s, outcome=:o, resolved_at=:r, payout=0 WHERE id=:i",
+                                    s="⏭ Check failed", o="UNFILLED", r=now.isoformat(), i=p["id"]
+                                )
+                                conn2.close()
+                                resolved += 1
+                                continue
                         else:
                             continue
                 
