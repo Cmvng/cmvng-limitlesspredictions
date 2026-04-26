@@ -4077,6 +4077,24 @@ def _fast_trade_scan():
                                         send_telegram("🔄 <b>2ND ALPHA {}</b>\n{} {} ${:.2f}\n{}\nPool: ${:.2f}".format(
                                             _us_a_tier, _us_a_side, _us_asset, _us_a_stake,
                                             _us_parsed["title"][:40], _alpha_state["balance"]))
+                                        # Save to alpha_trades for resolution tracking
+                                        try:
+                                            _us_ac = get_db()
+                                            _us_ac.run("""INSERT INTO alpha_trades
+                                                (market_id, title, asset, bet_side, tier, stake, fill_price,
+                                                 engines, pool_after, order_id, status, fired_at, slug)
+                                                VALUES (:mid, :ttl, :ast, :bs, :tier, :stake, :fill,
+                                                        :eng, :pool, :oid, 'Pending', :now, :slg)""",
+                                                mid=_us_parsed["market_id"], ttl=_us_parsed["title"], ast=_us_asset,
+                                                bs=_us_a_side, tier=_us_a_tier, stake=_us_a_stake,
+                                                fill=round(_us_a_max, 3), eng="P2.3(2nd)",
+                                                pool=_alpha_state["balance"],
+                                                oid=_us_snipe.get("order_id") if _us_snipe else None,
+                                                now=datetime.now(timezone.utc).isoformat(),
+                                                slg=_us_parsed["slug"])
+                                            _us_ac.close()
+                                        except:
+                                            pass
                 except Exception as _us_err:
                     print("Second pass error {}: {}".format(_us_asset, _us_err))
             
@@ -4174,6 +4192,24 @@ def _fast_trade_scan():
                                     _alpha_traded_markets.add(_us_parsed["market_id"])
                                     print("2ND ALPHA {} 1H: {} {} ${:.2f} | pool=${:.2f}".format(
                                         _us_h_tier, _us_scored_val["bet_side"], _us_asset, _us_h_stake, _alpha_state["balance"]))
+                                    # Save to alpha_trades for resolution tracking
+                                    try:
+                                        _us_hc = get_db()
+                                        _us_hc.run("""INSERT INTO alpha_trades
+                                            (market_id, title, asset, bet_side, tier, stake, fill_price,
+                                             engines, pool_after, order_id, status, fired_at, slug)
+                                            VALUES (:mid, :ttl, :ast, :bs, :tier, :stake, :fill,
+                                                    :eng, :pool, :oid, 'Pending', :now, :slg)""",
+                                            mid=_us_parsed["market_id"], ttl=_us_parsed["title"], ast=_us_asset,
+                                            bs=_us_scored_val["bet_side"], tier=_us_h_tier, stake=_us_h_stake,
+                                            fill=round(_us_h_max_fill, 3), eng="P2.4(2nd)",
+                                            pool=_alpha_state["balance"],
+                                            oid=_us_snipe.get("order_id") if _us_snipe else None,
+                                            now=datetime.now(timezone.utc).isoformat(),
+                                            slg=_us_parsed["slug"])
+                                        _us_hc.close()
+                                    except:
+                                        pass
                 except Exception as _us_err:
                     print("Second pass 1H error {}: {}".format(_us_asset, _us_err))
         
@@ -4268,6 +4304,24 @@ def _backup_live_snipe(bot_id, bot_state, scored, parsed, market, asset):
             _bk_tag, _bk_side, asset, _bk_stake, _alpha_state["balance"]))
         send_telegram("🔄 <b>BACKUP ALPHA {}</b>\n{} {} ${:.2f}\n{}\nPool: ${:.2f}".format(
             _bk_tag, _bk_side, asset, _bk_stake, parsed["title"][:40], _alpha_state["balance"]))
+        # Save to alpha_trades for resolution tracking
+        try:
+            _bk_db = get_db()
+            _bk_db.run("""INSERT INTO alpha_trades
+                (market_id, title, asset, bet_side, tier, stake, fill_price,
+                 engines, pool_after, order_id, status, fired_at, slug)
+                VALUES (:mid, :ttl, :ast, :bs, :tier, :stake, :fill,
+                        :eng, :pool, :oid, 'Pending', :now, :slg)""",
+                mid=parsed["market_id"], ttl=parsed["title"], ast=asset,
+                bs=_bk_side, tier=_bk_tag, stake=_bk_stake,
+                fill=round(_bk_max_fill, 3), eng="backup",
+                pool=_alpha_state["balance"],
+                oid=snipe_order.get("order_id") if snipe_order else None,
+                now=datetime.now(timezone.utc).isoformat(),
+                slg=parsed.get("slug", ""))
+            _bk_db.close()
+        except:
+            pass
         return True
     return False
 
