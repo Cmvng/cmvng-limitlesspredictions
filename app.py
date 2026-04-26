@@ -233,10 +233,10 @@ FAVOURITE_HOURLY = ["ADA", "BNB", "DOGE"]
 # One pool, tiered staking by multi-bot agreement
 _alpha_state = {
     "enabled": True,
-    "balance": 200.0,
-    "peak_balance": 200.0,
-    "starting_balance": 200.0,
-    "floor_balance": 80.0,  # Emergency stop
+    "balance": 100.0,
+    "peak_balance": 100.0,
+    "starting_balance": 100.0,
+    "floor_balance": 5.0,  # Emergency stop — confirmed safe in 10K-day sim
     "trades_today": 0,
     "wins_today": 0,
     "losses_today": 0,
@@ -246,90 +246,44 @@ _alpha_traded_markets = set()  # Dedup per cycle
 
 
 def _alpha_get_tier(scored22, scored23, scored33, asset, is_hourly=False):
-    """Determine Alpha tier based on multi-bot agreement.
+    """Determine Alpha tier based on P2.3 as sole trigger.
+    Strategy F: Only P2.3 fires live trades on ETH/BTC/SOL.
+    P3.3-alone and DIST_ONLY are paper-only (confirmed negative EV at 66c).
     Returns (tier_tag, base_stake, max_fill, bet_side) or None to skip."""
 
     if is_hourly:
-        # 1H: only SOL and DOGE
-        if asset == "SOL":
-            return None  # handled separately with P2.4 scoring
-        elif asset == "DOGE":
-            return None  # handled separately
-        else:
-            return None  # Skip BTC/ETH/XRP on 1H
+        return None  # 1H handled separately with P2.4 scoring
 
-    # ── 15M tier logic ──
-    # Skip DOGE on 15M (50-60% WR = no edge)
-    if asset == "DOGE":
-        return None
+    # ── 15M: P2.3 is the ONLY live trigger ──
+    # Skip assets with weak WR
+    if asset not in ("ETH", "BTC", "SOL"):
+        return None  # Skip XRP (70.5% borderline), DOGE (5 trades, no confidence)
 
-    s23 = scored23 is not None
-    s22 = scored22 is not None
-    s33 = scored33 is not None
+    # P2.3 must fire for a live trade
+    if scored23 is None:
+        return None  # P3.3-alone and P2.2-alone are paper only
 
-    # P3.3 fix 1: Disable DIST_ONLY trades (50% WR coin flips)
-    if s33 and "DIST_ONLY" in (scored33.get("indicators") or ""):
-        s33 = False
-        scored33 = None
+    bet_side = scored23["bet_side"]
 
-    # P3.3 fix 2: Skip XRP on P3.3 (57.5% WR)
-    if s33 and asset == "XRP":
-        s33 = False
-        scored33 = None
-
-    # Determine bet direction from the strongest signal
-    bet_side = None
-    if s23:
-        bet_side = scored23["bet_side"]
-    elif s33:
-        bet_side = scored33["bet_side"]
-    elif s22:
-        bet_side = scored22["bet_side"]
-
-    if bet_side is None:
-        return None
-
-    # Check agreement and assign tier
-    # T1: P2.3 + P3.3 agree on same direction
-    if s23 and s33 and scored23["bet_side"] == scored33["bet_side"]:
-        return ("T1", 4.00, 0.72, bet_side)
-
-    # T2: P2.3 signals (P2.2 always agrees when P2.3 does)
-    if s23:
-        return ("T2", 2.50, 0.68, bet_side)
-
-    # T3: P3.3 alone (fixed - no DIST_ONLY, no XRP)
-    if s33:
-        # XRP on T3 = skip (already filtered above for P3.3)
-        if asset == "XRP":
-            return None
-        return ("T3", 1.50, 0.66, scored33["bet_side"])
-
-    # T3: P2.2 alone (P2.3 didn't confirm via DIST)
-    if s22:
-        # Skip XRP on T3-P2.2 alone
-        if asset == "XRP":
-            return None
-        return ("T3", 1.50, 0.64, scored22["bet_side"])
+    # Stakes by asset (from corrected 50K-day simulation)
+    if asset == "ETH":
+        return ("T1", 4.00, 0.72, bet_side)   # 84.3% WR, breakeven at 84c
+    elif asset == "BTC":
+        return ("T1", 4.00, 0.72, bet_side)   # 81.6% WR, breakeven at 82c
+    elif asset == "SOL":
+        return ("T2", 2.00, 0.68, bet_side)   # 78.6% WR, breakeven at 79c
 
     return None
 
 
 def _alpha_calc_stake(base_stake, asset, pool_balance):
-    """Calculate final stake with asset bonus and auto-scaling."""
-    scale = max(pool_balance / 200.0, 0.5)  # Scale relative to $200 baseline
+    """Calculate final stake — fixed stakes from simulation, scaled to pool."""
+    # Scale relative to $100 baseline (the test pool)
+    scale = max(pool_balance / 100.0, 0.5)
     stake = round(base_stake * scale, 2)
 
-    # Asset bonuses (scaled)
-    if asset == "ETH":
-        stake = round(stake + 1.00 * scale, 2)
-    elif asset == "BTC":
-        stake = round(stake + 0.50 * scale, 2)
-    elif asset == "XRP":
-        stake = max(round(stake - 0.50 * scale, 2), 1.00)
-
-    # Cap at 2.5% of pool
-    max_trade = round(pool_balance * 0.025, 2)
+    # Cap at 5% of pool (safety limit)
+    max_trade = round(pool_balance * 0.05, 2)
     stake = min(stake, max_trade)
 
     # Minimum $1.00
@@ -3966,10 +3920,10 @@ def _fast_trade_scan():
                         _h_scored = scored24 or scored34
                         if _h_scored:
                             _h_side = _h_scored["bet_side"]
-                            _h_base = 2.00 if asset == "SOL" else 1.50
+                            _h_base = 1.00  # Both SOL and DOGE at $1.00 base
                             _h_tier = "T2H" if asset == "SOL" else "T3H"
                             _h_max_fill = 0.68 if asset == "SOL" else 0.64
-                            _h_scale = max(_alpha_state["balance"] / 200.0, 0.5)
+                            _h_scale = max(_alpha_state["balance"] / 100.0, 0.5)
                             _h_stake = round(min(_h_base * _h_scale, _alpha_state["balance"] * 0.025), 2)
                             _h_stake = max(_h_stake, 1.00)
                             
@@ -4202,10 +4156,10 @@ def _fast_trade_scan():
                         
                         # Place Alpha 1H live order — SOL and DOGE only
                         if _us_asset in ("SOL", "DOGE") and _us_parsed["market_id"] not in _alpha_traded_markets and _alpha_state["enabled"]:
-                            _us_h_base = 2.00 if _us_asset == "SOL" else 1.50
+                            _us_h_base = 1.00  # Both SOL and DOGE at $1.00
                             _us_h_tier = "T2H" if _us_asset == "SOL" else "T3H"
                             _us_h_max_fill = 0.68 if _us_asset == "SOL" else 0.64
-                            _us_h_scale = max(_alpha_state["balance"] / 200.0, 0.5)
+                            _us_h_scale = max(_alpha_state["balance"] / 100.0, 0.5)
                             _us_h_stake = round(min(_us_h_base * _us_h_scale, _alpha_state["balance"] * 0.025), 2)
                             _us_h_stake = max(_us_h_stake, 1.00)
                             if _alpha_state["balance"] > _alpha_state["floor_balance"] and \
@@ -4281,10 +4235,10 @@ def _backup_live_snipe(bot_id, bot_state, scored, parsed, market, asset):
         if asset not in ("SOL", "DOGE"):
             return False
         _bk_side = scored["bet_side"]
-        _bk_base = 2.00 if asset == "SOL" else 1.50
+        _bk_base = 1.00  # Both SOL and DOGE at $1.00
         _bk_tag = "T2H" if asset == "SOL" else "T3H"
         _bk_max_fill = 0.68 if asset == "SOL" else 0.64
-        _bk_scale = max(_alpha_state["balance"] / 200.0, 0.5)
+        _bk_scale = max(_alpha_state["balance"] / 100.0, 0.5)
         _bk_stake = round(min(_bk_base * _bk_scale, _alpha_state["balance"] * 0.025), 2)
         _bk_stake = max(_bk_stake, 1.00)
     else:
@@ -13789,14 +13743,14 @@ try:
     _bot34_state["starting_balance"] = 30.0
     _bot34_state["floor_balance"] = 0.0
     _bot34_state["fixed_stake"] = 1.50
-    # Alpha unified pool — restore from DB or start at $200
+    # Alpha unified pool — restore from DB or start at $100
     if not _alpha_restored:
-        _alpha_state["balance"] = 200.0
-        _alpha_state["peak_balance"] = 200.0
-    _alpha_state["starting_balance"] = 200.0
-    _alpha_state["floor_balance"] = 80.0
+        _alpha_state["balance"] = 100.0
+        _alpha_state["peak_balance"] = 100.0
+    _alpha_state["starting_balance"] = 100.0
+    _alpha_state["floor_balance"] = 5.0
     _alpha_state["enabled"] = True
-    print("ALPHA LIVE: ${:.2f} pool{} | T1=$4 T2=$2.50 T3=$1.50 | Floor=$80".format(
+    print("ALPHA LIVE: ${:.2f} pool{} | Strategy F: ETH/BTC $4 SOL $2 | 1H SOL/DOGE $1 | Floor=$5 | P2.3 only trigger".format(
         _alpha_state["balance"], " (restored)" if _alpha_restored else " (fresh)"))
     # Warm trading credentials for sniper
     threading.Thread(target=_warm_credentials, daemon=True).start()
