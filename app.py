@@ -4530,7 +4530,7 @@ def _snipe_place_gtc(market_data, parsed, bet_side, stake, best_ask, max_price=0
             return {
                 "order_id": order_id, "slug": slug, "bet_side": bet_side,
                 "token_id": token_id, "stake": stake, "asset": asset,
-                "current_price": price, "step_idx": 8, "filled": False,
+                "current_price": price, "step_idx": 99, "filled": False,
                 "fill_price": None, "exchange_addr": exchange_addr,
                 "profile_id": profile_id, "fee_bps": fee_bps,
             }
@@ -4602,10 +4602,29 @@ def _manage_snipe_orders():
                     order["bet_side"], order["asset"], order["current_price"] * 100, slug[:25]))
                 continue
             
-            # Already at max price — leave it sitting
+            # Already at max price — try cancel to detect fill
             if step_idx >= len(_o_steps) - 1:
-                print("SNIPE @{:.0f}% sitting on book for {}".format(
-                    _o_steps[-1] * 100, slug[:25]))
+                # Try cancel — if order filled, cancel returns "FILLED" (400 response)
+                _sit_cancel = _cancel_order(order_id)
+                if _sit_cancel == "FILLED":
+                    order["filled"] = True
+                    order["fill_price"] = order["current_price"]
+                    _mark_alpha_filled(slug, order_id, order["current_price"])
+                    print("SNIPE FILLED via cancel: {} {} @{:.0f}%".format(
+                        order["bet_side"], order["asset"], order["current_price"] * 100))
+                elif _sit_cancel == True:
+                    # Cancel succeeded — order was NOT filled, re-place at same price
+                    time.sleep(0.3)
+                    new_oid = _place_gtc_order(
+                        slug, order["bet_side"], order["token_id"], order["stake"],
+                        order["current_price"], order["exchange_addr"], order["profile_id"], order["fee_bps"])
+                    if new_oid:
+                        order["order_id"] = new_oid
+                        still_active.append(order)
+                        print("SNIPE re-placed @{:.0f}% on {}".format(order["current_price"] * 100, slug[:25]))
+                else:
+                    # Cancel returned unclear — keep order, check next round
+                    still_active.append(order)
                 continue
             
             # Determine next price
@@ -4673,7 +4692,7 @@ def _manage_snipe_orders():
             if t == "T1": return len(price_steps_t1)
             if t in ("T2", "T2H"): return len(price_steps_t2)
             return len(price_steps)
-        _active_snipe_orders = [o for o in _active_snipe_orders if not o["filled"] and o["step_idx"] < _max_steps(o) - 1]
+        _active_snipe_orders = [o for o in _active_snipe_orders if not o["filled"]]
         
         if not _active_snipe_orders:
             break
@@ -4681,9 +4700,10 @@ def _manage_snipe_orders():
         # Wait between rounds (all markets get one step per round)
         time.sleep(2)
     
-    # Final check on remaining orders
+    # Final check on remaining orders — use cancel to reliably detect fills
     for order in _active_snipe_orders:
         if not order["filled"]:
+            # Try API check first
             status = _check_order_filled(order["order_id"])
             if status == "FILLED":
                 order["filled"] = True
@@ -4692,8 +4712,21 @@ def _manage_snipe_orders():
                 print("SNIPE FILLED final check: {} {} @{:.0f}%".format(
                     order["bet_side"], order["asset"], order["current_price"] * 100))
             else:
-                print("SNIPE left @{:.0f}% on book: {} {}".format(
-                    order["current_price"] * 100, order["asset"], order["slug"][:25]))
+                # API returned UNKNOWN/LIVE — try cancel to confirm
+                _fc_cancel = _cancel_order(order["order_id"])
+                if _fc_cancel == "FILLED":
+                    order["filled"] = True
+                    order["fill_price"] = order["current_price"]
+                    _mark_alpha_filled(order["slug"], order["order_id"], order["current_price"])
+                    print("SNIPE FILLED final cancel: {} {} @{:.0f}%".format(
+                        order["bet_side"], order["asset"], order["current_price"] * 100))
+                elif _fc_cancel == True:
+                    # Cancelled — was not filled. Leave it, resolution will return stake.
+                    print("SNIPE CANCELLED final: {} {} — not filled".format(
+                        order["asset"], order["slug"][:25]))
+                else:
+                    print("SNIPE left on book: {} {} @{:.0f}%".format(
+                        order["asset"], order["slug"][:25], order["current_price"] * 100))
     
     filled_count = sum(1 for o in _active_snipe_orders if o["filled"])
     total = len(_active_snipe_orders)
