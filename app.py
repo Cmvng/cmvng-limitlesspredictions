@@ -12098,6 +12098,7 @@ tbody tr:hover{background:var(--bg)}
     <nav class="nav-tabs">
       <a href="/" class="nav-tab">Home</a>
       <a href="/app" class="nav-tab active">Crypto</a>
+      <a href="/app/alpha" class="nav-tab" style="color:#1a7046;font-weight:700">⚡ Alpha</a>
       <a href="/app/paper" class="nav-tab">Bot 2</a>
       <a href="/app/paper3" class="nav-tab">Paper 3</a>
       <a href="/app/paper4" class="nav-tab">Paper 4</a>
@@ -12302,6 +12303,7 @@ tbody tr:hover{background:var(--bg)}
     <nav class="nav-tabs">
       <a href="/" class="nav-tab">Home</a>
       <a href="/app" class="nav-tab">Crypto</a>
+      <a href="/app/alpha" class="nav-tab" style="color:#1a7046;font-weight:700">⚡ Alpha</a>
       <a href="/app/poly/btc5m" class="nav-tab">Polymarket</a>
       <a href="/app/football" class="nav-tab active">Football</a>
     </nav>
@@ -13205,6 +13207,7 @@ tr:hover td{background:#fafaf7}
   <nav class="nav-tabs">
     <a href="/" class="nav-tab">Home</a>
     <a href="/app" class="nav-tab">Crypto</a>
+    <a href="/app/alpha" class="nav-tab" style="color:#1a7046;font-weight:700">⚡ Alpha</a>
     <a href="/app/paper" class="nav-tab active">Paper</a>
     <a href="/app/paper3" class="nav-tab">Paper 3</a>
     <a href="/app/paper4" class="nav-tab">Paper 4</a>
@@ -13438,6 +13441,7 @@ td{padding:8px 12px;border-bottom:1px solid #f4f3ed;color:var(--ink-2)}tr:last-c
   <nav class="nav-tabs">
     <a href="/" class="nav-tab">Home</a>
     <a href="/app" class="nav-tab">Crypto</a>
+    <a href="/app/alpha" class="nav-tab" style="color:#1a7046;font-weight:700">⚡ Alpha</a>
     <a href="/app/paper" class="nav-tab">Bot 2</a>
     <a href="/app/paper3" class="nav-tab""" + (" active" if nav_active == "paper3" else "") + """">Paper 3</a>
     <a href="/app/paper21" class="nav-tab""" + (" active" if nav_active == "paper21" else "") + """">Paper 2.1</a>
