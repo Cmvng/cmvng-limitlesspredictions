@@ -330,6 +330,61 @@ _poly_live_p31 = {
     "trades_today": 0,
 }
 
+# ═══════════════════════════════════════════════════════════
+# POLYMARKET ALPHA — Strategy P (P2.3 engine on 5M + 15M)
+# ═══════════════════════════════════════════════════════════
+_poly_alpha_state = {
+    "enabled": True,
+    "balance": 70.0,
+    "peak_balance": 70.0,
+    "starting_balance": 70.0,
+    "floor_balance": 10.0,
+    "trades_today": 0,
+    "wins_today": 0,
+    "losses_today": 0,
+    "profit_today": 0.0,
+}
+
+_poly_alpha_traded_markets = set()  # Dedup: don't trade same market twice
+
+def _poly_alpha_load_recent_trades():
+    """Load recently traded market IDs from DB to prevent double-trading after restart."""
+    try:
+        conn = get_db()
+        rows = conn.run("SELECT market_id FROM poly_alpha_trades WHERE fired_at::timestamptz > NOW() - INTERVAL '1 hour'")
+        conn.close()
+        for r in rows:
+            _poly_alpha_traded_markets.add(r[0])
+        if _poly_alpha_traded_markets:
+            print("Poly Alpha: loaded {} recent market IDs for dedup".format(len(_poly_alpha_traded_markets)))
+    except:
+        pass
+
+def _poly_alpha_get_tier(asset, timeframe):
+    """Get Polymarket Alpha tier, base stake, and max fill for an asset+timeframe.
+    Returns (tier, base_stake, max_fill) or None if not traded."""
+    if timeframe == "15M":
+        if asset in ("XRP", "ETH"):
+            return ("PA1", 3.00, 0.52)   # 67.7% / 66.2% WR
+        elif asset in ("BTC", "SOL"):
+            return ("PA2", 2.50, 0.52)   # 64.1% / 63.2% WR
+    elif timeframe == "5M":
+        if asset == "BTC":
+            return ("PB1", 2.50, 0.52)   # 61.8% WR
+    return None
+
+def _poly_alpha_calc_stake(base_stake, pool_balance):
+    """Calculate Poly Alpha stake — scaled to pool, min $2.50 (5 shares), cap 8%."""
+    scale = max(pool_balance / 70.0, 0.5)
+    stake = round(base_stake * scale, 2)
+    max_trade = round(pool_balance * 0.08, 2)  # 8% cap (higher than Limitless because min is $2.50)
+    stake = min(stake, max_trade)
+    stake = max(stake, 2.50)  # Polymarket minimum: 5 shares at ~50¢
+    # If minimum exceeds cap AND pool can't afford it, skip
+    if stake > pool_balance * 0.10:
+        return 0  # Pool too small to trade safely
+    return stake
+
 def _poly_has_creds():
     return bool(POLY_API_KEY and POLY_API_SECRET and POLY_API_PASSPHRASE and LIMITLESS_PRIV_KEY and POLY_FUNDER_ADDRESS)
 
@@ -1039,6 +1094,31 @@ def init_db():
             slug TEXT
         )
     """)
+    # Polymarket Alpha trades — Strategy P
+    conn.run("""
+        CREATE TABLE IF NOT EXISTS poly_alpha_trades (
+            id SERIAL PRIMARY KEY,
+            market_id TEXT,
+            title TEXT,
+            asset TEXT,
+            timeframe TEXT,
+            bet_side TEXT,
+            tier TEXT,
+            stake REAL,
+            fill_price REAL,
+            pool_after REAL,
+            payout REAL,
+            order_id TEXT,
+            token_id TEXT,
+            condition_id TEXT,
+            slug TEXT,
+            filled BOOLEAN DEFAULT FALSE,
+            status TEXT DEFAULT 'Pending',
+            outcome TEXT,
+            fired_at TEXT,
+            resolved_at TEXT
+        )
+    """)
     # Polymarket paper trades — single table for all sections/strategies
     conn.run("""
         CREATE TABLE IF NOT EXISTS poly_trades (
@@ -1080,7 +1160,8 @@ def send_telegram(message):
         return
     # FILTER: Only send Alpha notifications and critical system alerts
     _allowed = any(k in message for k in [
-        "ALPHA", "Alpha", "alpha",           # All Alpha trade/resolution messages
+        "ALPHA", "Alpha", "alpha",           # All Alpha trade/resolution messages (Limitless + Poly)
+        "POLY",                              # Polymarket Alpha notifications
         "Auto-trading", "Kill switch",        # System control alerts
         "Auto-redeemed", "Redeemed",          # Redemption confirmations
         "Bot v4", "LIVE",                     # Startup message
@@ -4814,6 +4895,8 @@ def scan_loop():
                 _save_bot_balance(_bn, _bs)
             # Save Alpha pool state
             _save_bot_balance("alpha", _alpha_state)
+            # Save Poly Alpha pool state
+            _save_bot_balance("poly_alpha", _poly_alpha_state)
         except Exception as e:
             print("Balance save error: {}".format(e))
         
@@ -12341,6 +12424,7 @@ tbody tr:hover{background:var(--bg)}
       <a href="/app/paper" class="nav-tab">Bot 2</a>
       <a href="/app/paper3" class="nav-tab">Paper 3</a>
       <a href="/app/paper4" class="nav-tab">Paper 4</a>
+      <a href="/app/poly-alpha" class="nav-tab" style="color:#388bfd;font-weight:700">⚡ Poly Alpha</a>
       <a href="/app/poly/btc5m" class="nav-tab">Polymarket</a>
       <a href="/app/football" class="nav-tab">Football</a>
     </nav>
@@ -12543,6 +12627,7 @@ tbody tr:hover{background:var(--bg)}
       <a href="/" class="nav-tab">Home</a>
       <a href="/app" class="nav-tab">Crypto</a>
       <a href="/app/alpha" class="nav-tab" style="color:#1a7046;font-weight:700">⚡ Alpha</a>
+      <a href="/app/poly-alpha" class="nav-tab" style="color:#388bfd;font-weight:700">⚡ Poly Alpha</a>
       <a href="/app/poly/btc5m" class="nav-tab">Polymarket</a>
       <a href="/app/football" class="nav-tab active">Football</a>
     </nav>
@@ -13450,7 +13535,8 @@ tr:hover td{background:#fafaf7}
     <a href="/app/paper" class="nav-tab active">Paper</a>
     <a href="/app/paper3" class="nav-tab">Paper 3</a>
     <a href="/app/paper4" class="nav-tab">Paper 4</a>
-    <a href="/app/poly/btc5m" class="nav-tab">Polymarket</a>
+    <a href="/app/poly-alpha" class="nav-tab" style="color:#388bfd;font-weight:700">⚡ Poly Alpha</a>
+      <a href="/app/poly/btc5m" class="nav-tab">Polymarket</a>
     <a href="/app/football" class="nav-tab">Football</a>
   </nav>
 </header>
@@ -13700,7 +13786,8 @@ td{padding:8px 12px;border-bottom:1px solid #f4f3ed;color:var(--ink-2)}tr:last-c
     <a href="/app/paper4" class="nav-tab""" + (" active" if nav_active == "paper4" else "") + """">Paper 4</a>
     <a href="/app/paper5" class="nav-tab""" + (" active" if nav_active == "paper5" else "") + """">Paper 5</a>
     <a href="/app/paper51" class="nav-tab""" + (" active" if nav_active == "paper51" else "") + """">Paper 5.1</a>
-    <a href="/app/poly/btc5m" class="nav-tab">Polymarket</a>
+    <a href="/app/poly-alpha" class="nav-tab" style="color:#388bfd;font-weight:700">⚡ Poly Alpha</a>
+      <a href="/app/poly/btc5m" class="nav-tab">Polymarket</a>
     <a href="/app/football" class="nav-tab">Football</a>
   </nav>
 </header>
@@ -14001,6 +14088,23 @@ try:
     _alpha_state["enabled"] = True
     print("ALPHA LIVE: ${:.2f} pool{} | Strategy F: ETH/BTC $4 SOL $2 | 1H SOL/DOGE $1 | Floor=$5 | P2.3 only trigger".format(
         _alpha_state["balance"], " (restored)" if _alpha_restored else " (fresh)"))
+    
+    # Restore Poly Alpha balance from DB
+    _poly_alpha_restored = False
+    _saved_poly_alpha = _saved_balances.get("poly_alpha", {})
+    if _saved_poly_alpha and _saved_poly_alpha.get("balance", 0) > 0:
+        _poly_alpha_state["balance"] = _saved_poly_alpha["balance"]
+        _poly_alpha_state["peak_balance"] = _saved_poly_alpha.get("peak_balance", _saved_poly_alpha["balance"])
+        _poly_alpha_restored = True
+    if not _poly_alpha_restored:
+        _poly_alpha_state["balance"] = 70.0
+        _poly_alpha_state["peak_balance"] = 70.0
+    _poly_alpha_state["starting_balance"] = 70.0
+    _poly_alpha_state["floor_balance"] = 10.0
+    _poly_alpha_state["enabled"] = True
+    print("POLY ALPHA LIVE: ${:.2f} pool{} | Strategy P: XRP/ETH $3 BTC/SOL $2.50 | BTC 5M $2.50 | Floor=$10".format(
+        _poly_alpha_state["balance"], " (restored)" if _poly_alpha_restored else " (fresh)"))
+    _poly_alpha_load_recent_trades()
     # Warm trading credentials for sniper
     threading.Thread(target=_warm_credentials, daemon=True).start()
     # One-time correction of historical paper trade resolutions
@@ -14841,97 +14945,90 @@ def run_poly_scan():
                         print("POLY_P23_SCORED: {} tf={} sec={} side={} odds={:.0f}%".format(
                             asset, tf, section, poly_side, effective_odds))
 
-                    # ─── POLYMARKET LIVE TRADING ───
-                    # P2.3 on 15M markets ONLY, autoscale from $2.50
-                    if strat == "p23" and tf == "15M":
-                        if _poly_has_creds() and _poly_live_p23["enabled"] and not _is_volatile_window():
-                            poly_stake = _calc_poly_autoscale_stake(_poly_live_p23)
-                            if poly_stake > 0:
-                                live_state = _poly_live_p23
-                                bot_label = "POLY-P2.3"
-                                # Get token ID from clob_tokens (already in parsed market)
+                    # ─── POLYMARKET ALPHA — Strategy P ───
+                    # P2.3 on 5M BTC and 15M all assets
+                    if strat == "p23" and tf in ("5M", "15M"):
+                        _pa_tier = _poly_alpha_get_tier(asset, tf)
+                        if _pa_tier and _poly_alpha_state["enabled"] and _poly_has_creds():
+                            _pa_tier_name, _pa_base, _pa_max_fill = _pa_tier
+                            _pa_stake = _poly_alpha_calc_stake(_pa_base, _poly_alpha_state["balance"])
+                            
+                            # Check pool has enough and market not already traded
+                            _pa_mkey = parsed["market_id"]
+                            if _pa_stake > 0 and _pa_stake <= _poly_alpha_state["balance"] and _pa_mkey not in _poly_alpha_traded_markets:
+                                # Get token ID
                                 clob_toks = parsed.get("clob_tokens", [])
                                 cid = parsed.get("condition_id", "")
                                 token_id = None
-
-                                if clob_toks and len(clob_toks) >= 2:
-                                    # clob_tokens[0] = YES/UP, clob_tokens[1] = NO/DOWN
-                                    token_id = clob_toks[0] if poly_side == "UP" else clob_toks[1]
-                                elif cid:
-                                    token_id = _get_poly_token_id(cid, poly_side)
-
-                                if token_id:
-                                    try:
-                                        print("{} ATTEMPTING: {} {} ${:.2f} @{:.2f} token={}...".format(
-                                            bot_label, poly_side, asset, poly_stake, share_price, str(token_id)[:20]))
-                                        _execute_poly_trade_async(
-                                            cid, token_id, poly_side, poly_stake, share_price,
-                                            live_state, bot_label, asset, effective_odds, parsed["title"])
-                                    except Exception as pe:
-                                        print("{} trade error: {}".format(bot_label, pe))
-                                else:
-                                    print("{} SKIP: no token_id for {} (clob_toks={}, cid={})".format(
-                                        bot_label, asset, len(clob_toks) if clob_toks else 0, cid[:20] if cid else "none"))
-
-                    # ─── POLYMARKET LIVE TRADING P3.3 ───
-                    # P3.3 on 15M markets ONLY, autoscale from $2.50
-                    if strat == "p33" and tf == "15M":
-                        if _poly_has_creds() and _poly_live_p33["enabled"] and not _is_volatile_window():
-                            poly_stake = _calc_poly_autoscale_stake(_poly_live_p33)
-                            if poly_stake > 0:
-                                live_state = _poly_live_p33
-                                bot_label = "POLY-P3.3"
-                                clob_toks = parsed.get("clob_tokens", [])
-                                cid = parsed.get("condition_id", "")
-                                token_id = None
-
                                 if clob_toks and len(clob_toks) >= 2:
                                     token_id = clob_toks[0] if poly_side == "UP" else clob_toks[1]
                                 elif cid:
                                     token_id = _get_poly_token_id(cid, poly_side)
-
-                                if token_id:
+                                
+                                if token_id and share_price <= _pa_max_fill:
+                                    # Place GTC maker order
                                     try:
-                                        print("{} ATTEMPTING: {} {} ${:.2f} @{:.2f} token={}...".format(
-                                            bot_label, poly_side, asset, poly_stake, share_price, str(token_id)[:20]))
-                                        _execute_poly_trade_async(
-                                            cid, token_id, poly_side, poly_stake, share_price,
-                                            live_state, bot_label, asset, effective_odds, parsed["title"])
-                                    except Exception as pe:
-                                        print("{} trade error: {}".format(bot_label, pe))
-                                else:
-                                    print("{} SKIP: no token_id for {} (clob_toks={}, cid={})".format(
-                                        bot_label, asset, len(clob_toks) if clob_toks else 0, cid[:20] if cid else "none"))
-
-                    # ─── POLYMARKET LIVE TRADING P2.1 (Bot 2) ───
-                    # P2.1 on 15M markets ONLY — 78% win rate on Limitless 15M
-                    if strat == "p21" and tf == "15M":
-                        if _poly_has_creds() and _poly_live_p21["enabled"] and not _is_volatile_window():
-                            poly_stake = _calc_poly_autoscale_stake(_poly_live_p21)
-                            if poly_stake > 0:
-                                live_state = _poly_live_p21
-                                bot_label = "POLY-P2.1"
-                                clob_toks = parsed.get("clob_tokens", [])
-                                cid = parsed.get("condition_id", "")
-                                token_id = None
-
-                                if clob_toks and len(clob_toks) >= 2:
-                                    token_id = clob_toks[0] if poly_side == "UP" else clob_toks[1]
-                                elif cid:
-                                    token_id = _get_poly_token_id(cid, poly_side)
-
-                                if token_id:
-                                    try:
-                                        print("{} ATTEMPTING: {} {} ${:.2f} @{:.2f} token={}...".format(
-                                            bot_label, poly_side, asset, poly_stake, share_price, str(token_id)[:20]))
-                                        _execute_poly_trade_async(
-                                            cid, token_id, poly_side, poly_stake, share_price,
-                                            live_state, bot_label, asset, effective_odds, parsed["title"])
-                                    except Exception as pe:
-                                        print("{} trade error: {}".format(bot_label, pe))
-                                else:
-                                    print("{} SKIP: no token_id for {} (clob_toks={}, cid={})".format(
-                                        bot_label, asset, len(clob_toks) if clob_toks else 0, cid[:20] if cid else "none"))
+                                        client = _get_poly_clob_client()
+                                        if client:
+                                            from py_clob_client.order_builder.constants import BUY
+                                            from py_clob_client.clob_types import OrderArgs, OrderType
+                                            
+                                            _pa_shares = max(5.0, round(_pa_stake / share_price, 2))
+                                            order_args = OrderArgs(
+                                                token_id=str(token_id),
+                                                price=round(share_price, 2),
+                                                size=_pa_shares,
+                                                side=BUY,
+                                            )
+                                            signed = client.create_order(order_args)
+                                            resp = client.post_order(signed, OrderType.GTC)
+                                            
+                                            _pa_oid = None
+                                            _pa_filled = False
+                                            if resp:
+                                                _pa_oid = resp.get("orderID") or resp.get("order_id")
+                                                _pa_status = (resp.get("status") or "").upper()
+                                                if _pa_status in ("MATCHED", "FILLED"):
+                                                    _pa_filled = True
+                                            
+                                            # Deduct from pool
+                                            _poly_alpha_state["balance"] = round(_poly_alpha_state["balance"] - _pa_stake, 2)
+                                            _poly_alpha_state["trades_today"] += 1
+                                            _poly_alpha_traded_markets.add(_pa_mkey)
+                                            
+                                            # Save to DB
+                                            try:
+                                                _pac = get_db()
+                                                _pac.run("""INSERT INTO poly_alpha_trades
+                                                    (market_id, title, asset, timeframe, bet_side, tier,
+                                                     stake, fill_price, pool_after, order_id, token_id,
+                                                     condition_id, slug, filled, status, fired_at)
+                                                    VALUES (:mid, :ttl, :ast, :tf, :bs, :tier,
+                                                            :stake, :fill, :pool, :oid, :tid,
+                                                            :cid, :slg, :filled, 'Pending', :now)""",
+                                                    mid=_pa_mkey, ttl=parsed["title"], ast=asset,
+                                                    tf=tf, bs=poly_side, tier=_pa_tier_name,
+                                                    stake=_pa_stake, fill=round(share_price, 4),
+                                                    pool=_poly_alpha_state["balance"],
+                                                    oid=_pa_oid, tid=str(token_id)[:50],
+                                                    cid=cid, slg=parsed.get("slug", ""),
+                                                    filled=_pa_filled,
+                                                    now=datetime.now(timezone.utc).isoformat())
+                                                _pac.close()
+                                            except Exception as _dbe:
+                                                print("POLY ALPHA DB error: {}".format(_dbe))
+                                            
+                                            _pa_fill_label = "FILLED" if _pa_filled else "MAKER"
+                                            print("POLY ALPHA {}: {} {} {} ${:.2f} @{:.0f}% [{}] | pool=${:.2f}".format(
+                                                _pa_tier_name, poly_side, asset, tf,
+                                                _pa_stake, share_price*100, _pa_fill_label,
+                                                _poly_alpha_state["balance"]))
+                                            send_telegram("⚡ <b>POLY ALPHA {}</b>\n{} {} {} ${:.2f} @{:.0f}%\n{}\nPool: ${:.2f}".format(
+                                                _pa_tier_name, poly_side, asset, tf,
+                                                _pa_stake, share_price*100,
+                                                parsed["title"][:35], _poly_alpha_state["balance"]))
+                                    except Exception as _pae:
+                                        print("POLY ALPHA trade error: {}".format(_pae))
         if inserts:
             try:
                 conn_batch = get_db()
@@ -15196,6 +15293,166 @@ def _resolve_poly_trades():
         return 0
 
 
+def _resolve_poly_alpha_trades():
+    """Resolve Polymarket Alpha trades using Gamma API + CLOB order status."""
+    import requests as req
+    try:
+        conn = get_db()
+        rows = conn.run("SELECT * FROM poly_alpha_trades WHERE status='Pending'")
+        cols = [c['name'] for c in conn.columns]
+        items = [dict(zip(cols, r)) for r in rows]
+        conn.close()
+        if not items:
+            return 0
+
+        now = datetime.now(timezone.utc)
+        resolved = 0
+        client = _get_poly_clob_client()
+
+        for p in items:
+            try:
+                if not p.get("fired_at"):
+                    continue
+                fired = datetime.fromisoformat(p["fired_at"])
+                if fired.tzinfo is None:
+                    fired = fired.replace(tzinfo=timezone.utc)
+                tf = p.get("timeframe", "15M")
+                expiry_hours = 0.25 if tf == "15M" else (1.0/12)  # 5 min
+                expiry = fired + timedelta(hours=expiry_hours)
+                if now < expiry + timedelta(minutes=2):
+                    continue
+
+                stake = float(p.get("stake") or 2.50)
+                order_id = p.get("order_id")
+                order_filled = p.get("filled", False)
+                market_expired = now > expiry
+
+                # ── CHECK FILL STATUS via CLOB API ──
+                if not order_filled and order_id and client:
+                    try:
+                        order_data = client.get_order(order_id)
+                        if order_data:
+                            o_status = (order_data.get("status") or "").upper()
+                            if o_status in ("MATCHED", "FILLED"):
+                                order_filled = True
+                                try:
+                                    _fc = get_db()
+                                    _fc.run("UPDATE poly_alpha_trades SET filled=TRUE WHERE id=:i", i=p["id"])
+                                    _fc.close()
+                                except:
+                                    pass
+                            elif o_status in ("CANCELED", "CANCELLED", "EXPIRED") and market_expired:
+                                # Order was cancelled, return stake
+                                _poly_alpha_state["balance"] = round(_poly_alpha_state["balance"] + stake, 2)
+                                conn2 = get_db()
+                                conn2.run("UPDATE poly_alpha_trades SET status=:s, outcome='UNFILLED', resolved_at=:r, payout=0 WHERE id=:i",
+                                    s="⏭ Unfilled", r=now.isoformat(), i=p["id"])
+                                conn2.close()
+                                resolved += 1
+                                print("POLY ALPHA #{} UNFILLED (cancelled): ${:.2f} returned | pool=${:.2f}".format(
+                                    p["id"], stake, _poly_alpha_state["balance"]))
+                                continue
+                    except:
+                        pass
+
+                if not order_filled and market_expired:
+                    # Market expired, order never filled — return stake
+                    _poly_alpha_state["balance"] = round(_poly_alpha_state["balance"] + stake, 2)
+                    conn2 = get_db()
+                    conn2.run("UPDATE poly_alpha_trades SET status=:s, outcome='UNFILLED', resolved_at=:r, payout=0 WHERE id=:i",
+                        s="⏭ Unfilled", r=now.isoformat(), i=p["id"])
+                    conn2.close()
+                    resolved += 1
+                    print("POLY ALPHA #{} UNFILLED: ${:.2f} returned | pool=${:.2f}".format(
+                        p["id"], stake, _poly_alpha_state["balance"]))
+                    continue
+
+                if not order_filled:
+                    continue  # Not filled yet, market still active
+
+                # ── RESOLVE OUTCOME via Gamma API ──
+                won = None
+                slug = p.get("slug")
+                cid = p.get("condition_id")
+                if slug or cid:
+                    try:
+                        lookups = []
+                        if slug:
+                            lookups.append("{}/markets/slug/{}".format(POLY_GAMMA_API, slug))
+                        if cid:
+                            lookups.append("{}/markets/{}".format(POLY_GAMMA_API, cid))
+                        for url in lookups:
+                            if won is not None:
+                                break
+                            mr = req.get(url, timeout=10)
+                            if mr.status_code == 200:
+                                mdata = mr.json()
+                                op = mdata.get("outcomePrices") or mdata.get("outcome_prices")
+                                if op:
+                                    if isinstance(op, str):
+                                        try:
+                                            op = json.loads(op)
+                                        except:
+                                            op = None
+                                    if isinstance(op, list) and len(op) >= 2:
+                                        p0, p1 = float(op[0]), float(op[1])
+                                        bet_side = p.get("bet_side") or "UP"
+                                        if p0 >= 0.95:
+                                            won = (bet_side == "UP")
+                                        elif p1 >= 0.95:
+                                            won = (bet_side == "DOWN")
+                    except:
+                        pass
+
+                if won is None:
+                    if now > expiry + timedelta(hours=1):
+                        won = False  # Force-loss after 1h if Gamma never resolves
+                    else:
+                        continue  # Wait for Gamma
+
+                outcome = "WIN" if won else "LOSS"
+                fill = float(p.get("fill_price") or 0.50)
+                payout = round(stake / fill, 4) if won else 0
+                status = "✅ Won" if won else "❌ Lost"
+
+                conn2 = get_db()
+                conn2.run("UPDATE poly_alpha_trades SET status=:s, outcome=:o, resolved_at=:r, payout=:p, filled=TRUE WHERE id=:i",
+                    s=status, o=outcome, r=now.isoformat(), p=payout, i=p["id"])
+                conn2.close()
+                resolved += 1
+
+                if won:
+                    _poly_alpha_state["balance"] = round(_poly_alpha_state["balance"] + payout, 2)
+                    _poly_alpha_state["wins_today"] += 1
+                    _poly_alpha_state["profit_today"] = round(_poly_alpha_state["profit_today"] + (payout - stake), 2)
+                else:
+                    _poly_alpha_state["losses_today"] += 1
+                    _poly_alpha_state["profit_today"] = round(_poly_alpha_state["profit_today"] - stake, 2)
+
+                if _poly_alpha_state["balance"] > _poly_alpha_state["peak_balance"]:
+                    _poly_alpha_state["peak_balance"] = _poly_alpha_state["balance"]
+                if _poly_alpha_state["balance"] <= _poly_alpha_state["floor_balance"]:
+                    _poly_alpha_state["enabled"] = False
+                    send_telegram("🚨 <b>POLY ALPHA STOPPED — Floor reached</b>\nPool: ${:.2f}".format(
+                        _poly_alpha_state["balance"]))
+
+                _pnl = "+${:.2f}".format(payout - stake) if won else "-${:.2f}".format(stake)
+                print("POLY ALPHA #{} {} {}: ${:.2f} → {} | pool=${:.2f}".format(
+                    p["id"], p.get("tier", "?"), outcome, stake, _pnl, _poly_alpha_state["balance"]))
+                send_telegram("{} <b>POLY {} {}</b>\n{} {} {} ${:.2f}\n{}\nPool: ${:.2f}".format(
+                    "✅" if won else "❌", p.get("tier", "?"), outcome, _pnl,
+                    p.get("asset", "?"), p.get("timeframe", "?"), stake,
+                    p.get("title", "")[:35], _poly_alpha_state["balance"]))
+
+            except Exception as e:
+                print("Poly alpha resolve error #{}: {}".format(p.get("id"), e))
+                continue
+        return resolved
+    except Exception as e:
+        print("Poly alpha resolve error: {}".format(e))
+        return 0
+
+
 def _poly_scan_loop():
     """Background thread for Polymarket scanning and resolving."""
     time.sleep(60)  # Wait for init
@@ -15208,6 +15465,12 @@ def _poly_scan_loop():
             _resolve_poly_trades()
         except Exception as e:
             print("Poly resolve loop error: {}".format(e))
+        try:
+            _pa_resolved = _resolve_poly_alpha_trades()
+            if _pa_resolved:
+                print("Poly Alpha resolved: {}".format(_pa_resolved))
+        except Exception as e:
+            print("Poly Alpha resolve error: {}".format(e))
         # BUG 4 FIX: 60 seconds for 5M market coverage
         time.sleep(60)
 
@@ -15440,6 +15703,135 @@ def _build_poly_page(section, page_title, subtitle, description):
     )
 
     return page_html
+
+
+@app.route("/app/poly-alpha")
+def poly_alpha_page():
+    """Polymarket Alpha dashboard — Strategy P tracking."""
+    try:
+        conn = get_db()
+        rows = conn.run("SELECT * FROM poly_alpha_trades ORDER BY id DESC LIMIT 100")
+        cols = [c['name'] for c in conn.columns]
+        trades = [dict(zip(cols, r)) for r in rows]
+        conn.close()
+    except:
+        trades = []
+
+    total = len(trades)
+    wins = sum(1 for t in trades if t.get("outcome") == "WIN")
+    losses = sum(1 for t in trades if t.get("outcome") == "LOSS")
+    unfilled = sum(1 for t in trades if t.get("outcome") == "UNFILLED")
+    pending = sum(1 for t in trades if t.get("status") == "Pending")
+    resolved = wins + losses
+    wr = round(wins / resolved * 100, 1) if resolved > 0 else 0
+    total_pnl = round(sum(float(t.get("payout") or 0) - float(t.get("stake") or 0)
+                          for t in trades if t.get("outcome") == "WIN") -
+                      sum(float(t.get("stake") or 0) for t in trades if t.get("outcome") == "LOSS"), 2)
+
+    pool_color = "#1a7046" if _poly_alpha_state["balance"] >= _poly_alpha_state["starting_balance"] else "#b4322e"
+    pnl_color = "#1a7046" if total_pnl >= 0 else "#b4322e"
+
+    # By tier
+    tier_stats = {}
+    for t in trades:
+        if t.get("outcome") in ("WIN", "LOSS"):
+            tier = t.get("tier", "?")
+            if tier not in tier_stats:
+                tier_stats[tier] = {"w": 0, "l": 0, "pnl": 0}
+            if t["outcome"] == "WIN":
+                tier_stats[tier]["w"] += 1
+                tier_stats[tier]["pnl"] += float(t.get("payout") or 0) - float(t.get("stake") or 0)
+            else:
+                tier_stats[tier]["l"] += 1
+                tier_stats[tier]["pnl"] -= float(t.get("stake") or 0)
+
+    tier_html = ""
+    for tier in sorted(tier_stats.keys()):
+        s = tier_stats[tier]
+        tw = s["w"] + s["l"]
+        twr = round(s["w"]/tw*100, 1) if tw > 0 else 0
+        pc = "#1a7046" if s["pnl"] >= 0 else "#b4322e"
+        tier_html += "<tr><td><b>{}</b></td><td>{}W/{}L</td><td>{:.1f}%</td><td style='color:{}'>${:.2f}</td></tr>".format(
+            tier, s["w"], s["l"], twr, pc, s["pnl"])
+
+    # By asset
+    asset_stats = {}
+    for t in trades:
+        if t.get("outcome") in ("WIN", "LOSS"):
+            asset = t.get("asset", "?")
+            if asset not in asset_stats:
+                asset_stats[asset] = {"w": 0, "l": 0, "pnl": 0}
+            if t["outcome"] == "WIN":
+                asset_stats[asset]["w"] += 1
+                asset_stats[asset]["pnl"] += float(t.get("payout") or 0) - float(t.get("stake") or 0)
+            else:
+                asset_stats[asset]["l"] += 1
+                asset_stats[asset]["pnl"] -= float(t.get("stake") or 0)
+
+    asset_html = ""
+    for asset in ["BTC", "ETH", "SOL", "XRP"]:
+        s = asset_stats.get(asset, {"w": 0, "l": 0, "pnl": 0})
+        tw = s["w"] + s["l"]
+        twr = round(s["w"]/tw*100, 1) if tw > 0 else 0
+        pc = "#1a7046" if s["pnl"] >= 0 else "#b4322e"
+        asset_html += "<tr><td><b>{}</b></td><td>{}W/{}L</td><td>{:.1f}%</td><td style='color:{}'>${:.2f}</td></tr>".format(
+            asset, s["w"], s["l"], twr, pc, s["pnl"])
+
+    # Trade rows
+    trade_rows = ""
+    for t in trades:
+        status = t.get("status", "Pending")
+        emoji = "✅" if "Won" in status else "❌" if "Lost" in status else "⏭" if "Unfilled" in status else "⏳"
+        if t.get("outcome") == "WIN":
+            pnl_str = "<span style='color:#1a7046'>+${:.2f}</span>".format(
+                float(t.get("payout") or 0) - float(t.get("stake") or 0))
+        elif t.get("outcome") == "LOSS":
+            pnl_str = "<span style='color:#b4322e'>-${:.2f}</span>".format(float(t.get("stake") or 0))
+        elif t.get("outcome") == "UNFILLED":
+            pnl_str = "<span style='color:#666'>returned</span>"
+        else:
+            pnl_str = "<span style='color:#8a6a2f'>pending</span>"
+        _fired_time = ""
+        if t.get("fired_at") and len(t["fired_at"]) >= 16:
+            _fired_time = t["fired_at"][11:16]
+        trade_rows += "<tr><td>{}</td><td>{}</td><td><b>{}</b></td><td>{}</td><td>{}</td><td>${:.2f}</td><td>{}</td><td>{}</td><td>{}</td><td>${:.2f}</td></tr>".format(
+            t.get("id", ""), emoji, t.get("tier", "?"), t.get("asset", "?"),
+            t.get("timeframe", "?"), float(t.get("stake") or 0), t.get("bet_side", "?"),
+            _fired_time, pnl_str, float(t.get("pool_after") or 0))
+
+    return """<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width">
+<title>Poly Alpha</title>
+<style>body{{font-family:-apple-system,sans-serif;max-width:900px;margin:0 auto;padding:16px;background:#fafafa}}
+h2{{margin:0 0 4px}}table{{width:100%;border-collapse:collapse;font-size:13px;margin:8px 0}}
+th{{background:#f0f0f0;padding:6px 4px;text-align:left;font-size:12px}}td{{padding:6px 4px;border-bottom:1px solid #eee}}
+.stats{{display:flex;flex-wrap:wrap;gap:8px;margin:12px 0}}.stat{{flex:1;min-width:100px;background:#fff;border:1px solid #ddd;border-radius:8px;padding:10px;text-align:center}}
+.stat-label{{font-size:11px;color:#666;text-transform:uppercase}}.stat-value{{font-size:20px;font-weight:700}}
+.tables{{display:flex;gap:16px;flex-wrap:wrap}}.tables>div{{flex:1;min-width:250px}}
+</style></head><body>
+<h2>⚡ POLY ALPHA — Strategy P</h2>
+<p style="color:#666;font-size:13px">P2.3 engine | 5M + 15M | GTC Maker orders | Gamma API resolution | <a href="/app">Back</a></p>
+<div class="stats">
+<div class="stat"><div class="stat-label">Pool Balance</div><div class="stat-value" style="color:{}">${:.2f}</div></div>
+<div class="stat"><div class="stat-label">Win Rate</div><div class="stat-value">{:.1f}%</div></div>
+<div class="stat"><div class="stat-label">Trades</div><div class="stat-value">{} <span style="font-size:12px">({} pending)</span></div></div>
+<div class="stat"><div class="stat-label">P&L</div><div class="stat-value" style="color:{}">${:.2f}</div></div>
+<div class="stat"><div class="stat-label">Peak</div><div class="stat-value">${:.2f}</div></div>
+<div class="stat"><div class="stat-label">Today</div><div class="stat-value">{}T {}W {}L</div></div>
+</div>
+<div class="tables"><div>
+<h3>By tier</h3>
+<table><tr><th>Tier</th><th>Record</th><th>WR</th><th>P&L</th></tr>{}</table>
+</div><div>
+<h3>By asset</h3>
+<table><tr><th>Asset</th><th>Record</th><th>WR</th><th>P&L</th></tr>{}</table>
+</div></div>
+<h3 style="margin:16px 0 8px">Trade history</h3>
+<table><tr><th>#</th><th></th><th>Tier</th><th>Asset</th><th>TF</th><th>Stake</th><th>Side</th><th>Time</th><th>P&L</th><th>Pool</th></tr>{}</table>
+</body></html>""".format(
+        pool_color, _poly_alpha_state["balance"], wr, total, pending,
+        pnl_color, total_pnl, _poly_alpha_state["peak_balance"],
+        _poly_alpha_state["trades_today"], _poly_alpha_state["wins_today"],
+        _poly_alpha_state["losses_today"], tier_html, asset_html, trade_rows)
 
 
 @app.route("/app/poly/btc5m")
