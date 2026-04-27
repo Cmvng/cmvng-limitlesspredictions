@@ -365,12 +365,12 @@ def _poly_alpha_get_tier(asset, timeframe):
     Returns (tier, base_stake, max_fill) or None if not traded."""
     if timeframe == "15M":
         if asset in ("XRP", "ETH"):
-            return ("PA1", 3.00, 0.52)   # 67.7% / 66.2% WR
+            return ("PA1", 3.00, 0.58)   # 67.7% / 66.2% WR, breakeven 58%
         elif asset in ("BTC", "SOL"):
-            return ("PA2", 2.50, 0.52)   # 64.1% / 63.2% WR
+            return ("PA2", 2.50, 0.58)   # 64.1% / 63.2% WR, breakeven 58%
     elif timeframe == "5M":
         if asset == "BTC":
-            return ("PB1", 2.50, 0.52)   # 61.8% WR
+            return ("PB1", 2.50, 0.52)   # 61.8% WR, breakeven 52% (odds near 50/50)
     return None
 
 def _poly_alpha_calc_stake(base_stake, pool_balance):
@@ -15031,6 +15031,11 @@ def run_poly_scan():
                                                 parsed["title"][:35], _poly_alpha_state["balance"]))
                                     except Exception as _pae:
                                         print("POLY ALPHA trade error: {}".format(_pae))
+                                elif token_id and share_price > _pa_max_fill:
+                                    print("POLY ALPHA SKIP: {} {} @{:.0f}% > max {:.0f}% | ${:.2f}".format(
+                                        asset, tf, share_price*100, _pa_max_fill*100, _pa_stake))
+                                elif not token_id:
+                                    print("POLY ALPHA SKIP: {} {} — no token_id".format(asset, tf))
         if inserts:
             try:
                 conn_batch = get_db()
