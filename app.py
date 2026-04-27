@@ -14518,6 +14518,8 @@ def _poly_parse_market(market, timeframe_hint=None):
             "hours_left": mins_left / 60,
             "yes_odds": up_odds,
             "is_short": timeframe in ("5M", "15M", "1H"),
+            "is_15m_market": timeframe in ("5M", "15M"),
+            "is_hourly_market": timeframe == "1H",
             "is_daily": False,
             "slug": slug,
             "condition_id": condition_id,
