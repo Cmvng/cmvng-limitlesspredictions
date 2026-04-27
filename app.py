@@ -15071,7 +15071,8 @@ def run_poly_scan():
                         if _pa2_mkey not in _poly_alpha2_traded_markets and _poly_alpha2_state["enabled"] and _poly_has_creds():
                             _poly_alpha2_pending[_pa2_mkey] = {
                                 "poly_side": poly_side, "share_price": share_price,
-                                "parsed": parsed, "asset": asset, "tf": tf,
+                                "parsed": dict(parsed),  # COPY to prevent mutation
+                                "asset": asset, "tf": tf,
                                 "p23_agrees": False,
                             }
                     
@@ -15303,26 +15304,26 @@ def run_poly_scan():
         for _pa2_mkey, _pa2_sig in list(_poly_alpha2_pending.items()):
             if _pa2_mkey in _poly_alpha2_traded_markets or not _poly_alpha2_state["enabled"]:
                 continue
-            _pa2_tier = _poly_alpha2_get_tier(_pa2_sig["asset"], _pa2_sig["tf"], p23_agrees=False)
-            if not _pa2_tier:
-                continue
-            _pa2_name, _pa2_base, _pa2_max = _pa2_tier
-            _pa2_stake = _poly_alpha2_calc_stake(_pa2_base, _poly_alpha2_state["balance"])
-            _pa2_share = _pa2_sig["share_price"]
-            _pa2_side = _pa2_sig["poly_side"]
-            _pa2_p = _pa2_sig["parsed"]
-            if _pa2_stake <= 0 or _pa2_stake > _poly_alpha2_state["balance"] or _pa2_share > _pa2_max:
-                continue
-            clob_toks = _pa2_p.get("clob_tokens", [])
-            cid = _pa2_p.get("condition_id", "")
-            tid = None
-            if clob_toks and len(clob_toks) >= 2:
-                tid = clob_toks[0] if _pa2_side == "UP" else clob_toks[1]
-            elif cid:
-                tid = _get_poly_token_id(cid, _pa2_side)
-            if not tid:
-                continue
             try:
+                _pa2_tier = _poly_alpha2_get_tier(_pa2_sig["asset"], _pa2_sig["tf"], p23_agrees=False)
+                if not _pa2_tier:
+                    continue
+                _pa2_name, _pa2_base, _pa2_max = _pa2_tier
+                _pa2_stake = _poly_alpha2_calc_stake(_pa2_base, _poly_alpha2_state["balance"])
+                _pa2_share = _pa2_sig["share_price"]
+                _pa2_side = _pa2_sig["poly_side"]
+                _pa2_p = _pa2_sig["parsed"]
+                if _pa2_stake <= 0 or _pa2_stake > _poly_alpha2_state["balance"] or _pa2_share > _pa2_max:
+                    continue
+                clob_toks = _pa2_p.get("clob_tokens", [])
+                cid = _pa2_p.get("condition_id", "")
+                tid = None
+                if clob_toks and len(clob_toks) >= 2:
+                    tid = clob_toks[0] if _pa2_side == "UP" else clob_toks[1]
+                elif cid:
+                    tid = _get_poly_token_id(cid, _pa2_side)
+                if not tid:
+                    continue
                 client = _get_poly_client()
                 if client:
                     from py_clob_client.order_builder.constants import BUY
@@ -15358,8 +15359,8 @@ def run_poly_scan():
                     send_telegram("⚡ <b>POLY A2 {}</b>\n{} {} {} ${:.2f} @{:.0f}%\nP2.1 only\nPool: ${:.2f}".format(
                         _pa2_name, _pa2_side, _pa2_sig["asset"], _pa2_sig["tf"],
                         _pa2_stake, _pa2_share*100, _poly_alpha2_state["balance"]))
-            except Exception as _e2:
-                print("POLY A2 P2.1-only error: {}".format(_e2))
+            except Exception as _e2f:
+                print("POLY A2 fallback error: {}".format(_e2f))
         _poly_alpha2_pending.clear()
         if inserts:
             try:
