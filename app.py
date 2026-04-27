@@ -14970,7 +14970,7 @@ def run_poly_scan():
                                 if token_id and share_price <= _pa_max_fill:
                                     # Place GTC maker order
                                     try:
-                                        client = _get_poly_clob_client()
+                                        client = _get_poly_client()
                                         if client:
                                             from py_clob_client.order_builder.constants import BUY
                                             from py_clob_client.clob_types import OrderArgs, OrderType
@@ -15314,7 +15314,7 @@ def _resolve_poly_alpha_trades():
 
         now = datetime.now(timezone.utc)
         resolved = 0
-        client = _get_poly_clob_client()
+        client = _get_poly_client()
 
         for p in items:
             try:
