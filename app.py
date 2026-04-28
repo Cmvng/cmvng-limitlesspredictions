@@ -14672,20 +14672,35 @@ def _poly_fetch_markets():
         for tf_slug, tf_sec in [("5m", 300), ("15m", 900)]:
             ws = (current_ts // tf_sec) * tf_sec
             slug = "{}-updown-{}-{}".format(asset_slug, tf_slug, ws)
-            try:
-                r = req.get("{}/events".format(POLY_GAMMA_API), params={"slug": slug}, timeout=8)
-                if r.status_code == 200:
-                    data = r.json()
-                    em = data[0].get("markets", []) if isinstance(data, list) and data and isinstance(data[0], dict) else data.get("markets", []) if isinstance(data, dict) else []
-                    for market in em:
-                        parsed = _poly_parse_market(market)
-                        if parsed:
-                            markets.append(parsed)
-                elif r.status_code == 429:
-                    print("Poly slug: rate limited")
+            
+            # Try path-based endpoint first: /events/slug/{slug}
+            for url in ["{}/events/slug/{}".format(POLY_GAMMA_API, slug),
+                        "{}/events".format(POLY_GAMMA_API)]:
+                try:
+                    params = {"slug": slug} if "?" not in url and "/slug/" not in url else {}
+                    r = req.get(url, params=params, timeout=8)
+                    if r.status_code == 200:
+                        data = r.json()
+                        em = []
+                        if isinstance(data, list) and data:
+                            em = data[0].get("markets", []) if isinstance(data[0], dict) else []
+                        elif isinstance(data, dict):
+                            em = data.get("markets", [])
+                        if em:
+                            print("POLY FOUND: {} → {} markets via {}".format(slug, len(em), "path" if "/slug/" in url else "query"))
+                        for market in em:
+                            parsed = _poly_parse_market(market)
+                            if parsed:
+                                markets.append(parsed)
+                        if markets:
+                            break
+                    elif r.status_code == 429:
+                        print("Poly slug: rate limited")
+                        break
+                except:
+                    pass
+                if markets:
                     break
-            except:
-                pass
         if markets:
             break
     if markets:
