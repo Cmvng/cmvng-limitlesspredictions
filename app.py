@@ -14687,8 +14687,41 @@ def _poly_fetch_markets():
                             parsed = _poly_parse_market(market)
                             if parsed:
                                 markets.append(parsed)
+                    elif tf_label in ("5M", "15M") and asset_slug == "btc":
+                        print("POLY SLUG DEBUG: {} → status {}".format(slug, r.status_code))
                 except Exception as e:
                     pass
+
+                # Try alternative slug formats (V2 may have changed)
+                if not any(m.get("slug") == slug for m in markets):
+                    alt_slugs = [
+                        "{}-updown-{}-{}".format(asset_slug, tf_slug, start_ts),
+                        "{}-up-or-down-{}-{}".format(asset_slug, tf_slug, start_ts),
+                        "{}-{}-price".format(asset_slug, "15min" if tf_label == "15M" else "5min" if tf_label == "5M" else "hourly"),
+                    ]
+                    for alt_slug in alt_slugs:
+                        if any(m.get("slug") == alt_slug for m in markets):
+                            continue
+                        try:
+                            r = req.get("{}/events".format(POLY_GAMMA_API),
+                                        params={"slug": alt_slug}, timeout=5)
+                            if r.status_code == 200:
+                                data = r.json()
+                                em = []
+                                if isinstance(data, list) and data:
+                                    em = data[0].get("markets", []) if isinstance(data[0], dict) else []
+                                elif isinstance(data, dict):
+                                    em = data.get("markets", [])
+                                for market in em:
+                                    parsed = _poly_parse_market(market)
+                                    if parsed:
+                                        markets.append(parsed)
+                                        if tf_label in ("5M", "15M"):
+                                            print("POLY V2 FOUND via alt slug: {} → {} markets".format(alt_slug, len(em)))
+                                if em:
+                                    break
+                        except:
+                            pass
 
                 # Also try /markets endpoint as fallback
                 if not any(m.get("slug") == slug for m in markets):
