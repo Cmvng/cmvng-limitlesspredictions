@@ -14662,29 +14662,23 @@ def _poly_fetch_markets():
                         if em:
                             print("POLY FOUND: {} → {} markets via {}".format(slug, len(em), "path" if "/slug/" in url else "query"))
                         for market in em:
-                            # Debug: show what we're trying to parse
                             mq = (market.get("question") or market.get("title") or "NO_Q")[:50]
                             ms = (market.get("slug") or "NO_SLUG")[:40]
                             me = market.get("endDate") or market.get("end_date_iso") or "NO_END"
-                            print("POLY PARSING: q='{}' slug='{}' end='{}'".format(mq, ms, str(me)[:25]))
                             parsed = _poly_parse_market(market)
                             if parsed:
                                 markets.append(parsed)
-                            else:
-                                print("POLY PARSE FAILED for slug={}".format(ms))
-                        if markets:
-                            break
+                        # Don't break — continue to try other assets
+                        if em:
+                            break  # Only break inner URL loop (path vs query), not asset loop
                     elif r.status_code == 429:
                         print("Poly slug: rate limited")
                         break
                 except:
                     pass
-                if markets:
-                    break
-        if markets:
-            break
+    
     if markets:
-        print("Poly slug: {} markets".format(len(markets)))
+        print("Poly slug: {} markets across {} assets".format(len(markets), len(set(m.get("asset","") for m in markets))))
         return markets
 
     # STRATEGY 3: Broad scan (1 call)
@@ -15010,8 +15004,27 @@ def run_poly_scan():
                                             if client:
                                                 from py_clob_client.order_builder.constants import BUY
                                                 from py_clob_client.clob_types import OrderArgs, OrderType
-                                                _pa2_shares = max(5.0, round(_pa2_stake / _pa2_share, 2))
-                                                oa = OrderArgs(token_id=str(tid), price=round(_pa2_share, 2), size=_pa2_shares, side=BUY)
+                                                
+                                                # Get orderbook for better pricing
+                                                _pa2_best_price = _pa2_share
+                                                try:
+                                                    book = client.get_order_book(str(tid))
+                                                    if book and book.get("asks"):
+                                                        best_ask = float(book["asks"][0]["price"])
+                                                        # Place 1-2 cents below best ask for priority fill
+                                                        _pa2_best_price = round(best_ask - 0.01, 2)
+                                                        # Don't go below 0.40 or above max fill
+                                                        _pa2_best_price = max(0.40, min(_pa2_best_price, _pa2_max))
+                                                    elif book and book.get("bids"):
+                                                        # No asks — place at best bid + 1 cent
+                                                        best_bid = float(book["bids"][0]["price"])
+                                                        _pa2_best_price = round(best_bid + 0.01, 2)
+                                                        _pa2_best_price = min(_pa2_best_price, _pa2_max)
+                                                except:
+                                                    pass  # Use share_price as fallback
+                                                
+                                                _pa2_shares = max(5.0, round(_pa2_stake / _pa2_best_price, 2))
+                                                oa = OrderArgs(token_id=str(tid), price=round(_pa2_best_price, 2), size=_pa2_shares, side=BUY)
                                                 signed = client.create_order(oa)
                                                 resp = client.post_order(signed, OrderType.GTC)
                                                 _pa2_oid = resp.get("orderID") or resp.get("order_id") if resp else None
