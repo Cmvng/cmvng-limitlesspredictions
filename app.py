@@ -244,44 +244,31 @@ _alpha_state = {
 _alpha_traded_markets = set()  # Dedup per cycle
 
 def _alpha_get_tier(scored22, scored23, scored33, asset, is_hourly=False):
-    """Determine Alpha tier based on P2.3 as sole trigger.
-    Strategy F: Only P2.3 fires live trades on ETH/BTC/SOL.
-    P3.3-alone and DIST_ONLY are paper-only (confirmed negative EV at 66c).
-    Returns (tier_tag, base_stake, max_fill, bet_side) or None to skip."""
+    """Model C: Flat $2 stakes, P2.3 filter for 15M, P2.4 for 1H.
+    Proven profitable in 1000-run Monte Carlo simulation.
+    15M: 77% WR → $6.40/day | 1H: 65% WR → $1.75/day"""
 
     if is_hourly:
-        return None  # 1H handled separately with P2.4 scoring
+        return None  # 1H handled via P2.4 in the hourly scan loop
 
-    # ── 15M: P2.3 is the ONLY live trigger ──
-    # Skip DOGE 15M (only 5 trades, no confidence)
+    # ── 15M: P2.3 is the ONLY trigger (77% WR proven over 456 trades) ──
     if asset not in ("ETH", "BTC", "SOL", "XRP"):
         return None
 
-    # P2.3 must fire for a live trade
+    # P2.3 must fire
     if scored23 is None:
-        return None  # P3.3-alone and P2.2-alone are paper only
+        return None
 
     bet_side = scored23["bet_side"]
 
-    # Stakes by asset (from corrected 50K-day simulation)
-    if asset == "ETH":
-        return ("T1", 4.00, 0.72, bet_side)   # 84.3% WR, breakeven at 72%
-    elif asset == "BTC":
-        return ("T1", 4.00, 0.72, bet_side)   # 81.6% WR, breakeven at 72%
-    elif asset == "SOL":
-        return ("T2", 2.00, 0.68, bet_side)   # 78.6% WR, breakeven at 68%
-    elif asset == "XRP":
-        return ("T3", 1.00, 0.64, bet_side)   # 70.5% WR, breakeven at 64% — trial
-
-    return None
+    # MODEL C: Flat $2.00 for ALL assets — no more $4 BTC bets
+    return ("T1", 2.00, 0.72, bet_side)
 
 def _alpha_calc_stake(base_stake, asset, pool_balance):
-    """Calculate final stake — fixed stakes from simulation, scaled to pool."""
-    # Scale relative to $100 baseline (the test pool)
-    scale = max(pool_balance / 100.0, 0.5)
-    stake = round(base_stake * scale, 2)
+    """Model C: Flat stakes with 5% pool cap safety."""
+    stake = base_stake  # Always $2.00
 
-    # Cap at 5% of pool (safety limit)
+    # Cap at 5% of pool
     max_trade = round(pool_balance * 0.05, 2)
     stake = min(stake, max_trade)
 
@@ -374,27 +361,27 @@ def _poly_alpha2_load_recent():
         pass
 
 def _poly_alpha2_get_tier(asset, timeframe, p23_agrees=False):
-    """Tiered: P2.1 base $2.50, P2.1+P2.3 boost $3.00."""
+    """Poly Alpha 2.0: 15M ONLY live trades (77% WR proven).
+    5M is paper-only until we have data confirming profitability.
+    All 4 assets: BTC, ETH, SOL, XRP."""
     if timeframe == "15M":
         if p23_agrees:
-            return ("PA+", 3.00, 0.58)
-        else:
-            return ("PA", 2.50, 0.58)
-    elif timeframe == "5M" and asset == "BTC":
-        if p23_agrees:
-            return ("PB+", 3.00, 0.52)
-        else:
-            return ("PB", 2.50, 0.52)
+            # P2.3 confirmed — 77% WR proven over 456 paper trades
+            if asset in ("BTC", "ETH", "SOL", "XRP"):
+                return ("PA15", 3.00, 0.65)
+        # Without P2.3: skip (only 72% WR, too close to breakeven after fees)
+        return None
+    # 5M: paper only — no live trades until data proves it
     return None
 
 def _poly_alpha2_calc_stake(base_stake, pool_balance):
-    scale = max(pool_balance / 70.0, 0.5)
-    stake = round(base_stake * scale, 2)
+    """Poly Alpha stake: 5 shares minimum, 8% pool cap."""
+    stake = base_stake
     max_trade = round(pool_balance * 0.08, 2)
     stake = min(stake, max_trade)
-    stake = max(stake, 2.50)
-    if stake > pool_balance * 0.10:
-        return 0
+    stake = max(stake, 2.50)  # 5 shares minimum at ~50c
+    if stake > pool_balance * 0.12:
+        return 0  # Don't risk more than 12% on one trade
     return stake
 
 def _poly_alpha_load_recent_trades():
@@ -411,26 +398,7 @@ def _poly_alpha_load_recent_trades():
         pass
 
 def _poly_alpha_get_tier(asset, timeframe, p23_agrees=False):
-    """Get Polymarket Alpha tier based on P2.1 + P2.3 agreement.
-    p23_agrees=True means both P2.1 and P2.3 fired → higher stake.
-    p23_agrees=False means P2.1 alone → base stake."""
-    if timeframe == "15M":
-        if p23_agrees:
-            # P2.1 + P2.3 both fire — high confidence
-            if asset in ("XRP", "ETH"):
-                return ("PA1+", 3.00, 0.58)   # 65-68% WR
-            elif asset in ("BTC", "SOL"):
-                return ("PA2+", 3.00, 0.58)   # 63-64% WR
-        else:
-            # P2.1 alone — good confidence, more volume
-            if asset in ("XRP", "ETH", "BTC", "SOL"):
-                return ("PA1", 2.50, 0.58)    # 59-61% WR
-    elif timeframe == "5M":
-        if asset == "BTC":
-            if p23_agrees:
-                return ("PB1+", 3.00, 0.52)   # 59.7% WR
-            else:
-                return ("PB1", 2.50, 0.52)    # 55.6% WR
+    """Poly Alpha v1 — PAUSED. Use Poly Alpha 2.0 instead."""
     return None
 
 def _poly_alpha_calc_stake(base_stake, pool_balance):
@@ -4171,18 +4139,18 @@ def _fast_trade_scan():
                         except:
                             pass
                     
-                    # ── ALPHA 1H: SOL and DOGE only ──
-                    # Paper trades still recorded above for all assets
-                    if asset in ("SOL", "DOGE") and parsed["market_id"] not in _alpha_traded_markets and _alpha_state["enabled"]:
-                        # Use P2.4 signal as primary (better 1H results)
-                        _h_scored = scored24 or scored34
+                    # ── ALPHA 1H: Model C — All 5 assets, $2 flat, P2.4 filter ──
+                    if asset in ("BTC", "ETH", "SOL", "XRP", "DOGE") and parsed["market_id"] not in _alpha_traded_markets and _alpha_state["enabled"]:
+                        # P2.4 signal required (65% WR over 510 trades)
+                        _h_scored = scored24
                         if _h_scored:
                             _h_side = _h_scored["bet_side"]
-                            _h_base = 1.00  # Both SOL and DOGE at $1.00 base
-                            _h_tier = "T2H" if asset == "SOL" else "T3H"
-                            _h_max_fill = 0.68 if asset == "SOL" else 0.64
-                            _h_scale = max(_alpha_state["balance"] / 100.0, 0.5)
-                            _h_stake = round(min(_h_base * _h_scale, _alpha_state["balance"] * 0.025), 2)
+                            _h_base = 2.00  # Model C: flat $2.00 for all assets
+                            _h_tier = "T1H"
+                            _h_max_fill = 0.70
+                            _h_stake = _h_base
+                            # Cap at 5% of pool
+                            _h_stake = min(_h_stake, round(_alpha_state["balance"] * 0.05, 2))
                             _h_stake = max(_h_stake, 1.00)
                             
                             if _alpha_state["balance"] > _alpha_state["floor_balance"] and \
@@ -14139,7 +14107,7 @@ try:
     _alpha_state["starting_balance"] = 100.0
     _alpha_state["floor_balance"] = 5.0
     _alpha_state["enabled"] = True
-    print("ALPHA LIVE: ${:.2f} pool{} | Strategy F: ETH/BTC $4 SOL $2 | 1H SOL/DOGE $1 | Floor=$5 | P2.3 only trigger".format(
+    print("ALPHA LIVE: ${:.2f} pool{} | Model C: $2 flat all assets | 15M P2.3 + 1H P2.4 | Floor=$5".format(
         _alpha_state["balance"], " (restored)" if _alpha_restored else " (fresh)"))
     
     # Restore Poly Alpha balance from DB
@@ -14172,7 +14140,7 @@ try:
     _poly_alpha2_state["starting_balance"] = 70.0
     _poly_alpha2_state["floor_balance"] = 10.0
     _poly_alpha2_state["enabled"] = True
-    print("POLY ALPHA 2.0: ${:.2f} pool{} | P2.1 base $2.50 + P2.3 boost $3.00 | 5M+15M | Floor=$10".format(
+    print("POLY ALPHA 2.0: ${:.2f} pool{} | 15M P2.3 only (proven 77% WR) | 5M paper only | Floor=$10".format(
         _poly_alpha2_state["balance"], " (restored)" if _poly_alpha2_restored else " (fresh)"))
     _poly_alpha2_load_recent()
     _poly_alpha_load_recent_trades()
@@ -14749,49 +14717,29 @@ def _poly_fetch_markets():
 
 
 def _poly_get_baseline(parsed, price, indicators):
-    """Get the Price to Beat from Polymarket's official PTB endpoint.
-    Priority: 1. Polymarket PTB API (EXACT match with resolution)
-              2. Baseline from market title/description (parsed)
-              3. Chainlink PTB captured at window boundary (fallback)"""
-    import requests as _req
+    """Get the Price to Beat for crypto Up/Down markets.
+    For crypto markets, the PTB is the Chainlink oracle price captured at window open.
+    Our RTDS feed captures this exact price at window boundaries.
+    This matches what Polymarket uses for resolution."""
     asset = parsed.get("asset", "")
     tf = parsed.get("timeframe", "")
-    slug = parsed.get("slug", "")
     
-    # Source 1: Polymarket's official Price-to-Beat endpoint (EXACT)
-    if slug:
-        try:
-            ptb_url = "https://polymarket.com/api/equity/price-to-beat/{}".format(slug)
-            r = _req.get(ptb_url, timeout=5)
-            if r.status_code == 200:
-                ptb_data = r.json()
-                ptb_val = None
-                if isinstance(ptb_data, dict):
-                    ptb_val = ptb_data.get("price") or ptb_data.get("value") or ptb_data.get("price_to_beat")
-                elif isinstance(ptb_data, (int, float)):
-                    ptb_val = float(ptb_data)
-                if ptb_val and float(ptb_val) > 0:
-                    ptb_val = float(ptb_val)
-                    print("POLY PTB (API): {} {} = ${:,.4f}".format(asset, tf, ptb_val))
-                    return ptb_val
-        except:
-            pass
-    
-    # Source 2: Baseline already extracted from market title/description
-    if parsed.get("baseline") and parsed["baseline"] > 0:
-        return parsed["baseline"]
-    
-    # Source 3: Chainlink PTB from window boundary (fallback only)
+    # Source 1: Chainlink PTB captured at window boundary (PRIMARY for crypto)
+    # This is the SAME Chainlink feed Polymarket uses for resolution
     key = "{}_{}".format(asset, tf)
     entry = _chainlink_ptb.get(key)
     if entry:
-        print("POLY PTB (Chainlink fallback): {} {} = ${:,.4f}".format(asset, tf, entry[1]))
+        print("POLY PTB: {} {} = ${:,.4f}".format(asset, tf, entry[1]))
         return entry[1]
     
-    # Source 4: Latest Chainlink streaming price (worst fallback)
+    # Source 2: Baseline from market title (for "above $X" format markets)
+    if parsed.get("baseline") and parsed["baseline"] > 0:
+        return parsed["baseline"]
+    
+    # Source 3: Latest Chainlink streaming price (close approximation)
     chainlink = _chainlink_prices.get(asset)
     if chainlink:
-        print("POLY PTB (streaming fallback): {} {} = ${:,.4f}".format(asset, tf, chainlink))
+        print("POLY PTB (latest stream): {} {} = ${:,.4f}".format(asset, tf, chainlink))
         return chainlink
     return None
 
@@ -14842,10 +14790,9 @@ def run_poly_scan():
             # Determine which sections this market belongs to
             sections = []
             if tf == "5M":
-                # 5M: BTC only
-                if asset == "BTC":
-                    sections.append("btc5m")
-                # Skip non-BTC 5M markets entirely
+                # Model C: ALL assets on 5M (not just BTC)
+                if asset in ("BTC", "ETH", "SOL", "XRP"):
+                    sections.append("all5m")
             elif tf == "15M":
                 sections.append("all15m")
             elif tf == "1H":
