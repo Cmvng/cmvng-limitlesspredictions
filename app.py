@@ -14451,6 +14451,7 @@ def _poly_parse_market(market, timeframe_hint=None):
             if "updown" in slug_lower:
                 print("POLY PARSE NO EXPIRY: slug='{}' keys={}".format(slug_lower[:40], list(market.keys())[:10]))
             return None
+        now = datetime.now(timezone.utc)
         mins_left = (expiry_dt - now).total_seconds() / 60
         if mins_left <= 0:
             return None
