@@ -14689,9 +14689,16 @@ def _poly_fetch_markets():
                         if em:
                             print("POLY FOUND: {} → {} markets via {}".format(slug, len(em), "path" if "/slug/" in url else "query"))
                         for market in em:
+                            # Debug: show what we're trying to parse
+                            mq = (market.get("question") or market.get("title") or "NO_Q")[:50]
+                            ms = (market.get("slug") or "NO_SLUG")[:40]
+                            me = market.get("endDate") or market.get("end_date_iso") or "NO_END"
+                            print("POLY PARSING: q='{}' slug='{}' end='{}'".format(mq, ms, str(me)[:25]))
                             parsed = _poly_parse_market(market)
                             if parsed:
                                 markets.append(parsed)
+                            else:
+                                print("POLY PARSE FAILED for slug={}".format(ms))
                         if markets:
                             break
                     elif r.status_code == 429:
