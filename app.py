@@ -14629,6 +14629,8 @@ def _poly_parse_market(market, timeframe_hint=None):
     except Exception as e:
         print("POLY PARSE EXCEPTION: {} — {}".format(market.get("slug", "?")[:30], e))
         return None
+
+def _poly_fetch_markets():
     """Fetch active crypto Up/Down markets from Polymarket.
     Public search FIRST (1 call), then slug lookups if needed."""
     import requests as req
