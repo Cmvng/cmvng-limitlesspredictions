@@ -14195,6 +14195,8 @@ try:
     if not _poly_alpha2_restored:
         _poly_alpha2_state["balance"] = 70.0
         _poly_alpha2_state["peak_balance"] = 70.0
+    _poly_alpha2_state["balance"] = 70.0  # RESET — testing outcomes fix
+    _poly_alpha2_state["peak_balance"] = 70.0
     _poly_alpha2_state["starting_balance"] = 70.0
     _poly_alpha2_state["floor_balance"] = 10.0
     _poly_alpha2_state["enabled"] = True
@@ -14547,6 +14549,33 @@ def _poly_parse_market(market, timeframe_hint=None):
                 clob_tokens = json.loads(clob_tokens)
             except:
                 clob_tokens = []
+        
+        # CRITICAL: Determine which index is UP/YES and which is DOWN/NO
+        # Do NOT assume index 0 = UP. Read the outcomes field.
+        outcomes_raw = market.get("outcomes")
+        if isinstance(outcomes_raw, str):
+            try:
+                outcomes_raw = json.loads(outcomes_raw)
+            except:
+                outcomes_raw = None
+        
+        up_index = 0  # default
+        down_index = 1
+        if isinstance(outcomes_raw, list) and len(outcomes_raw) >= 2:
+            o0 = str(outcomes_raw[0]).lower().strip()
+            o1 = str(outcomes_raw[1]).lower().strip()
+            # Log outcomes for debugging
+            if tf in ("5M", "15M"):
+                print("POLY OUTCOMES {}: [{}] up_idx={} down_idx={}".format(asset, ", ".join(str(x) for x in outcomes_raw), up_index, down_index))
+            # Check for reversed ordering
+            if o0 in ("no", "down", "below") and o1 in ("yes", "up", "above"):
+                up_index = 1
+                down_index = 0
+                print("🚨 POLY OUTCOMES REVERSED: {} → up_idx={} down_idx={}".format(outcomes_raw, up_index, down_index))
+                # Fix up_odds for reversed ordering
+                if isinstance(outcome_prices, list) and len(outcome_prices) >= 2:
+                    up_raw = float(outcome_prices[1])  # index 1 is actually UP
+                    up_odds = up_raw * 100 if up_raw <= 1.0 else up_raw
 
         market_id = str(market.get("id") or condition_id or slug)
 
@@ -14622,6 +14651,8 @@ def _poly_parse_market(market, timeframe_hint=None):
             "condition_id": condition_id,
             "timeframe": timeframe,
             "clob_tokens": clob_tokens or [],
+            "up_token_index": up_index,
+            "down_token_index": down_index,
             "expiry_minute": expiry_minute,
             "expiry_hour": expiry_hour,
         }
@@ -15086,6 +15117,11 @@ def run_poly_scan():
                     if strat == "p23" and tf in ("5M", "15M"):
                         _pa2_mkey = parsed["market_id"]
                         _pa2_sig = _poly_alpha2_pending.pop(_pa2_mkey, None)
+                        if not _pa2_sig:
+                            # Debug: P2.3 scored but no P2.1 pending entry
+                            _pa2_in_dedup = _pa2_mkey in _poly_alpha2_traded_markets
+                            print("POLY A2 DEBUG: P2.3 scored {} {} but no P2.1 pending (dedup={} enabled={} creds={})".format(
+                                asset, tf, _pa2_in_dedup, _poly_alpha2_state["enabled"], _poly_has_creds()))
                         if _pa2_sig and _poly_alpha2_state["enabled"] and _poly_has_creds():
                             _pa2_tier = _poly_alpha2_get_tier(_pa2_sig["asset"], _pa2_sig["tf"], _pa2_sig["p23_agrees"])
                             if _pa2_tier:
@@ -15099,7 +15135,7 @@ def run_poly_scan():
                                     cid = _pa2_p.get("condition_id", "")
                                     tid = None
                                     if clob_toks and len(clob_toks) >= 2:
-                                        tid = clob_toks[0] if _pa2_side == "UP" else clob_toks[1]
+                                        up_idx = _pa2_p.get("up_token_index", 0); down_idx = _pa2_p.get("down_token_index", 1); tid = clob_toks[up_idx] if _pa2_side == "UP" else clob_toks[down_idx]
                                     elif cid:
                                         tid = _get_poly_token_id(cid, _pa2_side)
                                     if tid:
@@ -15165,7 +15201,7 @@ def run_poly_scan():
             cid = _pa_parsed.get("condition_id", "")
             token_id = None
             if clob_toks and len(clob_toks) >= 2:
-                token_id = clob_toks[0] if _pa_side == "UP" else clob_toks[1]
+                up_idx = _pa_parsed.get("up_token_index", 0); down_idx = _pa_parsed.get("down_token_index", 1); token_id = clob_toks[up_idx] if _pa_side == "UP" else clob_toks[down_idx]
             elif cid:
                 token_id = _get_poly_token_id(cid, _pa_side)
             if not token_id:
@@ -15237,7 +15273,7 @@ def run_poly_scan():
                 cid = _pa2_p.get("condition_id", "")
                 tid = None
                 if clob_toks and len(clob_toks) >= 2:
-                    tid = clob_toks[0] if _pa2_side == "UP" else clob_toks[1]
+                    up_idx = _pa2_p.get("up_token_index", 0); down_idx = _pa2_p.get("down_token_index", 1); tid = clob_toks[up_idx] if _pa2_side == "UP" else clob_toks[down_idx]
                 elif cid:
                     tid = _get_poly_token_id(cid, _pa2_side)
                 if not tid:
@@ -15773,8 +15809,22 @@ def _resolve_poly_alpha2_trades():
                                     if isinstance(op,list) and len(op)>=2:
                                         p0,p1=float(op[0]),float(op[1])
                                         bs=p.get("bet_side") or "UP"
-                                        if p0>=0.95: won=(bs=="UP")
-                                        elif p1>=0.95: won=(bs=="DOWN")
+                                        # Determine which index is UP/YES
+                                        _oc = mdata.get("outcomes") or mdata.get("outcome_labels")
+                                        if isinstance(_oc, str):
+                                            try: _oc = json.loads(_oc)
+                                            except: _oc = None
+                                        _up_idx = 0
+                                        if isinstance(_oc, list) and len(_oc) >= 2:
+                                            o0 = str(_oc[0]).lower().strip()
+                                            if o0 in ("no", "down", "below"):
+                                                _up_idx = 1
+                                        if _up_idx == 0:
+                                            if p0>=0.95: won=(bs=="UP")
+                                            elif p1>=0.95: won=(bs=="DOWN")
+                                        else:
+                                            if p1>=0.95: won=(bs=="UP")
+                                            elif p0>=0.95: won=(bs=="DOWN")
                     except: pass
                 if won is None:
                     if now>expiry+timedelta(hours=1): won=False
