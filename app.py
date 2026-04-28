@@ -14432,16 +14432,20 @@ def _poly_parse_market(market, timeframe_hint=None):
             return None
 
         # Get expiry FIRST (needed for duration-based timeframe detection)
+        now = datetime.now(timezone.utc)
         end_date = market.get("endDate") or market.get("end_date_iso") or ""
         exp_ts = market.get("expirationTimestamp") or market.get("expiration_timestamp")
         expiry_dt = None
         if exp_ts:
-            if isinstance(exp_ts, str):
-                exp_ts = int(exp_ts)
-            if exp_ts > 1e12:
-                exp_ts = exp_ts / 1000
-            expiry_dt = datetime.fromtimestamp(exp_ts, tz=timezone.utc)
-        elif end_date:
+            try:
+                if isinstance(exp_ts, str):
+                    exp_ts = int(exp_ts)
+                if exp_ts > 1e12:
+                    exp_ts = exp_ts / 1000
+                expiry_dt = datetime.fromtimestamp(exp_ts, tz=timezone.utc)
+            except:
+                exp_ts = None
+        if not expiry_dt and end_date:
             try:
                 expiry_dt = datetime.fromisoformat(end_date.replace("Z", "+00:00"))
                 exp_ts = int(expiry_dt.timestamp())
@@ -14451,7 +14455,6 @@ def _poly_parse_market(market, timeframe_hint=None):
             if "updown" in slug_lower:
                 print("POLY PARSE NO EXPIRY: slug='{}' keys={}".format(slug_lower[:40], list(market.keys())[:10]))
             return None
-        now = datetime.now(timezone.utc)
         mins_left = (expiry_dt - now).total_seconds() / 60
         if mins_left <= 0:
             return None
@@ -14536,7 +14539,7 @@ def _poly_parse_market(market, timeframe_hint=None):
             o0 = str(outcomes_raw[0]).lower().strip()
             o1 = str(outcomes_raw[1]).lower().strip()
             # Log outcomes for debugging
-            if tf in ("5M", "15M"):
+            if timeframe in ("5M", "15M"):
                 print("POLY OUTCOMES {}: [{}] up_idx={} down_idx={}".format(asset, ", ".join(str(x) for x in outcomes_raw), up_index, down_index))
             # Check for reversed ordering
             if o0 in ("no", "down", "below") and o1 in ("yes", "up", "above"):
