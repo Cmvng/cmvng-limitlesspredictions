@@ -9472,7 +9472,8 @@ def _resolve_alpha_trades():
                 status = "✅ Won" if won else "❌ Lost"
                 stake = float(p.get("stake") or 1.0)
                 fill = float(p.get("fill_price") or 0.66)
-                payout = round(stake / fill, 4) if won else 0
+                fee_rate = 0.03  # 300 bps Limitless fee
+                payout = round((stake * (1 - fee_rate)) / fill, 4) if won else 0
 
                 conn2 = get_db()
                 conn2.run(
@@ -15388,7 +15389,9 @@ def run_poly_scan():
             poly_counts["all15m"], poly_counts["hourly24"]))
 
     except Exception as e:
-        print("Poly scan error: {}".format(e))
+        print("Poly scan error: {} at line {}".format(e, e.__traceback__.tb_lineno if e.__traceback__ else "?"))
+        import traceback
+        traceback.print_exc()
 
 
 def _resolve_poly_trades():
@@ -15829,7 +15832,8 @@ def _resolve_poly_alpha2_trades():
                                 _poly_alpha2_state["balance"]=round(_poly_alpha2_state["balance"]+stake,2)
                                 c2=get_db(); c2.run("UPDATE poly_alpha2_trades SET status=:s,outcome='UNFILLED',resolved_at=:r,payout=0 WHERE id=:i",s="⏭ Unfilled",r=now.isoformat(),i=p["id"]); c2.close()
                                 resolved+=1; continue
-                    except: pass
+                    except Exception as _goe:
+                        print("POLY A2 get_order error #{}: {}".format(p.get("id"), _goe))
                 if not order_filled and market_expired:
                     _poly_alpha2_state["balance"]=round(_poly_alpha2_state["balance"]+stake,2)
                     c2=get_db(); c2.run("UPDATE poly_alpha2_trades SET status=:s,outcome='UNFILLED',resolved_at=:r,payout=0 WHERE id=:i",s="⏭ Unfilled",r=now.isoformat(),i=p["id"]); c2.close()
