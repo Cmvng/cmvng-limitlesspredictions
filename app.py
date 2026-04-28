@@ -361,17 +361,18 @@ def _poly_alpha2_load_recent():
         pass
 
 def _poly_alpha2_get_tier(asset, timeframe, p23_agrees=False):
-    """Poly Alpha 2.0: 15M ONLY live trades (77% WR proven).
-    5M is paper-only until we have data confirming profitability.
-    All 4 assets: BTC, ETH, SOL, XRP."""
+    """Poly Alpha 2.0: 15M live trades for all 4 assets.
+    P2.3 boost when available, but P2.1 alone is sufficient (72% WR).
+    P2.3 distance math less reliable on Polymarket because PTB is
+    captured from Chainlink stream (close but not exact match).
+    5M is paper-only until proven."""
     if timeframe == "15M":
-        if p23_agrees:
-            # P2.3 confirmed — 77% WR proven over 456 paper trades
-            if asset in ("BTC", "ETH", "SOL", "XRP"):
-                return ("PA15", 3.00, 0.65)
-        # Without P2.3: skip (only 72% WR, too close to breakeven after fees)
-        return None
-    # 5M: paper only — no live trades until data proves it
+        if asset in ("BTC", "ETH", "SOL", "XRP"):
+            if p23_agrees:
+                return ("PA15+", 3.00, 0.65)  # P2.3 confirmed
+            else:
+                return ("PA15", 2.50, 0.62)   # P2.1 alone — 72% WR, profitable after 1.56% fee
+    # 5M: paper only
     return None
 
 def _poly_alpha2_calc_stake(base_stake, pool_balance):
