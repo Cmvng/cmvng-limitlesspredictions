@@ -2760,8 +2760,8 @@ def _execute_poly_trade(condition_id, token_id, side, stake, price):
             return False
 
         try:
-            from py_clob_client.order_builder.constants import BUY
-            from py_clob_client.clob_types import OrderArgs, MarketOrderArgs, OrderType
+            from py_clob_client_v2 import Side, OrderArgs, OrderType
+            BUY = Side.BUY
         except ImportError:
             from py_clob_client_v2 import Side, OrderArgs, OrderType
             BUY = Side.BUY
@@ -15003,8 +15003,8 @@ def run_poly_scan():
                                         try:
                                             client = _get_poly_client()
                                             if client:
-                                                from py_clob_client.order_builder.constants import BUY
-                                                from py_clob_client.clob_types import OrderArgs, OrderType
+                                                from py_clob_client_v2 import Side, OrderArgs, OrderType
+                                                BUY = Side.BUY
                                                 
                                                 # Get orderbook for better pricing
                                                 _pa2_best_price = _pa2_share
@@ -15089,8 +15089,8 @@ def run_poly_scan():
             try:
                 client = _get_poly_client()
                 if client:
-                    from py_clob_client.order_builder.constants import BUY
-                    from py_clob_client.clob_types import OrderArgs, OrderType
+                    from py_clob_client_v2 import Side, OrderArgs, OrderType
+                    BUY = Side.BUY
                     _pa_shares = max(5.0, round(_pa_stake / _pa_share, 2))
                     order_args = OrderArgs(token_id=str(token_id), price=round(_pa_share, 2), size=_pa_shares, side=BUY)
                     signed = client.create_order(order_args)
@@ -15160,8 +15160,8 @@ def run_poly_scan():
                     continue
                 client = _get_poly_client()
                 if client:
-                    from py_clob_client.order_builder.constants import BUY
-                    from py_clob_client.clob_types import OrderArgs, OrderType
+                    from py_clob_client_v2 import Side, OrderArgs, OrderType
+                    BUY = Side.BUY
                     _pa2_shares = max(5.0, round(_pa2_stake / _pa2_share, 2))
                     oa = OrderArgs(token_id=str(tid), price=round(_pa2_share, 2), size=_pa2_shares, side=BUY)
                     signed = client.create_order(oa)
