@@ -14690,7 +14690,8 @@ def _poly_fetch_markets():
                     elif tf_label in ("5M", "15M") and asset_slug == "btc":
                         print("POLY SLUG DEBUG: {} → status {}".format(slug, r.status_code))
                 except Exception as e:
-                    pass
+                    if tf_label in ("5M", "15M"):
+                        print("POLY SLUG ERROR: {} → {}".format(slug, e))
 
                 # Try alternative slug formats (V2 may have changed)
                 if not any(m.get("slug") == slug for m in markets):
@@ -14720,8 +14721,9 @@ def _poly_fetch_markets():
                                             print("POLY V2 FOUND via alt slug: {} → {} markets".format(alt_slug, len(em)))
                                 if em:
                                     break
-                        except:
-                            pass
+                        except Exception as _ae:
+                            if tf_label in ("5M", "15M"):
+                                print("POLY ALT SLUG ERROR: {} → {}".format(alt_slug, _ae))
 
                 # Also try /markets endpoint as fallback
                 if not any(m.get("slug") == slug for m in markets):
@@ -14743,8 +14745,9 @@ def _poly_fetch_markets():
                             parsed = _poly_parse_market(market)
                             if parsed:
                                 markets.append(parsed)
-                    except:
-                        pass
+                    except Exception as _me:
+                        if tf_label in ("5M", "15M"):
+                            print("POLY MARKETS ENDPOINT ERROR: {} → {}".format(slug, _me))
 
     if not markets:
         # Fallback: try broad search
@@ -14770,6 +14773,16 @@ def _poly_fetch_markets():
                     for _dm in batch[:3]:
                         _dq = (_dm.get("question") or _dm.get("title") or "NO_TITLE")[:80]
                         print("  RAW MARKET: {}".format(_dq))
+                    # Also check for any crypto-related markets
+                    _crypto_found = [(_dm.get("question") or "")[:80] for _dm in batch 
+                                     if any(k in (_dm.get("question") or "").lower() 
+                                            for k in ["btc", "bitcoin", "eth", "sol", "xrp", "crypto", "above", "up or down", "updown"])]
+                    if _crypto_found:
+                        print("  CRYPTO in batch: {}".format(len(_crypto_found)))
+                        for _cf in _crypto_found[:5]:
+                            print("    → {}".format(_cf))
+                    else:
+                        print("  NO crypto Up/Down markets in {} results".format(len(batch)))
             else:
                 print("Poly API status: {}".format(r.status_code))
         except Exception as e:
