@@ -14424,11 +14424,11 @@ def _poly_parse_market(market, timeframe_hint=None):
                     break
 
         if not asset:
+            if "updown" in slug_lower or "up or down" in q_lower:
+                print("POLY PARSE NO ASSET: q='{}' slug='{}'".format(q_lower[:60], slug_lower[:40]))
             return None
-
-        # Must be an Up or Down market (Polymarket format)
-        # Do NOT accept "above/below" — those are Limitless markets on the same API
         if "up or down" not in q_lower and "updown" not in slug_lower:
+            print("POLY PARSE REJECT: q='{}' slug='{}'".format(q_lower[:60], slug_lower[:40]))
             return None
 
         # Get expiry FIRST (needed for duration-based timeframe detection)
@@ -14448,9 +14448,9 @@ def _poly_parse_market(market, timeframe_hint=None):
             except:
                 return None
         else:
+            if "updown" in slug_lower:
+                print("POLY PARSE NO EXPIRY: slug='{}' keys={}".format(slug_lower[:40], list(market.keys())[:10]))
             return None
-
-        now = datetime.now(timezone.utc)
         mins_left = (expiry_dt - now).total_seconds() / 60
         if mins_left <= 0:
             return None
