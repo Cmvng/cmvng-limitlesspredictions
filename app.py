@@ -116,7 +116,6 @@ _bot3_state = {
     "compound_threshold": 1.20,  # 20% profit
 }
 
-
 # Paper 2.1: Bot 2 + BTC Tiebreaker + 15M + 4H Pullback (paper only)
 _bot21_state = {
     "enabled": False,
@@ -244,7 +243,6 @@ _alpha_state = {
 }
 _alpha_traded_markets = set()  # Dedup per cycle
 
-
 def _alpha_get_tier(scored22, scored23, scored33, asset, is_hourly=False):
     """Determine Alpha tier based on P2.3 as sole trigger.
     Strategy F: Only P2.3 fires live trades on ETH/BTC/SOL.
@@ -276,7 +274,6 @@ def _alpha_get_tier(scored22, scored23, scored33, asset, is_hourly=False):
         return ("T3", 1.00, 0.64, bet_side)   # 70.5% WR, breakeven at 64% — trial
 
     return None
-
 
 def _alpha_calc_stake(base_stake, asset, pool_balance):
     """Calculate final stake — fixed stakes from simulation, scaled to pool."""
@@ -489,7 +486,6 @@ def _calc_dist_score(price, baseline, sigma, momentum, time_remaining=0.67):
     else:
         return prob_above, "STRONG_SELL"
 
-
 def _calc_bot_stake(state):
     """Calculate stake for any bot. $1 fixed until 20% profit, then 2.5% compounding."""
     balance = state.get("balance", state.get("last_balance", 0)) or 0
@@ -519,7 +515,6 @@ def _calc_bot_stake(state):
         return 0
 
     return stake
-
 
 def _calc_autoscale_stake(state):
     """Fixed-step auto-scaling stake calculator for P2.1 and P3.1.
@@ -589,7 +584,6 @@ def _calc_autoscale_stake(state):
     
     return stake
 
-
 def _calc_poly_autoscale_stake(state):
     """Auto-scaling stake for Polymarket. Same logic as Limitless but starts at $2.50.
     
@@ -650,7 +644,6 @@ def _calc_poly_autoscale_stake(state):
     
     return stake
 
-
 YAHOO_MAP = {
     "BTC":"BTC-USD",  "ETH":"ETH-USD",  "SOL":"SOL-USD",
     "ADA":"ADA-USD",  "BNB":"BNB-USD",  "DOGE":"DOGE-USD",
@@ -677,7 +670,6 @@ def get_db():
         ssl_context=True
     )
 
-
 def _save_bot_balance(bot_name, state):
     """Save bot balance to database so it persists across deploys."""
     try:
@@ -696,7 +688,6 @@ def _save_bot_balance(bot_name, state):
         conn.close()
     except Exception as e:
         print("Save balance error {}: {}".format(bot_name, e))
-
 
 def _load_bot_balances():
     """Load saved balances from database on startup."""
@@ -1254,7 +1245,6 @@ def send_telegram(message):
         except Exception as e:
             print("Telegram error: {}".format(e))
     threading.Thread(target=_send, daemon=True).start()
-
 
 def _correct_historical_resolutions():
     """One-time correction: re-resolve all resolved paper trades using actual
@@ -2677,7 +2667,6 @@ def _place_fok_order(slug, bet_side, token_id, stake, exchange_addr, profile_id,
         print("FOK error: {}".format(e))
         return False
 
-
 # ═══════════════════════════════════════════════════════════
 # POLYMARKET LIVE ORDER EXECUTION
 # ═══════════════════════════════════════════════════════════
@@ -2692,25 +2681,42 @@ def _get_poly_client():
     if not _poly_has_creds():
         return None
     try:
-        from py_clob_client.client import ClobClient
-        from py_clob_client.clob_types import ApiCreds
-
-        creds = ApiCreds(
-            api_key=POLY_API_KEY,
-            api_secret=POLY_API_SECRET,
-            api_passphrase=POLY_API_PASSPHRASE
-        )
-
-        # Initialize with key + chain_id + signature_type + funder
-        client = ClobClient(
-            "https://clob.polymarket.com",
-            key=LIMITLESS_PRIV_KEY,
-            chain_id=137,
-            signature_type=2,  # GNOSIS_SAFE — browser wallet proxy
-            funder=POLY_FUNDER_ADDRESS,
-        )
-        # Set API creds AFTER init (official pattern from docs)
-        client.set_api_creds(creds)
+        # Try V2 SDK first (post-migration)
+        try:
+            from py_clob_client_v2 import ClobClient, ApiCreds
+            client = ClobClient(
+                host="https://clob.polymarket.com",
+                chain_id=137,
+                key=LIMITLESS_PRIV_KEY,
+                signature_type=2,
+                funder=POLY_FUNDER_ADDRESS,
+                creds=ApiCreds(
+                    api_key=POLY_API_KEY,
+                    api_secret=POLY_API_SECRET,
+                    api_passphrase=POLY_API_PASSPHRASE,
+                ),
+            )
+            _poly_clob_client = client
+            print("Polymarket CLOB V2 client initialized (funder={})".format(POLY_FUNDER_ADDRESS[:10]))
+        except ImportError:
+            # Fall back to V1 SDK
+            from py_clob_client.client import ClobClient
+            from py_clob_client.clob_types import ApiCreds
+            creds = ApiCreds(
+                api_key=POLY_API_KEY,
+                api_secret=POLY_API_SECRET,
+                api_passphrase=POLY_API_PASSPHRASE
+            )
+            client = ClobClient(
+                "https://clob.polymarket.com",
+                key=LIMITLESS_PRIV_KEY,
+                chain_id=137,
+                signature_type=2,
+                funder=POLY_FUNDER_ADDRESS,
+            )
+            client.set_api_creds(creds)
+            _poly_clob_client = client
+            print("Polymarket CLOB V1 client initialized (funder={})".format(POLY_FUNDER_ADDRESS[:10]))
 
         # Set proxy if available (bypasses datacenter IP geoblock)
         if POLY_PROXY_URL:
@@ -2741,7 +2747,6 @@ def _get_poly_client():
         import traceback
         traceback.print_exc()
         return None
-
 
 _poly_active_trades = set()  # Track markets with active trade threads
 
@@ -2774,7 +2779,6 @@ def _execute_poly_trade_async(condition_id, token_id, side, stake, price,
             _poly_active_trades.discard(trade_key)
     threading.Thread(target=_run, daemon=True).start()
 
-
 def _execute_poly_trade(condition_id, token_id, side, stake, price):
     """Escalating execution: FOK first, then GTC that walks up the book.
     Each step raises the price until filled or max 70 cents reached.
@@ -2786,8 +2790,12 @@ def _execute_poly_trade(condition_id, token_id, side, stake, price):
             print("Poly trade: no client")
             return False
 
-        from py_clob_client.order_builder.constants import BUY
-        from py_clob_client.clob_types import OrderArgs, MarketOrderArgs, OrderType
+        try:
+            from py_clob_client.order_builder.constants import BUY
+            from py_clob_client.clob_types import OrderArgs, MarketOrderArgs, OrderType
+        except ImportError:
+            from py_clob_client_v2 import Side, OrderArgs, OrderType
+            BUY = Side.BUY
 
         min_shares = 5.0
         max_price = 0.70
@@ -2952,7 +2960,6 @@ def _execute_poly_trade(condition_id, token_id, side, stake, price):
         import traceback
         traceback.print_exc()
         return False
-
 
 def _get_poly_token_id(condition_id, side):
     """Get the token ID for UP or DOWN from Polymarket Gamma API."""
@@ -4478,7 +4485,6 @@ def _fast_trade_scan():
     except Exception as e:
         print("Fast trade scan error: {}".format(e))
 
-
 def _precalc_indicators():
     """Pre-calculate and cache all indicators for all assets.
     Called ~10 seconds before 15M window opens so cache is warm when fast scan fires."""
@@ -4893,7 +4899,6 @@ def _rapid_poll_snipe():
     
     return 0
 
-
 def scan_loop():
     time.sleep(30)
     # Initial precalc and market ID seeding
@@ -5302,7 +5307,6 @@ def _calculate_indicators(asset, timeframe="1h"):
                     pivot_signal = "SELL"
                 elif last_ph and last_pl:
                     pivot_signal = "BUY" if abs(current - last_ph) < abs(current - last_pl) else "SELL"
-
 
         # === Squeeze Momentum [LazyBear] ===
         squeeze_val = None
@@ -5939,7 +5943,6 @@ def _score_paper4_trade(p, price, indicators):
 # PAPER 3 & 4 SCANNER AND RESOLVER
 # ═══════════════════════════════════════════════════════════
 
-
 # ═══════════════════════════════════════════════════════════
 # PAPER 5: Squeeze Momentum + Smart Money Concepts + BTC
 # Structure-based momentum — quality over quantity
@@ -6089,7 +6092,6 @@ def _score_paper5_trade(p, price, indicators, ind_macro=None, expiry_minute=None
                 bet_side = "NO" if p["direction"] == "above" else "YES"
                 confidence = "LOW"; reason = "STRONG_BTC_TIEBREAK_SELL"
 
-
     if bet_side is None: return None
 
     effective_odds = yes_odds if bet_side == "YES" else no_odds
@@ -6132,7 +6134,6 @@ def _score_paper5_trade(p, price, indicators, ind_macro=None, expiry_minute=None
         "confidence": confidence, "indicators": " | ".join(indicator_details),
         "market_type": mtype, "sim_payout": sim_payout,
     }
-
 
 # ═══════════════════════════════════════════════════════════
 # PAPER 3.1: BTC Tiebreaker + Dual Timeframe + UT Gatekeeper
@@ -6328,7 +6329,6 @@ def _score_paper31_trade(p, price, indicators, ind_macro=None, expiry_minute=Non
         "market_type": mtype, "sim_payout": sim_payout,
     }
 
-
 # ═══════════════════════════════════════════════════════════
 # PAPER 2.1: Bot 2 strategy + BTC Tiebreaker + 15M Pullback
 # ═══════════════════════════════════════════════════════════
@@ -6512,7 +6512,6 @@ def _score_paper21_trade(p, price, indicators=None, ind_macro=None, expiry_minut
         "confidence": confidence, "indicators": " | ".join(indicator_details),
         "market_type": mtype, "sim_payout": sim_payout,
     }
-
 
 # ═══════════════════════════════════════════════════════════
 # PAPER 5.1: Squeeze + SMC + BTC tiebreaker + FULL dual timeframe
@@ -6706,7 +6705,6 @@ def _score_paper51_trade(p, price, indicators, ind_macro=None, expiry_minute=Non
         "market_type": mtype, "sim_payout": sim_payout,
     }
 
-
 # ═══════════════════════════════════════════════════════════
 # PAPER 2.3: Bot 2.1 + Distance Calculator — FULL CONFIDENCE ONLY
 # Only takes trades where BOTH indicators AND distance math agree
@@ -6762,7 +6760,6 @@ def _score_paper23_trade(p, price, indicators=None, ind_macro=None, expiry_minut
         "confidence": confidence, "indicators": ind_str,
         "market_type": scored["market_type"], "sim_payout": scored["sim_payout"],
     }
-
 
 # ═══════════════════════════════════════════════════════════
 # PAPER 2.7: P2.3 + ADX + RSI + Volume + Parabolic SAR
@@ -6867,7 +6864,6 @@ def _score_paper27_trade(p, price, indicators=None, ind_macro=None, expiry_minut
         "confidence": confidence, "indicators": ind_str,
         "market_type": scored["market_type"], "sim_payout": scored["sim_payout"],
     }
-
 
 # ═══════════════════════════════════════════════════════════
 # PAPER 3.3: Bot 3.1 + Distance Calculator — MIXED MODE
@@ -6984,7 +6980,6 @@ def _score_paper33_trade(p, price, indicators=None, ind_macro=None, expiry_minut
 
     return None
 
-
 # ═══════════════════════════════════════════════════════════
 # PAPER 2.4: P2.1 + Distance Math + 15M Candle Pattern (1H ONLY)
 # Uses the first 1-3 completed 15M candles within the 1H window
@@ -7064,7 +7059,6 @@ def _get_15m_candle_pattern(asset, expiry_hour, mins_left):
 
     except Exception:
         return 0, 0, 0, "NONE", 0
-
 
 # ═══════════════════════════════════════════════════════════
 # PAPER 3.7: P3.3 + ADX + RSI + Volume + Parabolic SAR
@@ -7163,7 +7157,6 @@ def _score_paper37_trade(p, price, indicators=None, ind_macro=None, expiry_minut
         "confidence": confidence, "indicators": ind_str,
         "market_type": scored["market_type"], "sim_payout": scored["sim_payout"],
     }
-
 
 def _score_paper24_trade(p, price, indicators=None, ind_macro=None, expiry_minute=None, expiry_hour=None):
     """Paper 2.4: P2.1 strategy + distance math + 15M candle pattern.
@@ -7304,7 +7297,6 @@ def _score_paper24_trade(p, price, indicators=None, ind_macro=None, expiry_minut
         "market_type": "1H", "sim_payout": sim_payout,
     }
 
-
 def _score_paper34_trade(p, price, indicators=None, ind_macro=None, expiry_minute=None, expiry_hour=None):
     """Paper 3.4: P3.1 strategy + distance math + 15M candle pattern.
     1H ONLY. Same concept as P2.4 but using 7-indicator P3.1 base."""
@@ -7419,7 +7411,6 @@ def _score_paper34_trade(p, price, indicators=None, ind_macro=None, expiry_minut
         "market_type": "1H", "sim_payout": sim_payout,
     }
 
-
 # ═══════════════════════════════════════════════════════════
 # CANDLE SEQUENCE READER — shared by P2.5/P3.5/P2.6/P3.6
 # ═══════════════════════════════════════════════════════════
@@ -7468,7 +7459,6 @@ def _read_candle_sequence(asset, timeframe="15m"):
         return candles
     except:
         return []
-
 
 def _candle_sequence_signal(candles, indicator_dir, h_in_4h, baseline, current_price):
     """Analyze candle sequence and return (bet_direction, confidence, reason).
@@ -7601,7 +7591,6 @@ def _candle_sequence_signal(candles, indicator_dir, h_in_4h, baseline, current_p
 
     return None, None, "NO_PATTERN"
 
-
 # ═══════════════════════════════════════════════════════════
 # PAPER 2.5: P2.1 + Candle Sequence — 1H ONLY
 # ═══════════════════════════════════════════════════════════
@@ -7698,7 +7687,6 @@ def _score_paper25_trade(p, price, indicators=None, ind_macro=None, expiry_minut
         "market_type": "1H", "sim_payout": sim_payout,
     }
 
-
 # ═══════════════════════════════════════════════════════════
 # PAPER 3.5: P3.1 + Candle Sequence — 1H ONLY
 # ═══════════════════════════════════════════════════════════
@@ -7790,7 +7778,6 @@ def _score_paper35_trade(p, price, indicators=None, ind_macro=None, expiry_minut
         "confidence": confidence, "indicators": ind_str,
         "market_type": "1H", "sim_payout": sim_payout,
     }
-
 
 # ═══════════════════════════════════════════════════════════
 # PAPER 2.6: P2.1 + Candle Position Context — 15M MARKETS
@@ -7997,7 +7984,6 @@ def _score_paper26_trade(p, price, indicators=None, ind_macro=None, expiry_minut
         "market_type": "15M", "sim_payout": sim_payout,
     }
 
-
 # ═══════════════════════════════════════════════════════════
 # PAPER 3.6: P3.1 + Candle Position Context — 15M MARKETS
 # ═══════════════════════════════════════════════════════════
@@ -8093,7 +8079,6 @@ def _score_paper36_trade(p, price, indicators=None, ind_macro=None, expiry_minut
         "confidence": confidence, "indicators": ind_str,
         "market_type": "15M", "sim_payout": sim_payout,
     }
-
 
 def run_paper34_scan():
     """Scan markets for Paper 3 (momentum) and Paper 4 (reversal) signals."""
@@ -9284,7 +9269,6 @@ def resolve_paper34_trades():
     if r3 or r4 or r5 or r24 or r34 or r25 or r35 or r26 or r36 or ra:
         print("Resolved: P3={} P4={} P5={} P3.1={} P2.1={} P5.1={} P2.2={} P3.2={} P2.3={} P3.3={} P2.4={} P3.4={} P2.5={} P3.5={} P2.6={} P3.6={} ALPHA={}".format(r3, r4, r5, r31, r21, r51, r22, r32, r23, r33, r24, r34, r25, r35, r26, r36, ra))
 
-
 def _resolve_alpha_trades():
     """Resolve Alpha unified trades and update pool balance.
     Checks fill status first — unfilled orders get stake returned."""
@@ -10257,7 +10241,6 @@ def _build_match_results_cache():
     print("Football results cache: {} total finished matches loaded".format(len(all_matches)))
     return all_matches
 
-
 def _match_result_from_cache(match_name, cache):
     """Find a match result from cache using fuzzy team name matching."""
     if not match_name:
@@ -10305,7 +10288,6 @@ def _match_result_from_cache(match_name, cache):
                 }
 
     return None
-
 
 def check_football_outcomes():
     """Auto-resolve football picks by fetching match results."""
@@ -10901,8 +10883,6 @@ def build_accumulators(picks):
         "mega_100x": build_slips(tier_matches["mega"],   target_odds=100.0, hard_max_picks=12),
     }
 
-
-
 # ═══════════════════════════════════════════════════════════
 # MARKET CLASSIFIER — team-level vs player-prop
 # ═══════════════════════════════════════════════════════════
@@ -10960,7 +10940,6 @@ def classify_market_type(title):
 
     return "team"  # default — try to analyze
 
-
 # ═══════════════════════════════════════════════════════════
 # OFF THE PITCH SCANNER — football prop markets on Limitless
 # ═══════════════════════════════════════════════════════════
@@ -11014,7 +10993,6 @@ def is_otp_market(market):
         return True
 
     return False
-
 
 def _fetch_team_context_for_match(home_team, away_team):
     """Fetch recent team stats to give Claude real data to analyze with.
@@ -11104,7 +11082,6 @@ def _extract_teams_from_title(title):
     if m2:
         return m2.group(1).strip(), m2.group(2).strip()
     return None, None
-
 
 # ═══════════════════════════════════════════════════════════
 # HEURISTIC ENGINE — pattern-match markets to real football stats
@@ -12122,7 +12099,6 @@ def manual_football_scan():
     threading.Thread(target=run_once, daemon=True).start()
     return {"status": "football scan triggered — wait 60-90 seconds, then refresh /app/football"}, 200
 
-
 @app.route("/debug/otp")
 def debug_otp():
     """Diagnostic endpoint — shows what the OTP scanner is seeing."""
@@ -12339,7 +12315,6 @@ def tv_trends_status():
             "btc_trend": _btc_trend_cache.get("trend"),
         }
     return jsonify(result), 200
-
 
 # ═══════════════════════════════════════════════════════════
 # DASHBOARD HTML
@@ -13154,9 +13129,6 @@ document.querySelectorAll('[data-count]').forEach(el => obs.observe(el));
 </script>
 
 </body></html>"""
-
-
-
 
 @app.route("/")
 def landing():
@@ -14398,7 +14370,6 @@ def _rtds_loop():
         _chainlink_connected = False
         time.sleep(10)  # Wait before reconnect
 
-
 # Polymarket balance tracking: {section}_{strategy} → balance
 _poly_balances = {}
 
@@ -14415,7 +14386,6 @@ def _poly_set_balance(section, strategy, bal):
 for _ps in ["btc5m", "all5m", "all15m", "all1h", "hourly24"]:
     for _pst in ["p21", "p23", "p31", "p33"]:
         _poly_set_balance(_ps, _pst, 20.0)
-
 
 def _poly_parse_market(market, timeframe_hint=None):
     """Parse a Polymarket crypto Up/Down market from Gamma API data."""
@@ -14659,7 +14629,6 @@ def _poly_parse_market(market, timeframe_hint=None):
     except Exception as e:
         return None
 
-
 def _poly_fetch_markets():
     """Fetch active crypto Up/Down markets from Polymarket.
     Uses deterministic slug construction + Gamma API lookup.
@@ -14855,26 +14824,52 @@ def _poly_fetch_markets():
 
     return markets
 
-
 def _poly_get_baseline(parsed, price, indicators):
-    """Get the Price to Beat from Chainlink RTDS cache.
-    Priority: 1. Chainlink PTB captured at window boundary (within 60s)
-              2. Latest Chainlink streaming price (close approximation)"""
+    """Get the Price to Beat from Polymarket's official PTB endpoint.
+    Priority: 1. Polymarket PTB API (EXACT match with resolution)
+              2. Baseline from market title/description (parsed)
+              3. Chainlink PTB captured at window boundary (fallback)"""
+    import requests as _req
     asset = parsed.get("asset", "")
     tf = parsed.get("timeframe", "")
-    key = "{}_{}".format(asset, tf)
+    slug = parsed.get("slug", "")
     
-    # Chainlink PTB from window boundary
+    # Source 1: Polymarket's official Price-to-Beat endpoint (EXACT)
+    if slug:
+        try:
+            ptb_url = "https://polymarket.com/api/equity/price-to-beat/{}".format(slug)
+            r = _req.get(ptb_url, timeout=5)
+            if r.status_code == 200:
+                ptb_data = r.json()
+                ptb_val = None
+                if isinstance(ptb_data, dict):
+                    ptb_val = ptb_data.get("price") or ptb_data.get("value") or ptb_data.get("price_to_beat")
+                elif isinstance(ptb_data, (int, float)):
+                    ptb_val = float(ptb_data)
+                if ptb_val and float(ptb_val) > 0:
+                    ptb_val = float(ptb_val)
+                    print("POLY PTB (API): {} {} = ${:,.4f}".format(asset, tf, ptb_val))
+                    return ptb_val
+        except:
+            pass
+    
+    # Source 2: Baseline already extracted from market title/description
+    if parsed.get("baseline") and parsed["baseline"] > 0:
+        return parsed["baseline"]
+    
+    # Source 3: Chainlink PTB from window boundary (fallback only)
+    key = "{}_{}".format(asset, tf)
     entry = _chainlink_ptb.get(key)
     if entry:
+        print("POLY PTB (Chainlink fallback): {} {} = ${:,.4f}".format(asset, tf, entry[1]))
         return entry[1]
     
-    # Fallback: latest Chainlink streaming price
+    # Source 4: Latest Chainlink streaming price (worst fallback)
     chainlink = _chainlink_prices.get(asset)
     if chainlink:
+        print("POLY PTB (streaming fallback): {} {} = ${:,.4f}".format(asset, tf, chainlink))
         return chainlink
     return None
-
 
 def run_poly_scan():
     """Scan Polymarket crypto markets and record paper predictions."""
@@ -15346,7 +15341,6 @@ def run_poly_scan():
         import traceback
         traceback.print_exc()
 
-
 def _resolve_poly_trades():
     """Resolve Polymarket paper trades. Uses price comparison fallback."""
     try:
@@ -15581,7 +15575,6 @@ def _resolve_poly_trades():
         print("Poly resolve error: {}".format(e))
         return 0
 
-
 def _resolve_poly_alpha_trades():
     """Resolve Polymarket Alpha trades using Gamma API + CLOB order status."""
     import requests as req
@@ -15741,7 +15734,6 @@ def _resolve_poly_alpha_trades():
         print("Poly alpha resolve error: {}".format(e))
         return 0
 
-
 def _resolve_poly_alpha2_trades():
     """Resolve Polymarket Alpha 2.0 trades."""
     import requests as req
@@ -15855,7 +15847,6 @@ def _resolve_poly_alpha2_trades():
     except Exception as e:
         print("Poly A2 resolve error: {}".format(e)); return 0
 
-
 def _poly_scan_loop():
     """Background thread for Polymarket scanning and resolving."""
     time.sleep(60)  # Wait for init
@@ -15882,7 +15873,6 @@ def _poly_scan_loop():
             print("Poly Alpha2 resolve error: {}".format(e))
         # BUG 4 FIX: 60 seconds for 5M market coverage
         time.sleep(60)
-
 
 # ═══════════════════════════════════════════════════════════
 # POLYMARKET PAGES
@@ -16113,7 +16103,6 @@ def _build_poly_page(section, page_title, subtitle, description):
 
     return page_html
 
-
 @app.route("/app/poly-alpha2")
 def poly_alpha2_page():
     """Polymarket Alpha 2.0 dashboard."""
@@ -16199,7 +16188,6 @@ th{{background:#f0f0f0;padding:6px 4px;text-align:left;font-size:12px}}td{{paddi
         pnlc, total_pnl, _poly_alpha2_state["peak_balance"],
         _poly_alpha2_state["trades_today"], _poly_alpha2_state["wins_today"],
         _poly_alpha2_state["losses_today"], tier_html, asset_html, trade_rows)
-
 
 @app.route("/app/poly-alpha")
 def poly_alpha_page():
@@ -16329,7 +16317,6 @@ th{{background:#f0f0f0;padding:6px 4px;text-align:left;font-size:12px}}td{{paddi
         _poly_alpha_state["trades_today"], _poly_alpha_state["wins_today"],
         _poly_alpha_state["losses_today"], tier_html, asset_html, trade_rows)
 
-
 @app.route("/app/poly/btc5m")
 def poly_btc5m_page():
     return _build_poly_page(
@@ -16426,7 +16413,6 @@ def paper37_page():
         "P3.3 + ADX + RSI + Volume + Parabolic SAR — 15M Only",
         "P3.3 strategy (P3.1 + DIST mixed mode) filtered through trend strength (ADX>20), momentum confirmation (RSI), volume above average, and Parabolic SAR direction. Needs 2/3 confirmations + ADX gate.",
         extra_cols=[], nav_active="paper37")
-
 
 @app.route("/app/alpha")
 def alpha_page():
@@ -16577,7 +16563,6 @@ td{padding:8px 14px;border-top:1px solid #ececea;font-size:13px}
 <table><tr><th>#</th><th></th><th>Tier</th><th>Asset</th><th>Stake</th><th>Side</th><th>Time</th><th>P&L</th><th>Pool</th></tr>""" + trade_rows + """</table>
 </div></body></html>"""
     return html
-
 
 # Start Polymarket threads (defined above)
 threading.Thread(target=_rtds_loop, daemon=True).start()
