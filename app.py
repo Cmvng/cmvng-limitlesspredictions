@@ -361,17 +361,15 @@ def _poly_alpha2_load_recent():
         pass
 
 def _poly_alpha2_get_tier(asset, timeframe, p23_agrees=False):
-    """Poly Alpha 2.0: 15M live trades for all 4 assets.
-    P2.3 boost when available, but P2.1 alone is sufficient (72% WR).
-    P2.3 distance math less reliable on Polymarket because PTB is
-    captured from Chainlink stream (close but not exact match).
-    5M is paper-only until proven."""
+    """Poly Alpha 2.0: P2.3 REQUIRED for live trades (77% WR).
+    Now that we have exact PTB from slug, P2.3 distance math works
+    the same as Limitless. No more P2.1-only trades."""
     if timeframe == "15M":
-        if asset in ("BTC", "ETH", "SOL", "XRP"):
-            if p23_agrees:
-                return ("PA15+", 3.00, 0.65)  # P2.3 confirmed
-            else:
-                return ("PA15", 2.50, 0.62)   # P2.1 alone — 72% WR, profitable after 1.56% fee
+        if p23_agrees:
+            if asset in ("BTC", "ETH", "SOL", "XRP"):
+                return ("PA15", 3.00, 0.65)  # P2.3 confirmed — 77% WR
+        # Without P2.3: skip live trade
+        return None
     # 5M: paper only
     return None
 
@@ -14526,26 +14524,56 @@ def _poly_parse_market(market, timeframe_hint=None):
         # Try multiple sources in order of reliability
         baseline = None
         
-        # Source 1: Check all text fields for dollar amounts ($XX,XXX.XX format)
-        for field in ["question", "description", "resolutionSource", "rules", "customData", "title"]:
-            text = str(market.get(field) or "")
-            if text and "$" in text:
-                all_prices = re.findall(r'\$([0-9,]+\.?\d*)', text)
-                for p in all_prices:
-                    try:
-                        val = float(p.replace(",", ""))
-                        if asset == "BTC" and 10000 < val < 200000:
-                            baseline = val; break
-                        elif asset == "ETH" and 500 < val < 10000:
-                            baseline = val; break
-                        elif asset == "SOL" and 5 < val < 500:
-                            baseline = val; break
-                        elif asset == "XRP" and 0.1 < val < 10:
-                            baseline = val; break
-                    except:
-                        pass
-                if baseline:
-                    break
+        # Source 1: Extract EXACT PTB from market slug (MOST RELIABLE)
+        # Child market slugs encode the exact PTB: "sol-above-dollar8480" → $84.80
+        # Pattern: {asset}-above-dollar{DIGITS} where digits = price without decimal
+        _mslug = (market.get("slug") or "").lower()
+        _slug_match = re.search(r'above-dollar(\d+)', _mslug)
+        if _slug_match:
+            _slug_num = int(_slug_match.group(1))
+            _slug_ptb = None
+            # BTC/ETH/SOL: divide by 100 (2 decimal places)
+            # XRP: divide by 10000 (4 decimal places)
+            # DOGE: divide by 1000 (3 decimal places)
+            if asset == "BTC":
+                _slug_ptb = _slug_num / 100
+                if not (10000 < _slug_ptb < 200000): _slug_ptb = None
+            elif asset == "ETH":
+                _slug_ptb = _slug_num / 100
+                if not (500 < _slug_ptb < 10000): _slug_ptb = None
+            elif asset == "SOL":
+                _slug_ptb = _slug_num / 100
+                if not (5 < _slug_ptb < 500): _slug_ptb = None
+            elif asset == "XRP":
+                _slug_ptb = _slug_num / 10000
+                if not (0.1 < _slug_ptb < 10): _slug_ptb = None
+            elif asset == "DOGE":
+                _slug_ptb = _slug_num / 1000
+                if not (0.01 < _slug_ptb < 1): _slug_ptb = None
+            if _slug_ptb:
+                baseline = _slug_ptb
+        
+        # Source 2: Check all text fields for dollar amounts ($XX,XXX.XX format)
+        if not baseline:
+            for field in ["question", "description", "resolutionSource", "rules", "customData", "title"]:
+                text = str(market.get(field) or "")
+                if text and "$" in text:
+                    all_prices = re.findall(r'\$([0-9,]+\.?\d*)', text)
+                    for p in all_prices:
+                        try:
+                            val = float(p.replace(",", ""))
+                            if asset == "BTC" and 10000 < val < 200000:
+                                baseline = val; break
+                            elif asset == "ETH" and 500 < val < 10000:
+                                baseline = val; break
+                            elif asset == "SOL" and 5 < val < 500:
+                                baseline = val; break
+                            elif asset == "XRP" and 0.1 < val < 10:
+                                baseline = val; break
+                        except:
+                            pass
+                    if baseline:
+                        break
 
         # Log what we found for debugging
         if baseline:
@@ -14896,24 +14924,7 @@ def run_poly_scan():
                         scored["score"] = scored.get("signals_agree", 0)
 
                     bet_side = scored["bet_side"]
-                    
-                    # For Polymarket: derive direction from indicator consensus
-                    # bet_side depends on price_above which uses baseline comparison
-                    # When baseline is inaccurate (Chainlink vs actual PTB), bet_side
-                    # is wrong — it almost always says YES/UP because price > stale baseline
-                    # Fix: use the indicator direction directly
-                    _ind_dir = scored.get("reason", "")
-                    _has_exact_baseline = parsed.get("baseline") and parsed.get("baseline") == baseline and "title" in str(parsed.get("_ptb_source", ""))
-                    if not _has_exact_baseline:
-                        # No exact PTB — use indicator direction to determine UP/DOWN
-                        if "BEAR" in _ind_dir or "SELL" in _ind_dir:
-                            poly_side = "DOWN"
-                        elif "BULL" in _ind_dir or "BUY" in _ind_dir or "CONFIRMS" in _ind_dir:
-                            poly_side = "UP"
-                        else:
-                            poly_side = "UP" if bet_side == "YES" else "DOWN"
-                    else:
-                        poly_side = "UP" if bet_side == "YES" else "DOWN"
+                    poly_side = "UP" if bet_side == "YES" else "DOWN"
 
                     up_odds = parsed["yes_odds"]
                     effective_odds = up_odds if poly_side == "UP" else (100 - up_odds)
