@@ -14987,23 +14987,22 @@ def run_poly_scan():
                                                 from py_clob_client_v2 import Side, OrderArgs, OrderType
                                                 BUY = Side.BUY
                                                 
-                                                # Get orderbook for better pricing
+                                                # Get orderbook for immediate fill
                                                 _pa2_best_price = _pa2_share
                                                 try:
                                                     book = client.get_order_book(str(tid))
                                                     if book and book.get("asks"):
                                                         best_ask = float(book["asks"][0]["price"])
-                                                        # Place 1-2 cents below best ask for priority fill
-                                                        _pa2_best_price = round(best_ask - 0.01, 2)
-                                                        # Don't go below 0.40 or above max fill
-                                                        _pa2_best_price = max(0.40, min(_pa2_best_price, _pa2_max))
+                                                        # Take the ask directly for immediate fill
+                                                        _pa2_best_price = round(best_ask, 2)
+                                                        # Cap at max fill
+                                                        _pa2_best_price = min(_pa2_best_price, _pa2_max)
                                                     elif book and book.get("bids"):
-                                                        # No asks — place at best bid + 1 cent
                                                         best_bid = float(book["bids"][0]["price"])
-                                                        _pa2_best_price = round(best_bid + 0.01, 2)
+                                                        _pa2_best_price = round(best_bid + 0.02, 2)
                                                         _pa2_best_price = min(_pa2_best_price, _pa2_max)
                                                 except:
-                                                    pass  # Use share_price as fallback
+                                                    pass
                                                 
                                                 _pa2_shares = max(5.0, round(_pa2_stake / _pa2_best_price, 2))
                                                 oa = OrderArgs(token_id=str(tid), price=round(_pa2_best_price, 2), size=_pa2_shares, side=BUY)
@@ -15143,8 +15142,17 @@ def run_poly_scan():
                 if client:
                     from py_clob_client_v2 import Side, OrderArgs, OrderType
                     BUY = Side.BUY
-                    _pa2_shares = max(5.0, round(_pa2_stake / _pa2_share, 2))
-                    oa = OrderArgs(token_id=str(tid), price=round(_pa2_share, 2), size=_pa2_shares, side=BUY)
+                    # Get best ask for immediate fill
+                    _pa2_best = _pa2_share
+                    try:
+                        _fb_book = client.get_order_book(str(tid))
+                        if _fb_book and _fb_book.get("asks"):
+                            _fb_ask = float(_fb_book["asks"][0]["price"])
+                            _pa2_best = min(round(_fb_ask, 2), _pa2_max)
+                    except:
+                        pass
+                    _pa2_shares = max(5.0, round(_pa2_stake / _pa2_best, 2))
+                    oa = OrderArgs(token_id=str(tid), price=round(_pa2_best, 2), size=_pa2_shares, side=BUY)
                     signed = client.create_order(oa)
                     resp = client.post_order(signed, OrderType.GTC)
                     _pa2_oid = resp.get("orderID") or resp.get("order_id") if resp else None
