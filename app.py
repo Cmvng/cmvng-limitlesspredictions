@@ -370,7 +370,7 @@ def _poly_alpha2_get_tier(asset, timeframe, p23_agrees=False):
             if p23_agrees:
                 return ("PA15+", 3.00, 0.65)  # P2.3 confirmed — 77% WR
             else:
-                return ("PA15", 2.50, 0.62)   # P2.1 alone — 72% WR
+                return ("PA15", 2.50, 0.68)   # P2.1 alone — 72% WR
     return None
 
 def _poly_alpha2_calc_stake(base_stake, pool_balance):
@@ -14203,16 +14203,17 @@ def _rtds_loop():
         The PTB is the FIRST Chainlink price at the exact window boundary.
         Per Polymarket developer: 'crypto_prices_chainlink matches the 
         Price To Beat exactly, at +0ms from window boundary.'
-        We capture the first tick within 3 seconds of boundary."""
-        for tf_label, tf_sec in [("5M", 300), ("15M", 900), ("1H", 3600)]:
+        We capture the first tick within a tight window of the boundary.
+        5M: within 5 seconds (ticks every ~1s, allows for 1-2 gaps)
+        15M/1H: within 10 seconds (same reason, less frequent boundaries)"""
+        for tf_label, tf_sec, max_delay in [("5M", 300, 5), ("15M", 900, 10), ("1H", 3600, 10)]:
             window_start = (ts_sec // tf_sec) * tf_sec
             window_end = window_start + tf_sec
             key = "{}_{}".format(asset, tf_label)
             existing = _chainlink_ptb.get(key)
             
-            # Only capture within FIRST 3 seconds of window boundary
-            # This matches the developer's "+0ms from window boundary" guidance
-            if ts_sec - window_start <= 3:
+            # Capture FIRST tick near boundary — once stored, don't overwrite
+            if ts_sec - window_start <= max_delay:
                 if not existing or existing[0] != window_end:
                     _chainlink_ptb[key] = (window_end, price)
                     print("PTB {} {} = ${:,.2f}".format(asset, tf_label, price))
