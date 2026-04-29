@@ -14713,25 +14713,26 @@ def _poly_fetch_markets():
 
 def _poly_get_baseline(parsed, price, indicators):
     """Get the Price to Beat for crypto Up/Down markets.
-    For crypto markets, the PTB is the Chainlink oracle price captured at window open.
-    Our RTDS feed captures this exact price at window boundaries.
-    This matches what Polymarket uses for resolution."""
+    Priority: (1) Exact PTB from market title/question — matches Polymarket display
+              (2) Chainlink boundary capture — close but not exact
+              (3) Latest Chainlink stream — last resort"""
     asset = parsed.get("asset", "")
     tf = parsed.get("timeframe", "")
     
-    # Source 1: Chainlink PTB captured at window boundary (PRIMARY for crypto)
-    # This is the SAME Chainlink feed Polymarket uses for resolution
+    # Source 1: Baseline from market title (EXACT — same as Polymarket displays)
+    # e.g. "BTC above $76,354.75" → baseline = 76354.75
+    if parsed.get("baseline") and parsed["baseline"] > 0:
+        print("POLY PTB (title): {} {} = ${:,.4f}".format(asset, tf, parsed["baseline"]))
+        return parsed["baseline"]
+    
+    # Source 2: Chainlink PTB captured at window boundary (close but not exact)
     key = "{}_{}".format(asset, tf)
     entry = _chainlink_ptb.get(key)
     if entry:
-        print("POLY PTB: {} {} = ${:,.4f}".format(asset, tf, entry[1]))
+        print("POLY PTB (chainlink): {} {} = ${:,.4f}".format(asset, tf, entry[1]))
         return entry[1]
     
-    # Source 2: Baseline from market title (for "above $X" format markets)
-    if parsed.get("baseline") and parsed["baseline"] > 0:
-        return parsed["baseline"]
-    
-    # Source 3: Latest Chainlink streaming price (close approximation)
+    # Source 3: Latest Chainlink streaming price (approximate)
     chainlink = _chainlink_prices.get(asset)
     if chainlink:
         print("POLY PTB (latest stream): {} {} = ${:,.4f}".format(asset, tf, chainlink))
