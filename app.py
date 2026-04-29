@@ -14200,16 +14200,19 @@ def _rtds_loop():
     
     def _store_ptb(asset, price, ts_sec):
         """Store Price to Beat at window boundaries.
-        Captures the first Chainlink price within 60 seconds of window start.
-        First price is closest to the actual PTB used for resolution."""
+        The PTB is the FIRST Chainlink price at the exact window boundary.
+        Per Polymarket developer: 'crypto_prices_chainlink matches the 
+        Price To Beat exactly, at +0ms from window boundary.'
+        We capture the first tick within 3 seconds of boundary."""
         for tf_label, tf_sec in [("5M", 300), ("15M", 900), ("1H", 3600)]:
             window_start = (ts_sec // tf_sec) * tf_sec
             window_end = window_start + tf_sec
             key = "{}_{}".format(asset, tf_label)
             existing = _chainlink_ptb.get(key)
             
-            # Store if within first 60 seconds of window AND this is a new window
-            if ts_sec - window_start <= 60:
+            # Only capture within FIRST 3 seconds of window boundary
+            # This matches the developer's "+0ms from window boundary" guidance
+            if ts_sec - window_start <= 3:
                 if not existing or existing[0] != window_end:
                     _chainlink_ptb[key] = (window_end, price)
                     print("PTB {} {} = ${:,.2f}".format(asset, tf_label, price))
@@ -14521,59 +14524,31 @@ def _poly_parse_market(market, timeframe_hint=None):
         market_id = str(market.get("id") or condition_id or slug)
 
         # Extract the "Price to Beat" (baseline) from the API data
-        # Try multiple sources in order of reliability
+        # For crypto Up/Down markets, the PTB comes from Chainlink RTDS
+        # captured at the exact window boundary (handled by _poly_get_baseline).
+        # Here we check if the API fields contain a dollar amount as backup.
         baseline = None
         
-        # Source 1: Extract EXACT PTB from market slug (MOST RELIABLE)
-        # Child market slugs encode the exact PTB: "sol-above-dollar8480" → $84.80
-        # Pattern: {asset}-above-dollar{DIGITS} where digits = price without decimal
-        _mslug = (market.get("slug") or "").lower()
-        _slug_match = re.search(r'above-dollar(\d+)', _mslug)
-        if _slug_match:
-            _slug_num = int(_slug_match.group(1))
-            _slug_ptb = None
-            # BTC/ETH/SOL: divide by 100 (2 decimal places)
-            # XRP: divide by 10000 (4 decimal places)
-            # DOGE: divide by 1000 (3 decimal places)
-            if asset == "BTC":
-                _slug_ptb = _slug_num / 100
-                if not (10000 < _slug_ptb < 200000): _slug_ptb = None
-            elif asset == "ETH":
-                _slug_ptb = _slug_num / 100
-                if not (500 < _slug_ptb < 10000): _slug_ptb = None
-            elif asset == "SOL":
-                _slug_ptb = _slug_num / 100
-                if not (5 < _slug_ptb < 500): _slug_ptb = None
-            elif asset == "XRP":
-                _slug_ptb = _slug_num / 10000
-                if not (0.1 < _slug_ptb < 10): _slug_ptb = None
-            elif asset == "DOGE":
-                _slug_ptb = _slug_num / 1000
-                if not (0.01 < _slug_ptb < 1): _slug_ptb = None
-            if _slug_ptb:
-                baseline = _slug_ptb
-        
-        # Source 2: Check all text fields for dollar amounts ($XX,XXX.XX format)
-        if not baseline:
-            for field in ["question", "description", "resolutionSource", "rules", "customData", "title"]:
-                text = str(market.get(field) or "")
-                if text and "$" in text:
-                    all_prices = re.findall(r'\$([0-9,]+\.?\d*)', text)
-                    for p in all_prices:
-                        try:
-                            val = float(p.replace(",", ""))
-                            if asset == "BTC" and 10000 < val < 200000:
-                                baseline = val; break
-                            elif asset == "ETH" and 500 < val < 10000:
-                                baseline = val; break
-                            elif asset == "SOL" and 5 < val < 500:
-                                baseline = val; break
-                            elif asset == "XRP" and 0.1 < val < 10:
-                                baseline = val; break
-                        except:
-                            pass
-                    if baseline:
-                        break
+        # Check all text fields for dollar amounts ($XX,XXX.XX format)
+        for field in ["question", "description", "resolutionSource", "rules", "customData", "title"]:
+            text = str(market.get(field) or "")
+            if text and "$" in text:
+                all_prices = re.findall(r'\$([0-9,]+\.?\d*)', text)
+                for p in all_prices:
+                    try:
+                        val = float(p.replace(",", ""))
+                        if asset == "BTC" and 10000 < val < 200000:
+                            baseline = val; break
+                        elif asset == "ETH" and 500 < val < 10000:
+                            baseline = val; break
+                        elif asset == "SOL" and 5 < val < 500:
+                            baseline = val; break
+                        elif asset == "XRP" and 0.1 < val < 10:
+                            baseline = val; break
+                    except:
+                        pass
+                if baseline:
+                    break
 
         # Log what we found for debugging
         if baseline:
