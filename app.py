@@ -14629,10 +14629,10 @@ def _poly_fetch_markets():
     except Exception as e:
         print("Poly search error: {}".format(e))
 
-    # STRATEGY 2: Slug lookup (current window only, 5M+15M)
+    # STRATEGY 2: Slug lookup (current window only, 5M+15M+1H)
     assets = [("btc", "BTC"), ("eth", "ETH"), ("sol", "SOL"), ("xrp", "XRP")]
     for asset_slug, _ in assets:
-        for tf_slug, tf_sec in [("5m", 300), ("15m", 900)]:
+        for tf_slug, tf_sec in [("5m", 300), ("15m", 900), ("1h", 3600)]:
             ws = (current_ts // tf_sec) * tf_sec
             slug = "{}-updown-{}-{}".format(asset_slug, tf_slug, ws)
             
