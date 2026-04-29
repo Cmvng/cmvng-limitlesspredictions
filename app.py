@@ -360,10 +360,10 @@ def _poly_alpha2_load_recent():
     except:
         pass
 
-def _poly_alpha2_get_tier(asset, timeframe, p23_agrees=False):
-    """Poly Alpha 2.0 — Model C with exact PTB from slug.
-    P2.1 alone: $2.50 (72% WR, profitable after 1.56% fee)
-    P2.1 + P2.3: $3.00 (77% WR, distance math confirmed)
+def _poly_alpha2_get_tier(asset, timeframe, p23_agrees=False, p24_agrees=False):
+    """ULTIMATE Model — Maximum profitable volume.
+    15M: P2.1 base ($2.50) + P2.3 boost ($3.00) | all 4 assets
+    1H:  P2.4 required ($2.50) | BTC/ETH/XRP only (SOL 53.5% WR = unprofitable)
     5M: paper only."""
     if timeframe == "15M":
         if asset in ("BTC", "ETH", "SOL", "XRP"):
@@ -371,6 +371,11 @@ def _poly_alpha2_get_tier(asset, timeframe, p23_agrees=False):
                 return ("PA15+", 3.00, 0.65)  # P2.3 confirmed — 77% WR
             else:
                 return ("PA15", 2.50, 0.68)   # P2.1 alone — 72% WR
+    elif timeframe == "1H":
+        # 1H P2.4: BTC 65.8%, ETH 61.0%, XRP 71.8% — all profitable
+        # SOL excluded at 53.5% WR (below breakeven after fees)
+        if asset in ("BTC", "ETH", "XRP") and p24_agrees:
+            return ("PA1H", 2.50, 0.68)       # P2.4 confirmed — 66% blended WR
     return None
 
 def _poly_alpha2_calc_stake(base_stake, pool_balance):
@@ -14973,6 +14978,76 @@ def run_poly_scan():
                                 asset, tf, _pa2_in_dedup, _poly_alpha2_state["enabled"], _poly_has_creds()))
                         if _pa2_sig and _poly_alpha2_state["enabled"] and _poly_has_creds():
                             _pa2_tier = _poly_alpha2_get_tier(_pa2_sig["asset"], _pa2_sig["tf"], _pa2_sig["p23_agrees"])
+
+                    # ─── POLY ALPHA 2.0: 1H P2.4 trades (ULTIMATE model) ───
+                    # P2.4 fires directly for 1H — no pending/boost needed
+                    if strat == "p24" and tf == "1H":
+                        _pa2_mkey = parsed["market_id"]
+                        if _pa2_mkey not in _poly_alpha2_traded_markets and _poly_alpha2_state["enabled"] and _poly_has_creds():
+                            _pa2_tier = _poly_alpha2_get_tier(asset, tf, p24_agrees=True)
+                            if _pa2_tier:
+                                _pa2_name, _pa2_base, _pa2_max = _pa2_tier
+                                _pa2_stake = _poly_alpha2_calc_stake(_pa2_base, _poly_alpha2_state["balance"])
+                                _pa2_share = share_price
+                                _pa2_side = poly_side
+                                _pa2_p = dict(parsed)
+                                if _pa2_stake > 0 and _pa2_stake <= _poly_alpha2_state["balance"] and _pa2_share <= _pa2_max:
+                                    clob_toks = _pa2_p.get("clob_tokens", [])
+                                    cid = _pa2_p.get("condition_id", "")
+                                    tid = None
+                                    if clob_toks and len(clob_toks) >= 2:
+                                        up_idx = _pa2_p.get("up_token_index", 0); down_idx = _pa2_p.get("down_token_index", 1)
+                                        tid = clob_toks[up_idx] if _pa2_side == "UP" else clob_toks[down_idx]
+                                    elif cid:
+                                        tid = _get_poly_token_id(cid, _pa2_side)
+                                    if tid:
+                                        try:
+                                            client = _get_poly_client()
+                                            if client:
+                                                from py_clob_client_v2 import Side, OrderArgs, OrderType
+                                                BUY = Side.BUY
+                                                # Take ask for immediate fill
+                                                _pa2_best = _pa2_share
+                                                try:
+                                                    book = client.get_order_book(str(tid))
+                                                    if book and book.get("asks"):
+                                                        _pa2_best = min(round(float(book["asks"][0]["price"]), 2), _pa2_max)
+                                                except:
+                                                    pass
+                                                _pa2_shares = max(5.0, round(_pa2_stake / _pa2_best, 2))
+                                                oa = OrderArgs(token_id=str(tid), price=round(_pa2_best, 2), size=_pa2_shares, side=BUY)
+                                                signed = client.create_order(oa)
+                                                resp = client.post_order(signed, OrderType.GTC)
+                                                _pa2_oid = resp.get("orderID") or resp.get("order_id") if resp else None
+                                                _pa2_filled = (resp.get("status") or "").upper() in ("MATCHED", "FILLED") if resp else False
+                                                _poly_alpha2_state["balance"] = round(_poly_alpha2_state["balance"] - _pa2_stake, 2)
+                                                _poly_alpha2_state["trades_today"] += 1
+                                                _poly_alpha2_traded_markets.add(_pa2_mkey)
+                                                try:
+                                                    _c2 = get_db()
+                                                    _c2.run("""INSERT INTO poly_alpha2_trades
+                                                        (market_id,title,asset,timeframe,bet_side,tier,stake,fill_price,
+                                                         pool_after,order_id,token_id,condition_id,slug,filled,status,fired_at)
+                                                        VALUES(:mid,:ttl,:ast,:tf,:bs,:tier,:stake,:fill,:pool,:oid,:tid,:cid,:slg,:filled,'Pending',:now)""",
+                                                        mid=_pa2_mkey, ttl=_pa2_p["title"], ast=asset,
+                                                        tf=tf, bs=_pa2_side, tier=_pa2_name,
+                                                        stake=_pa2_stake, fill=round(_pa2_share, 4),
+                                                        pool=_poly_alpha2_state["balance"],
+                                                        oid=_pa2_oid, tid=str(tid)[:50], cid=cid,
+                                                        slg=_pa2_p.get("slug",""), filled=_pa2_filled,
+                                                        now=datetime.now(timezone.utc).isoformat())
+                                                    _c2.close()
+                                                except:
+                                                    pass
+                                                _fl = "FILLED" if _pa2_filled else "MAKER"
+                                                print("POLY A2 {}: {} {} {} ${:.2f} @{:.0f}% [{}] P2.4 | pool=${:.2f}".format(
+                                                    _pa2_name, _pa2_side, asset, tf,
+                                                    _pa2_stake, _pa2_share*100, _fl, _poly_alpha2_state["balance"]))
+                                                send_telegram("⚡ <b>POLY A2 {}</b>\n{} {} {} ${:.2f} @{:.0f}%\nP2.4\nPool: ${:.2f}".format(
+                                                    _pa2_name, _pa2_side, asset, tf,
+                                                    _pa2_stake, _pa2_share*100, _poly_alpha2_state["balance"]))
+                                        except Exception as _e1h:
+                                            print("POLY A2 1H error: {}".format(_e1h))
                             if _pa2_tier:
                                 _pa2_name, _pa2_base, _pa2_max = _pa2_tier
                                 _pa2_stake = _poly_alpha2_calc_stake(_pa2_base, _poly_alpha2_state["balance"])
