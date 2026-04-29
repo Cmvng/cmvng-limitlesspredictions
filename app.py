@@ -361,16 +361,16 @@ def _poly_alpha2_load_recent():
         pass
 
 def _poly_alpha2_get_tier(asset, timeframe, p23_agrees=False):
-    """Poly Alpha 2.0: P2.3 REQUIRED for live trades (77% WR).
-    Now that we have exact PTB from slug, P2.3 distance math works
-    the same as Limitless. No more P2.1-only trades."""
+    """Poly Alpha 2.0 — Model C with exact PTB from slug.
+    P2.1 alone: $2.50 (72% WR, profitable after 1.56% fee)
+    P2.1 + P2.3: $3.00 (77% WR, distance math confirmed)
+    5M: paper only."""
     if timeframe == "15M":
-        if p23_agrees:
-            if asset in ("BTC", "ETH", "SOL", "XRP"):
-                return ("PA15", 3.00, 0.65)  # P2.3 confirmed — 77% WR
-        # Without P2.3: skip live trade
-        return None
-    # 5M: paper only
+        if asset in ("BTC", "ETH", "SOL", "XRP"):
+            if p23_agrees:
+                return ("PA15+", 3.00, 0.65)  # P2.3 confirmed — 77% WR
+            else:
+                return ("PA15", 2.50, 0.62)   # P2.1 alone — 72% WR
     return None
 
 def _poly_alpha2_calc_stake(base_stake, pool_balance):
