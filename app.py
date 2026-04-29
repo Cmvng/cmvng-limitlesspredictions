@@ -14526,46 +14526,26 @@ def _poly_parse_market(market, timeframe_hint=None):
         # Try multiple sources in order of reliability
         baseline = None
         
-        # Source 1: Check all text fields for dollar amounts
-        description = market.get("description") or ""
-        
-        # Source 2: Check for specific price-related metadata
-        # Some markets have customData, metadata, or resolution details
-        for field in ["description", "resolutionSource", "rules", "customData"]:
+        # Source 1: Check all text fields for dollar amounts ($XX,XXX.XX format)
+        for field in ["question", "description", "resolutionSource", "rules", "customData", "title"]:
             text = str(market.get(field) or "")
             if text and "$" in text:
-                # Find all dollar amounts
                 all_prices = re.findall(r'\$([0-9,]+\.?\d*)', text)
                 for p in all_prices:
                     try:
                         val = float(p.replace(",", ""))
-                        # Sanity check: must be a reasonable crypto price
                         if asset == "BTC" and 10000 < val < 200000:
-                            baseline = val
-                            break
+                            baseline = val; break
                         elif asset == "ETH" and 500 < val < 10000:
-                            baseline = val
-                            break
+                            baseline = val; break
                         elif asset == "SOL" and 5 < val < 500:
-                            baseline = val
-                            break
+                            baseline = val; break
                         elif asset == "XRP" and 0.1 < val < 10:
-                            baseline = val
-                            break
+                            baseline = val; break
                     except:
                         pass
                 if baseline:
                     break
-
-        # Source 3: Check the title/question itself for a price
-        if not baseline:
-            for text in [question, market.get("title") or ""]:
-                price_in_title = re.search(r'\$([0-9,]+\.?\d*)', text)
-                if price_in_title:
-                    try:
-                        baseline = float(price_in_title.group(1).replace(",", ""))
-                    except:
-                        pass
 
         # Log what we found for debugging
         if baseline:
@@ -14663,8 +14643,8 @@ def _poly_fetch_markets():
                         if em:
                             print("POLY FOUND: {} → {} markets via {}".format(slug, len(em), "path" if "/slug/" in url else "query"))
                         for market in em:
-                            mq = (market.get("question") or market.get("title") or "NO_Q")[:50]
-                            ms = (market.get("slug") or "NO_SLUG")[:40]
+                            mq = (market.get("question") or market.get("title") or "NO_Q")[:80]
+                            ms = (market.get("slug") or "NO_SLUG")[:60]
                             me = market.get("endDate") or market.get("end_date_iso") or "NO_END"
                             parsed = _poly_parse_market(market)
                             if parsed:
