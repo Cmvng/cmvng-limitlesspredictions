@@ -14703,6 +14703,7 @@ def _poly_get_baseline(parsed, price, indicators):
     # e.g. "BTC above $76,354.75" → baseline = 76354.75
     if parsed.get("baseline") and parsed["baseline"] > 0:
         print("POLY PTB (title): {} {} = ${:,.4f}".format(asset, tf, parsed["baseline"]))
+        parsed["_ptb_source"] = "title"
         return parsed["baseline"]
     
     # Source 2: Chainlink PTB captured at window boundary (close but not exact)
@@ -14710,12 +14711,14 @@ def _poly_get_baseline(parsed, price, indicators):
     entry = _chainlink_ptb.get(key)
     if entry:
         print("POLY PTB (chainlink): {} {} = ${:,.4f}".format(asset, tf, entry[1]))
+        parsed["_ptb_source"] = "chainlink"
         return entry[1]
     
     # Source 3: Latest Chainlink streaming price (approximate)
     chainlink = _chainlink_prices.get(asset)
     if chainlink:
         print("POLY PTB (latest stream): {} {} = ${:,.4f}".format(asset, tf, chainlink))
+        parsed["_ptb_source"] = "stream"
         return chainlink
     return None
 
@@ -14893,7 +14896,24 @@ def run_poly_scan():
                         scored["score"] = scored.get("signals_agree", 0)
 
                     bet_side = scored["bet_side"]
-                    poly_side = "UP" if bet_side == "YES" else "DOWN"
+                    
+                    # For Polymarket: derive direction from indicator consensus
+                    # bet_side depends on price_above which uses baseline comparison
+                    # When baseline is inaccurate (Chainlink vs actual PTB), bet_side
+                    # is wrong — it almost always says YES/UP because price > stale baseline
+                    # Fix: use the indicator direction directly
+                    _ind_dir = scored.get("reason", "")
+                    _has_exact_baseline = parsed.get("baseline") and parsed.get("baseline") == baseline and "title" in str(parsed.get("_ptb_source", ""))
+                    if not _has_exact_baseline:
+                        # No exact PTB — use indicator direction to determine UP/DOWN
+                        if "BEAR" in _ind_dir or "SELL" in _ind_dir:
+                            poly_side = "DOWN"
+                        elif "BULL" in _ind_dir or "BUY" in _ind_dir or "CONFIRMS" in _ind_dir:
+                            poly_side = "UP"
+                        else:
+                            poly_side = "UP" if bet_side == "YES" else "DOWN"
+                    else:
+                        poly_side = "UP" if bet_side == "YES" else "DOWN"
 
                     up_odds = parsed["yes_odds"]
                     effective_odds = up_odds if poly_side == "UP" else (100 - up_odds)
