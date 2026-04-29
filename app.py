@@ -14393,12 +14393,10 @@ try:
     if not _poly_alpha2_restored:
         _poly_alpha2_state["balance"] = 70.0
         _poly_alpha2_state["peak_balance"] = 70.0
-    _poly_alpha2_state["balance"] = 70.0  # RESET — testing outcomes fix
-    _poly_alpha2_state["peak_balance"] = 70.0
     _poly_alpha2_state["starting_balance"] = 70.0
     _poly_alpha2_state["floor_balance"] = 10.0
     _poly_alpha2_state["enabled"] = True
-    print("POLY ALPHA 2.0: ${:.2f} pool{} | 15M P2.3 only (proven 77% WR) | 5M paper only | Floor=$10".format(
+    print("POLY ALPHA 2.0: ${:.2f} pool{} | PA15+PA1H live | Floor=$10".format(
         _poly_alpha2_state["balance"], " (restored)" if _poly_alpha2_restored else " (fresh)"))
     _poly_alpha2_load_recent()
     _poly_alpha_load_recent_trades()
@@ -14885,41 +14883,43 @@ def _poly_fetch_markets():
 
     # STRATEGY 2: Slug lookup (current window only, 5M+15M+1H)
     assets = [("btc", "BTC"), ("eth", "ETH"), ("sol", "SOL"), ("xrp", "XRP")]
-    # 1H slugs use date format: "bitcoin-up-or-down-april-29-2026-2pm-et"
-    _1h_asset_names = {"btc": "bitcoin", "eth": "ethereum", "sol": "solana", "xrp": "xrp"}
+    # 1H uses date-based slug: "bitcoin-up-or-down-april-29-2026-2pm-et"
+    # Confirmed from: dappboris-dev/polymarket-trading-bot & live Polymarket URLs
+    _1h_full_names = {"btc": "bitcoin", "eth": "ethereum", "sol": "solana", "xrp": "xrp"}
     try:
         from zoneinfo import ZoneInfo
         _ET = ZoneInfo("America/New_York")
     except Exception:
-        _ET = timezone(timedelta(hours=-4))  # Fallback EDT
+        _ET = timezone(timedelta(hours=-4))
     now_et = now.astimezone(_ET)
-    _1h_hour_start = now_et.replace(minute=0, second=0, microsecond=0)
-    _1h_h12 = _1h_hour_start.hour % 12
-    if _1h_h12 == 0:
-        _1h_h12 = 12
-    _1h_ampm = "am" if _1h_hour_start.hour < 12 else "pm"
-    _1h_month = _1h_hour_start.strftime("%B").lower()
-    _1h_day = _1h_hour_start.day
-    _1h_year = _1h_hour_start.year
+    _1h_start = now_et.replace(minute=0, second=0, microsecond=0)
+    _1h_h12 = _1h_start.hour % 12 or 12
+    _1h_ap = "am" if _1h_start.hour < 12 else "pm"
+    _1h_mo = _1h_start.strftime("%B").lower()
+    _1h_dy = _1h_start.day
+    _1h_yr = _1h_start.year
 
     for asset_slug, _ in assets:
         slugs_to_try = []
+        # 5M and 15M: timestamp-based slug
         for tf_slug, tf_sec in [("5m", 300), ("15m", 900)]:
             ws = (current_ts // tf_sec) * tf_sec
-            slugs_to_try.append(("{}-updown-{}-{}".format(asset_slug, tf_slug, ws), tf_slug))
-        # 1H: date-based event slug
-        _1h_name = _1h_asset_names.get(asset_slug, asset_slug)
-        _1h_slug = "{}-up-or-down-{}-{}-{}-{}{}-et".format(
-            _1h_name, _1h_month, _1h_day, _1h_year, _1h_h12, _1h_ampm)
-        slugs_to_try.append((_1h_slug, "1h"))
+            slugs_to_try.append("{}-updown-{}-{}".format(asset_slug, tf_slug, ws))
+        # 1H: date-based slug — try WITH year first (current format), then WITHOUT year (old format)
+        _1h_name = _1h_full_names.get(asset_slug, asset_slug)
+        slugs_to_try.append("{}-up-or-down-{}-{}-{}-{}{}-et".format(
+            _1h_name, _1h_mo, _1h_dy, _1h_yr, _1h_h12, _1h_ap))
+        slugs_to_try.append("{}-up-or-down-{}-{}-{}{}-et".format(
+            _1h_name, _1h_mo, _1h_dy, _1h_h12, _1h_ap))
 
-        for slug, tf_slug in slugs_to_try:
+        for slug in slugs_to_try:
+            _is_1h_slug = "-up-or-down-" in slug
             
-            # Try path-based endpoint first: /events/slug/{slug}
+            # Try path-based endpoint: /events/slug/{slug}, then query: /events?slug={slug}
             for url in ["{}/events/slug/{}".format(POLY_GAMMA_API, slug),
                         "{}/events".format(POLY_GAMMA_API)]:
                 try:
-                    params = {"slug": slug} if "?" not in url and "/slug/" not in url else {}
+                    params = {"slug": slug} if "/slug/" not in url else {}
                     r = req.get(url, params=params, timeout=8)
                     if r.status_code == 200:
                         data = r.json()
@@ -14931,24 +14931,15 @@ def _poly_fetch_markets():
                         if em:
                             print("POLY FOUND: {} → {} markets via {}".format(slug, len(em), "path" if "/slug/" in url else "query"))
                         for market in em:
-                            mq = (market.get("question") or market.get("title") or "NO_Q")[:80]
-                            ms = (market.get("slug") or "NO_SLUG")[:60]
-                            me = market.get("endDate") or market.get("end_date_iso") or "NO_END"
-                            # Pass timeframe hint for 1H markets (slug doesn't contain -1h-)
-                            _tf_hint = "1H" if tf_slug == "1h" else None
-                            parsed = _poly_parse_market(market, timeframe_hint=_tf_hint)
+                            parsed = _poly_parse_market(market, timeframe_hint="1H" if _is_1h_slug else None)
                             if parsed:
                                 markets.append(parsed)
-                            elif tf_slug == "1h":
-                                _mslug = (market.get("slug") or "NO_SLUG")[:60]
-                                _mq = (market.get("question") or "NO_Q")[:80]
-                                _mend = market.get("endDate") or market.get("end_date_iso") or market.get("expirationTimestamp") or "NO_END"
-                                _mcid = (market.get("conditionId") or "NO_CID")[:20]
-                                _mout = market.get("outcomes") or "NO_OUT"
-                                print("POLY 1H PARSE FAIL: slug={} q={} end={} cid={} out={}".format(_mslug, _mq, _mend, _mcid, _mout))
-                        # Don't break — continue to try other assets
+                            elif _is_1h_slug:
+                                _mslug = (market.get("slug") or "")[:60]
+                                _mq = (market.get("question") or "")[:80]
+                                print("POLY 1H PARSE FAIL: slug={} q={}".format(_mslug, _mq))
                         if em:
-                            break  # Only break inner URL loop (path vs query), not asset loop
+                            break  # Found via this URL format — skip the other format
                     elif r.status_code == 429:
                         print("Poly slug: rate limited")
                         break
@@ -15843,8 +15834,18 @@ def _resolve_poly_alpha_trades():
                 if fired.tzinfo is None:
                     fired = fired.replace(tzinfo=timezone.utc)
                 tf = p.get("timeframe", "15M")
-                expiry_hours = 0.25 if tf == "15M" else (1.0/12)  # 5 min
-                expiry = fired + timedelta(hours=expiry_hours)
+                # Calculate actual market window end time
+                if tf == "1H":
+                    window_start = fired.replace(minute=0, second=0, microsecond=0)
+                    expiry = window_start + timedelta(hours=1)
+                elif tf == "5M":
+                    m5 = (fired.minute // 5) * 5
+                    window_start = fired.replace(minute=m5, second=0, microsecond=0)
+                    expiry = window_start + timedelta(minutes=5)
+                else:
+                    m15 = (fired.minute // 15) * 15
+                    window_start = fired.replace(minute=m15, second=0, microsecond=0)
+                    expiry = window_start + timedelta(minutes=15)
                 if now < expiry + timedelta(minutes=2):
                     continue
 
@@ -16000,8 +16001,22 @@ def _resolve_poly_alpha2_trades():
                 if fired.tzinfo is None:
                     fired = fired.replace(tzinfo=timezone.utc)
                 tf = p.get("timeframe", "15M")
-                expiry_hours = 0.25 if tf == "15M" else (1.0/12)
-                expiry = fired + timedelta(hours=expiry_hours)
+                # Calculate when the market window actually ends
+                # 5M=5min, 15M=15min, 1H=60min from WINDOW START (not from fired_at)
+                if tf == "1H":
+                    # 1H window: round fired_at DOWN to the hour boundary
+                    window_start = fired.replace(minute=0, second=0, microsecond=0)
+                    expiry = window_start + timedelta(hours=1)
+                elif tf == "5M":
+                    # 5M window: round fired_at DOWN to 5-min boundary
+                    m5 = (fired.minute // 5) * 5
+                    window_start = fired.replace(minute=m5, second=0, microsecond=0)
+                    expiry = window_start + timedelta(minutes=5)
+                else:
+                    # 15M window: round fired_at DOWN to 15-min boundary
+                    m15 = (fired.minute // 15) * 15
+                    window_start = fired.replace(minute=m15, second=0, microsecond=0)
+                    expiry = window_start + timedelta(minutes=15)
                 if now < expiry + timedelta(minutes=2):
                     continue
                 stake = float(p.get("stake") or 2.50)
