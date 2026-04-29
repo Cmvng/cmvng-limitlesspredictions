@@ -14060,6 +14060,7 @@ td{padding:8px 12px;border-bottom:1px solid #f4f3ed;color:var(--ink-2)}tr:last-c
     <a href="/app/paper36" class="nav-tab""" + (" active" if nav_active == "paper36" else "") + """">Paper 3.6</a>
     <a href="/app/paper27" class="nav-tab""" + (" active" if nav_active == "paper27" else "") + """">Paper 2.7</a>
     <a href="/app/paper37" class="nav-tab""" + (" active" if nav_active == "paper37" else "") + """">Paper 3.7</a>
+    <a href="/app/paper28" class="nav-tab""" + (" active" if nav_active == "paper28" else "") + """">Paper 2.8</a>
     <a href="/app/paper4" class="nav-tab""" + (" active" if nav_active == "paper4" else "") + """">Paper 4</a>
     <a href="/app/paper5" class="nav-tab""" + (" active" if nav_active == "paper5" else "") + """">Paper 5</a>
     <a href="/app/paper51" class="nav-tab""" + (" active" if nav_active == "paper51" else "") + """">Paper 5.1</a>
@@ -16652,7 +16653,7 @@ def paper37_page():
 def paper28_page():
     return _build_paper_page("paper28_trades", "Paper 2.8",
         "P2.1 + Candle-at-Baseline — 15M Only",
-        "Reads the current forming candle's position relative to the exact baseline (PTB). Detects continuation (candle confirms trend at baseline), rejection (price tested baseline and bounced), and breaks (price crossed through). Skips when price is too close to baseline (coin flip zone).",
+        "P2.1 direction + previous candle pattern filter. Reads the previous completed candle's structure to confirm or contradict P2.1 indicators. Candle confirms trend → TAKE. Candle contradicts (hammer vs DOWN, shooting star vs UP) → SKIP. Neutral candle + strong P2.1 (3/3) → TAKE. Neutral + weak P2.1 → SKIP.",
         extra_cols=[], nav_active="paper28")
 
 @app.route("/app/alpha")
