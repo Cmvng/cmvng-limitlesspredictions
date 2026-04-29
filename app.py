@@ -14681,7 +14681,7 @@ def _poly_parse_market(market, timeframe_hint=None):
                 exp_ts = int(expiry_dt.timestamp())
             except:
                 return None
-        else:
+        if not expiry_dt:
             if "updown" in slug_lower:
                 print("POLY PARSE NO EXPIRY: slug='{}' keys={}".format(slug_lower[:40], list(market.keys())[:10]))
             return None
@@ -14769,8 +14769,8 @@ def _poly_parse_market(market, timeframe_hint=None):
             o0 = str(outcomes_raw[0]).lower().strip()
             o1 = str(outcomes_raw[1]).lower().strip()
             # Log outcomes for debugging
-            if timeframe in ("5M", "15M"):
-                print("POLY OUTCOMES {}: [{}] up_idx={} down_idx={}".format(asset, ", ".join(str(x) for x in outcomes_raw), up_index, down_index))
+            if timeframe in ("5M", "15M", "1H"):
+                print("POLY OUTCOMES {}: [{}] up_idx={} down_idx={} tf={}".format(asset, ", ".join(str(x) for x in outcomes_raw), up_index, down_index, timeframe))
             # Check for reversed ordering
             if o0 in ("no", "down", "below") and o1 in ("yes", "up", "above"):
                 up_index = 1
@@ -14934,9 +14934,18 @@ def _poly_fetch_markets():
                             mq = (market.get("question") or market.get("title") or "NO_Q")[:80]
                             ms = (market.get("slug") or "NO_SLUG")[:60]
                             me = market.get("endDate") or market.get("end_date_iso") or "NO_END"
-                            parsed = _poly_parse_market(market)
+                            # Pass timeframe hint for 1H markets (slug doesn't contain -1h-)
+                            _tf_hint = "1H" if tf_slug == "1h" else None
+                            parsed = _poly_parse_market(market, timeframe_hint=_tf_hint)
                             if parsed:
                                 markets.append(parsed)
+                            elif tf_slug == "1h":
+                                _mslug = (market.get("slug") or "NO_SLUG")[:60]
+                                _mq = (market.get("question") or "NO_Q")[:80]
+                                _mend = market.get("endDate") or market.get("end_date_iso") or market.get("expirationTimestamp") or "NO_END"
+                                _mcid = (market.get("conditionId") or "NO_CID")[:20]
+                                _mout = market.get("outcomes") or "NO_OUT"
+                                print("POLY 1H PARSE FAIL: slug={} q={} end={} cid={} out={}".format(_mslug, _mq, _mend, _mcid, _mout))
                         # Don't break — continue to try other assets
                         if em:
                             break  # Only break inner URL loop (path vs query), not asset loop
