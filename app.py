@@ -1097,6 +1097,18 @@ def init_db():
             fired_at TEXT, resolved_at TEXT, slug TEXT
         )
     """)
+    # Paper 2.8: P2.1 + Candle-at-Baseline (15M only)
+    conn.run("""
+        CREATE TABLE IF NOT EXISTS paper28_trades (
+            id SERIAL PRIMARY KEY, market_id TEXT, title TEXT, asset TEXT,
+            direction TEXT, baseline REAL, bet_odds REAL, bet_side TEXT,
+            current_price REAL, hours_left REAL, market_type TEXT,
+            indicators TEXT, score INTEGER, total_signals INTEGER,
+            simulated_stake REAL DEFAULT 1.0, simulated_payout REAL,
+            status TEXT DEFAULT 'Pending', outcome TEXT,
+            fired_at TEXT, resolved_at TEXT, slug TEXT
+        )
+    """)
     # ─── ALPHA unified trading system table ───
     conn.run("""
         CREATE TABLE IF NOT EXISTS alpha_trades (
@@ -6838,6 +6850,213 @@ def _score_paper27_trade(p, price, indicators=None, ind_macro=None, expiry_minut
     }
 
 # ═══════════════════════════════════════════════════════════
+# PAPER 2.8: P2.3 + Candle Contradiction Filter — 15M ONLY
+#
+# Simple concept: Run P2.3 first. If P2.3 says trade, check
+# the previous completed candle. If the candle CONTRADICTS
+# P2.3's direction, SKIP. Otherwise, TAKE the trade.
+#
+# Goal: Keep P2.3's 77% wins, filter out the 23% losses where
+# the candle was screaming the opposite direction.
+#
+# P2.3 says DOWN + prev candle = hammer        → SKIP
+# P2.3 says DOWN + prev candle = bear trap     → SKIP
+# P2.3 says DOWN + prev candle = strong green  → SKIP
+# P2.3 says DOWN + prev candle = anything else → TAKE
+#
+# P2.3 says UP + prev candle = shooting star   → SKIP
+# P2.3 says UP + prev candle = bull trap       → SKIP
+# P2.3 says UP + prev candle = strong red      → SKIP
+# P2.3 says UP + prev candle = anything else   → TAKE
+# ═══════════════════════════════════════════════════════════
+
+def _fetch_binance_candles_small(asset, interval="15m", limit=10):
+    """Fetch candles from Binance — works with any limit (no min-20 check)."""
+    import requests as req
+    BMAP = {"BTC": "BTCUSDT", "ETH": "ETHUSDT", "SOL": "SOLUSDT",
+            "XRP": "XRPUSDT", "DOGE": "DOGEUSDT"}
+    symbol = BMAP.get(asset.upper())
+    if not symbol:
+        return None
+    try:
+        r = req.get("https://api.binance.com/api/v3/klines",
+                     params={"symbol": symbol, "interval": interval, "limit": limit},
+                     timeout=3)
+        if r.status_code != 200:
+            return None
+        klines = r.json()
+        if not klines or len(klines) < 2:
+            return None
+        candles = []
+        for k in klines:
+            candles.append({
+                "ts": int(k[0]),
+                "open": float(k[1]),
+                "high": float(k[2]),
+                "low": float(k[3]),
+                "close": float(k[4]),
+                "volume": float(k[5]),
+            })
+        return candles
+    except Exception as e:
+        print("P28 Binance error {} {}: {}".format(asset, interval, e))
+        return None
+
+
+def _p28_read_prev_candle(asset):
+    """Fetch the most recently completed 15M candle and read its pattern.
+    
+    Returns: dict with pattern name and key metrics, or None on failure.
+    """
+    candles = _fetch_binance_candles_small(asset, "15m", 4)
+    if not candles or len(candles) < 2:
+        return None
+    
+    from datetime import datetime, timezone
+    now_ts = int(datetime.now(timezone.utc).timestamp() * 1000)
+    
+    completed = []
+    for c in candles:
+        candle_close_ts = c["ts"] + (15 * 60 * 1000)
+        if candle_close_ts <= now_ts:
+            completed.append(c)
+    
+    if not completed:
+        return None
+    
+    prev = completed[-1]
+    o, h, l, c = prev["open"], prev["high"], prev["low"], prev["close"]
+    
+    body = abs(c - o)
+    total_range = h - l
+    
+    if total_range == 0:
+        return {"pattern": "doji", "body_ratio": 0, "upper_wick_ratio": 0,
+                "lower_wick_ratio": 0, "is_green": False, "is_red": False}
+    
+    upper_wick = h - max(o, c)
+    lower_wick = min(o, c) - l
+    body_ratio = body / total_range
+    upper_wick_ratio = upper_wick / total_range
+    lower_wick_ratio = lower_wick / total_range
+    is_green = c > o
+    is_red = c < o
+    
+    pattern = "unclear"
+    
+    if body_ratio < 0.1:
+        pattern = "doji"
+    elif lower_wick_ratio > 0.6 and body_ratio < 0.35:
+        pattern = "hammer"
+    elif upper_wick_ratio > 0.6 and body_ratio < 0.35:
+        pattern = "shooting_star"
+    elif is_green and upper_wick > body * 2 and upper_wick_ratio > 0.45:
+        pattern = "bull_trap"
+    elif is_red and lower_wick > body * 2 and lower_wick_ratio > 0.45:
+        pattern = "bear_trap"
+    elif is_red and body_ratio > 0.7:
+        pattern = "red_no_lower_wick" if lower_wick_ratio < 0.05 else "strong_red"
+    elif is_green and body_ratio > 0.7:
+        pattern = "green_no_upper_wick" if upper_wick_ratio < 0.05 else "strong_green"
+    elif is_red and body_ratio > 0.4:
+        pattern = "moderate_red"
+    elif is_green and body_ratio > 0.4:
+        pattern = "moderate_green"
+    
+    return {
+        "pattern": pattern,
+        "body_ratio": round(body_ratio, 2),
+        "upper_wick_ratio": round(upper_wick_ratio, 2),
+        "lower_wick_ratio": round(lower_wick_ratio, 2),
+        "is_green": is_green,
+        "is_red": is_red,
+    }
+
+
+def _score_paper28_trade(p, price, indicators=None, ind_macro=None, expiry_minute=None, expiry_hour=None):
+    """Paper 2.8: P2.1 + candle contradiction filter.
+    
+    P2.1 gives the direction (TV + SMA + BTC).
+    The previous candle tells you if that direction is real at the baseline.
+    
+    P2.1 says DOWN + candle = hammer/bounce     → SKIP (chasing bottom)
+    P2.1 says DOWN + candle = strong red         → TAKE (momentum confirms)
+    P2.1 says UP + candle = shooting star/reject → SKIP (chasing top)
+    P2.1 says UP + candle = strong green         → TAKE (momentum confirms)
+    Neutral candle + strong P2.1 (3/3)           → TAKE
+    Neutral candle + weak P2.1 (2/3)             → SKIP
+    """
+    if price is None:
+        return None
+
+    mtype = "15M" if p.get("is_15m_market") else "1H" if p.get("is_hourly_market") else "Daily"
+    if mtype != "15M":
+        return None
+
+    asset = p["asset"]
+    baseline = p.get("baseline", 0)
+    if not baseline or baseline <= 0:
+        return None
+
+    # Step 1: Run P2.1
+    scored21 = _score_paper21_trade(p, price, indicators=indicators, ind_macro=ind_macro,
+                                     expiry_minute=expiry_minute, expiry_hour=expiry_hour)
+    if not scored21:
+        return None
+
+    p21_side = scored21["bet_side"]
+    p21_direction = "UP" if (p21_side == "YES" and p["direction"] == "above") or \
+                            (p21_side == "NO" and p["direction"] != "above") else "DOWN"
+    p21_score = scored21.get("score", 2)  # 3 = strong (3/3), 2 = weak (2/3)
+
+    # Step 2: Read previous candle
+    candle = _p28_read_prev_candle(asset)
+    if not candle:
+        # No candle data — only take if P2.1 was strong
+        if p21_score >= 3:
+            scored21["indicators"] = scored21.get("indicators", "") + " | P28:NO_DATA+STRONG"
+            return scored21
+        return None
+
+    pattern = candle["pattern"]
+
+    # Step 3: Contradiction — candle says opposite to P2.1
+    # These patterns say "price is going UP" — contradicts a DOWN bet
+    contradicts_down = {"hammer", "bear_trap", "strong_green", "green_no_upper_wick"}
+    # These patterns say "price is going DOWN" — contradicts an UP bet
+    contradicts_up = {"shooting_star", "bull_trap", "strong_red", "red_no_lower_wick"}
+
+    if p21_direction == "DOWN" and pattern in contradicts_down:
+        return None  # Chasing the bottom — candle shows buyers defending
+    if p21_direction == "UP" and pattern in contradicts_up:
+        return None  # Chasing the top — candle shows sellers rejecting
+
+    # Step 4: Confirmation — candle agrees with P2.1
+    confirms_down = {"strong_red", "red_no_lower_wick", "shooting_star"}
+    confirms_up = {"strong_green", "green_no_upper_wick", "hammer"}
+
+    candle_confirms = (
+        (p21_direction == "DOWN" and pattern in confirms_down) or
+        (p21_direction == "UP" and pattern in confirms_up)
+    )
+
+    # Step 5: Decision
+    if candle_confirms:
+        tag = "CONFIRMS"
+    elif p21_score >= 3:
+        # Neutral candle but P2.1 strong (3/3) — trust the indicators
+        tag = "NEUTRAL+STRONG"
+    else:
+        # Neutral candle + weak P2.1 (2/3) — not enough conviction
+        return None
+
+    scored21["indicators"] = scored21.get("indicators", "") + " | P28:{}={} b={:.0f}% uw={:.0f}% lw={:.0f}%".format(
+        tag, pattern, candle["body_ratio"]*100,
+        candle["upper_wick_ratio"]*100, candle["lower_wick_ratio"]*100)
+
+    return scored21
+
+# ═══════════════════════════════════════════════════════════
 # PAPER 3.3: Bot 3.1 + Distance Calculator — MIXED MODE
 # Uses distance to adjust confidence and can override weak-period pullbacks
 # ═══════════════════════════════════════════════════════════
@@ -8153,6 +8372,11 @@ def run_paper34_scan():
             p37_ids = set(str(row[0]) for row in p37_rows)
         except:
             p37_ids = set()
+        try:
+            p28_rows = conn.run("SELECT market_id FROM paper28_trades WHERE fired_at::timestamptz > NOW() - INTERVAL '30 hours'")
+            p28_ids = set(str(row[0]) for row in p28_rows)
+        except:
+            p28_ids = set()
         # Get Bot 1 and Bot 2 market IDs to avoid overlap
         try:
             bot12_rows = conn.run("""SELECT market_id FROM limitless_predictions WHERE created_at > NOW() - INTERVAL '30 hours'
@@ -8182,6 +8406,7 @@ def run_paper34_scan():
         p36_count = 0
         p27_count = 0
         p37_count = 0
+        p28_count = 0
 
         for market in markets:
             try:
@@ -8931,11 +9156,38 @@ def run_paper34_scan():
                         except Exception as e:
                             print("Paper37 save error: {}".format(e))
 
+                # ── Paper 2.8 (P2.1 + Candle-at-Baseline) ──
+                if parsed["market_id"] not in p28_ids:
+                    scored28 = _score_paper28_trade(parsed, price, indicators=ind, ind_macro=ind_macro, expiry_minute=expiry_minute, expiry_hour=expiry_hour)
+                    if scored28:
+                        try:
+                            c28 = get_db()
+                            c28.run(
+                                """INSERT INTO paper28_trades
+                                (market_id, title, asset, direction, baseline, bet_odds, bet_side,
+                                 current_price, hours_left, market_type, indicators, score,
+                                 total_signals, simulated_stake, simulated_payout, status, fired_at, slug)
+                                VALUES (:mid, :ttl, :ast, :dir, :base, :odds, :bs,
+                                        :pr, :hrs, :mt, :ind, :sc, :ts, 1.0, :sp, 'Pending', :now, :slg)""",
+                                mid=parsed["market_id"], ttl=parsed["title"], ast=asset,
+                                dir=parsed["direction"], base=parsed["baseline"],
+                                odds=scored28["bet_odds"], bs=scored28["bet_side"],
+                                pr=price, hrs=round(parsed["hours_left"], 2),
+                                mt=scored28["market_type"],
+                                ind="[{}] {}".format(scored28["confidence"], scored28["indicators"]),
+                                sc=scored28["score"], ts=scored28["total_signals"],
+                                sp=scored28["sim_payout"], now=now, slg=parsed["slug"])
+                            c28.close()
+                            p28_ids.add(parsed["market_id"])
+                            p28_count += 1
+                        except Exception as e:
+                            print("Paper28 save error: {}".format(e))
+
             except Exception as e:
                 print("Paper345 market error: {}".format(e))
 
-        if p3_count > 0 or p4_count > 0 or p5_count > 0 or p24_count > 0 or p34_count > 0 or p25_count > 0 or p35_count > 0 or p26_count > 0 or p36_count > 0 or p27_count > 0 or p37_count > 0:
-            print("P3:{} P4:{} P5:{} P3.1:{} P2.1:{} P5.1:{} P2.2:{} P3.2:{} P2.3:{} P3.3:{} P2.4:{} P3.4:{} P2.5:{} P3.5:{} P2.6:{} P3.6:{} P2.7:{} P3.7:{}".format(p3_count, p4_count, p5_count, p31_count, p21_count, p51_count, p22_count, p32_count, p23_count, p33_count, p24_count, p34_count, p25_count, p35_count, p26_count, p36_count, p27_count, p37_count))
+        if p3_count > 0 or p4_count > 0 or p5_count > 0 or p24_count > 0 or p34_count > 0 or p25_count > 0 or p35_count > 0 or p26_count > 0 or p36_count > 0 or p27_count > 0 or p37_count > 0 or p28_count > 0:
+            print("P3:{} P4:{} P5:{} P3.1:{} P2.1:{} P5.1:{} P2.2:{} P3.2:{} P2.3:{} P3.3:{} P2.4:{} P3.4:{} P2.5:{} P3.5:{} P2.6:{} P3.6:{} P2.7:{} P3.7:{} P2.8:{}".format(p3_count, p4_count, p5_count, p31_count, p21_count, p51_count, p22_count, p32_count, p23_count, p33_count, p24_count, p34_count, p25_count, p35_count, p26_count, p36_count, p27_count, p37_count, p28_count))
         else:
             # Count how many assets we got indicators for
             ind_ok = sum(1 for v in indicator_cache_local.values() if v is not None)
@@ -9237,6 +9489,7 @@ def resolve_paper34_trades():
     r36 = _resolve_paper_table("paper36_trades")
     r27 = _resolve_paper_table("paper27_trades")
     r37 = _resolve_paper_table("paper37_trades")
+    r28 = _resolve_paper_table("paper28_trades")
     ra = _resolve_alpha_trades()
     if r3 or r4 or r5 or r24 or r34 or r25 or r35 or r26 or r36 or ra:
         print("Resolved: P3={} P4={} P5={} P3.1={} P2.1={} P5.1={} P2.2={} P3.2={} P2.3={} P3.3={} P2.4={} P3.4={} P2.5={} P3.5={} P2.6={} P3.6={} ALPHA={}".format(r3, r4, r5, r31, r21, r51, r22, r32, r23, r33, r24, r34, r25, r35, r26, r36, ra))
@@ -14631,10 +14884,35 @@ def _poly_fetch_markets():
 
     # STRATEGY 2: Slug lookup (current window only, 5M+15M+1H)
     assets = [("btc", "BTC"), ("eth", "ETH"), ("sol", "SOL"), ("xrp", "XRP")]
+    # 1H slugs use date format: "bitcoin-up-or-down-april-29-2026-2pm-et"
+    _1h_asset_names = {"btc": "bitcoin", "eth": "ethereum", "sol": "solana", "xrp": "xrp"}
+    try:
+        from zoneinfo import ZoneInfo
+        _ET = ZoneInfo("America/New_York")
+    except Exception:
+        _ET = timezone(timedelta(hours=-4))  # Fallback EDT
+    now_et = now.astimezone(_ET)
+    _1h_hour_start = now_et.replace(minute=0, second=0, microsecond=0)
+    _1h_h12 = _1h_hour_start.hour % 12
+    if _1h_h12 == 0:
+        _1h_h12 = 12
+    _1h_ampm = "am" if _1h_hour_start.hour < 12 else "pm"
+    _1h_month = _1h_hour_start.strftime("%B").lower()
+    _1h_day = _1h_hour_start.day
+    _1h_year = _1h_hour_start.year
+
     for asset_slug, _ in assets:
-        for tf_slug, tf_sec in [("5m", 300), ("15m", 900), ("1h", 3600)]:
+        slugs_to_try = []
+        for tf_slug, tf_sec in [("5m", 300), ("15m", 900)]:
             ws = (current_ts // tf_sec) * tf_sec
-            slug = "{}-updown-{}-{}".format(asset_slug, tf_slug, ws)
+            slugs_to_try.append(("{}-updown-{}-{}".format(asset_slug, tf_slug, ws), tf_slug))
+        # 1H: date-based event slug
+        _1h_name = _1h_asset_names.get(asset_slug, asset_slug)
+        _1h_slug = "{}-up-or-down-{}-{}-{}-{}{}-et".format(
+            _1h_name, _1h_month, _1h_day, _1h_year, _1h_h12, _1h_ampm)
+        slugs_to_try.append((_1h_slug, "1h"))
+
+        for slug, tf_slug in slugs_to_try:
             
             # Try path-based endpoint first: /events/slug/{slug}
             for url in ["{}/events/slug/{}".format(POLY_GAMMA_API, slug),
@@ -14753,7 +15031,7 @@ def run_poly_scan():
         conn.close()
 
         poly_counts = {"btc5m": 0, "all5m": 0, "all15m": 0, "hourly24": 0}
-        strategies = ["p21", "p23", "p31", "p33", "p24", "p34", "p25", "p35", "p26", "p36", "bot2"]
+        strategies = ["p21", "p23", "p31", "p33", "p24", "p34", "p25", "p35", "p26", "p36", "p28", "bot2"]
         # BUG 3 FIX: Batch inserts with single connection
         inserts = []
         _pa_pending_signals = {}  # Track P2.1 signals per market for tiered trading
@@ -14770,7 +15048,7 @@ def run_poly_scan():
             # 1H: score in last 45 mins (15+ mins of movement)
             if tf == "5M" and (mins_left < 1 or mins_left > 4):
                 continue
-            if tf == "15M" and (mins_left < 2 or mins_left > 13):
+            if tf == "15M" and (mins_left < 2 or mins_left > 10):
                 continue
             if tf == "1H" and (mins_left < 5 or mins_left > 45):
                 continue
@@ -14885,6 +15163,11 @@ def run_poly_scan():
                                                           expiry_hour=expiry_hour)
                         elif strat == "p36":
                             scored = _score_paper36_trade(parsed, price, indicators=ind,
+                                                          ind_macro=ind_macro,
+                                                          expiry_minute=expiry_minute,
+                                                          expiry_hour=expiry_hour)
+                        elif strat == "p28":
+                            scored = _score_paper28_trade(parsed, price, indicators=ind,
                                                           ind_macro=ind_macro,
                                                           expiry_minute=expiry_minute,
                                                           expiry_hour=expiry_hour)
@@ -16364,6 +16647,13 @@ def paper37_page():
         "P3.3 + ADX + RSI + Volume + Parabolic SAR — 15M Only",
         "P3.3 strategy (P3.1 + DIST mixed mode) filtered through trend strength (ADX>20), momentum confirmation (RSI), volume above average, and Parabolic SAR direction. Needs 2/3 confirmations + ADX gate.",
         extra_cols=[], nav_active="paper37")
+
+@app.route("/app/paper28")
+def paper28_page():
+    return _build_paper_page("paper28_trades", "Paper 2.8",
+        "P2.1 + Candle-at-Baseline — 15M Only",
+        "Reads the current forming candle's position relative to the exact baseline (PTB). Detects continuation (candle confirms trend at baseline), rejection (price tested baseline and bounced), and breaks (price crossed through). Skips when price is too close to baseline (coin flip zone).",
+        extra_cols=[], nav_active="paper28")
 
 @app.route("/app/alpha")
 def alpha_page():
