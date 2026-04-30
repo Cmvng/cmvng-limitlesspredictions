@@ -17101,7 +17101,7 @@ def poly_alpha3_page():
             float(t.get("stake") or 0), t.get("bet_side","?"), fired, pnl_str,
             float(t.get("pool_after") or 0))
 
-    return _build_paper_page.__doc__ and """<!DOCTYPE html><html><head><title>Poly Alpha 3.0</title>
+    return """<!DOCTYPE html><html><head><title>Poly Alpha 3.0</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <style>body{{font-family:-apple-system,sans-serif;max-width:900px;margin:0 auto;padding:10px;background:#0a0a0a;color:#e0e0e0}}
 h1{{color:#00d4aa}}h2{{color:#888;font-size:14px}}
@@ -17124,7 +17124,7 @@ a{{color:#00d4aa}}
 <a href="/" class="nav-tab">Home</a>
 </div>
 <h1>⚡ Poly Alpha 3.0</h1>
-<h2>Pure P2.3 · 15M + 1H · Compounding 5% · Max Fill 62¢</h2>
+<h2>Pure P2.3 · 15M Only · Compounding 5% · Max Fill 62¢ · Aggressive Fills</h2>
 <div class="stats">
 <div class="stat"><div class="val">${:.2f}</div><div class="lbl">Pool</div></div>
 <div class="stat"><div class="val">{}%</div><div class="lbl">Win Rate</div></div>
@@ -17142,7 +17142,7 @@ a{{color:#00d4aa}}
         _poly_alpha3_state["balance"], wr, total,
         pnlc, total_pnl, _poly_alpha3_state["peak_balance"],
         "{}T {}W {}L".format(_poly_alpha3_state["trades_today"], _poly_alpha3_state["wins_today"], _poly_alpha3_state["losses_today"]),
-        tf_html, asset_html, trade_rows) or ""
+        tf_html, asset_html, trade_rows)
 
 @app.route("/app/poly-alpha")
 def poly_alpha_page():
