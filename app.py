@@ -6974,17 +6974,29 @@ def _p28_read_prev_candle(asset):
 
 
 def _score_paper28_trade(p, price, indicators=None, ind_macro=None, expiry_minute=None, expiry_hour=None):
-    """Paper 2.8: P2.1 + candle contradiction filter.
+    """Paper 2.8: CANDLE-FIRST strategy.
     
-    P2.1 gives the direction (TV + SMA + BTC).
-    The previous candle tells you if that direction is real at the baseline.
+    The previous completed candle IS the signal. A pro trader reads the candle 
+    and decides direction. P2.1 is optional confirmation (boosts confidence).
     
-    P2.1 says DOWN + candle = hammer/bounce     → SKIP (chasing bottom)
-    P2.1 says DOWN + candle = strong red         → TAKE (momentum confirms)
-    P2.1 says UP + candle = shooting star/reject → SKIP (chasing top)
-    P2.1 says UP + candle = strong green         → TAKE (momentum confirms)
-    Neutral candle + strong P2.1 (3/3)           → TAKE
-    Neutral candle + weak P2.1 (2/3)             → SKIP
+    CANDLE → DIRECTION:
+      strong_red / red_no_lower_wick → DOWN (sellers in full control)
+      strong_green / green_no_upper_wick → UP (buyers in full control)
+      shooting_star → DOWN (sellers rejected the top)
+      hammer → UP (buyers defended the bottom)
+      bull_trap (green + long upper wick) → DOWN (trapped buyers)
+      bear_trap (red + long lower wick) → UP (trapped sellers)
+      moderate_red → DOWN (lean, needs P2.1 or price confirmation)
+      moderate_green → UP (lean, needs P2.1 or price confirmation)
+      doji → SKIP (no conviction)
+      unclear → SKIP
+    
+    P2.1 ROLE: optional boost, not a gate
+      Candle strong + P2.1 agrees → HIGH confidence
+      Candle strong + no P2.1 → MEDIUM confidence (still trades!)
+      Candle moderate + P2.1 agrees → MEDIUM confidence
+      Candle moderate + no P2.1 → need price below/above baseline to confirm
+      Candle moderate + P2.1 opposes → SKIP (conflicting signals)
     """
     if price is None:
         return None
@@ -6998,63 +7010,147 @@ def _score_paper28_trade(p, price, indicators=None, ind_macro=None, expiry_minut
     if not baseline or baseline <= 0:
         return None
 
-    # Step 1: Run P2.1
-    scored21 = _score_paper21_trade(p, price, indicators=indicators, ind_macro=ind_macro,
-                                     expiry_minute=expiry_minute, expiry_hour=expiry_hour)
-    if not scored21:
+    yes_odds = p["yes_odds"]
+    no_odds = 100 - yes_odds
+    if not (15 <= yes_odds <= 80 or 15 <= no_odds <= 80):
         return None
 
-    p21_side = scored21["bet_side"]
-    p21_direction = "UP" if (p21_side == "YES" and p["direction"] == "above") or \
-                            (p21_side == "NO" and p["direction"] != "above") else "DOWN"
-    p21_score = scored21.get("score", 2)  # 3 = strong (3/3), 2 = weak (2/3)
-
-    # Step 2: Read previous candle
+    # ── Step 1: Read the previous candle — THIS is the primary signal ──
     candle = _p28_read_prev_candle(asset)
     if not candle:
-        # No candle data — only take if P2.1 was strong
-        if p21_score >= 3:
-            scored21["indicators"] = scored21.get("indicators", "") + " | P28:NO_DATA+STRONG"
-            return scored21
         return None
 
     pattern = candle["pattern"]
 
-    # Step 3: Contradiction — candle says opposite to P2.1
-    # These patterns say "price is going UP" — contradicts a DOWN bet
-    contradicts_down = {"hammer", "bear_trap", "strong_green", "green_no_upper_wick"}
-    # These patterns say "price is going DOWN" — contradicts an UP bet
-    contradicts_up = {"shooting_star", "bull_trap", "strong_red", "red_no_lower_wick"}
-
-    if p21_direction == "DOWN" and pattern in contradicts_down:
-        return None  # Chasing the bottom — candle shows buyers defending
-    if p21_direction == "UP" and pattern in contradicts_up:
-        return None  # Chasing the top — candle shows sellers rejecting
-
-    # Step 4: Confirmation — candle agrees with P2.1
-    confirms_down = {"strong_red", "red_no_lower_wick", "shooting_star"}
-    confirms_up = {"strong_green", "green_no_upper_wick", "hammer"}
-
-    candle_confirms = (
-        (p21_direction == "DOWN" and pattern in confirms_down) or
-        (p21_direction == "UP" and pattern in confirms_up)
-    )
-
-    # Step 5: Decision
-    if candle_confirms:
-        tag = "CONFIRMS"
-    elif p21_score >= 3:
-        # Neutral candle but P2.1 strong (3/3) — trust the indicators
-        tag = "NEUTRAL+STRONG"
-    else:
-        # Neutral candle + weak P2.1 (2/3) — not enough conviction
+    # Skip patterns with no conviction
+    if pattern in ("doji", "unclear"):
         return None
 
-    scored21["indicators"] = scored21.get("indicators", "") + " | P28:{}={} b={:.0f}% uw={:.0f}% lw={:.0f}%".format(
-        tag, pattern, candle["body_ratio"]*100,
-        candle["upper_wick_ratio"]*100, candle["lower_wick_ratio"]*100)
+    # Determine candle direction and strength
+    candle_dir = None    # "UP" or "DOWN"
+    candle_strong = False  # Strong patterns don't need P2.1
 
-    return scored21
+    if pattern in ("strong_red", "red_no_lower_wick"):
+        candle_dir = "DOWN"
+        candle_strong = True
+    elif pattern in ("strong_green", "green_no_upper_wick"):
+        candle_dir = "UP"
+        candle_strong = True
+    elif pattern == "shooting_star":
+        candle_dir = "DOWN"
+        candle_strong = True
+    elif pattern == "hammer":
+        candle_dir = "UP"
+        candle_strong = True
+    elif pattern == "bull_trap":
+        candle_dir = "DOWN"
+        candle_strong = True
+    elif pattern == "bear_trap":
+        candle_dir = "UP"
+        candle_strong = True
+    elif pattern == "moderate_red":
+        candle_dir = "DOWN"
+        candle_strong = False
+    elif pattern == "moderate_green":
+        candle_dir = "UP"
+        candle_strong = False
+
+    if candle_dir is None:
+        return None
+
+    # ── Step 2: Check P2.1 (optional — not required for strong candles) ──
+    scored21 = _score_paper21_trade(p, price, indicators=indicators, ind_macro=ind_macro,
+                                     expiry_minute=expiry_minute, expiry_hour=expiry_hour)
+    
+    p21_dir = None
+    p21_score = 0
+    if scored21:
+        p21_side = scored21["bet_side"]
+        p21_dir = "UP" if (p21_side == "YES" and p["direction"] == "above") or \
+                          (p21_side == "NO" and p["direction"] != "above") else "DOWN"
+        p21_score = scored21.get("score", 2)
+
+    # ── Step 3: Price position relative to baseline ──
+    price_above = price > baseline
+
+    # ── Step 4: Decision matrix ──
+    confidence = None
+    tag = ""
+
+    if candle_strong:
+        # Strong candle — ALWAYS trade, P2.1 is just a boost
+        if p21_dir == candle_dir:
+            confidence = "HIGH"
+            tag = "STRONG+P21"
+        elif p21_dir is not None and p21_dir != candle_dir:
+            # P2.1 opposes strong candle — candle wins but lower confidence
+            confidence = "MEDIUM"
+            tag = "STRONG>P21"
+        else:
+            # No P2.1 signal — candle alone is enough for strong patterns
+            confidence = "MEDIUM"
+            tag = "STRONG_SOLO"
+    else:
+        # Moderate candle — needs EITHER P2.1 OR price confirmation
+        if p21_dir == candle_dir:
+            confidence = "MEDIUM"
+            tag = "MOD+P21"
+        elif p21_dir is not None and p21_dir != candle_dir:
+            # P2.1 opposes moderate candle — SKIP (conflicting)
+            return None
+        else:
+            # No P2.1 — check if price position confirms candle
+            # Price above baseline + candle says UP = confirmation
+            # Price below baseline + candle says DOWN = confirmation
+            if (candle_dir == "UP" and price_above) or (candle_dir == "DOWN" and not price_above):
+                confidence = "LOW"
+                tag = "MOD+PRICE"
+            else:
+                # Moderate candle, no P2.1, price contradicts — SKIP
+                return None
+
+    if confidence is None:
+        return None
+
+    # ── Step 5: Build the trade ──
+    if candle_dir == "UP":
+        bet_side = "YES" if p["direction"] == "above" else "NO"
+    else:
+        bet_side = "NO" if p["direction"] == "above" else "YES"
+
+    effective_odds = yes_odds if bet_side == "YES" else no_odds
+
+    # Confidence scoring
+    total_signals = 1  # candle always counts
+    signals_agree = 1
+    if p21_dir == candle_dir:
+        total_signals += 1
+        signals_agree += 1
+    elif p21_dir is not None:
+        total_signals += 1  # P2.1 present but disagrees
+
+    # Build indicator string
+    ind_str = "CANDLE={}({}) b={:.0f}% uw={:.0f}% lw={:.0f}%".format(
+        pattern, candle_dir,
+        candle["body_ratio"]*100,
+        candle["upper_wick_ratio"]*100,
+        candle["lower_wick_ratio"]*100)
+    if p21_dir:
+        ind_str += " | P2.1={}({}/3)".format(p21_dir, p21_score)
+    ind_str += " | {}".format(tag)
+
+    return {
+        "bet_side": bet_side,
+        "confidence": confidence,
+        "score": signals_agree,
+        "total_signals": total_signals,
+        "signals_agree": signals_agree,
+        "p23_agrees": False,
+        "indicators": ind_str,
+        "tv_dir": candle_dir,  # for compatibility
+        "sma_dir": p21_dir or "—",
+        "btc_dir": "—",
+    }
 
 # ═══════════════════════════════════════════════════════════
 # PAPER 3.3: Bot 3.1 + Distance Calculator — MIXED MODE
@@ -16677,7 +16773,7 @@ def paper37_page():
 def paper28_page():
     return _build_paper_page("paper28_trades", "Paper 2.8",
         "P2.1 + Candle-at-Baseline — 15M Only",
-        "P2.1 direction + previous candle pattern filter. Reads the previous completed candle's structure to confirm or contradict P2.1 indicators. Candle confirms trend → TAKE. Candle contradicts (hammer vs DOWN, shooting star vs UP) → SKIP. Neutral candle + strong P2.1 (3/3) → TAKE. Neutral + weak P2.1 → SKIP.",
+        "CANDLE-FIRST strategy. Reads previous completed candle to determine direction — strong patterns (hammer, shooting star, strong red/green, bull/bear trap) trade immediately without needing P2.1. Moderate candles need P2.1 agreement or price confirmation. Much higher volume than filter-based approach.",
         extra_cols=[], nav_active="paper28")
 
 @app.route("/app/alpha")
