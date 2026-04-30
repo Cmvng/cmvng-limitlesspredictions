@@ -5564,6 +5564,8 @@ def _calculate_indicators(asset, timeframe="1h"):
             "candle_open": candle_open,
             "_closes": closes.tolist() if hasattr(closes, 'tolist') else list(closes),
             "_opens": opens.tolist() if hasattr(opens, 'tolist') else list(opens),
+            "_highs": highs.tolist() if hasattr(highs, 'tolist') else list(highs),
+            "_lows": lows.tolist() if hasattr(lows, 'tolist') else list(lows),
         }
 
         _indicator_cache[cache_key] = {"data": result, "updated": datetime.now(timezone.utc)}
@@ -6906,26 +6908,57 @@ def _fetch_binance_candles_small(asset, interval="15m", limit=10):
 def _p28_read_prev_candle(asset, tf="15m"):
     """Fetch the most recently completed candle and read its pattern.
     tf: "5m", "15m", or "1h"
+    Primary: Binance API. Fallback: yfinance indicator cache.
     Returns: dict with pattern name and key metrics, or None on failure.
     """
     tf_mins = {"5m": 5, "15m": 15, "1h": 60}.get(tf, 15)
+    
+    # Try Binance first
     candles = _fetch_binance_candles_small(asset, tf, 4)
+    
+    # Fallback: extract from yfinance indicator cache (already fetched by scanner)
+    if not candles or len(candles) < 2:
+        try:
+            ind = _calculate_indicators(asset, tf)
+            if ind and ind.get("_opens") and ind.get("_closes") and ind.get("_highs") and ind.get("_lows"):
+                opens = ind["_opens"]
+                closes = ind["_closes"]
+                highs = ind["_highs"]
+                lows = ind["_lows"]
+                if len(opens) >= 2:
+                    # Use the second-to-last candle (last completed)
+                    candles = []
+                    for i in range(-3, 0):
+                        if abs(i) <= len(opens):
+                            candles.append({
+                                "ts": 0,  # Not needed for pattern reading
+                                "open": opens[i],
+                                "high": highs[i],
+                                "low": lows[i],
+                                "close": closes[i],
+                            })
+        except:
+            pass
+    
     if not candles or len(candles) < 2:
         return None
     
     from datetime import datetime, timezone
     now_ts = int(datetime.now(timezone.utc).timestamp() * 1000)
     
-    completed = []
-    for c in candles:
-        candle_close_ts = c["ts"] + (tf_mins * 60 * 1000)
-        if candle_close_ts <= now_ts:
-            completed.append(c)
-    
-    if not completed:
-        return None
-    
-    prev = completed[-1]
+    # If from Binance, filter to completed candles
+    if candles[0].get("ts", 0) > 0:
+        completed = []
+        for c in candles:
+            candle_close_ts = c["ts"] + (tf_mins * 60 * 1000)
+            if candle_close_ts <= now_ts:
+                completed.append(c)
+        if not completed:
+            return None
+        prev = completed[-1]
+    else:
+        # From yfinance cache — second-to-last is the last completed
+        prev = candles[-2]
     o, h, l, c = prev["open"], prev["high"], prev["low"], prev["close"]
     
     body = abs(c - o)
@@ -14041,12 +14074,13 @@ tr:hover td{background:#fafaf7}
 
     return paper_html
 
-def _build_paper_page(table_name, page_title, subtitle, description, extra_cols, nav_active):
+def _build_paper_page(table_name, page_title, subtitle, description, extra_cols, nav_active, where_clause=""):
     """Generic page builder for Paper 3 and Paper 4."""
     try:
         conn = get_db()
         # Fetch ALL trades for accurate stats
-        all_rows = conn.run("SELECT * FROM {} ORDER BY id DESC".format(table_name))
+        q = "SELECT * FROM {} {} ORDER BY id DESC".format(table_name, where_clause)
+        all_rows = conn.run(q)
         cols = [c['name'] for c in conn.columns]
         all_trades = [dict(zip(cols, r)) for r in all_rows]
         conn.close()
@@ -16791,111 +16825,11 @@ def paper28_page():
 
 @app.route("/app/paper28poly")
 def paper28poly_page():
-    """Paper 2.8 Polymarket view — filtered from poly_trades."""
-    try:
-        conn = get_db()
-        all_rows = conn.run("SELECT * FROM poly_trades WHERE strategy='p28' ORDER BY id DESC")
-        cols = [c['name'] for c in conn.columns]
-        all_trades = [dict(zip(cols, r)) for r in all_rows]
-        conn.close()
-    except Exception as e:
-        print("Paper28 poly page error: {}".format(e))
-        all_trades = []
-
-    trades = all_trades
-    total = len(trades)
-    wins = sum(1 for t in trades if t.get("outcome") == "WIN")
-    losses = sum(1 for t in trades if t.get("outcome") == "LOSS")
-    pending = sum(1 for t in trades if t.get("status") == "Pending")
-    resolved = wins + losses
-    win_rate = round(wins / resolved * 100, 1) if resolved > 0 else 0
-
-    total_profit = 0
-    for t in trades:
-        if t.get("outcome") == "WIN":
-            total_profit += float(t.get("simulated_payout") or 0) - float(t.get("simulated_stake") or 1)
-        elif t.get("outcome") == "LOSS":
-            total_profit -= float(t.get("simulated_stake") or 1)
-    total_profit = round(total_profit, 2)
-
-    # By asset
-    asset_stats = {}
-    for t in trades:
-        a = t.get("asset") or "?"
-        if a not in asset_stats:
-            asset_stats[a] = {"w": 0, "l": 0, "pnl": 0}
-        if t.get("outcome") == "WIN":
-            asset_stats[a]["w"] += 1
-            asset_stats[a]["pnl"] += float(t.get("simulated_payout") or 0) - float(t.get("simulated_stake") or 1)
-        elif t.get("outcome") == "LOSS":
-            asset_stats[a]["l"] += 1
-            asset_stats[a]["pnl"] -= float(t.get("simulated_stake") or 1)
-
-    display_trades = trades[:200]
-
-    asset_html = ""
-    for a_name in sorted(asset_stats.keys()):
-        st = asset_stats[a_name]
-        wr = round(st["w"] / (st["w"] + st["l"]) * 100, 1) if (st["w"] + st["l"]) > 0 else 0
-        asset_html += "<tr><td>{}</td><td>{}%</td><td>{}W / {}L · ${:.2f}</td></tr>".format(
-            a_name, wr, st["w"], st["l"], st["pnl"])
-
-    rows_html = ""
-    for t in display_trades:
-        outcome = t.get("outcome") or ""
-        icon = "✅" if outcome == "WIN" else "❌" if outcome == "LOSS" else "⏳"
-        pnl = ""
-        if outcome == "WIN":
-            pnl = "+${:.2f}".format(float(t.get("simulated_payout") or 0) - float(t.get("simulated_stake") or 1))
-        elif outcome == "LOSS":
-            pnl = "-${:.2f}".format(float(t.get("simulated_stake") or 1))
-        fired = t.get("fired_at") or ""
-        if fired:
-            try: fired = datetime.fromisoformat(str(fired)).strftime("%Y-%m-%d %H:%M")
-            except: pass
-        rows_html += "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{:.1f}%</td><td>{}</td><td>{}</td><td>{}</td></tr>".format(
-            t.get("id",""), icon, t.get("asset","?"), t.get("bet_side","?"),
-            float(t.get("bet_odds") or 0), t.get("market_type","15M"), pnl, fired)
-
-    return _build_paper_page.__wrapped__("poly_trades", "P2.8 Poly", "Candle-First on Polymarket",
-        "CANDLE-FIRST strategy on Polymarket Up/Down markets. Reads previous candle to determine direction.",
-        extra_cols=[], nav_active="paper28poly") if False else """<!DOCTYPE html><html><head><title>P2.8 Poly</title>
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<style>body{{font-family:-apple-system,sans-serif;max-width:900px;margin:0 auto;padding:10px;background:#0a0a0a;color:#e0e0e0}}
-h1{{color:#00d4aa}}h2{{color:#888;font-size:14px}}
-.stats{{display:grid;grid-template-columns:repeat(auto-fit,minmax(100px,1fr));gap:8px;margin:10px 0}}
-.stat{{background:#1a1a2e;padding:12px;border-radius:8px;text-align:center}}
-.stat .val{{font-size:24px;font-weight:700;color:#00d4aa}}.stat .lbl{{font-size:11px;color:#888}}
-table{{width:100%;border-collapse:collapse;font-size:13px;margin:10px 0}}
-th,td{{padding:6px 8px;border-bottom:1px solid #222;text-align:left}}
-th{{background:#1a1a2e;color:#888;font-size:11px}}
-.nav{{display:flex;gap:4px;flex-wrap:wrap;margin:10px 0}}
-.nav-tab{{padding:6px 12px;background:#1a1a2e;color:#888;text-decoration:none;border-radius:4px;font-size:12px}}
-.nav-tab.active{{background:#00d4aa;color:#000}}
-a{{color:#00d4aa}}
-</style></head><body>
-<div class="nav">
-<a href="/app/paper28" class="nav-tab">Paper 2.8</a>
-<a href="/app/paper28poly" class="nav-tab active">P2.8 Poly</a>
-<a href="/app/poly-alpha2" class="nav-tab">⚡ Poly A2</a>
-<a href="/app/poly/btc5m" class="nav-tab">Polymarket</a>
-<a href="/" class="nav-tab">Home</a>
-</div>
-<h1>Paper 2.8 — Polymarket</h1>
-<h2>CANDLE-FIRST strategy on Polymarket Up/Down markets</h2>
-<div class="stats">
-<div class="stat"><div class="val">{}</div><div class="lbl">Total</div></div>
-<div class="stat"><div class="val">{}%</div><div class="lbl">Win Rate</div></div>
-<div class="stat"><div class="val">{}</div><div class="lbl">Wins</div></div>
-<div class="stat"><div class="val">{}</div><div class="lbl">Losses</div></div>
-<div class="stat"><div class="val">{}</div><div class="lbl">Pending</div></div>
-<div class="stat"><div class="val">${:.2f}</div><div class="lbl">Sim P&L</div></div>
-</div>
-<h2>By Asset</h2><table><tr><th>Asset</th><th>WR</th><th>Record</th></tr>{}</table>
-<h2>Trade Log</h2><table><tr><th>#</th><th></th><th>Asset</th><th>Side</th><th>Odds</th><th>TF</th><th>P&L</th><th>Time</th></tr>{}</table>
-<p style="color:#444;font-size:11px">Paper trading · $1 simulated stakes · Auto-resolves · Auto-refresh 60s</p>
-<script>setTimeout(()=>location.reload(),60000)</script>
-</body></html>""".format(total, win_rate, wins, losses, pending, total_profit, asset_html, rows_html)
+    return _build_paper_page("poly_trades", "P2.8 Poly",
+        "Candle-First on Polymarket",
+        "CANDLE-FIRST strategy on Polymarket Up/Down markets. Reads previous candle to determine direction — strong patterns trade immediately, moderate candles need P2.1 or price confirmation.",
+        extra_cols=[], nav_active="paper28poly",
+        where_clause="WHERE strategy='p28'")
 
 @app.route("/app/alpha")
 def alpha_page():
