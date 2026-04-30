@@ -14767,7 +14767,7 @@ try:
         _poly_alpha2_state["peak_balance"] = 60.0
     _poly_alpha2_state["starting_balance"] = 60.0
     _poly_alpha2_state["floor_balance"] = 5.0
-    _poly_alpha2_state["enabled"] = True  # ACTIVE — PA15+ 15M only
+    _poly_alpha2_state["enabled"] = False  # PAUSED — replaced by Alpha 3.0
     print("POLY ALPHA 2.0: ${:.2f} pool{} | PA15+ 15M only | Floor=$10".format(
         _poly_alpha2_state["balance"], " (restored)" if _poly_alpha2_restored else " (fresh)"))
     _poly_alpha2_load_recent()
@@ -14784,8 +14784,8 @@ try:
         _poly_alpha3_state["peak_balance"] = 60.0
     _poly_alpha3_state["starting_balance"] = 60.0
     _poly_alpha3_state["floor_balance"] = 5.0
-    _poly_alpha3_state["enabled"] = False  # PAUSED — using Alpha 2.0 instead
-    print("POLY ALPHA 3.0: ${:.2f} pool{} | PAUSED".format(
+    _poly_alpha3_state["enabled"] = True  # ACTIVE — Pure P2.3 live bot
+    print("POLY ALPHA 3.0: ${:.2f} pool{} | Pure P2.3 15M | Compound 5% | Floor=$5".format(
         _poly_alpha3_state["balance"], " (restored)" if _poly_alpha3_restored else " (fresh)"))
     _poly_alpha3_load_recent()
 
