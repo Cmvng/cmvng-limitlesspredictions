@@ -381,6 +381,9 @@ def _poly_alpha2_calc_stake(base_stake, pool_balance):
     return stake
 
 def _poly_alpha_load_recent_trades():
+    # Start sniper thread
+    threading.Thread(target=_sniper_thread, daemon=True).start()
+    print("SNIPER thread launched")
     """Load recently traded market IDs from DB to prevent double-trading after restart."""
     try:
         conn = get_db()
@@ -413,6 +416,23 @@ _poly_alpha3_state = {
 _poly_alpha3_traded_markets = set()
 
 def _poly_alpha3_load_recent():
+
+    # ── POLY ALPHA 4.0 SNIPER init ──
+    _poly_alpha4_restored = False
+    _saved_pa4 = _saved_balances.get("poly_alpha4", {})
+    if _saved_pa4 and _saved_pa4.get("balance", 0) > 0:
+        _poly_alpha4_state["balance"] = _saved_pa4["balance"]
+        _poly_alpha4_state["peak_balance"] = _saved_pa4.get("peak_balance", _saved_pa4["balance"])
+        _poly_alpha4_restored = True
+    if not _poly_alpha4_restored:
+        _poly_alpha4_state["balance"] = 60.0
+        _poly_alpha4_state["peak_balance"] = 60.0
+    _poly_alpha4_state["starting_balance"] = 60.0
+    _poly_alpha4_state["floor_balance"] = 5.0
+    _poly_alpha4_state["enabled"] = True
+    print("SNIPER A4: ${:.2f} pool{} | P2.1 at boundary | 15M | 50¢ fills".format(
+        _poly_alpha4_state["balance"], " (restored)" if _poly_alpha4_restored else " (fresh)"))
+
     try:
         conn = get_db()
         rows = conn.run("SELECT market_id FROM poly_alpha3_trades WHERE fired_at::timestamptz > NOW() - INTERVAL '2 hours'")
@@ -434,6 +454,454 @@ def _poly_alpha3_calc_stake(pool_balance):
     if stake > pool_balance * 0.15:
         return 0  # Safety: don't risk more than 15% on one trade
     return stake
+
+# ═══════════════════════════════════════════════════════════
+# POLY ALPHA 4.0 — THE SNIPER
+# Pre-calculated P2.1 signals fired at exact window boundary at 50¢
+# Independent thread, no scanner dependency
+# ═══════════════════════════════════════════════════════════
+
+_poly_alpha4_state = {
+    "enabled": True,
+    "balance": 60.0,
+    "peak_balance": 60.0,
+    "starting_balance": 60.0,
+    "floor_balance": 5.0,
+    "trades_today": 0,
+    "wins_today": 0,
+    "losses_today": 0,
+    "profit_today": 0.0,
+}
+_poly_alpha4_traded_markets = set()
+
+def _poly_alpha4_calc_stake(pool_balance):
+    """Compounding: 5% of pool, min $2.50, max $8.00."""
+    stake = round(pool_balance * 0.05, 2)
+    stake = max(stake, 2.50)
+    stake = min(stake, 8.00)
+    if stake > pool_balance * 0.15:
+        return 0
+    return stake
+
+def _sniper_get_direction(asset):
+    """Read P2.1 direction from cached indicators. No market dict needed.
+    Returns ("UP", signals_agree, "TV=BUY|SMA=BUY|BTC=BUY") or (None, 0, "") if no signal.
+    """
+    # Read cached indicators — these persist from previous scan cycle
+    tv = _tv_trends.get(asset.upper())
+    tv_dir = tv["dir"] if tv else None
+
+    sma_data = _pair_sma_cache.get(asset.upper(), {})
+    sma_dir = sma_data.get("trend")
+
+    btc_trend = _btc_trend_cache.get("trend")
+
+    # Pair direction: TV + SMA vote
+    pair_signals = [s for s in [tv_dir, sma_dir] if s in ("BUY", "SELL")]
+    pair_buy = sum(1 for s in pair_signals if s == "BUY")
+    pair_sell = sum(1 for s in pair_signals if s == "SELL")
+
+    if pair_buy > pair_sell:
+        pair_dir = "BUY"
+    elif pair_sell > pair_buy:
+        pair_dir = "SELL"
+    elif len(pair_signals) == 0:
+        pair_dir = btc_trend  # no pair data, use BTC as direction
+    else:
+        # TV and SMA split — check BTC as tiebreaker
+        if btc_trend:
+            pair_dir = btc_trend
+        else:
+            pair_dir = None  # no tiebreaker → skip
+
+    if not pair_dir:
+        return None, 0, ""
+
+    # Count agreement
+    signals_agree = sum(1 for s in [tv_dir, sma_dir, btc_trend] if s == pair_dir)
+    total_signals = sum(1 for s in [tv_dir, sma_dir, btc_trend] if s is not None)
+
+    # Map to UP/DOWN for Polymarket
+    direction = "UP" if pair_dir == "BUY" else "DOWN"
+
+    # Build indicator string
+    ind_str = "TV={} SMA={} BTC={} [{}/{}]".format(
+        tv_dir or "—", sma_dir or "—", btc_trend or "—",
+        signals_agree, total_signals)
+
+    return direction, signals_agree, ind_str
+
+def _sniper_thread():
+    """Dedicated sniper thread — fires at exact 15M window boundaries.
+    Runs independently from the main scanner.
+    
+    Timeline every 15 minutes:
+      T-30s: Read indicators, determine direction for each asset
+      T-20s: Calculate next window slug
+      T-15s: Fetch token IDs from Gamma API
+      T-5s:  Pre-sign orders
+      T+0s:  Fire all orders at 50¢
+      T+3s:  Check fill status
+    """
+    import time as _time
+    SNIPER_ASSETS = ["BTC", "ETH", "SOL", "XRP"]
+    SNIPER_SLUGS = {
+        "BTC": "btc-updown-15m-{}",
+        "ETH": "eth-updown-15m-{}",
+        "SOL": "sol-updown-15m-{}",
+        "XRP": "xrp-updown-15m-{}",
+    }
+    SNIPER_MAX_FILL = 0.52  # Max 52¢ — very close to 50¢
+    GAMMA_API = "https://gamma-api.polymarket.com"
+
+    print("SNIPER THREAD STARTED — waiting for first boundary...")
+
+    while True:
+        try:
+            if not _poly_alpha4_state["enabled"]:
+                _time.sleep(30)
+                continue
+
+            if not _poly_has_creds():
+                _time.sleep(30)
+                continue
+
+            # ── Calculate time to next 15M boundary ──
+            now = datetime.now(timezone.utc)
+            current_minute = now.minute
+            current_second = now.second
+
+            # Next boundary: :00, :15, :30, :45
+            mins_to_next = 15 - (current_minute % 15)
+            if mins_to_next == 15:
+                mins_to_next = 0
+
+            secs_to_boundary = mins_to_next * 60 - current_second
+
+            # If more than 35 seconds away, sleep and retry
+            if secs_to_boundary > 35:
+                _time.sleep(min(secs_to_boundary - 35, 60))
+                continue
+
+            # ── T-30s: Read indicators for all assets ──
+            snipe_targets = []
+            for asset in SNIPER_ASSETS:
+                direction, signals_agree, ind_str = _sniper_get_direction(asset)
+                if direction and signals_agree >= 2:
+                    snipe_targets.append({
+                        "asset": asset,
+                        "direction": direction,
+                        "signals_agree": signals_agree,
+                        "indicators": ind_str,
+                    })
+
+            if not snipe_targets:
+                # No signals — wait for next boundary
+                _time.sleep(max(secs_to_boundary + 5, 5))
+                continue
+
+            # ── T-20s: Calculate next window's slug and timestamp ──
+            # The NEXT window starts at the upcoming boundary
+            next_boundary = now.replace(second=0, microsecond=0)
+            next_min = ((now.minute // 15) + 1) * 15
+            if next_min >= 60:
+                next_boundary = next_boundary.replace(minute=0) + timedelta(hours=1)
+            else:
+                next_boundary = next_boundary.replace(minute=next_min)
+
+            window_ts = int(next_boundary.timestamp())
+
+            # ── T-15s: Fetch token IDs from Gamma API ──
+            import requests as _req
+            token_map = {}  # {asset: {"up_token": ..., "down_token": ..., "condition_id": ...}}
+            for target in snipe_targets:
+                asset = target["asset"]
+                slug = SNIPER_SLUGS[asset].format(window_ts)
+                try:
+                    r = _req.get("{}/markets/slug/{}".format(GAMMA_API, slug), timeout=8)
+                    if r.status_code == 200:
+                        md = r.json()
+                        tokens = md.get("clobTokenIds")
+                        if isinstance(tokens, str):
+                            try:
+                                import json as _json
+                                tokens = _json.loads(tokens)
+                            except:
+                                tokens = None
+                        outcomes = md.get("outcomes")
+                        if isinstance(outcomes, str):
+                            try:
+                                outcomes = _json.loads(outcomes)
+                            except:
+                                outcomes = None
+                        if tokens and isinstance(tokens, list) and len(tokens) >= 2 and outcomes:
+                            up_idx = 0
+                            if isinstance(outcomes, list) and len(outcomes) >= 2:
+                                o0 = str(outcomes[0]).lower().strip()
+                                if o0 in ("no", "down", "below"):
+                                    up_idx = 1
+                            down_idx = 1 - up_idx
+                            token_map[asset] = {
+                                "up_token": tokens[up_idx],
+                                "down_token": tokens[down_idx],
+                                "condition_id": md.get("conditionId", ""),
+                                "slug": slug,
+                                "title": md.get("question", slug),
+                            }
+                    else:
+                        # Market might not be deployed yet — try with path search
+                        r2 = _req.get("{}/markets?slug={}".format(GAMMA_API, slug), timeout=8)
+                        if r2.status_code == 200:
+                            results = r2.json()
+                            if isinstance(results, list) and len(results) > 0:
+                                md = results[0]
+                                tokens = md.get("clobTokenIds")
+                                if isinstance(tokens, str):
+                                    try: tokens = _json.loads(tokens)
+                                    except: tokens = None
+                                outcomes = md.get("outcomes")
+                                if isinstance(outcomes, str):
+                                    try: outcomes = _json.loads(outcomes)
+                                    except: outcomes = None
+                                if tokens and isinstance(tokens, list) and len(tokens) >= 2:
+                                    up_idx = 0
+                                    if isinstance(outcomes, list) and len(outcomes) >= 2:
+                                        o0 = str(outcomes[0]).lower().strip()
+                                        if o0 in ("no", "down", "below"):
+                                            up_idx = 1
+                                    down_idx = 1 - up_idx
+                                    token_map[asset] = {
+                                        "up_token": tokens[up_idx],
+                                        "down_token": tokens[down_idx],
+                                        "condition_id": md.get("conditionId", ""),
+                                        "slug": slug,
+                                        "title": md.get("question", slug),
+                                    }
+                except Exception as e:
+                    print("SNIPER fetch {} error: {}".format(asset, e))
+
+            if not token_map:
+                print("SNIPER: no markets found for boundary {} — tokens not deployed yet".format(window_ts))
+                _time.sleep(max(secs_to_boundary + 5, 5))
+                continue
+
+            # ── Wait until T+0 (exact boundary) ──
+            now2 = datetime.now(timezone.utc)
+            wait_secs = (next_boundary - now2).total_seconds()
+            if wait_secs > 0 and wait_secs < 120:
+                print("SNIPER: {} targets ready, waiting {:.1f}s for boundary...".format(len(token_map), wait_secs))
+                _time.sleep(max(wait_secs - 0.5, 0))  # Fire 0.5s early to account for network latency
+
+            # ── T+0: FIRE ALL ORDERS ──
+            client = _get_poly_client()
+            if not client:
+                print("SNIPER: no CLOB client — skipping")
+                _time.sleep(20)
+                continue
+
+            from py_clob_client_v2 import Side, OrderArgs, OrderType
+            BUY = Side.BUY
+
+            fired_count = 0
+            for target in snipe_targets:
+                asset = target["asset"]
+                if asset not in token_map:
+                    continue
+
+                market_key = "sniper_{}_{}_{}".format(asset, "15M", window_ts)
+                if market_key in _poly_alpha4_traded_markets:
+                    continue
+
+                stake = _poly_alpha4_calc_stake(_poly_alpha4_state["balance"])
+                if stake <= 0 or stake > _poly_alpha4_state["balance"]:
+                    continue
+
+                tdata = token_map[asset]
+                direction = target["direction"]
+                token_id = tdata["up_token"] if direction == "UP" else tdata["down_token"]
+
+                # Order at 50¢ — or check order book for best ask up to 52¢
+                order_price = 0.50
+                try:
+                    book = client.get_order_book(str(token_id))
+                    if book and book.get("asks") and len(book["asks"]) > 0:
+                        best_ask = round(float(book["asks"][0]["price"]), 2)
+                        if best_ask <= SNIPER_MAX_FILL:
+                            order_price = best_ask
+                        else:
+                            order_price = 0.50  # Place at 50¢ as maker
+                except:
+                    pass  # Order book not available yet — place at 50¢
+
+                shares = max(5.0, round(stake / order_price, 2))
+
+                try:
+                    oa = OrderArgs(token_id=str(token_id), price=round(order_price, 2), size=shares, side=BUY)
+                    signed = client.create_order(oa)
+                    resp = client.post_order(signed, OrderType.GTC)
+                    order_id = resp.get("orderID") or resp.get("order_id") if resp else None
+                    filled = (resp.get("status") or "").upper() in ("MATCHED", "FILLED") if resp else False
+
+                    # Update pool
+                    _poly_alpha4_state["balance"] = round(_poly_alpha4_state["balance"] - stake, 2)
+                    _poly_alpha4_state["trades_today"] += 1
+                    _poly_alpha4_traded_markets.add(market_key)
+                    if _poly_alpha4_state["balance"] > _poly_alpha4_state["peak_balance"]:
+                        _poly_alpha4_state["peak_balance"] = _poly_alpha4_state["balance"]
+
+                    # Save to DB
+                    try:
+                        c4 = get_db()
+                        c4.run("""INSERT INTO poly_alpha4_trades
+                            (market_id,title,asset,timeframe,bet_side,stake,fill_price,
+                             pool_after,order_id,token_id,condition_id,slug,filled,status,
+                             indicators,signals_agree,fired_at)
+                            VALUES(:mid,:ttl,:ast,:tf,:bs,:stake,:fill,:pool,:oid,:tid,:cid,:slg,:filled,'Pending',
+                                   :ind,:sa,:now)""",
+                            mid=market_key, ttl=tdata.get("title", ""),
+                            ast=asset, tf="15M", bs=direction, stake=stake,
+                            fill=round(order_price, 4), pool=_poly_alpha4_state["balance"],
+                            oid=order_id, tid=str(token_id)[:50],
+                            cid=tdata.get("condition_id", ""),
+                            slg=tdata.get("slug", ""),
+                            filled=filled,
+                            ind=target["indicators"],
+                            sa=target["signals_agree"],
+                            now=datetime.now(timezone.utc).isoformat())
+                        c4.close()
+                    except Exception as e:
+                        print("SNIPER DB save error: {}".format(e))
+
+                    fl_tag = "FILLED" if filled else "MAKER"
+                    print("SNIPER A4: {} {} 15M ${:.2f} @{:.0f}¢ [{}] {} | pool=${:.2f}".format(
+                        direction, asset, stake, order_price * 100,
+                        fl_tag, target["indicators"], _poly_alpha4_state["balance"]))
+                    send_telegram("🎯 <b>SNIPER A4</b>\n{} {} 15M ${:.2f} @{:.0f}¢\n{}\nPool: ${:.2f}".format(
+                        direction, asset, stake, order_price * 100,
+                        target["indicators"], _poly_alpha4_state["balance"]))
+
+                    fired_count += 1
+
+                except Exception as e:
+                    print("SNIPER order {} error: {}".format(asset, e))
+
+            if fired_count > 0:
+                print("SNIPER: fired {} orders at boundary {}".format(fired_count, window_ts))
+                _save_bot_balance("poly_alpha4", _poly_alpha4_state)
+
+            # Sleep until next cycle (at least 60s to avoid double-firing)
+            _time.sleep(60)
+
+        except Exception as e:
+            print("SNIPER thread error: {}".format(e))
+            _time.sleep(30)
+
+
+def _resolve_poly_alpha4_trades():
+    """Resolve Alpha 4.0 sniper trades."""
+    try:
+        conn = get_db()
+        rows = conn.run("SELECT * FROM poly_alpha4_trades WHERE status='Pending' ORDER BY id")
+        cols = [c['name'] for c in conn.columns]
+        items = [dict(zip(cols, r)) for r in rows]
+        conn.close()
+        if not items: return 0
+        now = datetime.now(timezone.utc)
+        resolved = 0
+        for p in items:
+            try:
+                if not p.get("fired_at"): continue
+                fired = datetime.fromisoformat(p["fired_at"])
+                if fired.tzinfo is None: fired = fired.replace(tzinfo=timezone.utc)
+                # 15M window-based expiry
+                m15 = (fired.minute // 15) * 15
+                window_start = fired.replace(minute=m15, second=0, microsecond=0)
+                expiry = window_start + timedelta(minutes=15)
+                if now < expiry + timedelta(minutes=2): continue
+
+                stake = float(p.get("stake") or 2.50)
+                order_filled = p.get("filled", False)
+
+                # Unfilled → return stake
+                if not order_filled and now > expiry:
+                    _poly_alpha4_state["balance"] = round(_poly_alpha4_state["balance"] + stake, 2)
+                    c4 = get_db()
+                    c4.run("UPDATE poly_alpha4_trades SET status='Returned',outcome='RETURNED',resolved_at=:r WHERE id=:i",
+                           r=now.isoformat(), i=p["id"])
+                    c4.close()
+                    resolved += 1; continue
+
+                # Check resolution via Gamma API
+                won = None
+                slug = p.get("slug", "")
+                bs = p.get("bet_side", "UP")
+                try:
+                    import requests as req
+                    if slug:
+                        r = req.get("{}/markets/slug/{}".format(POLY_GAMMA_API, slug), timeout=8)
+                        if r.status_code == 200:
+                            md = r.json()
+                            ops = md.get("outcomePrices")
+                            if isinstance(ops, str):
+                                try: ops = json.loads(ops)
+                                except: ops = None
+                            if isinstance(ops, list) and len(ops) >= 2:
+                                p0 = float(ops[0]); p1 = float(ops[1])
+                                _oc = md.get("outcomes")
+                                if isinstance(_oc, str):
+                                    try: _oc = json.loads(_oc)
+                                    except: _oc = None
+                                _up_idx = 0
+                                if isinstance(_oc, list) and len(_oc) >= 2:
+                                    o0 = str(_oc[0]).lower().strip()
+                                    if o0 in ("no", "down", "below"): _up_idx = 1
+                                if _up_idx == 0:
+                                    if p0 >= 0.95: won = (bs == "UP")
+                                    elif p1 >= 0.95: won = (bs == "DOWN")
+                                else:
+                                    if p1 >= 0.95: won = (bs == "UP")
+                                    elif p0 >= 0.95: won = (bs == "DOWN")
+                except: pass
+
+                if won is None:
+                    if now > expiry + timedelta(hours=1): won = False
+                    else: continue
+
+                fill = float(p.get("fill_price") or 0.50)
+                payout = round(stake / fill, 4) if won else 0
+                status = "Won" if won else "Lost"
+
+                c4 = get_db()
+                c4.run("UPDATE poly_alpha4_trades SET status=:s,outcome=:o,resolved_at=:r,payout=:p,filled=TRUE WHERE id=:i",
+                       s=status, o="WIN" if won else "LOSS", r=now.isoformat(), p=payout, i=p["id"])
+                c4.close()
+                resolved += 1
+
+                if won:
+                    _poly_alpha4_state["balance"] = round(_poly_alpha4_state["balance"] + payout, 2)
+                    _poly_alpha4_state["wins_today"] += 1
+                    _poly_alpha4_state["profit_today"] = round(_poly_alpha4_state["profit_today"] + (payout - stake), 2)
+                else:
+                    _poly_alpha4_state["losses_today"] += 1
+                    _poly_alpha4_state["profit_today"] = round(_poly_alpha4_state["profit_today"] - stake, 2)
+
+                if _poly_alpha4_state["balance"] > _poly_alpha4_state["peak_balance"]:
+                    _poly_alpha4_state["peak_balance"] = _poly_alpha4_state["balance"]
+                if _poly_alpha4_state["balance"] <= _poly_alpha4_state["floor_balance"]:
+                    _poly_alpha4_state["enabled"] = False
+                    send_telegram("🚨 SNIPER A4 STOPPED — Floor ${:.2f}".format(_poly_alpha4_state["balance"]))
+
+                _pnl = "+${:.2f}".format(payout - stake) if won else "-${:.2f}".format(stake)
+                print("SNIPER A4 #{} {}: ${:.2f} → {} | pool=${:.2f}".format(
+                    p["id"], "WIN" if won else "LOSS", stake, _pnl, _poly_alpha4_state["balance"]))
+
+            except Exception as e:
+                print("SNIPER A4 resolve error #{}: {}".format(p.get("id"), e))
+        return resolved
+    except Exception as e:
+        print("SNIPER A4 resolve error: {}".format(e))
+        return 0
+
 
 def _poly_alpha_get_tier(asset, timeframe, p23_agrees=False):
     """Poly Alpha v1 — PAUSED. Use Poly Alpha 2.0 instead."""
@@ -1222,6 +1690,18 @@ def init_db():
             pool_after REAL, payout REAL, order_id TEXT, token_id TEXT,
             condition_id TEXT, slug TEXT, filled BOOLEAN DEFAULT FALSE,
             status TEXT DEFAULT 'Pending', outcome TEXT,
+            fired_at TEXT, resolved_at TEXT
+        )
+    """)
+    conn.run("""
+        CREATE TABLE IF NOT EXISTS poly_alpha4_trades (
+            id SERIAL PRIMARY KEY,
+            market_id TEXT, title TEXT, asset TEXT, timeframe TEXT,
+            bet_side TEXT, stake REAL, fill_price REAL,
+            pool_after REAL, payout REAL, order_id TEXT, token_id TEXT,
+            condition_id TEXT, slug TEXT, filled BOOLEAN DEFAULT FALSE,
+            status TEXT DEFAULT 'Pending', outcome TEXT,
+            indicators TEXT, signals_agree INTEGER,
             fired_at TEXT, resolved_at TEXT
         )
     """)
@@ -5019,6 +5499,7 @@ def scan_loop():
             _save_bot_balance("poly_alpha", _poly_alpha_state)
             _save_bot_balance("poly_alpha2", _poly_alpha2_state)
             _save_bot_balance("poly_alpha3", _poly_alpha3_state)
+            _save_bot_balance("poly_alpha4", _poly_alpha4_state)
         except Exception as e:
             print("Balance save error: {}".format(e))
         
@@ -14433,6 +14914,7 @@ td{padding:8px 12px;border-bottom:1px solid #f4f3ed;color:var(--ink-2)}tr:last-c
     <a href="/app/paper29" class="nav-tab""" + (" active" if nav_active == "paper29" else "") + """">Paper 2.9</a>
     <a href="/app/paper29poly" class="nav-tab""" + (" active" if nav_active == "paper29poly" else "") + """">P2.9 Poly</a>
     <a href="/app/poly-alpha3" class="nav-tab""" + (" active" if nav_active == "poly-alpha3" else "") + """">⚡ Poly A3</a>
+    <a href="/app/poly-alpha4" class="nav-tab""" + (" active" if nav_active == "poly-alpha4" else "") + """">🎯 Sniper A4</a>
     <a href="/app/paper4" class="nav-tab""" + (" active" if nav_active == "paper4" else "") + """">Paper 4</a>
     <a href="/app/paper5" class="nav-tab""" + (" active" if nav_active == "paper5" else "") + """">Paper 5</a>
     <a href="/app/paper51" class="nav-tab""" + (" active" if nav_active == "paper51" else "") + """">Paper 5.1</a>
@@ -14784,8 +15266,8 @@ try:
         _poly_alpha3_state["peak_balance"] = 60.0
     _poly_alpha3_state["starting_balance"] = 60.0
     _poly_alpha3_state["floor_balance"] = 5.0
-    _poly_alpha3_state["enabled"] = True  # ACTIVE — Pure P2.3 live bot
-    print("POLY ALPHA 3.0: ${:.2f} pool{} | Pure P2.3 15M | Compound 5% | Floor=$5".format(
+    _poly_alpha3_state["enabled"] = False  # PAUSED — replaced by Sniper A4
+    print("POLY ALPHA 3.0: ${:.2f} pool{} | PAUSED (replaced by Sniper A4)".format(
         _poly_alpha3_state["balance"], " (restored)" if _poly_alpha3_restored else " (fresh)"))
     _poly_alpha3_load_recent()
 
@@ -16700,6 +17182,12 @@ def _poly_scan_loop():
         except Exception as e:
             print("Poly Alpha3 resolve error: {}".format(e))
         # BUG 4 FIX: 60 seconds for 5M market coverage
+        try:
+            _pa4_resolved = _resolve_poly_alpha4_trades()
+            if _pa4_resolved:
+                print("Sniper Alpha4 resolved: {}".format(_pa4_resolved))
+        except Exception as e:
+            print("Sniper Alpha4 resolve error: {}".format(e))
         time.sleep(60)
 
 # ═══════════════════════════════════════════════════════════
@@ -17118,6 +17606,7 @@ a{{color:#00d4aa}}
 </style></head><body>
 <div class="nav">
 <a href="/app/poly-alpha3" class="nav-tab active">⚡ Poly A3</a>
+    <a href="/app/poly-alpha4" class="nav-tab""" + (" active" if nav_active == "poly-alpha4" else "") + """">🎯 Sniper A4</a>
 <a href="/app/poly-alpha2" class="nav-tab">⚡ Poly A2</a>
 <a href="/app/paper28poly" class="nav-tab">P2.8 Poly</a>
 <a href="/app/paper29poly" class="nav-tab">P2.9 Poly</a>
@@ -17143,6 +17632,138 @@ a{{color:#00d4aa}}
         pnlc, total_pnl, _poly_alpha3_state["peak_balance"],
         "{}T {}W {}L".format(_poly_alpha3_state["trades_today"], _poly_alpha3_state["wins_today"], _poly_alpha3_state["losses_today"]),
         tf_html, asset_html, trade_rows)
+
+
+@app.route("/app/poly-alpha4")
+def poly_alpha4_page():
+    """Polymarket Alpha 4.0 — The Sniper."""
+    try:
+        conn = get_db()
+        rows = conn.run("SELECT * FROM poly_alpha4_trades ORDER BY id DESC LIMIT 200")
+        cols = [c['name'] for c in conn.columns]
+        trades = [dict(zip(cols, r)) for r in rows]
+        conn.close()
+    except:
+        trades = []
+
+    total = len(trades)
+    wins = sum(1 for t in trades if t.get("outcome") == "WIN")
+    losses = sum(1 for t in trades if t.get("outcome") == "LOSS")
+    returned = sum(1 for t in trades if t.get("outcome") == "RETURNED")
+    pending = sum(1 for t in trades if t.get("status") == "Pending")
+    resolved = wins + losses
+    wr = round(wins / resolved * 100, 1) if resolved > 0 else 0
+    total_pnl = 0
+    for t in trades:
+        if t.get("outcome") == "WIN":
+            total_pnl += float(t.get("payout") or 0) - float(t.get("stake") or 0)
+        elif t.get("outcome") == "LOSS":
+            total_pnl -= float(t.get("stake") or 0)
+    total_pnl = round(total_pnl, 2)
+    pnlc = "color:#1a7046" if total_pnl >= 0 else "color:#b4322e"
+
+    asset_stats = {}
+    for t in trades:
+        a = t.get("asset", "?")
+        if a not in asset_stats: asset_stats[a] = {"w": 0, "l": 0, "pnl": 0}
+        if t.get("outcome") == "WIN":
+            asset_stats[a]["w"] += 1
+            asset_stats[a]["pnl"] += float(t.get("payout") or 0) - float(t.get("stake") or 0)
+        elif t.get("outcome") == "LOSS":
+            asset_stats[a]["l"] += 1
+            asset_stats[a]["pnl"] -= float(t.get("stake") or 0)
+
+    score_stats = {}
+    for t in trades:
+        sa = t.get("signals_agree") or 0
+        key = "{}/3".format(sa)
+        if key not in score_stats: score_stats[key] = {"w": 0, "l": 0, "pnl": 0}
+        if t.get("outcome") == "WIN":
+            score_stats[key]["w"] += 1
+            score_stats[key]["pnl"] += float(t.get("payout") or 0) - float(t.get("stake") or 0)
+        elif t.get("outcome") == "LOSS":
+            score_stats[key]["l"] += 1
+            score_stats[key]["pnl"] -= float(t.get("stake") or 0)
+
+    asset_html = ""
+    for a in sorted(asset_stats.keys()):
+        d = asset_stats[a]
+        awr = round(d["w"] / (d["w"] + d["l"]) * 100, 1) if (d["w"] + d["l"]) > 0 else 0
+        asset_html += "<tr><td>{}</td><td>{}W/{}L</td><td>{}%</td><td>${:.2f}</td></tr>".format(a, d["w"], d["l"], awr, d["pnl"])
+
+    score_html = ""
+    for sc in sorted(score_stats.keys()):
+        d = score_stats[sc]
+        swr = round(d["w"] / (d["w"] + d["l"]) * 100, 1) if (d["w"] + d["l"]) > 0 else 0
+        score_html += "<tr><td>{}</td><td>{}W/{}L</td><td>{}%</td><td>${:.2f}</td></tr>".format(sc, d["w"], d["l"], swr, d["pnl"])
+
+    trade_rows = ""
+    for t in trades[:100]:
+        outcome = t.get("outcome", "")
+        icon = "\u2705" if outcome == "WIN" else "\u274c" if outcome == "LOSS" else "\u23ed" if outcome == "RETURNED" else "\u23f3"
+        pnl_str = ""
+        if outcome == "WIN":
+            pnl_str = "+${:.2f}".format(float(t.get("payout") or 0) - float(t.get("stake") or 0))
+        elif outcome == "LOSS":
+            pnl_str = "-${:.2f}".format(float(t.get("stake") or 0))
+        elif outcome == "RETURNED":
+            pnl_str = "returned"
+        fired = (t.get("fired_at") or "")[:16].replace("T", " ")
+        trade_rows += "<tr><td>{}</td><td>{}</td><td>{}</td><td>${:.2f}</td><td>{}</td><td>{:.0f}&#162;</td><td>{}</td><td>{}</td><td>${:.2f}</td></tr>".format(
+            t.get("id",""), icon, t.get("asset","?"),
+            float(t.get("stake") or 0), t.get("bet_side","?"),
+            float(t.get("fill_price") or 0.50) * 100,
+            fired, pnl_str,
+            float(t.get("pool_after") or 0))
+
+    fill_rate = 0
+    filled_count = sum(1 for t in trades if t.get("filled"))
+    total_orders = sum(1 for t in trades if t.get("outcome") != "RETURNED")
+    if total_orders > 0:
+        fill_rate = round(filled_count / len(trades) * 100, 1)
+
+    return """<!DOCTYPE html><html><head><title>Sniper Alpha 4.0</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>body{{font-family:-apple-system,sans-serif;max-width:900px;margin:0 auto;padding:10px;background:#0a0a0a;color:#e0e0e0}}
+h1{{color:#00d4aa}}h2{{color:#888;font-size:14px}}
+.stats{{display:grid;grid-template-columns:repeat(auto-fit,minmax(100px,1fr));gap:8px;margin:10px 0}}
+.stat{{background:#1a1a2e;padding:12px;border-radius:8px;text-align:center}}
+.stat .val{{font-size:24px;font-weight:700;color:#00d4aa}}.stat .lbl{{font-size:11px;color:#888}}
+table{{width:100%;border-collapse:collapse;font-size:13px;margin:10px 0}}
+th,td{{padding:6px 8px;border-bottom:1px solid #222;text-align:left}}
+th{{background:#1a1a2e;color:#888;font-size:11px}}
+.nav{{display:flex;gap:4px;flex-wrap:wrap;margin:10px 0}}
+.nav-tab{{padding:6px 12px;background:#1a1a2e;color:#888;text-decoration:none;border-radius:4px;font-size:12px}}
+.nav-tab.active{{background:#00d4aa;color:#000}}
+a{{color:#00d4aa}}
+</style></head><body>
+<div class="nav">
+<a href="/app/poly-alpha4" class="nav-tab active">\U0001f3af Sniper A4</a>
+<a href="/app/poly-alpha3" class="nav-tab">\u26a1 Poly A3</a>
+<a href="/app/poly-alpha2" class="nav-tab">\u26a1 Poly A2</a>
+<a href="/" class="nav-tab">Home</a>
+</div>
+<h1>\U0001f3af Sniper Alpha 4.0</h1>
+<h2>P2.1 at Window Boundary · 15M Only · 50\u00a2 Target · Compounding 5%</h2>
+<div class="stats">
+<div class="stat"><div class="val">${:.2f}</div><div class="lbl">Pool</div></div>
+<div class="stat"><div class="val">{}%</div><div class="lbl">Win Rate</div></div>
+<div class="stat"><div class="val">{}</div><div class="lbl">Trades</div></div>
+<div class="stat"><div class="val" style="{}">${:.2f}</div><div class="lbl">P&L</div></div>
+<div class="stat"><div class="val">${:.2f}</div><div class="lbl">Peak</div></div>
+<div class="stat"><div class="val">{}</div><div class="lbl">Today</div></div>
+</div>
+<h2>By Signal Strength</h2><table><tr><th>Score</th><th>Record</th><th>WR</th><th>P&L</th></tr>{}</table>
+<h2>By Asset</h2><table><tr><th>Asset</th><th>Record</th><th>WR</th><th>P&L</th></tr>{}</table>
+<h2>Trade History</h2><table><tr><th>#</th><th></th><th>Asset</th><th>Stake</th><th>Side</th><th>Fill</th><th>Time</th><th>P&L</th><th>Pool</th></tr>{}</table>
+<p style="color:#444;font-size:11px">Sniper · Fires at window boundary · 50\u00a2 target · Auto-refresh 60s</p>
+<script>setTimeout(()=>location.reload(),60000)</script>
+</body></html>""".format(
+        _poly_alpha4_state["balance"], wr, total,
+        pnlc, total_pnl, _poly_alpha4_state["peak_balance"],
+        "{}T {}W {}L".format(_poly_alpha4_state["trades_today"], _poly_alpha4_state["wins_today"], _poly_alpha4_state["losses_today"]),
+        score_html, asset_html, trade_rows)
+
 
 @app.route("/app/poly-alpha")
 def poly_alpha_page():
@@ -17398,6 +18019,73 @@ def paper29poly_page():
         "Trend context + candle reading on Polymarket Up/Down markets. Reads 4 candles for trend, identifies bounce traps and pullback traps, trades choppy markets with price position.",
         extra_cols=[], nav_active="paper29poly",
         where_clause="WHERE strategy='p29'")
+
+
+@app.route("/api/p21-score-breakdown")
+def p21_score_breakdown():
+    """Show P2.1 win rate breakdown by score (2/3 vs 3/3) from Limitless paper data."""
+    try:
+        conn = get_db()
+        
+        # Limitless paper21_trades
+        rows = conn.run("SELECT score, outcome FROM paper21_trades WHERE outcome IN ('WIN','LOSS')")
+        cols = [c['name'] for c in conn.columns]
+        trades = [dict(zip(cols, r)) for r in rows]
+        
+        # Also get Polymarket poly_trades for p21
+        poly_rows = conn.run("SELECT score, outcome FROM poly_trades WHERE strategy='p21' AND outcome IN ('WIN','LOSS')")
+        poly_cols = [c['name'] for c in conn.columns]
+        poly_trades = [dict(zip(poly_cols, r)) for r in poly_rows]
+        
+        conn.close()
+        
+        # Limitless breakdown
+        lim_scores = {}
+        for t in trades:
+            sc = int(t.get("score") or 0)
+            if sc not in lim_scores:
+                lim_scores[sc] = {"w": 0, "l": 0}
+            if t["outcome"] == "WIN":
+                lim_scores[sc]["w"] += 1
+            else:
+                lim_scores[sc]["l"] += 1
+        
+        # Poly breakdown
+        poly_scores = {}
+        for t in poly_trades:
+            sc = int(t.get("score") or 0)
+            if sc not in poly_scores:
+                poly_scores[sc] = {"w": 0, "l": 0}
+            if t["outcome"] == "WIN":
+                poly_scores[sc]["w"] += 1
+            else:
+                poly_scores[sc]["l"] += 1
+        
+        result = "<html><body style='background:#0a0a0a;color:#e0e0e0;font-family:monospace;padding:20px'>"
+        result += "<h1 style='color:#00d4aa'>P2.1 Score Breakdown: 2/3 vs 3/3</h1>"
+        
+        result += "<h2>Limitless Paper (paper21_trades)</h2>"
+        result += "<table border=1 cellpadding=8><tr><th>Score</th><th>Wins</th><th>Losses</th><th>Total</th><th>WR</th></tr>"
+        for sc in sorted(lim_scores.keys()):
+            d = lim_scores[sc]
+            total = d["w"] + d["l"]
+            wr = round(d["w"] / total * 100, 1) if total > 0 else 0
+            result += "<tr><td>{}/3</td><td>{}</td><td>{}</td><td>{}</td><td>{}%</td></tr>".format(sc, d["w"], d["l"], total, wr)
+        result += "</table>"
+        
+        result += "<h2>Polymarket Paper (poly_trades strategy=p21)</h2>"
+        result += "<table border=1 cellpadding=8><tr><th>Score</th><th>Wins</th><th>Losses</th><th>Total</th><th>WR</th></tr>"
+        for sc in sorted(poly_scores.keys()):
+            d = poly_scores[sc]
+            total = d["w"] + d["l"]
+            wr = round(d["w"] / total * 100, 1) if total > 0 else 0
+            result += "<tr><td>{}/3</td><td>{}</td><td>{}</td><td>{}</td><td>{}%</td></tr>".format(sc, d["w"], d["l"], total, wr)
+        result += "</table>"
+        
+        result += "</body></html>"
+        return result
+    except Exception as e:
+        return "Error: {}".format(e), 500
 
 @app.route("/app/alpha")
 def alpha_page():
