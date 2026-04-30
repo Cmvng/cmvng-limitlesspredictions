@@ -15626,7 +15626,7 @@ def run_poly_scan():
 
                     # ─── POLYMARKET ALPHA 3.0 — Pure P2.3 with Compounding ───
                     # Fires directly when P2.3 scores on 15M or 1H — no pending, no mixing
-                    if strat == "p23" and tf in ("15M", "1H"):
+                    if strat == "p23" and tf == "15M":
                         _pa3_mkey = parsed["market_id"]
                         if _pa3_mkey not in _poly_alpha3_traded_markets and _poly_alpha3_state["enabled"] and _poly_has_creds():
                             _pa3_stake = _poly_alpha3_calc_stake(_poly_alpha3_state["balance"])
@@ -15646,11 +15646,16 @@ def run_poly_scan():
                                         if client:
                                             from py_clob_client_v2 import Side, OrderArgs, OrderType
                                             BUY = Side.BUY
-                                            _pa3_best = share_price
+                                            _pa3_best = min(share_price + 0.03, _pa3_max_fill)  # Aggressive default
                                             try:
                                                 book = client.get_order_book(str(_pa3_tid))
-                                                if book and book.get("asks"):
-                                                    _pa3_best = min(round(float(book["asks"][0]["price"]), 2), _pa3_max_fill)
+                                                if book and book.get("asks") and len(book["asks"]) > 0:
+                                                    # Take ask + 1¢ to guarantee fill
+                                                    _pa3_ask = round(float(book["asks"][0]["price"]), 2)
+                                                    _pa3_best = min(_pa3_ask + 0.01, _pa3_max_fill)
+                                                elif book and book.get("bids") and len(book["bids"]) > 0:
+                                                    _pa3_bid = round(float(book["bids"][0]["price"]), 2)
+                                                    _pa3_best = min(_pa3_bid + 0.03, _pa3_max_fill)
                                             except:
                                                 pass
                                             _pa3_shares = max(5.0, round(_pa3_stake / _pa3_best, 2))
