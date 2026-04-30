@@ -6903,12 +6903,13 @@ def _fetch_binance_candles_small(asset, interval="15m", limit=10):
         return None
 
 
-def _p28_read_prev_candle(asset):
-    """Fetch the most recently completed 15M candle and read its pattern.
-    
+def _p28_read_prev_candle(asset, tf="15m"):
+    """Fetch the most recently completed candle and read its pattern.
+    tf: "5m", "15m", or "1h"
     Returns: dict with pattern name and key metrics, or None on failure.
     """
-    candles = _fetch_binance_candles_small(asset, "15m", 4)
+    tf_mins = {"5m": 5, "15m": 15, "1h": 60}.get(tf, 15)
+    candles = _fetch_binance_candles_small(asset, tf, 4)
     if not candles or len(candles) < 2:
         return None
     
@@ -6917,7 +6918,7 @@ def _p28_read_prev_candle(asset):
     
     completed = []
     for c in candles:
-        candle_close_ts = c["ts"] + (15 * 60 * 1000)
+        candle_close_ts = c["ts"] + (tf_mins * 60 * 1000)
         if candle_close_ts <= now_ts:
             completed.append(c)
     
@@ -7002,8 +7003,8 @@ def _score_paper28_trade(p, price, indicators=None, ind_macro=None, expiry_minut
         return None
 
     mtype = "15M" if p.get("is_15m_market") else "1H" if p.get("is_hourly_market") else "Daily"
-    if mtype != "15M":
-        return None
+    if mtype == "Daily":
+        return None  # Skip daily markets
 
     asset = p["asset"]
     baseline = p.get("baseline", 0)
@@ -7016,7 +7017,13 @@ def _score_paper28_trade(p, price, indicators=None, ind_macro=None, expiry_minut
         return None
 
     # ── Step 1: Read the previous candle — THIS is the primary signal ──
-    candle = _p28_read_prev_candle(asset)
+    # Use matching candle timeframe: 5M market → 5m candle, 15M → 15m, 1H → 1h
+    candle_tf = "15m"
+    if mtype == "1H":
+        candle_tf = "1h"
+    elif p.get("timeframe") == "5M":
+        candle_tf = "5m"
+    candle = _p28_read_prev_candle(asset, candle_tf)
     if not candle:
         return None
 
@@ -7139,15 +7146,20 @@ def _score_paper28_trade(p, price, indicators=None, ind_macro=None, expiry_minut
         ind_str += " | P2.1={}({}/3)".format(p21_dir, p21_score)
     ind_str += " | {}".format(tag)
 
+    sim_payout = round(1.0 / (effective_odds / 100.0), 4) if effective_odds > 0 else 0
+
     return {
         "bet_side": bet_side,
+        "bet_odds": effective_odds,
         "confidence": confidence,
         "score": signals_agree,
         "total_signals": total_signals,
         "signals_agree": signals_agree,
         "p23_agrees": False,
         "indicators": ind_str,
-        "tv_dir": candle_dir,  # for compatibility
+        "market_type": mtype,
+        "sim_payout": sim_payout,
+        "tv_dir": candle_dir,
         "sma_dir": p21_dir or "—",
         "btc_dir": "—",
     }
@@ -14157,6 +14169,7 @@ td{padding:8px 12px;border-bottom:1px solid #f4f3ed;color:var(--ink-2)}tr:last-c
     <a href="/app/paper27" class="nav-tab""" + (" active" if nav_active == "paper27" else "") + """">Paper 2.7</a>
     <a href="/app/paper37" class="nav-tab""" + (" active" if nav_active == "paper37" else "") + """">Paper 3.7</a>
     <a href="/app/paper28" class="nav-tab""" + (" active" if nav_active == "paper28" else "") + """">Paper 2.8</a>
+    <a href="/app/paper28poly" class="nav-tab""" + (" active" if nav_active == "paper28poly" else "") + """">P2.8 Poly</a>
     <a href="/app/paper4" class="nav-tab""" + (" active" if nav_active == "paper4" else "") + """">Paper 4</a>
     <a href="/app/paper5" class="nav-tab""" + (" active" if nav_active == "paper5" else "") + """">Paper 5</a>
     <a href="/app/paper51" class="nav-tab""" + (" active" if nav_active == "paper51" else "") + """">Paper 5.1</a>
@@ -15190,10 +15203,10 @@ def run_poly_scan():
             for section in sections:
                 for strat in strategies:
                     # Section-strategy filtering:
-                    # hourly24: only P2.4, P3.4, P2.5, P3.5 (1H candle strategies)
+                    # hourly24: P2.4, P3.4, P2.5, P3.5, P2.8 (1H strategies)
                     # P2.5/P3.5 are 1H only — skip on 15M and 5M sections
                     # P2.6/P3.6 are 15M only — skip on 1H sections
-                    if section == "hourly24" and strat not in ("p24", "p34", "p25", "p35"):
+                    if section == "hourly24" and strat not in ("p24", "p34", "p25", "p35", "p28"):
                         continue
                     if section in ("btc5m", "all15m") and strat in ("p24", "p34", "p25", "p35"):
                         continue
@@ -16775,6 +16788,135 @@ def paper28_page():
         "P2.1 + Candle-at-Baseline — 15M Only",
         "CANDLE-FIRST strategy. Reads previous completed candle to determine direction — strong patterns (hammer, shooting star, strong red/green, bull/bear trap) trade immediately without needing P2.1. Moderate candles need P2.1 agreement or price confirmation. Much higher volume than filter-based approach.",
         extra_cols=[], nav_active="paper28")
+
+@app.route("/app/paper28poly")
+def paper28poly_page():
+    """Paper 2.8 Polymarket view — filtered from poly_trades."""
+    try:
+        conn = get_db()
+        all_rows = conn.run("SELECT * FROM poly_trades WHERE strategy='p28' ORDER BY id DESC")
+        cols = [c['name'] for c in conn.columns]
+        all_trades = [dict(zip(cols, r)) for r in all_rows]
+        conn.close()
+    except Exception as e:
+        print("Paper28 poly page error: {}".format(e))
+        all_trades = []
+
+    trades = all_trades
+    total = len(trades)
+    wins = sum(1 for t in trades if t.get("outcome") == "WIN")
+    losses = sum(1 for t in trades if t.get("outcome") == "LOSS")
+    pending = sum(1 for t in trades if t.get("status") == "Pending")
+    resolved = wins + losses
+    win_rate = round(wins / resolved * 100, 1) if resolved > 0 else 0
+
+    total_profit = 0
+    for t in trades:
+        if t.get("outcome") == "WIN":
+            total_profit += float(t.get("simulated_payout") or 0) - float(t.get("simulated_stake") or 1)
+        elif t.get("outcome") == "LOSS":
+            total_profit -= float(t.get("simulated_stake") or 1)
+    total_profit = round(total_profit, 2)
+
+    # By timeframe
+    tf_stats = {}
+    for t in trades:
+        tf = t.get("market_type") or "15M"
+        if tf not in tf_stats:
+            tf_stats[tf] = {"w": 0, "l": 0, "pnl": 0}
+        if t.get("outcome") == "WIN":
+            tf_stats[tf]["w"] += 1
+            tf_stats[tf]["pnl"] += float(t.get("simulated_payout") or 0) - float(t.get("simulated_stake") or 1)
+        elif t.get("outcome") == "LOSS":
+            tf_stats[tf]["l"] += 1
+            tf_stats[tf]["pnl"] -= float(t.get("simulated_stake") or 1)
+
+    # By asset
+    asset_stats = {}
+    for t in trades:
+        a = t.get("asset") or "?"
+        if a not in asset_stats:
+            asset_stats[a] = {"w": 0, "l": 0, "pnl": 0}
+        if t.get("outcome") == "WIN":
+            asset_stats[a]["w"] += 1
+            asset_stats[a]["pnl"] += float(t.get("simulated_payout") or 0) - float(t.get("simulated_stake") or 1)
+        elif t.get("outcome") == "LOSS":
+            asset_stats[a]["l"] += 1
+            asset_stats[a]["pnl"] -= float(t.get("simulated_stake") or 1)
+
+    display_trades = trades[:200]
+
+    tf_html = ""
+    for tf_name in sorted(tf_stats.keys()):
+        s = tf_stats[tf_name]
+        wr = round(s["w"] / (s["w"] + s["l"]) * 100, 1) if (s["w"] + s["l"]) > 0 else 0
+        tf_html += "<tr><td>{}</td><td>{}%</td><td>{}W / {}L · ${:.2f}</td></tr>".format(
+            tf_name, wr, s["w"], s["l"], s["pnl"])
+
+    asset_html = ""
+    for a_name in sorted(asset_stats.keys()):
+        s = asset_stats[a_name]
+        wr = round(s["w"] / (s["w"] + s["l"]) * 100, 1) if (s["w"] + s["l"]) > 0 else 0
+        asset_html += "<tr><td>{}</td><td>{}%</td><td>{}W / {}L · ${:.2f}</td></tr>".format(
+            a_name, wr, s["w"], s["l"], s["pnl"])
+
+    rows_html = ""
+    for t in display_trades:
+        status = t.get("status") or "Pending"
+        outcome = t.get("outcome") or ""
+        icon = "✅" if outcome == "WIN" else "❌" if outcome == "LOSS" else "⏳"
+        side = t.get("bet_side") or "?"
+        odds = t.get("bet_odds") or 0
+        pnl = ""
+        if outcome == "WIN":
+            pnl = "+${:.2f}".format(float(t.get("simulated_payout") or 0) - float(t.get("simulated_stake") or 1))
+        elif outcome == "LOSS":
+            pnl = "-${:.2f}".format(float(t.get("simulated_stake") or 1))
+
+        fired = t.get("fired_at") or ""
+        if fired:
+            try:
+                fd = datetime.fromisoformat(str(fired))
+                fired = fd.strftime("%Y-%m-%d %H:%M")
+            except:
+                pass
+
+        rows_html += "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{:.1f}%</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>".format(
+            t.get("id", ""), icon, t.get("asset", "?"), side, odds,
+            t.get("market_type", "15M"), pnl, status, fired)
+
+    return """<!DOCTYPE html><html><head><title>Paper 2.8 Polymarket</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>body{{font-family:-apple-system,sans-serif;max-width:900px;margin:0 auto;padding:10px;background:#0a0a0a;color:#e0e0e0}}
+h1{{color:#00d4aa}}h2{{color:#888;font-size:14px}}
+.stats{{display:grid;grid-template-columns:repeat(auto-fit,minmax(100px,1fr));gap:8px;margin:10px 0}}
+.stat{{background:#1a1a2e;padding:12px;border-radius:8px;text-align:center}}
+.stat .val{{font-size:24px;font-weight:700;color:#00d4aa}}.stat .lbl{{font-size:11px;color:#888}}
+table{{width:100%;border-collapse:collapse;font-size:13px;margin:10px 0}}
+th,td{{padding:6px 8px;border-bottom:1px solid #222;text-align:left}}
+th{{background:#1a1a2e;color:#888;font-size:11px}}
+.nav{{display:flex;gap:4px;flex-wrap:wrap;margin:10px 0}}
+.nav-tab{{padding:6px 12px;background:#1a1a2e;color:#888;text-decoration:none;border-radius:4px;font-size:12px}}
+.nav-tab.active{{background:#00d4aa;color:#000}}
+</style></head><body>
+""" + _build_nav_html("paper28poly") + """
+<h1>Paper 2.8 — Polymarket</h1>
+<h2>CANDLE-FIRST strategy on Polymarket Up/Down markets</h2>
+<div class="stats">
+<div class="stat"><div class="val">{}</div><div class="lbl">Total</div></div>
+<div class="stat"><div class="val">{}%</div><div class="lbl">Win Rate</div></div>
+<div class="stat"><div class="val">{}</div><div class="lbl">Wins</div></div>
+<div class="stat"><div class="val">{}</div><div class="lbl">Losses</div></div>
+<div class="stat"><div class="val">{}</div><div class="lbl">Pending</div></div>
+<div class="stat"><div class="val">${:.2f}</div><div class="lbl">Sim P&L</div></div>
+</div>
+<h2>By Timeframe</h2><table><tr><th>TF</th><th>WR</th><th>Record</th></tr>{}</table>
+<h2>By Asset</h2><table><tr><th>Asset</th><th>WR</th><th>Record</th></tr>{}</table>
+<h2>Trade Log</h2><table><tr><th>#</th><th></th><th>Asset</th><th>Side</th><th>Odds</th><th>TF</th><th>P&L</th><th>Status</th><th>Time</th></tr>{}</table>
+<p style="color:#444;font-size:11px">Paper trading · $1 simulated stakes · Auto-resolves · Auto-refresh 60s</p>
+<script>setTimeout(()=>location.reload(),60000)</script>
+</body></html>""".format(total, win_rate, wins, losses, pending, total_profit,
+                          tf_html, asset_html, rows_html)
 
 @app.route("/app/alpha")
 def alpha_page():
