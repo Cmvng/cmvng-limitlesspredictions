@@ -1109,6 +1109,17 @@ def init_db():
             fired_at TEXT, resolved_at TEXT, slug TEXT
         )
     """)
+    conn.run("""
+        CREATE TABLE IF NOT EXISTS paper29_trades (
+            id SERIAL PRIMARY KEY, market_id TEXT, title TEXT, asset TEXT,
+            direction TEXT, baseline REAL, bet_odds REAL, bet_side TEXT,
+            current_price REAL, hours_left REAL, market_type TEXT,
+            indicators TEXT, score INTEGER, total_signals INTEGER,
+            simulated_stake REAL DEFAULT 1.0, simulated_payout REAL,
+            status TEXT DEFAULT 'Pending', outcome TEXT,
+            fired_at TEXT, resolved_at TEXT, slug TEXT
+        )
+    """)
     # ─── ALPHA unified trading system table ───
     conn.run("""
         CREATE TABLE IF NOT EXISTS alpha_trades (
@@ -7009,35 +7020,126 @@ def _p28_read_prev_candle(asset, tf="15m"):
 
 def _score_paper28_trade(p, price, indicators=None, ind_macro=None, expiry_minute=None, expiry_hour=None):
     """Paper 2.8: CANDLE-FIRST strategy.
+    Reads previous candle pattern as the primary signal.
+    Strong patterns (hammer, shooting star, strong red/green) trade immediately.
+    Moderate candles use P2.1 or price position as confirmation.
+    """
+    if price is None:
+        return None
+    mtype = p.get("timeframe") or ("15M" if p.get("is_15m_market") else "1H" if p.get("is_hourly_market") else "Daily")
+    if mtype == "Daily":
+        return None
+    asset = p["asset"]
+    baseline = p.get("baseline", 0)
+    if not baseline or baseline <= 0:
+        return None
+    yes_odds = p["yes_odds"]
+    no_odds = 100 - yes_odds
+    if not (15 <= yes_odds <= 80 or 15 <= no_odds <= 80):
+        return None
+
+    candle_tf = "15m"
+    if mtype == "1H": candle_tf = "1h"
+    elif p.get("timeframe") == "5M": candle_tf = "5m"
+
+    candle = _p28_read_prev_candle(asset, candle_tf)
+    if not candle:
+        return None
+    pattern = candle["pattern"]
+    if pattern in ("doji", "unclear"):
+        return None
+
+    candle_dir = None
+    candle_strong = False
+    if pattern in ("strong_red", "red_no_lower_wick"):
+        candle_dir = "DOWN"; candle_strong = True
+    elif pattern in ("strong_green", "green_no_upper_wick"):
+        candle_dir = "UP"; candle_strong = True
+    elif pattern == "shooting_star":
+        candle_dir = "DOWN"; candle_strong = True
+    elif pattern == "hammer":
+        candle_dir = "UP"; candle_strong = True
+    elif pattern == "bull_trap":
+        candle_dir = "DOWN"; candle_strong = True
+    elif pattern == "bear_trap":
+        candle_dir = "UP"; candle_strong = True
+    elif pattern == "moderate_red":
+        candle_dir = "DOWN"; candle_strong = False
+    elif pattern == "moderate_green":
+        candle_dir = "UP"; candle_strong = False
+    if candle_dir is None:
+        return None
+
+    scored21 = _score_paper21_trade(p, price, indicators=indicators, ind_macro=ind_macro,
+                                     expiry_minute=expiry_minute, expiry_hour=expiry_hour)
+    p21_dir = None
+    if scored21:
+        p21_side = scored21["bet_side"]
+        p21_dir = "UP" if (p21_side == "YES" and p["direction"] == "above") or \
+                          (p21_side == "NO" and p["direction"] != "above") else "DOWN"
+
+    price_above = price > baseline
+    confidence = None; tag = ""
+    if candle_strong:
+        if p21_dir == candle_dir: confidence = "HIGH"; tag = "STRONG+P21"
+        elif p21_dir is not None and p21_dir != candle_dir: confidence = "MEDIUM"; tag = "STRONG>P21"
+        else: confidence = "MEDIUM"; tag = "STRONG_SOLO"
+    else:
+        if p21_dir == candle_dir: confidence = "MEDIUM"; tag = "MOD+P21"
+        elif p21_dir is not None and p21_dir != candle_dir: return None
+        else:
+            if (candle_dir == "UP" and price_above) or (candle_dir == "DOWN" and not price_above):
+                confidence = "LOW"; tag = "MOD+PRICE"
+            else: return None
+    if confidence is None: return None
+
+    if candle_dir == "UP": bet_side = "YES" if p["direction"] == "above" else "NO"
+    else: bet_side = "NO" if p["direction"] == "above" else "YES"
+    effective_odds = yes_odds if bet_side == "YES" else no_odds
+    sim_payout = round(1.0 / (effective_odds / 100.0), 4) if effective_odds > 0 else 0
+    ind_str = "CANDLE={}({}) b={:.0f}% | {}".format(pattern, candle_dir, candle["body_ratio"]*100, tag)
+    if p21_dir: ind_str += " | P2.1={}".format(p21_dir)
+    return {
+        "bet_side": bet_side, "bet_odds": effective_odds, "confidence": confidence,
+        "score": 2 if confidence in ("HIGH","MEDIUM") else 1, "total_signals": 2,
+        "signals_agree": 2 if confidence == "HIGH" else 1, "p23_agrees": False,
+        "indicators": ind_str, "market_type": mtype, "sim_payout": sim_payout,
+        "tv_dir": candle_dir, "sma_dir": p21_dir or "—", "btc_dir": "—",
+    }
+
+
+def _score_paper29_trade(p, price, indicators=None, ind_macro=None, expiry_minute=None, expiry_hour=None):
+    """Paper 2.9: BLACKROCK TRADER.
     
-    The previous completed candle IS the signal. A pro trader reads the candle 
-    and decides direction. P2.1 is optional confirmation (boosts confidence).
+    An 80% WR trader at BlackRock doesn't skip markets — he reads them ALL.
+    He looks at the last 4 candles, understands the story, and makes a call.
     
-    CANDLE → DIRECTION:
-      strong_red / red_no_lower_wick → DOWN (sellers in full control)
-      strong_green / green_no_upper_wick → UP (buyers in full control)
-      shooting_star → DOWN (sellers rejected the top)
-      hammer → UP (buyers defended the bottom)
-      bull_trap (green + long upper wick) → DOWN (trapped buyers)
-      bear_trap (red + long lower wick) → UP (trapped sellers)
-      moderate_red → DOWN (lean, needs P2.1 or price confirmation)
-      moderate_green → UP (lean, needs P2.1 or price confirmation)
-      doji → SKIP (no conviction)
-      unclear → SKIP
+    The trend tells him WHAT the market is doing.
+    The latest candle tells him WHERE the momentum is NOW.
+    Price vs baseline tells him WHICH SIDE to bet.
     
-    P2.1 ROLE: optional boost, not a gate
-      Candle strong + P2.1 agrees → HIGH confidence
-      Candle strong + no P2.1 → MEDIUM confidence (still trades!)
-      Candle moderate + P2.1 agrees → MEDIUM confidence
-      Candle moderate + no P2.1 → need price below/above baseline to confirm
-      Candle moderate + P2.1 opposes → SKIP (conflicting signals)
+    He trades MORE than others, not less. His edge is reading correctly,
+    not sitting on the sidelines.
+    
+    TRENDING MARKET:
+      Trend DOWN + red candle → DOWN (obvious, high confidence)
+      Trend DOWN + small green → DOWN (relief bounce, crowd is wrong)
+      Trend DOWN + big green → cautious DOWN (might reverse, lower confidence)
+      Trend DOWN + hammer → flip to UP (real reversal signal)
+      
+    CHOPPY MARKET:
+      He doesn't skip — he reads the latest candle and price position.
+      Choppy + price below baseline + red candle → DOWN
+      Choppy + price above baseline + green candle → UP
+      Choppy + strong candle pattern → follow the candle
+      Choppy + doji at baseline → ONLY time he skips (true coin flip)
     """
     if price is None:
         return None
 
-    mtype = "15M" if p.get("is_15m_market") else "1H" if p.get("is_hourly_market") else "Daily"
+    mtype = p.get("timeframe") or ("15M" if p.get("is_15m_market") else "1H" if p.get("is_hourly_market") else "Daily")
     if mtype == "Daily":
-        return None  # Skip daily markets
+        return None
 
     asset = p["asset"]
     baseline = p.get("baseline", 0)
@@ -7049,153 +7151,279 @@ def _score_paper28_trade(p, price, indicators=None, ind_macro=None, expiry_minut
     if not (15 <= yes_odds <= 80 or 15 <= no_odds <= 80):
         return None
 
-    # ── Step 1: Read the previous candle — THIS is the primary signal ──
-    # Use matching candle timeframe: 5M market → 5m candle, 15M → 15m, 1H → 1h
+    # ══════════════════════════════════════════════════════
+    # STEP 1: READ THE FULL STORY — last 4 candles
+    # ══════════════════════════════════════════════════════
     candle_tf = "15m"
     if mtype == "1H":
         candle_tf = "1h"
     elif p.get("timeframe") == "5M":
         candle_tf = "5m"
-    candle = _p28_read_prev_candle(asset, candle_tf)
-    if not candle:
+
+    candle_data = _p28_read_candle_series(asset, candle_tf, count=6)
+    if not candle_data or len(candle_data) < 5:
         return None
 
-    pattern = candle["pattern"]
+    trend_candles = candle_data[-5:-1]  # 4 completed candles
+    lc = candle_data[-2]  # Most recently completed
 
-    # Skip patterns with no conviction
-    if pattern in ("doji", "unclear"):
-        return None
+    # Count trend direction
+    reds = 0
+    greens = 0
+    for c in trend_candles:
+        if c["close"] < c["open"]:
+            reds += 1
+        elif c["close"] > c["open"]:
+            greens += 1
 
-    # Determine candle direction and strength
-    candle_dir = None    # "UP" or "DOWN"
-    candle_strong = False  # Strong patterns don't need P2.1
+    total_move = trend_candles[-1]["close"] - trend_candles[0]["open"]
 
-    if pattern in ("strong_red", "red_no_lower_wick"):
-        candle_dir = "DOWN"
-        candle_strong = True
-    elif pattern in ("strong_green", "green_no_upper_wick"):
-        candle_dir = "UP"
-        candle_strong = True
-    elif pattern == "shooting_star":
-        candle_dir = "DOWN"
-        candle_strong = True
-    elif pattern == "hammer":
-        candle_dir = "UP"
-        candle_strong = True
-    elif pattern == "bull_trap":
-        candle_dir = "DOWN"
-        candle_strong = True
-    elif pattern == "bear_trap":
-        candle_dir = "UP"
-        candle_strong = True
-    elif pattern == "moderate_red":
-        candle_dir = "DOWN"
-        candle_strong = False
-    elif pattern == "moderate_green":
-        candle_dir = "UP"
-        candle_strong = False
+    # Classify trend
+    if reds >= 3 and total_move < 0:
+        trend = "STRONG_DOWN"
+    elif greens >= 3 and total_move > 0:
+        trend = "STRONG_UP"
+    elif reds >= 2 and total_move < 0:
+        trend = "DOWN"
+    elif greens >= 2 and total_move > 0:
+        trend = "UP"
+    else:
+        trend = "CHOPPY"
 
-    if candle_dir is None:
-        return None
+    # ══════════════════════════════════════════════════════
+    # STEP 2: READ THE LATEST CANDLE
+    # ══════════════════════════════════════════════════════
+    lc_body = abs(lc["close"] - lc["open"])
+    lc_range = lc["high"] - lc["low"]
+    lc_is_green = lc["close"] > lc["open"]
+    lc_is_red = lc["close"] < lc["open"]
+    lc_is_doji = False
 
-    # ── Step 2: Check P2.1 (optional — not required for strong candles) ──
-    scored21 = _score_paper21_trade(p, price, indicators=indicators, ind_macro=ind_macro,
-                                     expiry_minute=expiry_minute, expiry_hour=expiry_hour)
-    
-    p21_dir = None
-    p21_score = 0
-    if scored21:
-        p21_side = scored21["bet_side"]
-        p21_dir = "UP" if (p21_side == "YES" and p["direction"] == "above") or \
-                          (p21_side == "NO" and p["direction"] != "above") else "DOWN"
-        p21_score = scored21.get("score", 2)
+    if lc_range > 0:
+        lc_body_ratio = lc_body / lc_range
+        lc_upper_wick = (lc["high"] - max(lc["open"], lc["close"])) / lc_range
+        lc_lower_wick = (min(lc["open"], lc["close"]) - lc["low"]) / lc_range
+    else:
+        lc_body_ratio = 0
+        lc_upper_wick = 0
+        lc_lower_wick = 0
+        lc_is_doji = True
 
-    # ── Step 3: Price position relative to baseline ──
+    if lc_body_ratio < 0.1:
+        lc_is_doji = True
+
+    is_hammer = lc_lower_wick > 0.6 and lc_body_ratio < 0.35
+    is_shooting_star = lc_upper_wick > 0.6 and lc_body_ratio < 0.35
+    is_strong_body = lc_body_ratio > 0.7
+
+    # ══════════════════════════════════════════════════════
+    # STEP 3: PRICE POSITION
+    # ══════════════════════════════════════════════════════
     price_above = price > baseline
+    price_dist = abs(price - baseline) / baseline * 100 if baseline > 0 else 0
+    price_at_baseline = price_dist < 0.02  # Within 0.02% = basically at baseline
 
-    # ── Step 4: Decision matrix ──
+    # ══════════════════════════════════════════════════════
+    # STEP 4: THE BLACKROCK DECISION
+    # ══════════════════════════════════════════════════════
+    candle_dir = None
     confidence = None
     tag = ""
 
-    if candle_strong:
-        # Strong candle — ALWAYS trade, P2.1 is just a boost
-        if p21_dir == candle_dir:
-            confidence = "HIGH"
-            tag = "STRONG+P21"
-        elif p21_dir is not None and p21_dir != candle_dir:
-            # P2.1 opposes strong candle — candle wins but lower confidence
+    if trend in ("STRONG_DOWN", "DOWN"):
+        # === MARKET IS FALLING ===
+        if is_hammer and trend == "STRONG_DOWN":
+            # Hammer after strong drop = REVERSAL — bold call: flip to UP
+            candle_dir = "UP"
             confidence = "MEDIUM"
-            tag = "STRONG>P21"
-        else:
-            # No P2.1 signal — candle alone is enough for strong patterns
-            confidence = "MEDIUM"
-            tag = "STRONG_SOLO"
-    else:
-        # Moderate candle — needs EITHER P2.1 OR price confirmation
-        if p21_dir == candle_dir:
-            confidence = "MEDIUM"
-            tag = "MOD+P21"
-        elif p21_dir is not None and p21_dir != candle_dir:
-            # P2.1 opposes moderate candle — SKIP (conflicting)
-            return None
-        else:
-            # No P2.1 — check if price position confirms candle
-            # Price above baseline + candle says UP = confirmation
-            # Price below baseline + candle says DOWN = confirmation
-            if (candle_dir == "UP" and price_above) or (candle_dir == "DOWN" and not price_above):
-                confidence = "LOW"
-                tag = "MOD+PRICE"
+            tag = "REVERSAL_HAMMER"
+        elif is_hammer:
+            # Hammer in moderate downtrend — still bet down, not convincing enough
+            candle_dir = "DOWN"
+            confidence = "LOW"
+            tag = "WEAK_HAMMER_IN_DOWN"
+        elif lc_is_red:
+            # Red confirms the drop
+            if is_strong_body:
+                confidence = "HIGH"
+                tag = "STRONG_RED_IN_DOWN"
             else:
-                # Moderate candle, no P2.1, price contradicts — SKIP
-                return None
+                confidence = "HIGH" if trend == "STRONG_DOWN" else "MEDIUM"
+                tag = "RED_CONFIRMS_DOWN"
+            candle_dir = "DOWN"
+        elif lc_is_green and lc_body_ratio < 0.5:
+            # Small green = relief bounce — crowd thinks it's reversing, they're WRONG
+            candle_dir = "DOWN"
+            confidence = "HIGH" if trend == "STRONG_DOWN" else "MEDIUM"
+            tag = "BOUNCE_TRAP"
+        elif lc_is_green and lc_body_ratio >= 0.5:
+            # Big green in downtrend — momentum shifting but trend still down
+            candle_dir = "DOWN"
+            confidence = "LOW" if trend == "STRONG_DOWN" else "LOW"
+            tag = "BIG_BOUNCE_RISKY"
+        elif lc_is_doji:
+            # Doji in downtrend = indecision, but trend favors continuation
+            candle_dir = "DOWN"
+            confidence = "MEDIUM" if trend == "STRONG_DOWN" else "LOW"
+            tag = "DOJI_IN_DOWN"
 
-    if confidence is None:
+    elif trend in ("STRONG_UP", "UP"):
+        # === MARKET IS RISING ===
+        if is_shooting_star and trend == "STRONG_UP":
+            # Shooting star after strong rally = TOP — bold call: flip to DOWN
+            candle_dir = "DOWN"
+            confidence = "MEDIUM"
+            tag = "REVERSAL_STAR"
+        elif is_shooting_star:
+            # Shooting star in moderate uptrend — still bet up
+            candle_dir = "UP"
+            confidence = "LOW"
+            tag = "WEAK_STAR_IN_UP"
+        elif lc_is_green:
+            # Green confirms the rally
+            if is_strong_body:
+                confidence = "HIGH"
+                tag = "STRONG_GREEN_IN_UP"
+            else:
+                confidence = "HIGH" if trend == "STRONG_UP" else "MEDIUM"
+                tag = "GREEN_CONFIRMS_UP"
+            candle_dir = "UP"
+        elif lc_is_red and lc_body_ratio < 0.5:
+            # Small red = pullback — crowd panics, they're WRONG
+            candle_dir = "UP"
+            confidence = "HIGH" if trend == "STRONG_UP" else "MEDIUM"
+            tag = "PULLBACK_TRAP"
+        elif lc_is_red and lc_body_ratio >= 0.5:
+            # Big red in uptrend — profit taking but trend still up
+            candle_dir = "UP"
+            confidence = "LOW" if trend == "STRONG_UP" else "LOW"
+            tag = "BIG_PULLBACK_RISKY"
+        elif lc_is_doji:
+            # Doji in uptrend = pause, trend favors continuation
+            candle_dir = "UP"
+            confidence = "MEDIUM" if trend == "STRONG_UP" else "LOW"
+            tag = "DOJI_IN_UP"
+
+    else:
+        # === CHOPPY MARKET — still trade, just read harder ===
+        if lc_is_doji and price_at_baseline:
+            # True coin flip — the ONLY situation we skip
+            return None
+
+        if is_hammer:
+            candle_dir = "UP"
+            confidence = "MEDIUM"
+            tag = "HAMMER_IN_CHOP"
+        elif is_shooting_star:
+            candle_dir = "DOWN"
+            confidence = "MEDIUM"
+            tag = "STAR_IN_CHOP"
+        elif is_strong_body and lc_is_red:
+            candle_dir = "DOWN"
+            confidence = "MEDIUM"
+            tag = "STRONG_RED_IN_CHOP"
+        elif is_strong_body and lc_is_green:
+            candle_dir = "UP"
+            confidence = "MEDIUM"
+            tag = "STRONG_GREEN_IN_CHOP"
+        elif lc_is_red and not price_above:
+            # Price below baseline + red candle = lean DOWN
+            candle_dir = "DOWN"
+            confidence = "LOW"
+            tag = "CHOP_LEAN_DOWN"
+        elif lc_is_green and price_above:
+            # Price above baseline + green candle = lean UP
+            candle_dir = "UP"
+            confidence = "LOW"
+            tag = "CHOP_LEAN_UP"
+        elif lc_is_red and price_above:
+            # Red candle but price still above — mixed
+            candle_dir = "DOWN" if lc_body_ratio > 0.4 else "UP"
+            confidence = "LOW"
+            tag = "CHOP_CROSS_DOWN" if candle_dir == "DOWN" else "CHOP_HOLD_UP"
+        elif lc_is_green and not price_above:
+            # Green candle but price still below — mixed
+            candle_dir = "UP" if lc_body_ratio > 0.4 else "DOWN"
+            confidence = "LOW"
+            tag = "CHOP_CROSS_UP" if candle_dir == "UP" else "CHOP_HOLD_DOWN"
+        elif lc_is_doji:
+            # Doji in choppy — use price position
+            if price_above:
+                candle_dir = "UP"
+            else:
+                candle_dir = "DOWN"
+            confidence = "LOW"
+            tag = "CHOP_DOJI_LEAN"
+
+    if candle_dir is None or confidence is None:
         return None
 
-    # ── Step 5: Build the trade ──
+    # ══════════════════════════════════════════════════════
+    # STEP 5: BUILD THE TRADE
+    # ══════════════════════════════════════════════════════
     if candle_dir == "UP":
         bet_side = "YES" if p["direction"] == "above" else "NO"
     else:
         bet_side = "NO" if p["direction"] == "above" else "YES"
 
     effective_odds = yes_odds if bet_side == "YES" else no_odds
-
-    # Confidence scoring
-    total_signals = 1  # candle always counts
-    signals_agree = 1
-    if p21_dir == candle_dir:
-        total_signals += 1
-        signals_agree += 1
-    elif p21_dir is not None:
-        total_signals += 1  # P2.1 present but disagrees
-
-    # Build indicator string
-    ind_str = "CANDLE={}({}) b={:.0f}% uw={:.0f}% lw={:.0f}%".format(
-        pattern, candle_dir,
-        candle["body_ratio"]*100,
-        candle["upper_wick_ratio"]*100,
-        candle["lower_wick_ratio"]*100)
-    if p21_dir:
-        ind_str += " | P2.1={}({}/3)".format(p21_dir, p21_score)
-    ind_str += " | {}".format(tag)
-
     sim_payout = round(1.0 / (effective_odds / 100.0), 4) if effective_odds > 0 else 0
+
+    ind_str = "TREND={} {}R/{}G | LAST={}(b={:.0f}%) | PRICE {} base({:.3f}%) | {}".format(
+        trend, reds, greens,
+        "GREEN" if lc_is_green else "RED" if lc_is_red else "DOJI",
+        lc_body_ratio * 100,
+        "ABOVE" if price_above else "BELOW",
+        price_dist,
+        tag)
 
     return {
         "bet_side": bet_side,
         "bet_odds": effective_odds,
         "confidence": confidence,
-        "score": signals_agree,
-        "total_signals": total_signals,
-        "signals_agree": signals_agree,
+        "score": 3 if confidence == "HIGH" else 2 if confidence == "MEDIUM" else 1,
+        "total_signals": 3,
+        "signals_agree": 3 if confidence == "HIGH" else 2,
         "p23_agrees": False,
         "indicators": ind_str,
         "market_type": mtype,
         "sim_payout": sim_payout,
         "tv_dir": candle_dir,
-        "sma_dir": p21_dir or "—",
+        "sma_dir": trend,
         "btc_dir": "—",
     }
+
+
+def _p28_read_candle_series(asset, tf="15m", count=6):
+    """Fetch a series of candles for trend analysis.
+    Returns list of dicts with open/high/low/close, or None on failure.
+    """
+    candles = _fetch_binance_candles_small(asset, tf, count)
+    if candles and len(candles) >= count:
+        return candles
+    try:
+        ind = _calculate_indicators(asset, tf)
+        if ind and ind.get("_opens") and ind.get("_closes") and ind.get("_highs") and ind.get("_lows"):
+            opens = ind["_opens"]
+            closes = ind["_closes"]
+            highs = ind["_highs"]
+            lows = ind["_lows"]
+            n = min(len(opens), len(closes), len(highs), len(lows))
+            if n >= count:
+                result = []
+                for i in range(-count, 0):
+                    result.append({
+                        "ts": 0,
+                        "open": opens[i],
+                        "high": highs[i],
+                        "low": lows[i],
+                        "close": closes[i],
+                    })
+                return result
+    except:
+        pass
+    return None
+
 
 # ═══════════════════════════════════════════════════════════
 # PAPER 3.3: Bot 3.1 + Distance Calculator — MIXED MODE
@@ -8518,6 +8746,11 @@ def run_paper34_scan():
             p28_ids = set(str(row[0]) for row in p28_rows)
         except:
             p28_ids = set()
+        try:
+            p29_rows = conn.run("SELECT market_id FROM paper29_trades WHERE fired_at::timestamptz > NOW() - INTERVAL '30 hours'")
+            p29_ids = set(str(row[0]) for row in p29_rows)
+        except:
+            p29_ids = set()
         # Get Bot 1 and Bot 2 market IDs to avoid overlap
         try:
             bot12_rows = conn.run("""SELECT market_id FROM limitless_predictions WHERE created_at > NOW() - INTERVAL '30 hours'
@@ -8548,6 +8781,7 @@ def run_paper34_scan():
         p27_count = 0
         p37_count = 0
         p28_count = 0
+        p29_count = 0
 
         for market in markets:
             try:
@@ -9324,11 +9558,38 @@ def run_paper34_scan():
                         except Exception as e:
                             print("Paper28 save error: {}".format(e))
 
+                # ── Paper 2.9 (BlackRock Trader — trend + candle + price) ──
+                if parsed["market_id"] not in p29_ids:
+                    scored29 = _score_paper29_trade(parsed, price, indicators=ind, ind_macro=ind_macro, expiry_minute=expiry_minute, expiry_hour=expiry_hour)
+                    if scored29:
+                        try:
+                            c29 = get_db()
+                            c29.run(
+                                """INSERT INTO paper29_trades
+                                (market_id, title, asset, direction, baseline, bet_odds, bet_side,
+                                 current_price, hours_left, market_type, indicators, score,
+                                 total_signals, simulated_stake, simulated_payout, status, fired_at, slug)
+                                VALUES (:mid, :ttl, :ast, :dir, :base, :odds, :bs,
+                                        :pr, :hrs, :mt, :ind, :sc, :ts, 1.0, :sp, 'Pending', :now, :slg)""",
+                                mid=parsed["market_id"], ttl=parsed["title"], ast=asset,
+                                dir=parsed["direction"], base=parsed["baseline"],
+                                odds=scored29["bet_odds"], bs=scored29["bet_side"],
+                                pr=price, hrs=round(parsed["hours_left"], 2),
+                                mt=scored29["market_type"],
+                                ind="[{}] {}".format(scored29["confidence"], scored29["indicators"]),
+                                sc=scored29["score"], ts=scored29["total_signals"],
+                                sp=scored29["sim_payout"], now=now, slg=parsed["slug"])
+                            c29.close()
+                            p29_ids.add(parsed["market_id"])
+                            p29_count += 1
+                        except Exception as e:
+                            print("Paper29 save error: {}".format(e))
+
             except Exception as e:
                 print("Paper345 market error: {}".format(e))
 
-        if p3_count > 0 or p4_count > 0 or p5_count > 0 or p24_count > 0 or p34_count > 0 or p25_count > 0 or p35_count > 0 or p26_count > 0 or p36_count > 0 or p27_count > 0 or p37_count > 0 or p28_count > 0:
-            print("P3:{} P4:{} P5:{} P3.1:{} P2.1:{} P5.1:{} P2.2:{} P3.2:{} P2.3:{} P3.3:{} P2.4:{} P3.4:{} P2.5:{} P3.5:{} P2.6:{} P3.6:{} P2.7:{} P3.7:{} P2.8:{}".format(p3_count, p4_count, p5_count, p31_count, p21_count, p51_count, p22_count, p32_count, p23_count, p33_count, p24_count, p34_count, p25_count, p35_count, p26_count, p36_count, p27_count, p37_count, p28_count))
+        if p3_count > 0 or p4_count > 0 or p5_count > 0 or p24_count > 0 or p34_count > 0 or p25_count > 0 or p35_count > 0 or p26_count > 0 or p36_count > 0 or p27_count > 0 or p37_count > 0 or p28_count > 0 or p29_count > 0:
+            print("P3:{} P4:{} P5:{} P3.1:{} P2.1:{} P5.1:{} P2.2:{} P3.2:{} P2.3:{} P3.3:{} P2.4:{} P3.4:{} P2.5:{} P3.5:{} P2.6:{} P3.6:{} P2.7:{} P3.7:{} P2.8:{} P2.9:{}".format(p3_count, p4_count, p5_count, p31_count, p21_count, p51_count, p22_count, p32_count, p23_count, p33_count, p24_count, p34_count, p25_count, p35_count, p26_count, p36_count, p27_count, p37_count, p28_count, p29_count))
         else:
             # Count how many assets we got indicators for
             ind_ok = sum(1 for v in indicator_cache_local.values() if v is not None)
@@ -9631,6 +9892,7 @@ def resolve_paper34_trades():
     r27 = _resolve_paper_table("paper27_trades")
     r37 = _resolve_paper_table("paper37_trades")
     r28 = _resolve_paper_table("paper28_trades")
+    r29 = _resolve_paper_table("paper29_trades")
     ra = _resolve_alpha_trades()
     if r3 or r4 or r5 or r24 or r34 or r25 or r35 or r26 or r36 or ra:
         print("Resolved: P3={} P4={} P5={} P3.1={} P2.1={} P5.1={} P2.2={} P3.2={} P2.3={} P3.3={} P2.4={} P3.4={} P2.5={} P3.5={} P2.6={} P3.6={} ALPHA={}".format(r3, r4, r5, r31, r21, r51, r22, r32, r23, r33, r24, r34, r25, r35, r26, r36, ra))
@@ -14204,6 +14466,8 @@ td{padding:8px 12px;border-bottom:1px solid #f4f3ed;color:var(--ink-2)}tr:last-c
     <a href="/app/paper37" class="nav-tab""" + (" active" if nav_active == "paper37" else "") + """">Paper 3.7</a>
     <a href="/app/paper28" class="nav-tab""" + (" active" if nav_active == "paper28" else "") + """">Paper 2.8</a>
     <a href="/app/paper28poly" class="nav-tab""" + (" active" if nav_active == "paper28poly" else "") + """">P2.8 Poly</a>
+    <a href="/app/paper29" class="nav-tab""" + (" active" if nav_active == "paper29" else "") + """">Paper 2.9</a>
+    <a href="/app/paper29poly" class="nav-tab""" + (" active" if nav_active == "paper29poly" else "") + """">P2.9 Poly</a>
     <a href="/app/paper4" class="nav-tab""" + (" active" if nav_active == "paper4" else "") + """">Paper 4</a>
     <a href="/app/paper5" class="nav-tab""" + (" active" if nav_active == "paper5" else "") + """">Paper 5</a>
     <a href="/app/paper51" class="nav-tab""" + (" active" if nav_active == "paper51" else "") + """">Paper 5.1</a>
@@ -15175,7 +15439,7 @@ def run_poly_scan():
         conn.close()
 
         poly_counts = {"btc5m": 0, "all5m": 0, "all15m": 0, "hourly24": 0}
-        strategies = ["p21", "p23", "p31", "p33", "p24", "p34", "p25", "p35", "p26", "p36", "p28", "bot2"]
+        strategies = ["p21", "p23", "p31", "p33", "p24", "p34", "p25", "p35", "p26", "p36", "p28", "p29", "bot2"]
         # BUG 3 FIX: Batch inserts with single connection
         inserts = []
         _pa_pending_signals = {}  # Track P2.1 signals per market for tiered trading
@@ -15240,7 +15504,7 @@ def run_poly_scan():
                     # hourly24: P2.4, P3.4, P2.5, P3.5, P2.8 (1H strategies)
                     # P2.5/P3.5 are 1H only — skip on 15M and 5M sections
                     # P2.6/P3.6 are 15M only — skip on 1H sections
-                    if section == "hourly24" and strat not in ("p24", "p34", "p25", "p35", "p28"):
+                    if section == "hourly24" and strat not in ("p24", "p34", "p25", "p35", "p28", "p29"):
                         continue
                     if section in ("btc5m", "all15m") and strat in ("p24", "p34", "p25", "p35"):
                         continue
@@ -15312,6 +15576,11 @@ def run_poly_scan():
                                                           expiry_hour=expiry_hour)
                         elif strat == "p28":
                             scored = _score_paper28_trade(parsed, price, indicators=ind,
+                                                          ind_macro=ind_macro,
+                                                          expiry_minute=expiry_minute,
+                                                          expiry_hour=expiry_hour)
+                        elif strat == "p29":
+                            scored = _score_paper29_trade(parsed, price, indicators=ind,
                                                           ind_macro=ind_macro,
                                                           expiry_minute=expiry_minute,
                                                           expiry_hour=expiry_hour)
@@ -16288,6 +16557,8 @@ def _build_poly_page(section, page_title, subtitle, description):
             ("p34", "Paper 3.4", "P3.1 + Distance Math + 15M Candle Pattern (1H Only)"),
             ("p25", "Paper 2.5", "P2.1 + Candle Sequence (1H Only)"),
             ("p35", "Paper 3.5", "P3.1 + Candle Sequence (1H Only)"),
+            ("p28", "Paper 2.8", "Candle-First (single candle + P2.1 optional)"),
+            ("p29", "Paper 2.9", "BlackRock Trader (trend + candle + price)"),
         ]
     else:
         strategies = [
@@ -16297,6 +16568,8 @@ def _build_poly_page(section, page_title, subtitle, description):
             ("p33", "Paper 3.3", "P3.1 + Distance Math (Mixed Mode)"),
             ("p26", "Paper 2.6", "P2.1 + Candle Position Context (15M)"),
             ("p36", "Paper 3.6", "P3.1 + Candle Position Context (15M)"),
+            ("p28", "Paper 2.8", "Candle-First (single candle + P2.1 optional)"),
+            ("p29", "Paper 2.9", "BlackRock Trader (trend + candle + price)"),
         ]
 
     try:
@@ -16830,6 +17103,21 @@ def paper28poly_page():
         "CANDLE-FIRST strategy on Polymarket Up/Down markets. Reads previous candle to determine direction — strong patterns trade immediately, moderate candles need P2.1 or price confirmation.",
         extra_cols=[], nav_active="paper28poly",
         where_clause="WHERE strategy='p28'")
+
+@app.route("/app/paper29")
+def paper29_page():
+    return _build_paper_page("paper29_trades", "Paper 2.9",
+        "BlackRock Trader — Trend + Candle + Price",
+        "Reads 4 candles for trend context, then makes the call. Counter-candles in trends are bounce/pullback traps. Trades choppy markets too. Only skips doji at baseline.",
+        extra_cols=[], nav_active="paper29")
+
+@app.route("/app/paper29poly")
+def paper29poly_page():
+    return _build_paper_page("poly_trades", "P2.9 Poly",
+        "BlackRock Trader on Polymarket",
+        "Trend context + candle reading on Polymarket Up/Down markets. Reads 4 candles for trend, identifies bounce traps and pullback traps, trades choppy markets with price position.",
+        extra_cols=[], nav_active="paper29poly",
+        where_clause="WHERE strategy='p29'")
 
 @app.route("/app/alpha")
 def alpha_page():
