@@ -16818,19 +16818,6 @@ def paper28poly_page():
             total_profit -= float(t.get("simulated_stake") or 1)
     total_profit = round(total_profit, 2)
 
-    # By timeframe
-    tf_stats = {}
-    for t in trades:
-        tf = t.get("market_type") or "15M"
-        if tf not in tf_stats:
-            tf_stats[tf] = {"w": 0, "l": 0, "pnl": 0}
-        if t.get("outcome") == "WIN":
-            tf_stats[tf]["w"] += 1
-            tf_stats[tf]["pnl"] += float(t.get("simulated_payout") or 0) - float(t.get("simulated_stake") or 1)
-        elif t.get("outcome") == "LOSS":
-            tf_stats[tf]["l"] += 1
-            tf_stats[tf]["pnl"] -= float(t.get("simulated_stake") or 1)
-
     # By asset
     asset_stats = {}
     for t in trades:
@@ -16846,46 +16833,33 @@ def paper28poly_page():
 
     display_trades = trades[:200]
 
-    tf_html = ""
-    for tf_name in sorted(tf_stats.keys()):
-        s = tf_stats[tf_name]
-        wr = round(s["w"] / (s["w"] + s["l"]) * 100, 1) if (s["w"] + s["l"]) > 0 else 0
-        tf_html += "<tr><td>{}</td><td>{}%</td><td>{}W / {}L · ${:.2f}</td></tr>".format(
-            tf_name, wr, s["w"], s["l"], s["pnl"])
-
     asset_html = ""
     for a_name in sorted(asset_stats.keys()):
-        s = asset_stats[a_name]
-        wr = round(s["w"] / (s["w"] + s["l"]) * 100, 1) if (s["w"] + s["l"]) > 0 else 0
+        st = asset_stats[a_name]
+        wr = round(st["w"] / (st["w"] + st["l"]) * 100, 1) if (st["w"] + st["l"]) > 0 else 0
         asset_html += "<tr><td>{}</td><td>{}%</td><td>{}W / {}L · ${:.2f}</td></tr>".format(
-            a_name, wr, s["w"], s["l"], s["pnl"])
+            a_name, wr, st["w"], st["l"], st["pnl"])
 
     rows_html = ""
     for t in display_trades:
-        status = t.get("status") or "Pending"
         outcome = t.get("outcome") or ""
         icon = "✅" if outcome == "WIN" else "❌" if outcome == "LOSS" else "⏳"
-        side = t.get("bet_side") or "?"
-        odds = t.get("bet_odds") or 0
         pnl = ""
         if outcome == "WIN":
             pnl = "+${:.2f}".format(float(t.get("simulated_payout") or 0) - float(t.get("simulated_stake") or 1))
         elif outcome == "LOSS":
             pnl = "-${:.2f}".format(float(t.get("simulated_stake") or 1))
-
         fired = t.get("fired_at") or ""
         if fired:
-            try:
-                fd = datetime.fromisoformat(str(fired))
-                fired = fd.strftime("%Y-%m-%d %H:%M")
-            except:
-                pass
+            try: fired = datetime.fromisoformat(str(fired)).strftime("%Y-%m-%d %H:%M")
+            except: pass
+        rows_html += "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{:.1f}%</td><td>{}</td><td>{}</td><td>{}</td></tr>".format(
+            t.get("id",""), icon, t.get("asset","?"), t.get("bet_side","?"),
+            float(t.get("bet_odds") or 0), t.get("market_type","15M"), pnl, fired)
 
-        rows_html += "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{:.1f}%</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>".format(
-            t.get("id", ""), icon, t.get("asset", "?"), side, odds,
-            t.get("market_type", "15M"), pnl, status, fired)
-
-    return """<!DOCTYPE html><html><head><title>Paper 2.8 Polymarket</title>
+    return _build_paper_page.__wrapped__("poly_trades", "P2.8 Poly", "Candle-First on Polymarket",
+        "CANDLE-FIRST strategy on Polymarket Up/Down markets. Reads previous candle to determine direction.",
+        extra_cols=[], nav_active="paper28poly") if False else """<!DOCTYPE html><html><head><title>P2.8 Poly</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <style>body{{font-family:-apple-system,sans-serif;max-width:900px;margin:0 auto;padding:10px;background:#0a0a0a;color:#e0e0e0}}
 h1{{color:#00d4aa}}h2{{color:#888;font-size:14px}}
@@ -16898,8 +16872,15 @@ th{{background:#1a1a2e;color:#888;font-size:11px}}
 .nav{{display:flex;gap:4px;flex-wrap:wrap;margin:10px 0}}
 .nav-tab{{padding:6px 12px;background:#1a1a2e;color:#888;text-decoration:none;border-radius:4px;font-size:12px}}
 .nav-tab.active{{background:#00d4aa;color:#000}}
+a{{color:#00d4aa}}
 </style></head><body>
-""" + _build_nav_html("paper28poly") + """
+<div class="nav">
+<a href="/app/paper28" class="nav-tab">Paper 2.8</a>
+<a href="/app/paper28poly" class="nav-tab active">P2.8 Poly</a>
+<a href="/app/poly-alpha2" class="nav-tab">⚡ Poly A2</a>
+<a href="/app/poly/btc5m" class="nav-tab">Polymarket</a>
+<a href="/" class="nav-tab">Home</a>
+</div>
 <h1>Paper 2.8 — Polymarket</h1>
 <h2>CANDLE-FIRST strategy on Polymarket Up/Down markets</h2>
 <div class="stats">
@@ -16910,13 +16891,11 @@ th{{background:#1a1a2e;color:#888;font-size:11px}}
 <div class="stat"><div class="val">{}</div><div class="lbl">Pending</div></div>
 <div class="stat"><div class="val">${:.2f}</div><div class="lbl">Sim P&L</div></div>
 </div>
-<h2>By Timeframe</h2><table><tr><th>TF</th><th>WR</th><th>Record</th></tr>{}</table>
 <h2>By Asset</h2><table><tr><th>Asset</th><th>WR</th><th>Record</th></tr>{}</table>
-<h2>Trade Log</h2><table><tr><th>#</th><th></th><th>Asset</th><th>Side</th><th>Odds</th><th>TF</th><th>P&L</th><th>Status</th><th>Time</th></tr>{}</table>
+<h2>Trade Log</h2><table><tr><th>#</th><th></th><th>Asset</th><th>Side</th><th>Odds</th><th>TF</th><th>P&L</th><th>Time</th></tr>{}</table>
 <p style="color:#444;font-size:11px">Paper trading · $1 simulated stakes · Auto-resolves · Auto-refresh 60s</p>
 <script>setTimeout(()=>location.reload(),60000)</script>
-</body></html>""".format(total, win_rate, wins, losses, pending, total_profit,
-                          tf_html, asset_html, rows_html)
+</body></html>""".format(total, win_rate, wins, losses, pending, total_profit, asset_html, rows_html)
 
 @app.route("/app/alpha")
 def alpha_page():
