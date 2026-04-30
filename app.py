@@ -381,9 +381,6 @@ def _poly_alpha2_calc_stake(base_stake, pool_balance):
     return stake
 
 def _poly_alpha_load_recent_trades():
-    # Start sniper thread
-    threading.Thread(target=_sniper_thread, daemon=True).start()
-    print("SNIPER thread launched")
     """Load recently traded market IDs from DB to prevent double-trading after restart."""
     try:
         conn = get_db()
@@ -15285,6 +15282,8 @@ threading.Thread(target=football_loop, daemon=True).start()
 threading.Thread(target=otp_loop, daemon=True).start()
 if SIGNALS_DB_URL:
     threading.Thread(target=_signals_poll_loop, daemon=True).start()
+threading.Thread(target=_sniper_thread, daemon=True).start()
+print("SNIPER A4 thread launched")
 
 # ═══════════════════════════════════════════════════════════
 # POLYMARKET MODULE — Paper trading on crypto Up/Down markets
