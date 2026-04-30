@@ -361,21 +361,13 @@ def _poly_alpha2_load_recent():
         pass
 
 def _poly_alpha2_get_tier(asset, timeframe, p23_agrees=False, p24_agrees=False):
-    """ULTIMATE Model — Maximum profitable volume.
-    15M: P2.1 base ($2.50) + P2.3 boost ($3.00) | all 4 assets
-    1H:  P2.4 required ($2.50) | BTC/ETH/XRP only (SOL 53.5% WR = unprofitable)
-    5M: paper only."""
+    """Alpha 2.0 v3 — PA15+ only, 15M only.
+    Only trades when P2.3 distance math confirms P2.1 direction.
+    No PA15 (P2.1 alone was 44% WR live). No PA1H (paused)."""
     if timeframe == "15M":
         if asset in ("BTC", "ETH", "SOL", "XRP"):
             if p23_agrees:
-                return ("PA15+", 3.00, 0.65)  # P2.3 confirmed — 77% WR
-            else:
-                return ("PA15", 2.50, 0.68)   # P2.1 alone — 72% WR
-    elif timeframe == "1H":
-        # 1H P2.4: BTC 65.8%, ETH 61.0%, XRP 71.8% — all profitable
-        # SOL excluded at 53.5% WR (below breakeven after fees)
-        if asset in ("BTC", "ETH", "XRP") and p24_agrees:
-            return ("PA1H", 2.50, 0.68)       # P2.4 confirmed — 66% blended WR
+                return ("PA15+", 3.00, 0.62)  # P2.3 confirmed, max fill 62¢
     return None
 
 def _poly_alpha2_calc_stake(base_stake, pool_balance):
@@ -1162,13 +1154,6 @@ def init_db():
             fired_at TEXT, resolved_at TEXT, slug TEXT
         )
     """)
-    # One-time reset: clear old P2.9 data (strategy rebuilt)
-    try:
-        conn.run("DELETE FROM paper29_trades")
-        conn.run("DELETE FROM poly_trades WHERE strategy='p29'")
-        print("P2.9 data reset — fresh start for rebuilt strategy")
-    except:
-        pass
     # ─── ALPHA unified trading system table ───
     conn.run("""
         CREATE TABLE IF NOT EXISTS alpha_trades (
@@ -14778,12 +14763,12 @@ try:
         _poly_alpha2_state["peak_balance"] = _saved_pa2.get("peak_balance", _saved_pa2["balance"])
         _poly_alpha2_restored = True
     if not _poly_alpha2_restored:
-        _poly_alpha2_state["balance"] = 70.0
-        _poly_alpha2_state["peak_balance"] = 70.0
-    _poly_alpha2_state["starting_balance"] = 70.0
-    _poly_alpha2_state["floor_balance"] = 10.0
-    _poly_alpha2_state["enabled"] = False  # PAUSED — replaced by Alpha 3.0
-    print("POLY ALPHA 2.0: ${:.2f} pool{} | PAUSED (replaced by Alpha 3.0)".format(
+        _poly_alpha2_state["balance"] = 60.0
+        _poly_alpha2_state["peak_balance"] = 60.0
+    _poly_alpha2_state["starting_balance"] = 60.0
+    _poly_alpha2_state["floor_balance"] = 5.0
+    _poly_alpha2_state["enabled"] = True  # ACTIVE — PA15+ 15M only
+    print("POLY ALPHA 2.0: ${:.2f} pool{} | PA15+ 15M only | Floor=$10".format(
         _poly_alpha2_state["balance"], " (restored)" if _poly_alpha2_restored else " (fresh)"))
     _poly_alpha2_load_recent()
 
@@ -14799,8 +14784,8 @@ try:
         _poly_alpha3_state["peak_balance"] = 60.0
     _poly_alpha3_state["starting_balance"] = 60.0
     _poly_alpha3_state["floor_balance"] = 5.0
-    _poly_alpha3_state["enabled"] = True
-    print("POLY ALPHA 3.0: ${:.2f} pool{} | Pure P2.3 15M+1H | Compound 5% | Floor=$5".format(
+    _poly_alpha3_state["enabled"] = False  # PAUSED — using Alpha 2.0 instead
+    print("POLY ALPHA 3.0: ${:.2f} pool{} | PAUSED".format(
         _poly_alpha3_state["balance"], " (restored)" if _poly_alpha3_restored else " (fresh)"))
     _poly_alpha3_load_recent()
 
@@ -15763,17 +15748,17 @@ def run_poly_scan():
                                             if client:
                                                 from py_clob_client_v2 import Side, OrderArgs, OrderType
                                                 BUY = Side.BUY
-                                                # Get best ask for immediate fill — Take the ask directly
-                                                _pa2_best_price = _pa2_share
+                                                # Aggressive fill — take ask + 1¢ for instant execution
+                                                _pa2_best_price = min(_pa2_share + 0.03, _pa2_max)
                                                 try:
                                                     book = client.get_order_book(str(tid))
-                                                    if book and book.get("asks"):
+                                                    if book and book.get("asks") and len(book["asks"]) > 0:
                                                         best_ask = float(book["asks"][0]["price"])
-                                                        _pa2_best_price = round(best_ask, 2)
+                                                        _pa2_best_price = round(best_ask + 0.01, 2)
                                                         _pa2_best_price = min(_pa2_best_price, _pa2_max)
-                                                    elif book and book.get("bids"):
+                                                    elif book and book.get("bids") and len(book["bids"]) > 0:
                                                         best_bid = float(book["bids"][0]["price"])
-                                                        _pa2_best_price = round(best_bid + 0.02, 2)
+                                                        _pa2_best_price = round(best_bid + 0.03, 2)
                                                         _pa2_best_price = min(_pa2_best_price, _pa2_max)
                                                 except:
                                                     pass
