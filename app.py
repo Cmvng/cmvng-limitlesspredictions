@@ -482,52 +482,95 @@ def _poly_alpha4_calc_stake(pool_balance):
     return stake
 
 def _sniper_get_direction(asset):
-    """Read P2.1 direction from cached indicators. No market dict needed.
-    Returns ("UP", signals_agree, "TV=BUY|SMA=BUY|BTC=BUY") or (None, 0, "") if no signal.
+    """FULL P2.1 scoring for sniper — uses ALL filters from paper bot.
+    Builds a synthetic market dict and runs _score_paper21_trade on it.
+    Returns (direction, signals_agree, indicators_str, scored_dict) or (None, 0, "", None).
     """
-    # Read cached indicators — these persist from previous scan cycle
-    tv = _tv_trends.get(asset.upper())
-    tv_dir = tv["dir"] if tv else None
+    # Get current price using the same function the scanner uses
+    asset_upper = asset.upper()
+    price = get_price(asset_upper)
+    if not price:
+        return None, 0, "", None
 
-    sma_data = _pair_sma_cache.get(asset.upper(), {})
-    sma_dir = sma_data.get("trend")
-
-    btc_trend = _btc_trend_cache.get("trend")
-
-    # Pair direction: TV + SMA vote
-    pair_signals = [s for s in [tv_dir, sma_dir] if s in ("BUY", "SELL")]
-    pair_buy = sum(1 for s in pair_signals if s == "BUY")
-    pair_sell = sum(1 for s in pair_signals if s == "SELL")
-
-    if pair_buy > pair_sell:
-        pair_dir = "BUY"
-    elif pair_sell > pair_buy:
-        pair_dir = "SELL"
-    elif len(pair_signals) == 0:
-        pair_dir = btc_trend  # no pair data, use BTC as direction
+    # Build synthetic market dict matching what parse_market returns
+    # This simulates what the paper bot sees at market open
+    now = datetime.now(timezone.utc)
+    
+    # Calculate expiry (next 15M boundary for Poly, next hour for LMTS)
+    next_15m = now.replace(second=0, microsecond=0)
+    next_min = ((now.minute // 15) + 1) * 15
+    if next_min >= 60:
+        next_15m = next_15m.replace(minute=0) + timedelta(hours=1)
     else:
-        # TV and SMA split — check BTC as tiebreaker
-        if btc_trend:
-            pair_dir = btc_trend
-        else:
-            pair_dir = None  # no tiebreaker → skip
+        next_15m = next_15m.replace(minute=next_min)
+    
+    mins_left = (next_15m - now).total_seconds() / 60
+    
+    synthetic_market = {
+        "asset": asset_upper,
+        "direction": "above",
+        "baseline": price,  # At market open, baseline ≈ current price
+        "yes_odds": 50.0,   # At market open, odds start at ~50%
+        "mins_left": max(mins_left, 1),
+        "hours_left": max(mins_left / 60, 0.01),
+        "is_short": True,
+        "is_daily": False,
+        "is_15m_market": True,
+        "is_hourly_market": False,
+        "title": "{} above ${} — Up or Down".format(asset_upper, price),  # "up or down" skips margin check
+        "slug": "",
+        "market_id": "sniper_synthetic",
+    }
+    
+    # Calculate FULL indicators — same function the paper bot uses
+    # This fetches live candle data and computes TV, SMA, UT Bot, squeeze, etc.
+    try:
+        ind = _calculate_indicators(asset_upper, "15m")
+    except Exception as e:
+        print("SNIPER indicator calc error {}: {}".format(asset_upper, e))
+        ind = {}
+    
+    if not ind:
+        return None, 0, "", None
+    
+    # Add TV signal from signals DB (not computed by _calculate_indicators)
+    tv = _tv_trends.get(asset_upper)
+    if tv:
+        ind["tv_dir"] = tv.get("dir")
+        ind["tv_score"] = tv.get("score", 0)
+    
+    # Macro indicators (4H timeframe) — for weak period detection in 1H
+    try:
+        ind_macro = _calculate_indicators(asset_upper, "4h")
+    except:
+        ind_macro = {}
+    
+    # Expiry timing for weak period detection
+    expiry_minute = next_15m.minute
+    expiry_hour = next_15m.hour
+    
+    # Run the FULL P2.1 scorer — same function the paper bot calls
+    scored = _score_paper21_trade(
+        synthetic_market, price,
+        indicators=ind,
+        ind_macro=ind_macro,
+        expiry_minute=expiry_minute,
+        expiry_hour=expiry_hour
+    )
+    
+    if scored is None:
+        return None, 0, "", None
+    
+    # Extract direction
+    bet_side = scored.get("bet_side", "YES")
+    direction = "UP" if bet_side == "YES" else "DOWN"
+    signals_agree = scored.get("score", 2)
+    total_signals = scored.get("total_signals", 3)
+    ind_str = scored.get("indicators", "")
+    confidence = scored.get("confidence", "LOW")
+    
+    return direction, signals_agree, "[{}] {}".format(confidence, ind_str), scored
 
-    if not pair_dir:
-        return None, 0, ""
-
-    # Count agreement
-    signals_agree = sum(1 for s in [tv_dir, sma_dir, btc_trend] if s == pair_dir)
-    total_signals = sum(1 for s in [tv_dir, sma_dir, btc_trend] if s is not None)
-
-    # Map to UP/DOWN for Polymarket
-    direction = "UP" if pair_dir == "BUY" else "DOWN"
-
-    # Build indicator string
-    ind_str = "TV={} SMA={} BTC={} [{}/{}]".format(
-        tv_dir or "—", sma_dir or "—", btc_trend or "—",
-        signals_agree, total_signals)
-
-    return direction, signals_agree, ind_str
 
 def _sniper_thread():
     """Dedicated sniper thread — fires at exact 15M window boundaries.
@@ -584,7 +627,7 @@ def _sniper_thread():
             # ── T-30s: Read indicators for all assets ──
             snipe_targets = []
             for asset in SNIPER_ASSETS:
-                direction, signals_agree, ind_str = _sniper_get_direction(asset)
+                direction, signals_agree, ind_str, _scored = _sniper_get_direction(asset)
                 if direction and signals_agree >= 2:
                     snipe_targets.append({
                         "asset": asset,
@@ -893,6 +936,10 @@ def _resolve_poly_alpha4_trades():
                 _pnl = "+${:.2f}".format(payout - stake) if won else "-${:.2f}".format(stake)
                 print("SNIPER A4 #{} {}: ${:.2f} → {} | pool=${:.2f}".format(
                     p["id"], "WIN" if won else "LOSS", stake, _pnl, _poly_alpha4_state["balance"]))
+                _emoji = "\u2705" if won else "\u274c"
+                send_telegram("{} <b>SNIPER A4</b> {} {}\n${:.2f} → {}\nPool: ${:.2f}".format(
+                    _emoji, p.get("asset","?"), "WIN" if won else "LOSS",
+                    stake, _pnl, _poly_alpha4_state["balance"]))
 
             except Exception as e:
                 print("SNIPER A4 resolve error #{}: {}".format(p.get("id"), e))
@@ -924,16 +971,9 @@ _limitless_sniper_traded = set()
 _limitless_prev_momentum = {}  # {asset: {"direction": "BUY"/"SELL", "confirmed": True/False}}
 
 def _limitless_sniper_stake(pool, tier):
-    """Tier 1 (HIGH): 2.5% of pool. Tier 2 (BASE): 2% of pool."""
-    if tier == "HIGH":
-        stake = round(pool * 0.025, 2)
-        stake = max(stake, 1.25)
-        stake = min(stake, 7.50)
-    else:
-        stake = round(pool * 0.02, 2)
-        stake = max(stake, 1.00)
-        stake = min(stake, 5.00)
-    if stake > pool * 0.10:
+    """Flat $1 per trade. Tier kept for tracking but stake is fixed."""
+    stake = 1.00
+    if stake > pool - 5.0:  # Don't trade below floor
         return 0
     return stake
 
@@ -952,261 +992,147 @@ def _limitless_update_momentum(asset, direction, p23_confirmed):
     }
 
 def _limitless_sniper_thread():
-    """Limitless sniper — fires at exact 15M window boundaries.
-    Uses P2.1 direction + P2.3 momentum carry-over for two-tier staking.
+    """Limitless 1H Sniper — fires at hourly boundaries using proven _place_gtc_order.
+    1H markets have better liquidity for 50c fills on Limitless.
     """
     import time as _time
     import requests as _req
-    from eth_account import Account as _Account
-    from eth_account.messages import encode_typed_data as _encode_typed_data
-    from web3 import Web3 as _Web3
 
     SNIPER_ASSETS = ["BTC", "ETH", "SOL", "XRP"]
-    CHAIN_ID = 8453  # Base
-    ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
-    MAX_FILL = 0.52  # 52¢ max
 
-    print("LIMITLESS SNIPER THREAD STARTED — waiting for first boundary...")
+    print("LIMITLESS 1H SNIPER THREAD STARTED — waiting for first boundary...")
+
+    for _warmup in range(30):
+        if _cached_credentials.get("ready"):
+            break
+        _warm_credentials()
+        _time.sleep(5)
 
     while True:
         try:
             if not _limitless_sniper_state["enabled"]:
-                _time.sleep(30)
+                _time.sleep(60)
                 continue
 
-            if not LIMITLESS_TOKEN_ID or not LIMITLESS_PRIV_KEY:
-                _time.sleep(30)
+            if not _has_trading_keys():
+                _time.sleep(300)
                 continue
 
-            # ── Calculate time to next 15M boundary ──
+            # ── Time to next hour boundary ──
             now = datetime.now(timezone.utc)
-            current_minute = now.minute
-            current_second = now.second
-
-            mins_to_next = 15 - (current_minute % 15)
-            if mins_to_next == 15:
+            mins_to_next = 60 - now.minute
+            if mins_to_next == 60:
                 mins_to_next = 0
-            secs_to_boundary = mins_to_next * 60 - current_second
+            secs_to_boundary = mins_to_next * 60 - now.second
 
-            if secs_to_boundary > 35:
-                _time.sleep(min(secs_to_boundary - 35, 60))
+            if secs_to_boundary > 45:
+                _time.sleep(min(secs_to_boundary - 45, 60))
                 continue
 
-            # ── T-30s: Read indicators for all assets ──
+            # ── T-40s: Read P2.1 direction ──
             snipe_targets = []
             for asset in SNIPER_ASSETS:
-                direction, signals_agree, ind_str = _sniper_get_direction(asset)
+                direction, signals_agree, ind_str, _scored = _sniper_get_direction(asset)
                 if direction and signals_agree >= 2:
-                    # Check momentum carry-over from previous window
                     prev_dir, prev_confirmed = _limitless_sniper_get_momentum(asset)
-                    
-                    if prev_dir == ("BUY" if direction == "UP" else "SELL") and prev_confirmed:
-                        tier = "HIGH"  # P2.1 + P2.3 momentum agree
-                    else:
-                        tier = "BASE"  # P2.1 only
-                    
+                    p21_dir = "BUY" if direction == "UP" else "SELL"
+                    tier = "HIGH" if (prev_dir == p21_dir and prev_confirmed) else "BASE"
                     snipe_targets.append({
-                        "asset": asset,
-                        "direction": direction,
-                        "signals_agree": signals_agree,
-                        "indicators": ind_str,
-                        "tier": tier,
+                        "asset": asset, "direction": direction,
+                        "bet_side": "YES" if direction == "UP" else "NO",
+                        "signals_agree": signals_agree, "indicators": ind_str, "tier": tier,
                     })
 
             if not snipe_targets:
                 _time.sleep(max(secs_to_boundary + 5, 5))
                 continue
 
-            # ── T-20s: Find Limitless 15M markets from /markets/active ──
-            market_data = {}
-            _lmts_headers = {
-                "X-API-Key": LIMITLESS_TOKEN_ID,
-                "Content-Type": "application/json",
-            }
-            target_assets = set(t["asset"] for t in snipe_targets)
-
+            # ── T-30s: Find 1H markets ──
+            market_map = {}
             try:
-                r = _req.get("{}/markets/active".format(LIMITLESS_API),
-                             headers=_lmts_headers, timeout=10)
+                r = _req.get("{}/markets/active".format(LIMITLESS_API), timeout=10)
                 if r.status_code == 200:
-                    all_markets = r.json()
-                    if isinstance(all_markets, list):
-                        for m in all_markets:
-                            slug = m.get("slug", "")
-                            stable = m.get("stableSlug", "")
-                            title = m.get("title", "") or m.get("question", "")
-                            # Match 15M markets
-                            if "15min" not in stable.lower() and "15min" not in slug.lower():
-                                continue
-                            if not m.get("positionIds") or len(m.get("positionIds", [])) < 2:
-                                continue
-                            venue = m.get("venue", {})
-                            if not venue or not venue.get("exchange"):
-                                continue
-                            # Match asset
-                            title_upper = title.upper()
-                            slug_lower = slug.lower()
-                            matched_asset = None
-                            for ast_name in target_assets:
-                                if ast_name.lower() in slug_lower or ast_name in title_upper:
-                                    matched_asset = ast_name
-                                    break
-                            if matched_asset and matched_asset not in market_data:
-                                market_data[matched_asset] = {
-                                    "slug": slug,
-                                    "title": title,
-                                    "venue_exchange": venue["exchange"],
-                                    "position_ids": m["positionIds"],
-                                }
+                    all_markets = r.json().get("data", [])
+                    for m in all_markets:
+                        parsed = parse_market(m)
+                        if not parsed:
+                            continue
+                        if not parsed.get("is_hourly_market"):
+                            continue
+                        asset = parsed.get("asset", "")
+                        if asset not in [t["asset"] for t in snipe_targets]:
+                            continue
+                        if asset in market_map:
+                            continue
+                        tokens = m.get("tokens", {})
+                        has_yes = tokens.get("yes") or tokens.get("Yes") or tokens.get("YES")
+                        if not has_yes:
+                            continue
+                        slug = parsed.get("slug") or m.get("slug", "")
+                        if not slug:
+                            continue
+                        market_map[asset] = {"parsed": parsed, "slug": slug, "tokens": tokens}
                 else:
                     print("LMTS SNIPER: /markets/active returned {}".format(r.status_code))
             except Exception as e:
                 print("LMTS SNIPER market fetch error: {}".format(e))
 
-            if not market_data:
-                print("LMTS SNIPER: no markets found — skipping boundary")
-                _time.sleep(max(secs_to_boundary + 5, 5))
+            if not market_map:
+                print("LMTS SNIPER: no 1H markets found")
+                _time.sleep(max(secs_to_boundary + 10, 60))
+                continue
+
+            print("LMTS SNIPER: found {} 1H markets: {}".format(len(market_map), list(market_map.keys())))
+
+            if not _cached_credentials.get("ready"):
+                _warm_credentials()
+            if not _cached_credentials.get("ready"):
+                print("LMTS SNIPER: credentials not ready")
+                _time.sleep(60)
                 continue
 
             # ── Wait until T+0 ──
-            next_boundary = now.replace(second=0, microsecond=0)
-            next_min = ((now.minute // 15) + 1) * 15
-            if next_min >= 60:
-                next_boundary = next_boundary.replace(minute=0) + timedelta(hours=1)
-            else:
-                next_boundary = next_boundary.replace(minute=next_min)
-
+            next_boundary = now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
             now2 = datetime.now(timezone.utc)
             wait_secs = (next_boundary - now2).total_seconds()
             if 0 < wait_secs < 120:
-                print("LMTS SNIPER: {} targets ready, waiting {:.1f}s...".format(len(market_data), wait_secs))
+                print("LMTS SNIPER: waiting {:.1f}s for 1H boundary...".format(wait_secs))
                 _time.sleep(max(wait_secs - 0.5, 0))
 
-            # ── T+0: FIRE ORDERS ──
-            account = _Account.from_key(LIMITLESS_PRIV_KEY)
-            maker_address = account.address
+            # ── FIRE ──
+            exchange_addr = _cached_credentials["exchange_addr"]
+            profile_id = _cached_credentials["profile_id"]
+            fee_bps = _cached_credentials.get("fee_bps") or 300
             fired_count = 0
 
             for target in snipe_targets:
                 asset = target["asset"]
-                if asset not in market_data:
+                if asset not in market_map:
                     continue
-
-                mkt = market_data[asset]
-                market_key = "lmts_sniper_{}_15M_{}".format(asset, int(next_boundary.timestamp()))
+                mkt = market_map[asset]
+                boundary_ts = int(next_boundary.timestamp())
+                market_key = "lmts_sniper_{}_1H_{}".format(asset, boundary_ts)
                 if market_key in _limitless_sniper_traded:
                     continue
 
-                tier = target["tier"]
-                stake = _limitless_sniper_stake(_limitless_sniper_state["balance"], tier)
+                stake = _limitless_sniper_stake(_limitless_sniper_state["balance"], target["tier"])
                 if stake <= 0 or stake > _limitless_sniper_state["balance"]:
                     continue
 
-                direction = target["direction"]
-                # YES = positionIds[0], NO = positionIds[1]
-                token_id = mkt["position_ids"][0] if direction == "UP" else mkt["position_ids"][1]
-                order_price = 0.50
+                tokens = mkt["tokens"]
+                token_id = (tokens.get("yes") or tokens.get("Yes") or tokens.get("YES")) if target["bet_side"] == "YES" else (tokens.get("no") or tokens.get("No") or tokens.get("NO"))
+                if not token_id:
+                    continue
 
-                # Build order
-                import time as _t2
-                num_shares = stake / order_price
-                maker_amount = int(order_price * num_shares * 1e6)  # USDC
-                taker_amount = int(num_shares * 1e6)  # Shares
-                salt = int(_t2.time() * 1000)
-
-                order_data = {
-                    "salt": salt,
-                    "maker": _Web3.to_checksum_address(maker_address),
-                    "signer": _Web3.to_checksum_address(maker_address),
-                    "taker": ZERO_ADDRESS,
-                    "tokenId": int(token_id),
-                    "makerAmount": maker_amount,
-                    "takerAmount": taker_amount,
-                    "expiration": 0,
-                    "nonce": 0,
-                    "feeRateBps": 0,
-                    "side": 0,  # BUY
-                    "signatureType": 0,  # EOA
-                }
-
-                # EIP-712 sign
-                try:
-                    domain = {
-                        "name": "Limitless CTF Exchange",
-                        "version": "1",
-                        "chainId": CHAIN_ID,
-                        "verifyingContract": _Web3.to_checksum_address(mkt["venue_exchange"]),
-                    }
-                    types = {
-                        "EIP712Domain": [
-                            {"name": "name", "type": "string"},
-                            {"name": "version", "type": "string"},
-                            {"name": "chainId", "type": "uint256"},
-                            {"name": "verifyingContract", "type": "address"},
-                        ],
-                        "Order": [
-                            {"name": "salt", "type": "uint256"},
-                            {"name": "maker", "type": "address"},
-                            {"name": "signer", "type": "address"},
-                            {"name": "taker", "type": "address"},
-                            {"name": "tokenId", "type": "uint256"},
-                            {"name": "makerAmount", "type": "uint256"},
-                            {"name": "takerAmount", "type": "uint256"},
-                            {"name": "expiration", "type": "uint256"},
-                            {"name": "nonce", "type": "uint256"},
-                            {"name": "feeRateBps", "type": "uint256"},
-                            {"name": "side", "type": "uint8"},
-                            {"name": "signatureType", "type": "uint8"},
-                        ],
-                    }
-                    typed_data = {
-                        "types": types,
-                        "primaryType": "Order",
-                        "domain": domain,
-                        "message": order_data,
-                    }
-                    encoded = _encode_typed_data(typed_data)
-                    signed = _Account.sign_message(encoded, private_key=LIMITLESS_PRIV_KEY)
-                    signature = signed.signature.hex()
-
-                    # Get owner ID
-                    owner_id = 0
-                    try:
-                        pr = _req.get("{}/profiles/{}".format(LIMITLESS_API, maker_address), headers=headers, timeout=8)
-                        if pr.status_code == 200:
-                            owner_id = pr.json().get("id", 0)
-                    except:
-                        pass
-
-                    # Submit order
-                    order_payload = {
-                        "order": {**order_data, "signature": signature},
-                        "ownerId": owner_id,
-                        "orderType": "GTC",
-                        "marketSlug": mkt["slug"],
-                    }
-                    resp = _req.post(
-                        "{}/orders".format(LIMITLESS_API),
-                        headers=headers,
-                        json=order_payload,
-                        timeout=10,
-                    )
-
-                    order_id = None
-                    filled = False
-                    if resp.status_code in (200, 201):
-                        rdata = resp.json()
-                        order_id = rdata.get("id") or rdata.get("orderId")
-                        filled = rdata.get("status", "").upper() in ("MATCHED", "FILLED")
-
-                    # Update pool
+                order_id = _place_gtc_order(mkt["slug"], target["bet_side"], token_id, stake, 0.50,
+                                            exchange_addr, profile_id, fee_bps)
+                if order_id:
                     _limitless_sniper_state["balance"] = round(_limitless_sniper_state["balance"] - stake, 2)
                     _limitless_sniper_state["trades_today"] += 1
                     _limitless_sniper_traded.add(market_key)
                     if _limitless_sniper_state["balance"] > _limitless_sniper_state["peak_balance"]:
                         _limitless_sniper_state["peak_balance"] = _limitless_sniper_state["balance"]
 
-                    # Save to DB
                     try:
                         c_lmts = get_db()
                         c_lmts.run("""INSERT INTO limitless_sniper_trades
@@ -1214,50 +1140,42 @@ def _limitless_sniper_thread():
                              pool_after,order_id,slug,filled,status,indicators,signals_agree,fired_at)
                             VALUES(:mid,:ttl,:ast,:tf,:bs,:tier,:stake,:fill,:pool,:oid,:slg,:filled,'Pending',
                                    :ind,:sa,:now)""",
-                            mid=market_key, ttl=mkt.get("title",""), ast=asset,
-                            tf="15M", bs=direction, tier=tier, stake=stake,
-                            fill=round(order_price, 4), pool=_limitless_sniper_state["balance"],
-                            oid=str(order_id or ""), slg=mkt.get("slug",""),
-                            filled=filled, ind=target["indicators"],
+                            mid=market_key, ttl=mkt["parsed"].get("title","")[:80],
+                            ast=asset, tf="1H", bs=target["bet_side"], tier=target["tier"], stake=stake,
+                            fill=0.50, pool=_limitless_sniper_state["balance"],
+                            oid=str(order_id or ""), slg=mkt["slug"],
+                            filled=False, ind=target["indicators"],
                             sa=target["signals_agree"],
                             now=datetime.now(timezone.utc).isoformat())
                         c_lmts.close()
                     except Exception as e:
                         print("LMTS SNIPER DB error: {}".format(e))
 
-                    fl_tag = "FILLED" if filled else "MAKER"
-                    print("LMTS SNIPER: {} {} {} 15M ${:.2f} @50¢ [{}] {} | pool=${:.2f}".format(
-                        tier, direction, asset, stake, fl_tag,
+                    print("LMTS SNIPER: {} {} {} 1H ${:.2f} @50c [{}] | pool=${:.2f}".format(
+                        target["tier"], target["bet_side"], asset, stake, target["indicators"],
+                        _limitless_sniper_state["balance"]))
+                    send_telegram("\U0001f3af <b>LMTS SNIPER</b>\n{} {} {} 1H ${:.2f} @50c\n{}\nPool: ${:.2f}".format(
+                        target["tier"], target["bet_side"], asset, stake,
                         target["indicators"], _limitless_sniper_state["balance"]))
-                    send_telegram("🎯 <b>LMTS SNIPER</b>\n{} {} {} ${:.2f} @50¢\n{}\nPool: ${:.2f}".format(
-                        tier, direction, asset, stake,
-                        target["indicators"], _limitless_sniper_state["balance"]))
-
                     fired_count += 1
-
-                except Exception as e:
-                    print("LMTS SNIPER order {} error: {}".format(asset, e))
+                else:
+                    print("LMTS SNIPER: order FAILED {} {} on {}".format(target["bet_side"], asset, mkt["slug"][:30]))
 
             if fired_count > 0:
-                print("LMTS SNIPER: fired {} orders at boundary".format(fired_count))
+                print("LMTS SNIPER: fired {} orders at 1H boundary".format(fired_count))
                 _save_bot_balance("limitless_sniper", _limitless_sniper_state)
 
-            # Update momentum cache for next window
             for target in snipe_targets:
-                asset = target["asset"]
                 p21_dir = "BUY" if target["direction"] == "UP" else "SELL"
-                # Check if P2.3 would have confirmed this direction
-                # (P2.3 uses distance math — if signals are strong, momentum is confirmed)
-                p23_confirmed = target["signals_agree"] >= 3
-                _limitless_update_momentum(asset, p21_dir, p23_confirmed)
+                _limitless_update_momentum(target["asset"], p21_dir, target["signals_agree"] >= 3)
 
-            _time.sleep(60)
+            _time.sleep(120)
 
         except Exception as e:
+            import traceback
             print("LMTS SNIPER thread error: {}".format(e))
+            traceback.print_exc()
             _time.sleep(30)
-
-
 
 def _resolve_limitless_sniper_trades():
     """Resolve Limitless sniper trades using Limitless API."""
@@ -1275,9 +1193,8 @@ def _resolve_limitless_sniper_trades():
                 if not p.get("fired_at"): continue
                 fired = datetime.fromisoformat(p["fired_at"])
                 if fired.tzinfo is None: fired = fired.replace(tzinfo=timezone.utc)
-                m15 = (fired.minute // 15) * 15
-                window_start = fired.replace(minute=m15, second=0, microsecond=0)
-                expiry = window_start + timedelta(minutes=15)
+                window_start = fired.replace(minute=0, second=0, microsecond=0)
+                expiry = window_start + timedelta(hours=1)
                 if now < expiry + timedelta(minutes=2): continue
                 stake = float(p.get("stake") or 1.0)
                 order_filled = p.get("filled", False)
@@ -1338,6 +1255,10 @@ def _resolve_limitless_sniper_trades():
                     send_telegram("LMTS SNIPER STOPPED — Floor ${:.2f}".format(_limitless_sniper_state["balance"]))
                 _pnl = "+${:.2f}".format(payout - stake) if won else "-${:.2f}".format(stake)
                 print("LMTS SNIPER #{} {}: ${:.2f} {} | pool=${:.2f}".format(p["id"], "WIN" if won else "LOSS", stake, _pnl, _limitless_sniper_state["balance"]))
+                _emoji = "\u2705" if won else "\u274c"
+                send_telegram("{} <b>LMTS SNIPER</b> {} {}\n${:.2f} → {}\nPool: ${:.2f}".format(
+                    _emoji, p.get("asset","?"), "WIN" if won else "LOSS",
+                    stake, _pnl, _limitless_sniper_state["balance"]))
             except Exception as e:
                 print("LMTS SNIPER resolve error #{}: {}".format(p.get("id"), e))
         return resolved
@@ -15757,7 +15678,7 @@ if SIGNALS_DB_URL:
     _limitless_sniper_state["starting_balance"] = 30.0
     _limitless_sniper_state["floor_balance"] = 5.0
     _limitless_sniper_state["enabled"] = True
-    print("LMTS SNIPER: ${:.2f} pool{} | P2.1+momentum | 15M | 50¢ | 2-tier".format(
+    print("LMTS SNIPER: ${:.2f} pool{} | P2.1+momentum | 1H | 50¢ | 2-tier".format(
         _limitless_sniper_state["balance"], " (restored)" if _lmts_sniper_restored else " (fresh)"))
     threading.Thread(target=_limitless_sniper_thread, daemon=True).start()
     print("LMTS SNIPER thread launched")
@@ -18213,7 +18134,7 @@ a{{color:#00d4aa}}
 <a href="/" class="nav-tab">Home</a>
 </div>
 <h1>\U0001f3af Limitless Sniper</h1>
-<h2>P2.1 + P2.3 Momentum · 15M · 50\u00a2 Target · Two-Tier Staking</h2>
+<h2>P2.1 + P2.3 Momentum · 1H · 50\u00a2 Target · Two-Tier Staking</h2>
 <div class="stats">
 <div class="stat"><div class="val">${:.2f}</div><div class="lbl">Pool</div></div>
 <div class="stat"><div class="val">{}%</div><div class="lbl">Win Rate</div></div>
