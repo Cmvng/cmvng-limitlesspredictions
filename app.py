@@ -482,105 +482,113 @@ def _poly_alpha4_calc_stake(pool_balance):
     return stake
 
 def _sniper_get_direction(asset):
-    """FULL P2.1 scoring for sniper — uses ALL filters from paper bot.
-    Builds a synthetic market dict and runs _score_paper21_trade on it.
-    Returns (direction, signals_agree, indicators_str, scored_dict) or (None, 0, "", None).
+    """Limitless P2.1 logic for sniper.
+    
+    Rules:
+      1. Read TV + SMA for this asset
+      2. If both agree → that's the direction. BTC confirms or gets ignored.
+      3. If both DISAGREE → SKIP (no tiebreaker allowed)
+      4. If only one exists → use it, BTC as second signal
+      5. During weak periods (:00/:30 expiry) → UT Bot can flip the trade
+    
+    Returns (direction, signals_agree, ind_str, confidence) or (None, 0, "", None)
     """
-    # Get current price using the same function the scanner uses
     asset_upper = asset.upper()
-    price = get_price(asset_upper)
-    if not price:
-        return None, 0, "", None
 
-    # Build synthetic market dict matching what parse_market returns
-    # This simulates what the paper bot sees at market open
-    now = datetime.now(timezone.utc)
-    
-    # Calculate expiry (next 15M boundary for Poly, next hour for LMTS)
-    next_15m = now.replace(second=0, microsecond=0)
-    next_min = ((now.minute // 15) + 1) * 15
-    if next_min >= 60:
-        next_15m = next_15m.replace(minute=0) + timedelta(hours=1)
-    else:
-        next_15m = next_15m.replace(minute=next_min)
-    
-    mins_left = (next_15m - now).total_seconds() / 60
-    
-    synthetic_market = {
-        "asset": asset_upper,
-        "direction": "above",
-        "baseline": price,  # At market open, baseline ≈ current price
-        "yes_odds": 50.0,   # At market open, odds start at ~50%
-        "mins_left": max(mins_left, 1),
-        "hours_left": max(mins_left / 60, 0.01),
-        "is_short": True,
-        "is_daily": False,
-        "is_15m_market": True,
-        "is_hourly_market": False,
-        "title": "{} above ${} — Up or Down".format(asset_upper, price),  # "up or down" skips margin check
-        "slug": "",
-        "market_id": "sniper_synthetic",
-    }
-    
-    # Read indicators from cache — updated every scan cycle (no HTTP calls needed)
+    # ── Read cached indicators (instant, no HTTP) ──
+    tv = _tv_trends.get(asset_upper)
+    tv_dir = tv["dir"] if tv else None
+
+    sma_data = _pair_sma_cache.get(asset_upper, {})
+    sma_dir = sma_data.get("trend")
+
+    btc_trend = _btc_trend_cache.get("trend")
+
+    # ── Read UT Bot and Squeeze from indicator cache ──
+    ut_trend = None
+    sqz_dir = None
     ind_entry = _indicator_cache.get("{}_15m".format(asset_upper))
     if ind_entry and ind_entry.get("data"):
-        ind = dict(ind_entry["data"])  # Copy so we don't mutate cache
-    else:
-        # Cache empty — try calculating (first cycle after deploy)
-        try:
-            ind = _calculate_indicators(asset_upper, "15m")
-        except:
-            ind = None
-    
-    if not ind:
-        return None, 0, "", None
-    
-    # Add TV signal from signals DB
-    tv = _tv_trends.get(asset_upper)
-    if tv:
-        ind["tv_dir"] = tv.get("dir")
-        ind["tv_score"] = tv.get("score", 0)
-    
-    # Macro indicators from cache (4H timeframe)
-    macro_entry = _indicator_cache.get("{}_4h".format(asset_upper))
-    if macro_entry and macro_entry.get("data"):
-        ind_macro = macro_entry["data"]
-    else:
-        macro_entry_1h = _indicator_cache.get("{}_1h".format(asset_upper))
-        if macro_entry_1h and macro_entry_1h.get("data"):
-            ind_macro = macro_entry_1h["data"]
+        ind_data = ind_entry["data"]
+        ut_trend = ind_data.get("ut_trend")
+        sqz_val = ind_data.get("squeeze_val")
+        if sqz_val is not None:
+            sqz_dir = "BUY" if sqz_val > 0 else "SELL" if sqz_val < 0 else None
+
+    # ── Pair direction: TV + SMA (Limitless P2.1 rules) ──
+    if tv_dir and sma_dir:
+        if tv_dir == sma_dir:
+            # Both agree → strong signal
+            pair_dir = tv_dir
         else:
-            try:
-                ind_macro = _calculate_indicators(asset_upper, "4h")
-            except:
-                ind_macro = {}
-    
-    # Expiry timing for weak period detection
-    expiry_minute = next_15m.minute
-    expiry_hour = next_15m.hour
-    
-    # Run the FULL P2.1 scorer — same function the paper bot calls
-    scored = _score_paper21_trade(
-        synthetic_market, price,
-        indicators=ind,
-        ind_macro=ind_macro,
-        expiry_minute=expiry_minute,
-        expiry_hour=expiry_hour
-    )
-    
-    if scored is None:
+            # TV and SMA DISAGREE → SKIP (no tiebreaker)
+            return None, 0, "", None
+    elif tv_dir:
+        # Only TV exists
+        pair_dir = tv_dir
+    elif sma_dir:
+        # Only SMA exists
+        pair_dir = sma_dir
+    else:
+        # Neither exists → no signal
         return None, 0, "", None
-    
-    # Extract direction
-    bet_side = scored.get("bet_side", "YES")
-    direction = "UP" if bet_side == "YES" else "DOWN"
-    signals_agree = scored.get("score", 2)
-    total_signals = scored.get("total_signals", 3)
-    ind_str = scored.get("indicators", "")
-    confidence = scored.get("confidence", "LOW")
-    
-    return direction, signals_agree, "[{}] {}".format(confidence, ind_str), scored
+
+    # ── BTC role: confirm or ignore ──
+    btc_confirms = (btc_trend == pair_dir) if btc_trend else False
+    if btc_confirms:
+        btc_role = "CONFIRM"
+    elif btc_trend and btc_trend != pair_dir:
+        btc_role = "IGNORED"
+    else:
+        btc_role = "NONE"
+
+    # ── Weak period check ──
+    now = datetime.now(timezone.utc)
+    next_min = ((now.minute // 15) + 1) * 15
+    if next_min >= 60:
+        expiry_minute = 0
+    else:
+        expiry_minute = next_min
+
+    is_weak = expiry_minute in (0, 30)
+    direction = pair_dir  # BUY or SELL
+    confidence = "HIGH" if btc_confirms else "MEDIUM"
+    flipped = False
+
+    # ── UT Bot gatekeeper during weak periods ──
+    if is_weak and ut_trend:
+        ut_opposes = (ut_trend == "SELL" and direction == "BUY") or                      (ut_trend == "BUY" and direction == "SELL")
+        if ut_opposes:
+            # FLIP the trade
+            direction = "SELL" if direction == "BUY" else "BUY"
+            confidence = "HIGH" if (sqz_dir and sqz_dir != pair_dir) else "MEDIUM"
+            flipped = True
+
+    # ── Map to UP/DOWN ──
+    bet_direction = "UP" if direction == "BUY" else "DOWN"
+
+    # ── Count signals agreement ──
+    signals_agree = sum(1 for x in [tv_dir, sma_dir, btc_trend] if x == pair_dir)
+    total_signals = sum(1 for x in [tv_dir, sma_dir, btc_trend] if x is not None)
+
+    # ── Build indicator string ──
+    parts = []
+    parts.append("TV={}".format(tv_dir or "\u2014"))
+    parts.append("SMA={}".format(sma_dir or "\u2014"))
+    parts.append("BTC={}".format(btc_trend or "\u2014"))
+    if ut_trend:
+        parts.append("UT={}".format(ut_trend))
+    if sqz_dir:
+        parts.append("SQZ={}".format(sqz_dir))
+    parts.append("BTC:{}".format(btc_role))
+    if is_weak:
+        parts.append("WEAK")
+    if flipped:
+        parts.append("FLIP")
+
+    ind_str = "[{}] {} | {}/{}".format(confidence, " | ".join(parts), signals_agree, total_signals)
+
+    return bet_direction, signals_agree, ind_str, confidence
 
 
 def _sniper_thread():
@@ -640,7 +648,7 @@ def _sniper_thread():
             _sniper_debug = []
             _sniper_reject = []
             for asset in SNIPER_ASSETS:
-                direction, signals_agree, ind_str, _scored = _sniper_get_direction(asset)
+                direction, signals_agree, ind_str, _confidence = _sniper_get_direction(asset)
                 if direction and signals_agree >= 2:
                     _sniper_debug.append("{}={}".format(asset, direction))
                     snipe_targets.append({
@@ -1049,7 +1057,7 @@ def _limitless_sniper_thread():
             # ── T-40s: Read P2.1 direction ──
             snipe_targets = []
             for asset in SNIPER_ASSETS:
-                direction, signals_agree, ind_str, _scored = _sniper_get_direction(asset)
+                direction, signals_agree, ind_str, _confidence = _sniper_get_direction(asset)
                 if direction and signals_agree >= 2:
                     prev_dir, prev_confirmed = _limitless_sniper_get_momentum(asset)
                     p21_dir = "BUY" if direction == "UP" else "SELL"
