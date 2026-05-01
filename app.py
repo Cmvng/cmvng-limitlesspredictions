@@ -1084,6 +1084,10 @@ def _limitless_sniper_thread():
                             continue
                         if not parsed.get("is_hourly_market"):
                             continue
+                        # Only trade markets that just OPENED (50+ mins left)
+                        # Skip markets that are about to CLOSE (< 10 mins left)
+                        if parsed.get("mins_left", 0) < 50:
+                            continue
                         asset = parsed.get("asset", "")
                         if asset not in [t["asset"] for t in snipe_targets]:
                             continue
@@ -1103,9 +1107,49 @@ def _limitless_sniper_thread():
                 print("LMTS SNIPER market fetch error: {}".format(e))
 
             if not market_map:
-                print("LMTS SNIPER: no 1H markets found")
-                _time.sleep(max(secs_to_boundary + 10, 60))
-                continue
+                # New 1H markets might not be deployed yet — wait and retry
+                now_retry = datetime.now(timezone.utc)
+                wait_for_boundary = (next_boundary - now_retry).total_seconds()
+                if wait_for_boundary > 0:
+                    _time.sleep(wait_for_boundary + 5)  # Wait until T+5s
+                else:
+                    _time.sleep(5)
+                
+                # Retry market fetch
+                try:
+                    r2 = _req.get("{}/markets/active".format(LIMITLESS_API), timeout=10)
+                    if r2.status_code == 200:
+                        all_markets2 = r2.json().get("data", [])
+                        for m in all_markets2:
+                            parsed = parse_market(m)
+                            if not parsed:
+                                continue
+                            if not parsed.get("is_hourly_market"):
+                                continue
+                            if parsed.get("mins_left", 0) < 50:
+                                continue
+                            asset = parsed.get("asset", "")
+                            if asset not in [t["asset"] for t in snipe_targets]:
+                                continue
+                            if asset in market_map:
+                                continue
+                            tokens = m.get("tokens", {})
+                            has_yes = tokens.get("yes") or tokens.get("Yes") or tokens.get("YES")
+                            if not has_yes:
+                                continue
+                            slug = parsed.get("slug") or m.get("slug", "")
+                            if not slug:
+                                continue
+                            market_map[asset] = {"parsed": parsed, "slug": slug, "tokens": tokens}
+                except Exception as e2:
+                    print("LMTS SNIPER retry error: {}".format(e2))
+                
+                if not market_map:
+                    print("LMTS SNIPER: no 1H markets found after retry")
+                    _time.sleep(60)
+                    continue
+                else:
+                    print("LMTS SNIPER: found {} 1H markets on retry: {}".format(len(market_map), list(market_map.keys())))
 
             print("LMTS SNIPER: found {} 1H markets: {}".format(len(market_map), list(market_map.keys())))
 
