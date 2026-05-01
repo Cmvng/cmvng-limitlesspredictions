@@ -1096,6 +1096,8 @@ def _limitless_sniper_thread():
             if mins_to_next == 60:
                 mins_to_next = 0
             secs_to_boundary = mins_to_next * 60 - now.second
+            # Calculate next_boundary here so it's available everywhere in this loop
+            next_boundary = now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
 
             if secs_to_boundary > 45:
                 _time.sleep(min(secs_to_boundary - 45, 60))
@@ -1208,7 +1210,6 @@ def _limitless_sniper_thread():
                 continue
 
             # ── Wait until T+0 ──
-            next_boundary = now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
             now2 = datetime.now(timezone.utc)
             wait_secs = (next_boundary - now2).total_seconds()
             if 0 < wait_secs < 120:
