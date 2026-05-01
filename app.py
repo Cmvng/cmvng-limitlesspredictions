@@ -2091,6 +2091,18 @@ def init_db():
             fired_at TEXT, resolved_at TEXT, slug TEXT
         )
     """)
+    # Paper 2.10: Shorter TF indicators (5M→15M, 30M→1H)
+    conn.run("""
+        CREATE TABLE IF NOT EXISTS paper210_trades (
+            id SERIAL PRIMARY KEY, market_id TEXT, title TEXT, asset TEXT,
+            direction TEXT, baseline REAL, bet_odds REAL, bet_side TEXT,
+            current_price REAL, hours_left REAL, market_type TEXT,
+            indicators TEXT, score INTEGER, total_signals INTEGER,
+            simulated_stake REAL DEFAULT 1.0, simulated_payout REAL,
+            status TEXT DEFAULT 'Pending', outcome TEXT,
+            fired_at TEXT, resolved_at TEXT, slug TEXT
+        )
+    """)
     # ─── ALPHA unified trading system table ───
     conn.run("""
         CREATE TABLE IF NOT EXISTS alpha_trades (
@@ -2259,6 +2271,7 @@ def _correct_historical_resolutions():
         "paper22_trades", "paper32_trades", "paper23_trades", "paper33_trades",
         "paper24_trades", "paper34_trades", "paper25_trades", "paper35_trades",
         "paper26_trades", "paper36_trades", "paper27_trades", "paper37_trades",
+        "paper28_trades", "paper29_trades", "paper210_trades",
     ]
     
     corrected = 0
@@ -6154,7 +6167,7 @@ def _calculate_indicators(asset, timeframe="1h"):
 
     cache_key = "{}_{}".format(asset, timeframe)
     cache = _indicator_cache.get(cache_key)
-    cache_ttl = 60 if timeframe == "5m" else 600 if timeframe == "15m" else 600
+    cache_ttl = 60 if timeframe == "5m" else 600 if timeframe == "15m" else 900 if timeframe == "30m" else 600
     if cache and (datetime.now(timezone.utc) - cache["updated"]).total_seconds() < cache_ttl:
         return cache["data"]
 
@@ -6203,6 +6216,8 @@ def _calculate_indicators(asset, timeframe="1h"):
                     df = yf.download(ticker, period="5d", interval="15m", progress=False)
             elif timeframe == "15m":
                 df = yf.download(ticker, period="5d", interval="15m", progress=False)
+            elif timeframe == "30m":
+                df = yf.download(ticker, period="7d", interval="30m", progress=False)
             elif timeframe == "1d":
                 df = yf.download(ticker, period="30d", interval="1d", progress=False)
             elif timeframe == "4h":
@@ -9810,6 +9825,11 @@ def run_paper34_scan():
             p29_ids = set(str(row[0]) for row in p29_rows)
         except:
             p29_ids = set()
+        try:
+            p210_rows = conn.run("SELECT market_id FROM paper210_trades WHERE fired_at::timestamptz > NOW() - INTERVAL '30 hours'")
+            p210_ids = set(str(row[0]) for row in p210_rows)
+        except:
+            p210_ids = set()
         # Get Bot 1 and Bot 2 market IDs to avoid overlap
         try:
             bot12_rows = conn.run("""SELECT market_id FROM limitless_predictions WHERE created_at > NOW() - INTERVAL '30 hours'
@@ -9841,6 +9861,7 @@ def run_paper34_scan():
         p37_count = 0
         p28_count = 0
         p29_count = 0
+        p210_count = 0
 
         for market in markets:
             try:
@@ -9855,6 +9876,18 @@ def run_paper34_scan():
                 if asset not in price_cache:
                     price_cache[asset] = get_price(asset)
                 price = price_cache[asset]
+
+                # ── Price fallback: use cached indicator or BTC cache if live fetch failed ──
+                if price is None:
+                    for _tf_try in ("15m", "1h", "1d"):
+                        _cached = _indicator_cache.get("{}_{}".format(asset, _tf_try))
+                        if _cached and _cached.get("data", {}).get("current"):
+                            price = float(_cached["data"]["current"])
+                            price_cache[asset] = price
+                            break
+                    if price is None and asset == "BTC" and _btc_trend_cache.get("price"):
+                        price = _btc_trend_cache["price"]
+                        price_cache[asset] = price
                 if price is None:
                     continue
 
@@ -9868,9 +9901,15 @@ def run_paper34_scan():
                     ind_tf = "1d"   # Daily market → daily candles
 
                 # Get indicators (cached per asset + timeframe)
-                ind_cache_key = "{}_{}".format(asset, ind_tf)
+                ind_cache_key = "{}_{}" .format(asset, ind_tf)
                 if ind_cache_key not in indicator_cache_local:
-                    indicator_cache_local[ind_cache_key] = _calculate_indicators(asset, ind_tf)
+                    ind_result = _calculate_indicators(asset, ind_tf)
+                    # Fallback: pull from global _indicator_cache if fresh calc failed
+                    if ind_result is None:
+                        _global_cached = _indicator_cache.get(ind_cache_key)
+                        if _global_cached and _global_cached.get("data"):
+                            ind_result = _global_cached["data"]
+                    indicator_cache_local[ind_cache_key] = ind_result
                 ind = indicator_cache_local[ind_cache_key]
                 if ind is None:
                     continue
@@ -10644,17 +10683,67 @@ def run_paper34_scan():
                         except Exception as e:
                             print("Paper29 save error: {}".format(e))
 
+                # ── Paper 2.10: Shorter TF indicators (5M→15M, 30M→1H) ──
+                if parsed["market_id"] not in p210_ids:
+                    _p210_tf = "5m" if parsed.get("is_15m_market") else "30m" if parsed.get("is_hourly_market") else None
+                    if _p210_tf:
+                        _p210_ind = None
+                        try:
+                            _p210_ind = _calculate_indicators(asset, _p210_tf)
+                        except:
+                            pass
+                        if _p210_ind:
+                            _tv_raw = _tv_trends.get(asset.upper())
+                            _p210_ind["tv_dir"] = _tv_raw["dir"] if _tv_raw else None
+                            try:
+                                _p210_btc = _calculate_indicators("BTC", _p210_tf)
+                                if _p210_btc and _p210_btc.get("sma10") and _p210_btc.get("current"):
+                                    _p210_ind["btc_trend"] = "BUY" if _p210_btc["current"] > _p210_btc["sma10"] else "SELL"
+                                else:
+                                    _p210_ind["btc_trend"] = _btc_trend_cache.get("trend")
+                            except:
+                                _p210_ind["btc_trend"] = _btc_trend_cache.get("trend")
+                            scored210 = _score_paper210_trade(
+                                parsed, price, indicators=_p210_ind,
+                                expiry_minute=expiry_minute, expiry_hour=expiry_hour)
+                            if scored210:
+                                try:
+                                    c210 = get_db()
+                                    c210.run(
+                                        """INSERT INTO paper210_trades
+                                        (market_id, title, asset, direction, baseline, bet_odds, bet_side,
+                                         current_price, hours_left, market_type, indicators, score,
+                                         total_signals, simulated_stake, simulated_payout, status, fired_at, slug)
+                                        VALUES (:mid, :ttl, :ast, :dir, :base, :odds, :bs,
+                                                :pr, :hrs, :mt, :ind, :sc, :ts, 1.0, :sp, 'Pending', :now, :slg)""",
+                                        mid=parsed["market_id"], ttl=parsed["title"], ast=asset,
+                                        dir=parsed["direction"], base=parsed["baseline"],
+                                        odds=scored210["bet_odds"], bs=scored210["bet_side"],
+                                        pr=price, hrs=round(parsed["hours_left"], 2),
+                                        mt=scored210.get("market_type", "15M"),
+                                        ind="[{}] {}".format(scored210["confidence"], scored210["indicators"]),
+                                        sc=scored210["score"], ts=scored210["total_signals"],
+                                        sp=scored210.get("sim_payout", 0),
+                                        now=now, slg=parsed.get("slug", ""))
+                                    c210.close()
+                                    p210_ids.add(parsed["market_id"])
+                                    p210_count += 1
+                                except Exception as e:
+                                    print("Paper210 save error: {}".format(e))
+
             except Exception as e:
                 print("Paper345 market error: {}".format(e))
 
-        if p3_count > 0 or p4_count > 0 or p5_count > 0 or p24_count > 0 or p34_count > 0 or p25_count > 0 or p35_count > 0 or p26_count > 0 or p36_count > 0 or p27_count > 0 or p37_count > 0 or p28_count > 0 or p29_count > 0:
-            print("P3:{} P4:{} P5:{} P3.1:{} P2.1:{} P5.1:{} P2.2:{} P3.2:{} P2.3:{} P3.3:{} P2.4:{} P3.4:{} P2.5:{} P3.5:{} P2.6:{} P3.6:{} P2.7:{} P3.7:{} P2.8:{} P2.9:{}".format(p3_count, p4_count, p5_count, p31_count, p21_count, p51_count, p22_count, p32_count, p23_count, p33_count, p24_count, p34_count, p25_count, p35_count, p26_count, p36_count, p27_count, p37_count, p28_count, p29_count))
+        if p3_count > 0 or p4_count > 0 or p5_count > 0 or p24_count > 0 or p34_count > 0 or p25_count > 0 or p35_count > 0 or p26_count > 0 or p36_count > 0 or p27_count > 0 or p37_count > 0 or p28_count > 0 or p29_count > 0 or p210_count > 0:
+            print("P3:{} P4:{} P5:{} P3.1:{} P2.1:{} P5.1:{} P2.2:{} P3.2:{} P2.3:{} P3.3:{} P2.4:{} P3.4:{} P2.5:{} P3.5:{} P2.6:{} P3.6:{} P2.7:{} P3.7:{} P2.8:{} P2.9:{} P2.10:{}".format(p3_count, p4_count, p5_count, p31_count, p21_count, p51_count, p22_count, p32_count, p23_count, p33_count, p24_count, p34_count, p25_count, p35_count, p26_count, p36_count, p27_count, p37_count, p28_count, p29_count, p210_count))
         else:
             # Count how many assets we got indicators for
             ind_ok = sum(1 for v in indicator_cache_local.values() if v is not None)
             ind_fail = sum(1 for v in indicator_cache_local.values() if v is None)
-            print("Paper34: 0 signals (indicators: {}ok/{}fail, markets: {})".format(
-                ind_ok, ind_fail, len(markets)))
+            price_ok = sum(1 for v in price_cache.values() if v is not None)
+            price_fail = sum(1 for v in price_cache.values() if v is None)
+            print("Paper34: 0 signals (prices: {}ok/{}fail, indicators: {}ok/{}fail, markets: {})".format(
+                price_ok, price_fail, ind_ok, ind_fail, len(markets)))
 
     except Exception as e:
         print("Paper34 scan error: {}".format(e))
@@ -10952,9 +11041,10 @@ def resolve_paper34_trades():
     r37 = _resolve_paper_table("paper37_trades")
     r28 = _resolve_paper_table("paper28_trades")
     r29 = _resolve_paper_table("paper29_trades")
+    r210 = _resolve_paper_table("paper210_trades")
     ra = _resolve_alpha_trades()
     if r3 or r4 or r5 or r24 or r34 or r25 or r35 or r26 or r36 or ra:
-        print("Resolved: P3={} P4={} P5={} P3.1={} P2.1={} P5.1={} P2.2={} P3.2={} P2.3={} P3.3={} P2.4={} P3.4={} P2.5={} P3.5={} P2.6={} P3.6={} ALPHA={}".format(r3, r4, r5, r31, r21, r51, r22, r32, r23, r33, r24, r34, r25, r35, r26, r36, ra))
+        print("Resolved: P3={} P4={} P5={} P3.1={} P2.1={} P5.1={} P2.2={} P3.2={} P2.3={} P3.3={} P2.4={} P3.4={} P2.5={} P3.5={} P2.6={} P3.6={} P2.10={} ALPHA={}".format(r3, r4, r5, r31, r21, r51, r22, r32, r23, r33, r24, r34, r25, r35, r26, r36, r210, ra))
 
 def _resolve_alpha_trades():
     """Resolve Alpha unified trades and update pool balance.
@@ -15527,6 +15617,7 @@ td{padding:8px 12px;border-bottom:1px solid #f4f3ed;color:var(--ink-2)}tr:last-c
     <a href="/app/paper28poly" class="nav-tab""" + (" active" if nav_active == "paper28poly" else "") + """">P2.8 Poly</a>
     <a href="/app/paper29" class="nav-tab""" + (" active" if nav_active == "paper29" else "") + """">Paper 2.9</a>
     <a href="/app/paper29poly" class="nav-tab""" + (" active" if nav_active == "paper29poly" else "") + """">P2.9 Poly</a>
+    <a href="/app/paper210" class="nav-tab""" + (" active" if nav_active == "paper210" else "") + """">Paper 2.10</a>
     <a href="/app/poly-alpha3" class="nav-tab""" + (" active" if nav_active == "poly-alpha3" else "") + """">⚡ Poly A3</a>
     <a href="/app/poly-alpha4" class="nav-tab""" + (" active" if nav_active == "poly-alpha4" else "") + """">🎯 Sniper A4</a>
     <a href="/app/lmts-sniper" class="nav-tab""" + (" active" if nav_active == "lmts-sniper" else "") + """">🎯 LMTS Sniper</a>
@@ -16553,12 +16644,12 @@ def run_poly_scan():
             # Wait for price to move from PTB before scoring:
             # 5M: score in last 4 mins (1 min of movement minimum)
             # 15M: score in last 10 mins (5+ mins of movement)
-            # 1H: score in last 45 mins (15+ mins of movement)
+            # 1H: score from 3 mins in up to 57 mins (wide window to catch new markets)
             if tf == "5M" and (mins_left < 1 or mins_left > 4):
                 continue
             if tf == "15M" and (mins_left < 2 or mins_left > 10):
                 continue
-            if tf == "1H" and (mins_left < 5 or mins_left > 45):
+            if tf == "1H" and (mins_left < 3 or mins_left > 57):
                 continue
 
             # Determine which sections this market belongs to
@@ -16861,11 +16952,11 @@ def run_poly_scan():
                     if strat == "p23" and tf in ("5M", "15M"):
                         _pa2_mkey = parsed["market_id"]
                         _pa2_sig = _poly_alpha2_pending.pop(_pa2_mkey, None)
-                        if not _pa2_sig:
-                            # Debug: P2.3 scored but no P2.1 pending entry
+                        if not _pa2_sig and _poly_alpha2_state["enabled"]:
+                            # Debug: P2.3 scored but no P2.1 pending entry (only log when enabled)
                             _pa2_in_dedup = _pa2_mkey in _poly_alpha2_traded_markets
-                            print("POLY A2 DEBUG: P2.3 scored {} {} but no P2.1 pending (dedup={} enabled={} creds={})".format(
-                                asset, tf, _pa2_in_dedup, _poly_alpha2_state["enabled"], _poly_has_creds()))
+                            print("POLY A2 DEBUG: P2.3 scored {} {} but no P2.1 pending (dedup={} creds={})".format(
+                                asset, tf, _pa2_in_dedup, _poly_has_creds()))
                         if _pa2_sig and _poly_alpha2_state["enabled"] and _poly_has_creds():
                             _pa2_tier = _poly_alpha2_get_tier(_pa2_sig["asset"], _pa2_sig["tf"], _pa2_sig["p23_agrees"])
                             if _pa2_tier:
@@ -18801,6 +18892,29 @@ def paper29poly_page():
         "Trend context + candle reading on Polymarket Up/Down markets. Reads 4 candles for trend, identifies bounce traps and pullback traps, trades choppy markets with price position.",
         extra_cols=[], nav_active="paper29poly",
         where_clause="WHERE strategy='p29'")
+
+@app.route("/app/paper210")
+def paper210_page():
+    return _build_paper_page(
+        "paper210_trades",
+        "Paper 2.10 — Shorter Timeframe Indicators",
+        "5M candles for 15M markets · 30M candles for 1H markets",
+        "P2.1 Limitless rules (TV+SMA agree=trade, disagree=SKIP, no BTC tiebreaker) but reads from a faster indicator timeframe. 15M markets use 5M candles. 1H markets use 30M candles. Goal: catch reversals earlier than standard P2.1.",
+        extra_cols=[],
+        nav_active="paper210"
+    )
+
+@app.route("/api/paper210/trades")
+def api_paper210_trades():
+    try:
+        conn = get_db()
+        rows = conn.run("SELECT * FROM paper210_trades ORDER BY id DESC LIMIT 500")
+        cols = [c['name'] for c in conn.columns]
+        trades = [dict(zip(cols, r)) for r in rows]
+        conn.close()
+        return jsonify({"trades": trades, "count": len(trades)})
+    except Exception as e:
+        return jsonify({"trades": [], "error": str(e)}), 200
 
 
 @app.route("/api/p21-score-breakdown")
