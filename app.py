@@ -562,18 +562,17 @@ def _sniper_get_direction(asset, timeframe="15m"):
     if not ut_trend and ind_1h_data:
         ut_trend = ind_1h_data.get("ut_trend")
 
-    # ── Pair direction: TV + 1H SMA (Limitless P2.1 rules) ──
+    # ── Pair direction: TV + 1H SMA must BOTH be present and agree ──
+    # TV=None means TradingView has no signal yet — do not trade on SMA alone.
+    # P2.1 on Limitless has both signals available; sniper must too.
     if tv_dir and sma_dir:
         if tv_dir == sma_dir:
             pair_dir = tv_dir
         else:
             # TV and 1H SMA DISAGREE → SKIP (same as Paper 2.1)
             return None, 0, "", None
-    elif tv_dir:
-        pair_dir = tv_dir
-    elif sma_dir:
-        pair_dir = sma_dir
     else:
+        # Either TV or SMA is missing — SKIP, not enough signal
         return None, 0, "", None
 
     # ── BTC role: confirm or ignore ──
