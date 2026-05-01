@@ -1745,6 +1745,7 @@ def send_telegram(message):
     _allowed = any(k in message for k in [
         "ALPHA", "Alpha", "alpha",           # All Alpha trade/resolution messages (Limitless + Poly)
         "POLY",                              # Polymarket Alpha notifications
+        "SNIPER", "Sniper",                  # Sniper Alpha 4.0 notifications
         "Auto-trading", "Kill switch",        # System control alerts
         "Auto-redeemed", "Redeemed",          # Redemption confirmations
         "Bot v4", "LIVE",                     # Startup message
