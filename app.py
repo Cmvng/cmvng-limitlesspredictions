@@ -421,10 +421,11 @@ def _poly_alpha3_load_recent():
         _poly_alpha4_state["balance"] = _saved_pa4["balance"]
         _poly_alpha4_state["peak_balance"] = _saved_pa4.get("peak_balance", _saved_pa4["balance"])
         _poly_alpha4_restored = True
-    if not _poly_alpha4_restored:
-        _poly_alpha4_state["balance"] = 60.0
-        _poly_alpha4_state["peak_balance"] = 60.0
+    # RESET to $60 fresh
+    _poly_alpha4_state["balance"] = 60.0
+    _poly_alpha4_state["peak_balance"] = 60.0
     _poly_alpha4_state["starting_balance"] = 60.0
+    _poly_alpha4_restored = False  # Force fresh start
     _poly_alpha4_state["floor_balance"] = 5.0
     _poly_alpha4_state["enabled"] = True
     print("SNIPER A4: ${:.2f} pool{} | P2.1 at boundary | 15M | 50¢ fills".format(
@@ -785,6 +786,7 @@ def _sniper_thread():
             if fired_count > 0:
                 print("SNIPER: fired {} orders at boundary {}".format(fired_count, window_ts))
                 _save_bot_balance("poly_alpha4", _poly_alpha4_state)
+            _save_bot_balance("limitless_sniper", _limitless_sniper_state)
 
             # Sleep until next cycle (at least 60s to avoid double-firing)
             _time.sleep(60)
@@ -899,6 +901,480 @@ def _resolve_poly_alpha4_trades():
         print("SNIPER A4 resolve error: {}".format(e))
         return 0
 
+
+
+# ═══════════════════════════════════════════════════════════
+# LIMITLESS SNIPER — P2.1 at Window Boundary + P2.3 Momentum Carry-Over
+# Two-tier staking: HIGH (P2.1 + momentum agree) vs BASE (P2.1 only)
+# Fires at exact :00/:15/:30/:45 on Limitless CLOB at 50¢
+# ═══════════════════════════════════════════════════════════
+
+_limitless_sniper_state = {
+    "enabled": True,
+    "balance": 30.0,
+    "peak_balance": 30.0,
+    "starting_balance": 30.0,
+    "floor_balance": 5.0,
+    "trades_today": 0,
+    "wins_today": 0,
+    "losses_today": 0,
+    "profit_today": 0.0,
+}
+_limitless_sniper_traded = set()
+_limitless_prev_momentum = {}  # {asset: {"direction": "BUY"/"SELL", "confirmed": True/False}}
+
+def _limitless_sniper_stake(pool, tier):
+    """Tier 1 (HIGH): 2.5% of pool. Tier 2 (BASE): 2% of pool."""
+    if tier == "HIGH":
+        stake = round(pool * 0.025, 2)
+        stake = max(stake, 1.25)
+        stake = min(stake, 7.50)
+    else:
+        stake = round(pool * 0.02, 2)
+        stake = max(stake, 1.00)
+        stake = min(stake, 5.00)
+    if stake > pool * 0.10:
+        return 0
+    return stake
+
+def _limitless_sniper_get_momentum(asset):
+    """Check if previous window had P2.3-confirmed momentum for this asset.
+    Returns ("BUY"/"SELL", True) if P2.3 confirmed, ("BUY"/"SELL", False) if only P2.1.
+    """
+    return _limitless_prev_momentum.get(asset.upper(), {}).get("direction"), \
+           _limitless_prev_momentum.get(asset.upper(), {}).get("confirmed", False)
+
+def _limitless_update_momentum(asset, direction, p23_confirmed):
+    """Update momentum cache at end of each window."""
+    _limitless_prev_momentum[asset.upper()] = {
+        "direction": direction,
+        "confirmed": p23_confirmed,
+    }
+
+def _limitless_sniper_thread():
+    """Limitless sniper — fires at exact 15M window boundaries.
+    Uses P2.1 direction + P2.3 momentum carry-over for two-tier staking.
+    """
+    import time as _time
+    import requests as _req
+    from eth_account import Account as _Account
+    from eth_account.messages import encode_typed_data as _encode_typed_data
+    from web3 import Web3 as _Web3
+
+    SNIPER_ASSETS = ["BTC", "ETH", "SOL", "XRP"]
+    CHAIN_ID = 8453  # Base
+    ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
+    MAX_FILL = 0.52  # 52¢ max
+
+    print("LIMITLESS SNIPER THREAD STARTED — waiting for first boundary...")
+
+    while True:
+        try:
+            if not _limitless_sniper_state["enabled"]:
+                _time.sleep(30)
+                continue
+
+            if not LIMITLESS_TOKEN_ID or not LIMITLESS_PRIV_KEY:
+                _time.sleep(30)
+                continue
+
+            # ── Calculate time to next 15M boundary ──
+            now = datetime.now(timezone.utc)
+            current_minute = now.minute
+            current_second = now.second
+
+            mins_to_next = 15 - (current_minute % 15)
+            if mins_to_next == 15:
+                mins_to_next = 0
+            secs_to_boundary = mins_to_next * 60 - current_second
+
+            if secs_to_boundary > 35:
+                _time.sleep(min(secs_to_boundary - 35, 60))
+                continue
+
+            # ── T-30s: Read indicators for all assets ──
+            snipe_targets = []
+            for asset in SNIPER_ASSETS:
+                direction, signals_agree, ind_str = _sniper_get_direction(asset)
+                if direction and signals_agree >= 2:
+                    # Check momentum carry-over from previous window
+                    prev_dir, prev_confirmed = _limitless_sniper_get_momentum(asset)
+                    
+                    if prev_dir == ("BUY" if direction == "UP" else "SELL") and prev_confirmed:
+                        tier = "HIGH"  # P2.1 + P2.3 momentum agree
+                    else:
+                        tier = "BASE"  # P2.1 only
+                    
+                    snipe_targets.append({
+                        "asset": asset,
+                        "direction": direction,
+                        "signals_agree": signals_agree,
+                        "indicators": ind_str,
+                        "tier": tier,
+                    })
+
+            if not snipe_targets:
+                _time.sleep(max(secs_to_boundary + 5, 5))
+                continue
+
+            # ── T-20s: Find Limitless market slugs ──
+            # Limitless 15M slugs follow pattern: btc-15min-{stable_slug}
+            # We need to search for active 15M markets
+            market_data = {}
+            headers = {
+                "X-API-Key": LIMITLESS_TOKEN_ID,
+                "Content-Type": "application/json",
+            }
+
+            for target in snipe_targets:
+                asset = target["asset"]
+                try:
+                    # Search for active 15M market for this asset
+                    search_term = asset.lower()
+                    r = _req.get(
+                        "{}/markets/active?category=crypto".format(LIMITLESS_API),
+                        headers=headers, timeout=10
+                    )
+                    if r.status_code == 200:
+                        markets = r.json()
+                        if isinstance(markets, list):
+                            for m in markets:
+                                slug = m.get("slug", "")
+                                title = m.get("title", "") or m.get("question", "")
+                                # Match: 15M market for this asset, opening at next boundary
+                                if (search_term in slug.lower() or asset in title.upper()) and \
+                                   "15min" in slug.lower() and \
+                                   m.get("positionIds") and len(m.get("positionIds", [])) >= 2:
+                                    venue = m.get("venue", {})
+                                    if venue and venue.get("exchange"):
+                                        market_data[asset] = {
+                                            "slug": slug,
+                                            "title": title,
+                                            "venue_exchange": venue["exchange"],
+                                            "position_ids": m["positionIds"],
+                                        }
+                                        break
+                except Exception as e:
+                    print("LMTS SNIPER fetch {} error: {}".format(asset, e))
+
+            if not market_data:
+                # Try individual slug patterns
+                for target in snipe_targets:
+                    asset = target["asset"]
+                    if asset in market_data:
+                        continue
+                    # Try common slug patterns
+                    next_boundary = now.replace(second=0, microsecond=0)
+                    next_min = ((now.minute // 15) + 1) * 15
+                    if next_min >= 60:
+                        next_boundary = next_boundary.replace(minute=0) + timedelta(hours=1)
+                    else:
+                        next_boundary = next_boundary.replace(minute=next_min)
+                    
+                    # Try fetching by search
+                    try:
+                        r = _req.get(
+                            "{}/markets/search?q={}&limit=5".format(LIMITLESS_API, asset.lower()),
+                            headers=headers, timeout=10
+                        )
+                        if r.status_code == 200:
+                            results = r.json()
+                            if isinstance(results, list):
+                                for m in results:
+                                    slug = m.get("slug", "")
+                                    if "15min" in slug.lower() and m.get("positionIds"):
+                                        venue = m.get("venue", {})
+                                        if venue and venue.get("exchange"):
+                                            market_data[asset] = {
+                                                "slug": slug,
+                                                "title": m.get("title", slug),
+                                                "venue_exchange": venue["exchange"],
+                                                "position_ids": m["positionIds"],
+                                            }
+                                            break
+                    except:
+                        pass
+
+            if not market_data:
+                print("LMTS SNIPER: no markets found — skipping boundary")
+                _time.sleep(max(secs_to_boundary + 5, 5))
+                continue
+
+            # ── Wait until T+0 ──
+            next_boundary = now.replace(second=0, microsecond=0)
+            next_min = ((now.minute // 15) + 1) * 15
+            if next_min >= 60:
+                next_boundary = next_boundary.replace(minute=0) + timedelta(hours=1)
+            else:
+                next_boundary = next_boundary.replace(minute=next_min)
+
+            now2 = datetime.now(timezone.utc)
+            wait_secs = (next_boundary - now2).total_seconds()
+            if 0 < wait_secs < 120:
+                print("LMTS SNIPER: {} targets ready, waiting {:.1f}s...".format(len(market_data), wait_secs))
+                _time.sleep(max(wait_secs - 0.5, 0))
+
+            # ── T+0: FIRE ORDERS ──
+            account = _Account.from_key(LIMITLESS_PRIV_KEY)
+            maker_address = account.address
+            fired_count = 0
+
+            for target in snipe_targets:
+                asset = target["asset"]
+                if asset not in market_data:
+                    continue
+
+                mkt = market_data[asset]
+                market_key = "lmts_sniper_{}_15M_{}".format(asset, int(next_boundary.timestamp()))
+                if market_key in _limitless_sniper_traded:
+                    continue
+
+                tier = target["tier"]
+                stake = _limitless_sniper_stake(_limitless_sniper_state["balance"], tier)
+                if stake <= 0 or stake > _limitless_sniper_state["balance"]:
+                    continue
+
+                direction = target["direction"]
+                # YES = positionIds[0], NO = positionIds[1]
+                token_id = mkt["position_ids"][0] if direction == "UP" else mkt["position_ids"][1]
+                order_price = 0.50
+
+                # Build order
+                import time as _t2
+                num_shares = stake / order_price
+                maker_amount = int(order_price * num_shares * 1e6)  # USDC
+                taker_amount = int(num_shares * 1e6)  # Shares
+                salt = int(_t2.time() * 1000)
+
+                order_data = {
+                    "salt": salt,
+                    "maker": _Web3.to_checksum_address(maker_address),
+                    "signer": _Web3.to_checksum_address(maker_address),
+                    "taker": ZERO_ADDRESS,
+                    "tokenId": int(token_id),
+                    "makerAmount": maker_amount,
+                    "takerAmount": taker_amount,
+                    "expiration": 0,
+                    "nonce": 0,
+                    "feeRateBps": 0,
+                    "side": 0,  # BUY
+                    "signatureType": 0,  # EOA
+                }
+
+                # EIP-712 sign
+                try:
+                    domain = {
+                        "name": "Limitless CTF Exchange",
+                        "version": "1",
+                        "chainId": CHAIN_ID,
+                        "verifyingContract": _Web3.to_checksum_address(mkt["venue_exchange"]),
+                    }
+                    types = {
+                        "EIP712Domain": [
+                            {"name": "name", "type": "string"},
+                            {"name": "version", "type": "string"},
+                            {"name": "chainId", "type": "uint256"},
+                            {"name": "verifyingContract", "type": "address"},
+                        ],
+                        "Order": [
+                            {"name": "salt", "type": "uint256"},
+                            {"name": "maker", "type": "address"},
+                            {"name": "signer", "type": "address"},
+                            {"name": "taker", "type": "address"},
+                            {"name": "tokenId", "type": "uint256"},
+                            {"name": "makerAmount", "type": "uint256"},
+                            {"name": "takerAmount", "type": "uint256"},
+                            {"name": "expiration", "type": "uint256"},
+                            {"name": "nonce", "type": "uint256"},
+                            {"name": "feeRateBps", "type": "uint256"},
+                            {"name": "side", "type": "uint8"},
+                            {"name": "signatureType", "type": "uint8"},
+                        ],
+                    }
+                    typed_data = {
+                        "types": types,
+                        "primaryType": "Order",
+                        "domain": domain,
+                        "message": order_data,
+                    }
+                    encoded = _encode_typed_data(typed_data)
+                    signed = _Account.sign_message(encoded, private_key=LIMITLESS_PRIV_KEY)
+                    signature = signed.signature.hex()
+
+                    # Get owner ID
+                    owner_id = 0
+                    try:
+                        pr = _req.get("{}/profiles/{}".format(LIMITLESS_API, maker_address), headers=headers, timeout=8)
+                        if pr.status_code == 200:
+                            owner_id = pr.json().get("id", 0)
+                    except:
+                        pass
+
+                    # Submit order
+                    order_payload = {
+                        "order": {**order_data, "signature": signature},
+                        "ownerId": owner_id,
+                        "orderType": "GTC",
+                        "marketSlug": mkt["slug"],
+                    }
+                    resp = _req.post(
+                        "{}/orders".format(LIMITLESS_API),
+                        headers=headers,
+                        json=order_payload,
+                        timeout=10,
+                    )
+
+                    order_id = None
+                    filled = False
+                    if resp.status_code in (200, 201):
+                        rdata = resp.json()
+                        order_id = rdata.get("id") or rdata.get("orderId")
+                        filled = rdata.get("status", "").upper() in ("MATCHED", "FILLED")
+
+                    # Update pool
+                    _limitless_sniper_state["balance"] = round(_limitless_sniper_state["balance"] - stake, 2)
+                    _limitless_sniper_state["trades_today"] += 1
+                    _limitless_sniper_traded.add(market_key)
+                    if _limitless_sniper_state["balance"] > _limitless_sniper_state["peak_balance"]:
+                        _limitless_sniper_state["peak_balance"] = _limitless_sniper_state["balance"]
+
+                    # Save to DB
+                    try:
+                        c_lmts = get_db()
+                        c_lmts.run("""INSERT INTO limitless_sniper_trades
+                            (market_id,title,asset,timeframe,bet_side,tier,stake,fill_price,
+                             pool_after,order_id,slug,filled,status,indicators,signals_agree,fired_at)
+                            VALUES(:mid,:ttl,:ast,:tf,:bs,:tier,:stake,:fill,:pool,:oid,:slg,:filled,'Pending',
+                                   :ind,:sa,:now)""",
+                            mid=market_key, ttl=mkt.get("title",""), ast=asset,
+                            tf="15M", bs=direction, tier=tier, stake=stake,
+                            fill=round(order_price, 4), pool=_limitless_sniper_state["balance"],
+                            oid=str(order_id or ""), slg=mkt.get("slug",""),
+                            filled=filled, ind=target["indicators"],
+                            sa=target["signals_agree"],
+                            now=datetime.now(timezone.utc).isoformat())
+                        c_lmts.close()
+                    except Exception as e:
+                        print("LMTS SNIPER DB error: {}".format(e))
+
+                    fl_tag = "FILLED" if filled else "MAKER"
+                    print("LMTS SNIPER: {} {} {} 15M ${:.2f} @50¢ [{}] {} | pool=${:.2f}".format(
+                        tier, direction, asset, stake, fl_tag,
+                        target["indicators"], _limitless_sniper_state["balance"]))
+                    send_telegram("🎯 <b>LMTS SNIPER</b>\n{} {} {} ${:.2f} @50¢\n{}\nPool: ${:.2f}".format(
+                        tier, direction, asset, stake,
+                        target["indicators"], _limitless_sniper_state["balance"]))
+
+                    fired_count += 1
+
+                except Exception as e:
+                    print("LMTS SNIPER order {} error: {}".format(asset, e))
+
+            if fired_count > 0:
+                print("LMTS SNIPER: fired {} orders at boundary".format(fired_count))
+                _save_bot_balance("limitless_sniper", _limitless_sniper_state)
+
+            # Update momentum cache for next window
+            for target in snipe_targets:
+                asset = target["asset"]
+                p21_dir = "BUY" if target["direction"] == "UP" else "SELL"
+                # Check if P2.3 would have confirmed this direction
+                # (P2.3 uses distance math — if signals are strong, momentum is confirmed)
+                p23_confirmed = target["signals_agree"] >= 3
+                _limitless_update_momentum(asset, p21_dir, p23_confirmed)
+
+            _time.sleep(60)
+
+        except Exception as e:
+            print("LMTS SNIPER thread error: {}".format(e))
+            _time.sleep(30)
+
+
+
+def _resolve_limitless_sniper_trades():
+    """Resolve Limitless sniper trades using Limitless API."""
+    try:
+        conn = get_db()
+        rows = conn.run("SELECT * FROM limitless_sniper_trades WHERE status='Pending' ORDER BY id")
+        cols = [c['name'] for c in conn.columns]
+        items = [dict(zip(cols, r)) for r in rows]
+        conn.close()
+        if not items: return 0
+        now = datetime.now(timezone.utc)
+        resolved = 0
+        for p in items:
+            try:
+                if not p.get("fired_at"): continue
+                fired = datetime.fromisoformat(p["fired_at"])
+                if fired.tzinfo is None: fired = fired.replace(tzinfo=timezone.utc)
+                m15 = (fired.minute // 15) * 15
+                window_start = fired.replace(minute=m15, second=0, microsecond=0)
+                expiry = window_start + timedelta(minutes=15)
+                if now < expiry + timedelta(minutes=2): continue
+                stake = float(p.get("stake") or 1.0)
+                order_filled = p.get("filled", False)
+                if not order_filled and now > expiry:
+                    _limitless_sniper_state["balance"] = round(_limitless_sniper_state["balance"] + stake, 2)
+                    c = get_db()
+                    c.run("UPDATE limitless_sniper_trades SET status='Returned',outcome='RETURNED',resolved_at=:r WHERE id=:i", r=now.isoformat(), i=p["id"])
+                    c.close()
+                    resolved += 1; continue
+                # Check resolution via Limitless API
+                won = None
+                slug = p.get("slug", "")
+                bs = p.get("bet_side", "UP")
+                try:
+                    import requests as req
+                    if slug:
+                        hdrs = {"X-API-Key": LIMITLESS_TOKEN_ID, "Content-Type": "application/json"}
+                        r = req.get("{}/markets/{}".format(LIMITLESS_API, slug), headers=hdrs, timeout=10)
+                        if r.status_code == 200:
+                            md = r.json()
+                            status = md.get("status", "").lower()
+                            if status in ("resolved", "closed"):
+                                winner = md.get("winner", "").lower()
+                                if winner == "yes": won = (bs == "UP")
+                                elif winner == "no": won = (bs == "DOWN")
+                            elif md.get("outcomePrices"):
+                                ops = md["outcomePrices"]
+                                if isinstance(ops, str):
+                                    try: ops = json.loads(ops)
+                                    except: ops = None
+                                if isinstance(ops, list) and len(ops) >= 2:
+                                    p0 = float(ops[0]); p1 = float(ops[1])
+                                    if p0 >= 0.95: won = (bs == "UP")
+                                    elif p1 >= 0.95: won = (bs == "DOWN")
+                except: pass
+                if won is None:
+                    if now > expiry + timedelta(hours=1): won = False
+                    else: continue
+                fill = float(p.get("fill_price") or 0.50)
+                payout = round(stake / fill, 4) if won else 0
+                status_str = "Won" if won else "Lost"
+                c = get_db()
+                c.run("UPDATE limitless_sniper_trades SET status=:s,outcome=:o,resolved_at=:r,payout=:p,filled=TRUE WHERE id=:i",
+                      s=status_str, o="WIN" if won else "LOSS", r=now.isoformat(), p=payout, i=p["id"])
+                c.close()
+                resolved += 1
+                if won:
+                    _limitless_sniper_state["balance"] = round(_limitless_sniper_state["balance"] + payout, 2)
+                    _limitless_sniper_state["wins_today"] += 1
+                    _limitless_sniper_state["profit_today"] = round(_limitless_sniper_state["profit_today"] + (payout - stake), 2)
+                else:
+                    _limitless_sniper_state["losses_today"] += 1
+                    _limitless_sniper_state["profit_today"] = round(_limitless_sniper_state["profit_today"] - stake, 2)
+                if _limitless_sniper_state["balance"] > _limitless_sniper_state["peak_balance"]:
+                    _limitless_sniper_state["peak_balance"] = _limitless_sniper_state["balance"]
+                if _limitless_sniper_state["balance"] <= _limitless_sniper_state["floor_balance"]:
+                    _limitless_sniper_state["enabled"] = False
+                    send_telegram("LMTS SNIPER STOPPED — Floor ${:.2f}".format(_limitless_sniper_state["balance"]))
+                _pnl = "+${:.2f}".format(payout - stake) if won else "-${:.2f}".format(stake)
+                print("LMTS SNIPER #{} {}: ${:.2f} {} | pool=${:.2f}".format(p["id"], "WIN" if won else "LOSS", stake, _pnl, _limitless_sniper_state["balance"]))
+            except Exception as e:
+                print("LMTS SNIPER resolve error #{}: {}".format(p.get("id"), e))
+        return resolved
+    except Exception as e:
+        print("LMTS SNIPER resolve error: {}".format(e)); return 0
 
 def _poly_alpha_get_tier(asset, timeframe, p23_agrees=False):
     """Poly Alpha v1 — PAUSED. Use Poly Alpha 2.0 instead."""
@@ -1702,6 +2178,18 @@ def init_db():
             fired_at TEXT, resolved_at TEXT
         )
     """)
+    conn.run("""
+        CREATE TABLE IF NOT EXISTS limitless_sniper_trades (
+            id SERIAL PRIMARY KEY,
+            market_id TEXT, title TEXT, asset TEXT, timeframe TEXT,
+            bet_side TEXT, tier TEXT, stake REAL, fill_price REAL,
+            pool_after REAL, payout REAL, order_id TEXT, slug TEXT,
+            filled BOOLEAN DEFAULT FALSE,
+            status TEXT DEFAULT 'Pending', outcome TEXT,
+            indicators TEXT, signals_agree INTEGER,
+            fired_at TEXT, resolved_at TEXT
+        )
+    """)
     # Polymarket paper trades — single table for all sections/strategies
     conn.run("""
         CREATE TABLE IF NOT EXISTS poly_trades (
@@ -1745,7 +2233,7 @@ def send_telegram(message):
     _allowed = any(k in message for k in [
         "ALPHA", "Alpha", "alpha",           # All Alpha trade/resolution messages (Limitless + Poly)
         "POLY",                              # Polymarket Alpha notifications
-        "SNIPER", "Sniper",                  # Sniper Alpha 4.0 notifications
+        "SNIPER", "Sniper", "LMTS",                  # Sniper Alpha 4.0 notifications
         "Auto-trading", "Kill switch",        # System control alerts
         "Auto-redeemed", "Redeemed",          # Redemption confirmations
         "Bot v4", "LIVE",                     # Startup message
@@ -5498,6 +5986,7 @@ def scan_loop():
             _save_bot_balance("poly_alpha2", _poly_alpha2_state)
             _save_bot_balance("poly_alpha3", _poly_alpha3_state)
             _save_bot_balance("poly_alpha4", _poly_alpha4_state)
+            _save_bot_balance("limitless_sniper", _limitless_sniper_state)
         except Exception as e:
             print("Balance save error: {}".format(e))
         
@@ -14913,6 +15402,7 @@ td{padding:8px 12px;border-bottom:1px solid #f4f3ed;color:var(--ink-2)}tr:last-c
     <a href="/app/paper29poly" class="nav-tab""" + (" active" if nav_active == "paper29poly" else "") + """">P2.9 Poly</a>
     <a href="/app/poly-alpha3" class="nav-tab""" + (" active" if nav_active == "poly-alpha3" else "") + """">⚡ Poly A3</a>
     <a href="/app/poly-alpha4" class="nav-tab""" + (" active" if nav_active == "poly-alpha4" else "") + """">🎯 Sniper A4</a>
+    <a href="/app/lmts-sniper" class="nav-tab""" + (" active" if nav_active == "lmts-sniper" else "") + """">🎯 LMTS Sniper</a>
     <a href="/app/paper4" class="nav-tab""" + (" active" if nav_active == "paper4" else "") + """">Paper 4</a>
     <a href="/app/paper5" class="nav-tab""" + (" active" if nav_active == "paper5" else "") + """">Paper 5</a>
     <a href="/app/paper51" class="nav-tab""" + (" active" if nav_active == "paper51" else "") + """">Paper 5.1</a>
@@ -15283,8 +15773,26 @@ threading.Thread(target=football_loop, daemon=True).start()
 threading.Thread(target=otp_loop, daemon=True).start()
 if SIGNALS_DB_URL:
     threading.Thread(target=_signals_poll_loop, daemon=True).start()
-threading.Thread(target=_sniper_thread, daemon=True).start()
-print("SNIPER A4 thread launched")
+    threading.Thread(target=_sniper_thread, daemon=True).start()
+    print("SNIPER A4 thread launched")
+
+    # ── LIMITLESS SNIPER init ──
+    _lmts_sniper_restored = False
+    _saved_lmts = _saved_balances.get("limitless_sniper", {})
+    if _saved_lmts and _saved_lmts.get("balance", 0) > 0:
+        _limitless_sniper_state["balance"] = _saved_lmts["balance"]
+        _limitless_sniper_state["peak_balance"] = _saved_lmts.get("peak_balance", _saved_lmts["balance"])
+        _lmts_sniper_restored = True
+    if not _lmts_sniper_restored:
+        _limitless_sniper_state["balance"] = 30.0
+        _limitless_sniper_state["peak_balance"] = 30.0
+    _limitless_sniper_state["starting_balance"] = 30.0
+    _limitless_sniper_state["floor_balance"] = 5.0
+    _limitless_sniper_state["enabled"] = True
+    print("LMTS SNIPER: ${:.2f} pool{} | P2.1+momentum | 15M | 50¢ | 2-tier".format(
+        _limitless_sniper_state["balance"], " (restored)" if _lmts_sniper_restored else " (fresh)"))
+    threading.Thread(target=_limitless_sniper_thread, daemon=True).start()
+    print("LMTS SNIPER thread launched")
 
 # ═══════════════════════════════════════════════════════════
 # POLYMARKET MODULE — Paper trading on crypto Up/Down markets
@@ -17189,6 +17697,12 @@ def _poly_scan_loop():
         except Exception as e:
             print("Sniper Alpha4 resolve error: {}".format(e))
         time.sleep(60)
+        try:
+            _lmts_resolved = _resolve_limitless_sniper_trades()
+            if _lmts_resolved:
+                print("LMTS Sniper resolved: {}".format(_lmts_resolved))
+        except Exception as e:
+            print("LMTS Sniper resolve error: {}".format(e))
 
 # ═══════════════════════════════════════════════════════════
 # POLYMARKET PAGES
@@ -17632,6 +18146,124 @@ a{{color:#00d4aa}}
         pnlc, total_pnl, _poly_alpha3_state["peak_balance"],
         "{}T {}W {}L".format(_poly_alpha3_state["trades_today"], _poly_alpha3_state["wins_today"], _poly_alpha3_state["losses_today"]),
         tf_html, asset_html, trade_rows)
+
+
+
+@app.route("/app/lmts-sniper")
+def lmts_sniper_page():
+    """Limitless Sniper dashboard."""
+    try:
+        conn = get_db()
+        rows = conn.run("SELECT * FROM limitless_sniper_trades ORDER BY id DESC LIMIT 200")
+        cols = [c['name'] for c in conn.columns]
+        trades = [dict(zip(cols, r)) for r in rows]
+        conn.close()
+    except:
+        trades = []
+
+    total = len(trades)
+    wins = sum(1 for t in trades if t.get("outcome") == "WIN")
+    losses = sum(1 for t in trades if t.get("outcome") == "LOSS")
+    pending = sum(1 for t in trades if t.get("status") == "Pending")
+    resolved = wins + losses
+    wr = round(wins / resolved * 100, 1) if resolved > 0 else 0
+    total_pnl = 0
+    for t in trades:
+        if t.get("outcome") == "WIN":
+            total_pnl += float(t.get("payout") or 0) - float(t.get("stake") or 0)
+        elif t.get("outcome") == "LOSS":
+            total_pnl -= float(t.get("stake") or 0)
+    total_pnl = round(total_pnl, 2)
+    pnlc = "color:#1a7046" if total_pnl >= 0 else "color:#b4322e"
+
+    tier_stats = {}
+    for t in trades:
+        tier = t.get("tier", "BASE")
+        if tier not in tier_stats: tier_stats[tier] = {"w": 0, "l": 0, "pnl": 0}
+        if t.get("outcome") == "WIN":
+            tier_stats[tier]["w"] += 1
+            tier_stats[tier]["pnl"] += float(t.get("payout") or 0) - float(t.get("stake") or 0)
+        elif t.get("outcome") == "LOSS":
+            tier_stats[tier]["l"] += 1
+            tier_stats[tier]["pnl"] -= float(t.get("stake") or 0)
+
+    asset_stats = {}
+    for t in trades:
+        a = t.get("asset", "?")
+        if a not in asset_stats: asset_stats[a] = {"w": 0, "l": 0, "pnl": 0}
+        if t.get("outcome") == "WIN":
+            asset_stats[a]["w"] += 1
+            asset_stats[a]["pnl"] += float(t.get("payout") or 0) - float(t.get("stake") or 0)
+        elif t.get("outcome") == "LOSS":
+            asset_stats[a]["l"] += 1
+            asset_stats[a]["pnl"] -= float(t.get("stake") or 0)
+
+    tier_html = ""
+    for tier in sorted(tier_stats.keys()):
+        d = tier_stats[tier]
+        twr = round(d["w"] / (d["w"] + d["l"]) * 100, 1) if (d["w"] + d["l"]) > 0 else 0
+        tier_html += "<tr><td>{}</td><td>{}W/{}L</td><td>{}%</td><td>${:.2f}</td></tr>".format(tier, d["w"], d["l"], twr, d["pnl"])
+
+    asset_html = ""
+    for a in sorted(asset_stats.keys()):
+        d = asset_stats[a]
+        awr = round(d["w"] / (d["w"] + d["l"]) * 100, 1) if (d["w"] + d["l"]) > 0 else 0
+        asset_html += "<tr><td>{}</td><td>{}W/{}L</td><td>{}%</td><td>${:.2f}</td></tr>".format(a, d["w"], d["l"], awr, d["pnl"])
+
+    trade_rows = ""
+    for t in trades[:100]:
+        outcome = t.get("outcome", "")
+        icon = "\u2705" if outcome == "WIN" else "\u274c" if outcome == "LOSS" else "\u23ed" if outcome == "RETURNED" else "\u23f3"
+        pnl_str = ""
+        if outcome == "WIN": pnl_str = "+${:.2f}".format(float(t.get("payout") or 0) - float(t.get("stake") or 0))
+        elif outcome == "LOSS": pnl_str = "-${:.2f}".format(float(t.get("stake") or 0))
+        elif outcome == "RETURNED": pnl_str = "returned"
+        fired = (t.get("fired_at") or "")[:16].replace("T", " ")
+        trade_rows += "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>${:.2f}</td><td>{}</td><td>{}</td><td>{}</td><td>${:.2f}</td></tr>".format(
+            t.get("id",""), icon, t.get("asset","?"), t.get("tier","?"),
+            float(t.get("stake") or 0), t.get("bet_side","?"),
+            fired, pnl_str, float(t.get("pool_after") or 0))
+
+    return """<!DOCTYPE html><html><head><title>Limitless Sniper</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>body{{font-family:-apple-system,sans-serif;max-width:900px;margin:0 auto;padding:10px;background:#0a0a0a;color:#e0e0e0}}
+h1{{color:#00d4aa}}h2{{color:#888;font-size:14px}}
+.stats{{display:grid;grid-template-columns:repeat(auto-fit,minmax(100px,1fr));gap:8px;margin:10px 0}}
+.stat{{background:#1a1a2e;padding:12px;border-radius:8px;text-align:center}}
+.stat .val{{font-size:24px;font-weight:700;color:#00d4aa}}.stat .lbl{{font-size:11px;color:#888}}
+table{{width:100%;border-collapse:collapse;font-size:13px;margin:10px 0}}
+th,td{{padding:6px 8px;border-bottom:1px solid #222;text-align:left}}
+th{{background:#1a1a2e;color:#888;font-size:11px}}
+.nav{{display:flex;gap:4px;flex-wrap:wrap;margin:10px 0}}
+.nav-tab{{padding:6px 12px;background:#1a1a2e;color:#888;text-decoration:none;border-radius:4px;font-size:12px}}
+.nav-tab.active{{background:#00d4aa;color:#000}}
+a{{color:#00d4aa}}
+</style></head><body>
+<div class="nav">
+<a href="/app/lmts-sniper" class="nav-tab active">\U0001f3af LMTS Sniper</a>
+<a href="/app/poly-alpha4" class="nav-tab">\U0001f3af Poly Sniper</a>
+<a href="/" class="nav-tab">Home</a>
+</div>
+<h1>\U0001f3af Limitless Sniper</h1>
+<h2>P2.1 + P2.3 Momentum · 15M · 50\u00a2 Target · Two-Tier Staking</h2>
+<div class="stats">
+<div class="stat"><div class="val">${:.2f}</div><div class="lbl">Pool</div></div>
+<div class="stat"><div class="val">{}%</div><div class="lbl">Win Rate</div></div>
+<div class="stat"><div class="val">{}</div><div class="lbl">Trades</div></div>
+<div class="stat"><div class="val" style="{}">${:.2f}</div><div class="lbl">P&L</div></div>
+<div class="stat"><div class="val">${:.2f}</div><div class="lbl">Peak</div></div>
+<div class="stat"><div class="val">{}</div><div class="lbl">Today</div></div>
+</div>
+<h2>By Tier</h2><table><tr><th>Tier</th><th>Record</th><th>WR</th><th>P&L</th></tr>{}</table>
+<h2>By Asset</h2><table><tr><th>Asset</th><th>Record</th><th>WR</th><th>P&L</th></tr>{}</table>
+<h2>Trade History</h2><table><tr><th>#</th><th></th><th>Asset</th><th>Tier</th><th>Stake</th><th>Side</th><th>Time</th><th>P&L</th><th>Pool</th></tr>{}</table>
+<p style="color:#444;font-size:11px">Limitless Sniper · Fires at window boundary · Two-tier staking · Auto-refresh 60s</p>
+<script>setTimeout(()=>location.reload(),60000)</script>
+</body></html>""".format(
+        _limitless_sniper_state["balance"], wr, total,
+        pnlc, total_pnl, _limitless_sniper_state["peak_balance"],
+        "{}T {}W {}L".format(_limitless_sniper_state["trades_today"], _limitless_sniper_state["wins_today"], _limitless_sniper_state["losses_today"]),
+        tier_html, asset_html, trade_rows)
 
 
 @app.route("/app/poly-alpha4")
