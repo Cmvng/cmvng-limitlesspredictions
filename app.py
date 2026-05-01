@@ -628,6 +628,15 @@ def _sniper_get_direction(asset, timeframe="15m"):
         parts.append("UT={}".format(ut_trend))
     if sqz_dir:
         parts.append("SQZ={}".format(sqz_dir))
+    parts.append("BTC:{}".format(btc_role))
+    if is_weak:
+        parts.append("WEAK")
+    if flipped:
+        parts.append("FLIP")
+    parts.append("{}/{}".format(signals_agree, total_signals))
+
+    ind_str = " | ".join(parts)
+    return bet_direction, signals_agree, ind_str, confidence
 
 def _sniper_thread():
     """Dedicated sniper thread — fires at exact 15M window boundaries.
@@ -6783,7 +6792,8 @@ def _score_paper3_trade(p, price, indicators, ind_macro=None, expiry_minute=None
     # ── Bot 2 signals ──
     tv = _tv_trends.get(asset.upper())
     tv_dir = tv["dir"] if tv else None
-    sma_trend = indicators.get("sma_trend")
+    # SMA from _pair_sma_cache (1H) — consistent with P2.1
+    sma_trend = _pair_sma_cache.get(asset.upper(), {}).get("trend") or indicators.get("sma_trend")
     btc_trend = _btc_trend_cache.get("trend")
 
     # ── New indicators (micro) ──
@@ -7329,7 +7339,9 @@ def _score_paper31_trade(p, price, indicators, ind_macro=None, expiry_minute=Non
     # ── Pair's own signals (without BTC) ──
     tv = _tv_trends.get(asset.upper())
     tv_dir = tv["dir"] if tv else None
-    sma_trend = indicators.get("sma_trend")
+    # SMA from _pair_sma_cache (1H) — same source as P2.1 for consistency.
+    # indicators.get("sma_trend") gives 15M SMA on Polymarket which is wrong.
+    sma_trend = _pair_sma_cache.get(asset.upper(), {}).get("trend") or indicators.get("sma_trend")
     btc_trend = _btc_trend_cache.get("trend")
     ut_trend = indicators.get("ut_trend")
     ema_stack = indicators.get("ema_stack")
