@@ -522,28 +522,39 @@ def _sniper_get_direction(asset):
         "market_id": "sniper_synthetic",
     }
     
-    # Calculate FULL indicators — same function the paper bot uses
-    # This fetches live candle data and computes TV, SMA, UT Bot, squeeze, etc.
-    try:
-        ind = _calculate_indicators(asset_upper, "15m")
-    except Exception as e:
-        print("SNIPER indicator calc error {}: {}".format(asset_upper, e))
-        ind = {}
+    # Read indicators from cache — updated every scan cycle (no HTTP calls needed)
+    ind_entry = _indicator_cache.get("{}_15m".format(asset_upper))
+    if ind_entry and ind_entry.get("data"):
+        ind = dict(ind_entry["data"])  # Copy so we don't mutate cache
+    else:
+        # Cache empty — try calculating (first cycle after deploy)
+        try:
+            ind = _calculate_indicators(asset_upper, "15m")
+        except:
+            ind = None
     
     if not ind:
         return None, 0, "", None
     
-    # Add TV signal from signals DB (not computed by _calculate_indicators)
+    # Add TV signal from signals DB
     tv = _tv_trends.get(asset_upper)
     if tv:
         ind["tv_dir"] = tv.get("dir")
         ind["tv_score"] = tv.get("score", 0)
     
-    # Macro indicators (4H timeframe) — for weak period detection in 1H
-    try:
-        ind_macro = _calculate_indicators(asset_upper, "4h")
-    except:
-        ind_macro = {}
+    # Macro indicators from cache (4H timeframe)
+    macro_entry = _indicator_cache.get("{}_4h".format(asset_upper))
+    if macro_entry and macro_entry.get("data"):
+        ind_macro = macro_entry["data"]
+    else:
+        macro_entry_1h = _indicator_cache.get("{}_1h".format(asset_upper))
+        if macro_entry_1h and macro_entry_1h.get("data"):
+            ind_macro = macro_entry_1h["data"]
+        else:
+            try:
+                ind_macro = _calculate_indicators(asset_upper, "4h")
+            except:
+                ind_macro = {}
     
     # Expiry timing for weak period detection
     expiry_minute = next_15m.minute
@@ -626,9 +637,11 @@ def _sniper_thread():
 
             # ── T-30s: Read indicators for all assets ──
             snipe_targets = []
+            _sniper_debug = []
             for asset in SNIPER_ASSETS:
                 direction, signals_agree, ind_str, _scored = _sniper_get_direction(asset)
                 if direction and signals_agree >= 2:
+                    _sniper_debug.append("{}={}".format(asset, direction))
                     snipe_targets.append({
                         "asset": asset,
                         "direction": direction,
@@ -637,9 +650,11 @@ def _sniper_thread():
                     })
 
             if not snipe_targets:
-                # No signals — wait for next boundary
+                print("SNIPER: 0 targets at boundary (all filtered by P2.1)")
                 _time.sleep(max(secs_to_boundary + 5, 5))
                 continue
+            else:
+                print("SNIPER: {} targets qualified: {}".format(len(snipe_targets), ", ".join(_sniper_debug)))
 
             # ── T-20s: Calculate next window's slug and timestamp ──
             # The NEXT window starts at the upcoming boundary
