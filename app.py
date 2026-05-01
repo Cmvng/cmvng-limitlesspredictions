@@ -638,6 +638,7 @@ def _sniper_thread():
             # ── T-30s: Read indicators for all assets ──
             snipe_targets = []
             _sniper_debug = []
+            _sniper_reject = []
             for asset in SNIPER_ASSETS:
                 direction, signals_agree, ind_str, _scored = _sniper_get_direction(asset)
                 if direction and signals_agree >= 2:
@@ -650,8 +651,9 @@ def _sniper_thread():
                     })
 
             if not snipe_targets:
-                print("SNIPER: 0 targets at boundary (all filtered by P2.1)")
-                _time.sleep(max(secs_to_boundary + 5, 5))
+                print("SNIPER: 0 targets at boundary (all filtered by P2.1) | cache: {}".format(
+                    {a: bool(_indicator_cache.get("{}_15m".format(a))) for a in SNIPER_ASSETS}))
+                _time.sleep(60)  # Wait 60s before checking again — avoids spam
                 continue
             else:
                 print("SNIPER: {} targets qualified: {}".format(len(snipe_targets), ", ".join(_sniper_debug)))
