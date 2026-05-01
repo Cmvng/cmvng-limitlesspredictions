@@ -244,44 +244,31 @@ _alpha_state = {
 _alpha_traded_markets = set()  # Dedup per cycle
 
 def _alpha_get_tier(scored22, scored23, scored33, asset, is_hourly=False):
-    """Determine Alpha tier based on P2.3 as sole trigger.
-    Strategy F: Only P2.3 fires live trades on ETH/BTC/SOL.
-    P3.3-alone and DIST_ONLY are paper-only (confirmed negative EV at 66c).
-    Returns (tier_tag, base_stake, max_fill, bet_side) or None to skip."""
+    """Model C: Flat $2 stakes, P2.3 filter for 15M, P2.4 for 1H.
+    Proven profitable in 1000-run Monte Carlo simulation.
+    15M: 77% WR → $6.40/day | 1H: 65% WR → $1.75/day"""
 
     if is_hourly:
-        return None  # 1H handled separately with P2.4 scoring
+        return None  # 1H handled via P2.4 in the hourly scan loop
 
-    # ── 15M: P2.3 is the ONLY live trigger ──
-    # Skip DOGE 15M (only 5 trades, no confidence)
+    # ── 15M: P2.3 is the ONLY trigger (77% WR proven over 456 trades) ──
     if asset not in ("ETH", "BTC", "SOL", "XRP"):
         return None
 
-    # P2.3 must fire for a live trade
+    # P2.3 must fire
     if scored23 is None:
-        return None  # P3.3-alone and P2.2-alone are paper only
+        return None
 
     bet_side = scored23["bet_side"]
 
-    # Stakes by asset (from corrected 50K-day simulation)
-    if asset == "ETH":
-        return ("T1", 4.00, 0.72, bet_side)   # 84.3% WR, breakeven at 72%
-    elif asset == "BTC":
-        return ("T1", 4.00, 0.72, bet_side)   # 81.6% WR, breakeven at 72%
-    elif asset == "SOL":
-        return ("T2", 2.00, 0.68, bet_side)   # 78.6% WR, breakeven at 68%
-    elif asset == "XRP":
-        return ("T3", 1.00, 0.64, bet_side)   # 70.5% WR, breakeven at 64% — trial
-
-    return None
+    # MODEL C: Flat $2.00 for ALL assets — no more $4 BTC bets
+    return ("T1", 2.00, 0.72, bet_side)
 
 def _alpha_calc_stake(base_stake, asset, pool_balance):
-    """Calculate final stake — fixed stakes from simulation, scaled to pool."""
-    # Scale relative to $100 baseline (the test pool)
-    scale = max(pool_balance / 100.0, 0.5)
-    stake = round(base_stake * scale, 2)
+    """Model C: Flat stakes with 5% pool cap safety."""
+    stake = base_stake  # Always $2.00
 
-    # Cap at 5% of pool (safety limit)
+    # Cap at 5% of pool
     max_trade = round(pool_balance * 0.05, 2)
     stake = min(stake, max_trade)
 
@@ -373,28 +360,24 @@ def _poly_alpha2_load_recent():
     except:
         pass
 
-def _poly_alpha2_get_tier(asset, timeframe, p23_agrees=False):
-    """Tiered: P2.1 base $2.50, P2.1+P2.3 boost $3.00."""
+def _poly_alpha2_get_tier(asset, timeframe, p23_agrees=False, p24_agrees=False):
+    """Alpha 2.0 v3 — PA15+ only, 15M only.
+    Only trades when P2.3 distance math confirms P2.1 direction.
+    No PA15 (P2.1 alone was 44% WR live). No PA1H (paused)."""
     if timeframe == "15M":
-        if p23_agrees:
-            return ("PA+", 3.00, 0.58)
-        else:
-            return ("PA", 2.50, 0.58)
-    elif timeframe == "5M" and asset == "BTC":
-        if p23_agrees:
-            return ("PB+", 3.00, 0.52)
-        else:
-            return ("PB", 2.50, 0.52)
+        if asset in ("BTC", "ETH", "SOL", "XRP"):
+            if p23_agrees:
+                return ("PA15+", 3.00, 0.62)  # P2.3 confirmed, max fill 62¢
     return None
 
 def _poly_alpha2_calc_stake(base_stake, pool_balance):
-    scale = max(pool_balance / 70.0, 0.5)
-    stake = round(base_stake * scale, 2)
+    """Poly Alpha stake: 5 shares minimum, 8% pool cap."""
+    stake = base_stake
     max_trade = round(pool_balance * 0.08, 2)
     stake = min(stake, max_trade)
-    stake = max(stake, 2.50)
-    if stake > pool_balance * 0.10:
-        return 0
+    stake = max(stake, 2.50)  # 5 shares minimum at ~50c
+    if stake > pool_balance * 0.12:
+        return 0  # Don't risk more than 12% on one trade
     return stake
 
 def _poly_alpha_load_recent_trades():
@@ -410,27 +393,959 @@ def _poly_alpha_load_recent_trades():
     except:
         pass
 
-def _poly_alpha_get_tier(asset, timeframe, p23_agrees=False):
-    """Get Polymarket Alpha tier based on P2.1 + P2.3 agreement.
-    p23_agrees=True means both P2.1 and P2.3 fired → higher stake.
-    p23_agrees=False means P2.1 alone → base stake."""
-    if timeframe == "15M":
-        if p23_agrees:
-            # P2.1 + P2.3 both fire — high confidence
-            if asset in ("XRP", "ETH"):
-                return ("PA1+", 3.00, 0.58)   # 65-68% WR
-            elif asset in ("BTC", "SOL"):
-                return ("PA2+", 3.00, 0.58)   # 63-64% WR
+# ═══════════════════════════════════════════════════════════
+# POLY ALPHA 3.0 — Pure P2.3 with Compounding
+# P2.3 alone (P2.1 direction + distance confirmation) on 15M + 1H
+# No mixing, no other strategies. Compounding stakes.
+# ═══════════════════════════════════════════════════════════
+
+_poly_alpha3_state = {
+    "enabled": True,
+    "balance": 60.0,
+    "peak_balance": 60.0,
+    "starting_balance": 60.0,
+    "floor_balance": 5.0,
+    "trades_today": 0,
+    "wins_today": 0,
+    "losses_today": 0,
+    "profit_today": 0.0,
+}
+_poly_alpha3_traded_markets = set()
+
+def _poly_alpha3_load_recent():
+
+    # ── POLY ALPHA 4.0 SNIPER init ──
+    _poly_alpha4_restored = False
+    _saved_pa4 = _saved_balances.get("poly_alpha4", {})
+    if _saved_pa4 and _saved_pa4.get("balance", 0) > 0:
+        _poly_alpha4_state["balance"] = _saved_pa4["balance"]
+        _poly_alpha4_state["peak_balance"] = _saved_pa4.get("peak_balance", _saved_pa4["balance"])
+        _poly_alpha4_restored = True
+    # RESET to $60 fresh
+    _poly_alpha4_state["balance"] = 60.0
+    _poly_alpha4_state["peak_balance"] = 60.0
+    _poly_alpha4_state["starting_balance"] = 60.0
+    _poly_alpha4_restored = False  # Force fresh start
+    _poly_alpha4_state["floor_balance"] = 5.0
+    _poly_alpha4_state["enabled"] = True
+    print("SNIPER A4: ${:.2f} pool{} | P2.1 at boundary | 15M | 50¢ fills".format(
+        _poly_alpha4_state["balance"], " (restored)" if _poly_alpha4_restored else " (fresh)"))
+
+    try:
+        conn = get_db()
+        rows = conn.run("SELECT market_id FROM poly_alpha3_trades WHERE fired_at::timestamptz > NOW() - INTERVAL '2 hours'")
+        conn.close()
+        for r in rows:
+            _poly_alpha3_traded_markets.add(r[0])
+        if _poly_alpha3_traded_markets:
+            print("Poly Alpha3: loaded {} recent IDs".format(len(_poly_alpha3_traded_markets)))
+    except:
+        pass
+
+def _poly_alpha3_calc_stake(pool_balance):
+    """Compounding stake: 5% of pool, min $2.50, max $8.00.
+    As pool grows → stakes grow. As pool shrinks → stakes shrink.
+    This protects downside and accelerates upside."""
+    stake = round(pool_balance * 0.05, 2)
+    stake = max(stake, 2.50)  # Polymarket minimum ~5 shares
+    stake = min(stake, 8.00)  # Cap per-trade risk
+    if stake > pool_balance * 0.15:
+        return 0  # Safety: don't risk more than 15% on one trade
+    return stake
+
+# ═══════════════════════════════════════════════════════════
+# POLY ALPHA 4.0 — THE SNIPER
+# Pre-calculated P2.1 signals fired at exact window boundary at 50¢
+# Independent thread, no scanner dependency
+# ═══════════════════════════════════════════════════════════
+
+_poly_alpha4_state = {
+    "enabled": True,
+    "balance": 60.0,
+    "peak_balance": 60.0,
+    "starting_balance": 60.0,
+    "floor_balance": 5.0,
+    "trades_today": 0,
+    "wins_today": 0,
+    "losses_today": 0,
+    "profit_today": 0.0,
+}
+_poly_alpha4_traded_markets = set()
+
+def _poly_alpha4_calc_stake(pool_balance):
+    """Compounding: 5% of pool, min $2.50, max $8.00."""
+    stake = round(pool_balance * 0.05, 2)
+    stake = max(stake, 2.50)
+    stake = min(stake, 8.00)
+    if stake > pool_balance * 0.15:
+        return 0
+    return stake
+
+def _sniper_get_direction(asset):
+    """Read P2.1 direction from cached indicators. No market dict needed.
+    Returns ("UP", signals_agree, "TV=BUY|SMA=BUY|BTC=BUY") or (None, 0, "") if no signal.
+    """
+    # Read cached indicators — these persist from previous scan cycle
+    tv = _tv_trends.get(asset.upper())
+    tv_dir = tv["dir"] if tv else None
+
+    sma_data = _pair_sma_cache.get(asset.upper(), {})
+    sma_dir = sma_data.get("trend")
+
+    btc_trend = _btc_trend_cache.get("trend")
+
+    # Pair direction: TV + SMA vote
+    pair_signals = [s for s in [tv_dir, sma_dir] if s in ("BUY", "SELL")]
+    pair_buy = sum(1 for s in pair_signals if s == "BUY")
+    pair_sell = sum(1 for s in pair_signals if s == "SELL")
+
+    if pair_buy > pair_sell:
+        pair_dir = "BUY"
+    elif pair_sell > pair_buy:
+        pair_dir = "SELL"
+    elif len(pair_signals) == 0:
+        pair_dir = btc_trend  # no pair data, use BTC as direction
+    else:
+        # TV and SMA split — check BTC as tiebreaker
+        if btc_trend:
+            pair_dir = btc_trend
         else:
-            # P2.1 alone — good confidence, more volume
-            if asset in ("XRP", "ETH", "BTC", "SOL"):
-                return ("PA1", 2.50, 0.58)    # 59-61% WR
-    elif timeframe == "5M":
-        if asset == "BTC":
-            if p23_agrees:
-                return ("PB1+", 3.00, 0.52)   # 59.7% WR
+            pair_dir = None  # no tiebreaker → skip
+
+    if not pair_dir:
+        return None, 0, ""
+
+    # Count agreement
+    signals_agree = sum(1 for s in [tv_dir, sma_dir, btc_trend] if s == pair_dir)
+    total_signals = sum(1 for s in [tv_dir, sma_dir, btc_trend] if s is not None)
+
+    # Map to UP/DOWN for Polymarket
+    direction = "UP" if pair_dir == "BUY" else "DOWN"
+
+    # Build indicator string
+    ind_str = "TV={} SMA={} BTC={} [{}/{}]".format(
+        tv_dir or "—", sma_dir or "—", btc_trend or "—",
+        signals_agree, total_signals)
+
+    return direction, signals_agree, ind_str
+
+def _sniper_thread():
+    """Dedicated sniper thread — fires at exact 15M window boundaries.
+    Runs independently from the main scanner.
+    
+    Timeline every 15 minutes:
+      T-30s: Read indicators, determine direction for each asset
+      T-20s: Calculate next window slug
+      T-15s: Fetch token IDs from Gamma API
+      T-5s:  Pre-sign orders
+      T+0s:  Fire all orders at 50¢
+      T+3s:  Check fill status
+    """
+    import time as _time
+    SNIPER_ASSETS = ["BTC", "ETH", "SOL", "XRP"]
+    SNIPER_SLUGS = {
+        "BTC": "btc-updown-15m-{}",
+        "ETH": "eth-updown-15m-{}",
+        "SOL": "sol-updown-15m-{}",
+        "XRP": "xrp-updown-15m-{}",
+    }
+    SNIPER_MAX_FILL = 0.52  # Max 52¢ — very close to 50¢
+    GAMMA_API = "https://gamma-api.polymarket.com"
+
+    print("SNIPER THREAD STARTED — waiting for first boundary...")
+
+    while True:
+        try:
+            if not _poly_alpha4_state["enabled"]:
+                _time.sleep(30)
+                continue
+
+            if not _poly_has_creds():
+                _time.sleep(30)
+                continue
+
+            # ── Calculate time to next 15M boundary ──
+            now = datetime.now(timezone.utc)
+            current_minute = now.minute
+            current_second = now.second
+
+            # Next boundary: :00, :15, :30, :45
+            mins_to_next = 15 - (current_minute % 15)
+            if mins_to_next == 15:
+                mins_to_next = 0
+
+            secs_to_boundary = mins_to_next * 60 - current_second
+
+            # If more than 35 seconds away, sleep and retry
+            if secs_to_boundary > 35:
+                _time.sleep(min(secs_to_boundary - 35, 60))
+                continue
+
+            # ── T-30s: Read indicators for all assets ──
+            snipe_targets = []
+            for asset in SNIPER_ASSETS:
+                direction, signals_agree, ind_str = _sniper_get_direction(asset)
+                if direction and signals_agree >= 2:
+                    snipe_targets.append({
+                        "asset": asset,
+                        "direction": direction,
+                        "signals_agree": signals_agree,
+                        "indicators": ind_str,
+                    })
+
+            if not snipe_targets:
+                # No signals — wait for next boundary
+                _time.sleep(max(secs_to_boundary + 5, 5))
+                continue
+
+            # ── T-20s: Calculate next window's slug and timestamp ──
+            # The NEXT window starts at the upcoming boundary
+            next_boundary = now.replace(second=0, microsecond=0)
+            next_min = ((now.minute // 15) + 1) * 15
+            if next_min >= 60:
+                next_boundary = next_boundary.replace(minute=0) + timedelta(hours=1)
             else:
-                return ("PB1", 2.50, 0.52)    # 55.6% WR
+                next_boundary = next_boundary.replace(minute=next_min)
+
+            window_ts = int(next_boundary.timestamp())
+
+            # ── T-15s: Fetch token IDs from Gamma API ──
+            import requests as _req
+            token_map = {}  # {asset: {"up_token": ..., "down_token": ..., "condition_id": ...}}
+            for target in snipe_targets:
+                asset = target["asset"]
+                slug = SNIPER_SLUGS[asset].format(window_ts)
+                try:
+                    r = _req.get("{}/markets/slug/{}".format(GAMMA_API, slug), timeout=8)
+                    if r.status_code == 200:
+                        md = r.json()
+                        tokens = md.get("clobTokenIds")
+                        if isinstance(tokens, str):
+                            try:
+                                import json as _json
+                                tokens = _json.loads(tokens)
+                            except:
+                                tokens = None
+                        outcomes = md.get("outcomes")
+                        if isinstance(outcomes, str):
+                            try:
+                                outcomes = _json.loads(outcomes)
+                            except:
+                                outcomes = None
+                        if tokens and isinstance(tokens, list) and len(tokens) >= 2 and outcomes:
+                            up_idx = 0
+                            if isinstance(outcomes, list) and len(outcomes) >= 2:
+                                o0 = str(outcomes[0]).lower().strip()
+                                if o0 in ("no", "down", "below"):
+                                    up_idx = 1
+                            down_idx = 1 - up_idx
+                            token_map[asset] = {
+                                "up_token": tokens[up_idx],
+                                "down_token": tokens[down_idx],
+                                "condition_id": md.get("conditionId", ""),
+                                "slug": slug,
+                                "title": md.get("question", slug),
+                            }
+                    else:
+                        # Market might not be deployed yet — try with path search
+                        r2 = _req.get("{}/markets?slug={}".format(GAMMA_API, slug), timeout=8)
+                        if r2.status_code == 200:
+                            results = r2.json()
+                            if isinstance(results, list) and len(results) > 0:
+                                md = results[0]
+                                tokens = md.get("clobTokenIds")
+                                if isinstance(tokens, str):
+                                    try: tokens = _json.loads(tokens)
+                                    except: tokens = None
+                                outcomes = md.get("outcomes")
+                                if isinstance(outcomes, str):
+                                    try: outcomes = _json.loads(outcomes)
+                                    except: outcomes = None
+                                if tokens and isinstance(tokens, list) and len(tokens) >= 2:
+                                    up_idx = 0
+                                    if isinstance(outcomes, list) and len(outcomes) >= 2:
+                                        o0 = str(outcomes[0]).lower().strip()
+                                        if o0 in ("no", "down", "below"):
+                                            up_idx = 1
+                                    down_idx = 1 - up_idx
+                                    token_map[asset] = {
+                                        "up_token": tokens[up_idx],
+                                        "down_token": tokens[down_idx],
+                                        "condition_id": md.get("conditionId", ""),
+                                        "slug": slug,
+                                        "title": md.get("question", slug),
+                                    }
+                except Exception as e:
+                    print("SNIPER fetch {} error: {}".format(asset, e))
+
+            if not token_map:
+                print("SNIPER: no markets found for boundary {} — tokens not deployed yet".format(window_ts))
+                _time.sleep(max(secs_to_boundary + 5, 5))
+                continue
+
+            # ── Wait until T+0 (exact boundary) ──
+            now2 = datetime.now(timezone.utc)
+            wait_secs = (next_boundary - now2).total_seconds()
+            if wait_secs > 0 and wait_secs < 120:
+                print("SNIPER: {} targets ready, waiting {:.1f}s for boundary...".format(len(token_map), wait_secs))
+                _time.sleep(max(wait_secs - 0.5, 0))  # Fire 0.5s early to account for network latency
+
+            # ── T+0: FIRE ALL ORDERS ──
+            client = _get_poly_client()
+            if not client:
+                print("SNIPER: no CLOB client — skipping")
+                _time.sleep(20)
+                continue
+
+            from py_clob_client_v2 import Side, OrderArgs, OrderType
+            BUY = Side.BUY
+
+            fired_count = 0
+            for target in snipe_targets:
+                asset = target["asset"]
+                if asset not in token_map:
+                    continue
+
+                market_key = "sniper_{}_{}_{}".format(asset, "15M", window_ts)
+                if market_key in _poly_alpha4_traded_markets:
+                    continue
+
+                stake = _poly_alpha4_calc_stake(_poly_alpha4_state["balance"])
+                if stake <= 0 or stake > _poly_alpha4_state["balance"]:
+                    continue
+
+                tdata = token_map[asset]
+                direction = target["direction"]
+                token_id = tdata["up_token"] if direction == "UP" else tdata["down_token"]
+
+                # Order at 50¢ — or check order book for best ask up to 52¢
+                order_price = 0.50
+                try:
+                    book = client.get_order_book(str(token_id))
+                    if book and book.get("asks") and len(book["asks"]) > 0:
+                        best_ask = round(float(book["asks"][0]["price"]), 2)
+                        if best_ask <= SNIPER_MAX_FILL:
+                            order_price = best_ask
+                        else:
+                            order_price = 0.50  # Place at 50¢ as maker
+                except:
+                    pass  # Order book not available yet — place at 50¢
+
+                shares = max(5.0, round(stake / order_price, 2))
+
+                try:
+                    oa = OrderArgs(token_id=str(token_id), price=round(order_price, 2), size=shares, side=BUY)
+                    signed = client.create_order(oa)
+                    resp = client.post_order(signed, OrderType.GTC)
+                    order_id = resp.get("orderID") or resp.get("order_id") if resp else None
+                    filled = (resp.get("status") or "").upper() in ("MATCHED", "FILLED") if resp else False
+
+                    # Update pool
+                    _poly_alpha4_state["balance"] = round(_poly_alpha4_state["balance"] - stake, 2)
+                    _poly_alpha4_state["trades_today"] += 1
+                    _poly_alpha4_traded_markets.add(market_key)
+                    if _poly_alpha4_state["balance"] > _poly_alpha4_state["peak_balance"]:
+                        _poly_alpha4_state["peak_balance"] = _poly_alpha4_state["balance"]
+
+                    # Save to DB
+                    try:
+                        c4 = get_db()
+                        c4.run("""INSERT INTO poly_alpha4_trades
+                            (market_id,title,asset,timeframe,bet_side,stake,fill_price,
+                             pool_after,order_id,token_id,condition_id,slug,filled,status,
+                             indicators,signals_agree,fired_at)
+                            VALUES(:mid,:ttl,:ast,:tf,:bs,:stake,:fill,:pool,:oid,:tid,:cid,:slg,:filled,'Pending',
+                                   :ind,:sa,:now)""",
+                            mid=market_key, ttl=tdata.get("title", ""),
+                            ast=asset, tf="15M", bs=direction, stake=stake,
+                            fill=round(order_price, 4), pool=_poly_alpha4_state["balance"],
+                            oid=order_id, tid=str(token_id)[:50],
+                            cid=tdata.get("condition_id", ""),
+                            slg=tdata.get("slug", ""),
+                            filled=filled,
+                            ind=target["indicators"],
+                            sa=target["signals_agree"],
+                            now=datetime.now(timezone.utc).isoformat())
+                        c4.close()
+                    except Exception as e:
+                        print("SNIPER DB save error: {}".format(e))
+
+                    fl_tag = "FILLED" if filled else "MAKER"
+                    print("SNIPER A4: {} {} 15M ${:.2f} @{:.0f}¢ [{}] {} | pool=${:.2f}".format(
+                        direction, asset, stake, order_price * 100,
+                        fl_tag, target["indicators"], _poly_alpha4_state["balance"]))
+                    send_telegram("🎯 <b>SNIPER A4</b>\n{} {} 15M ${:.2f} @{:.0f}¢\n{}\nPool: ${:.2f}".format(
+                        direction, asset, stake, order_price * 100,
+                        target["indicators"], _poly_alpha4_state["balance"]))
+
+                    fired_count += 1
+
+                except Exception as e:
+                    print("SNIPER order {} error: {}".format(asset, e))
+
+            if fired_count > 0:
+                print("SNIPER: fired {} orders at boundary {}".format(fired_count, window_ts))
+                _save_bot_balance("poly_alpha4", _poly_alpha4_state)
+            _save_bot_balance("limitless_sniper", _limitless_sniper_state)
+
+            # Sleep until next cycle (at least 60s to avoid double-firing)
+            _time.sleep(60)
+
+        except Exception as e:
+            print("SNIPER thread error: {}".format(e))
+            _time.sleep(30)
+
+
+def _resolve_poly_alpha4_trades():
+    """Resolve Alpha 4.0 sniper trades."""
+    try:
+        conn = get_db()
+        rows = conn.run("SELECT * FROM poly_alpha4_trades WHERE status='Pending' ORDER BY id")
+        cols = [c['name'] for c in conn.columns]
+        items = [dict(zip(cols, r)) for r in rows]
+        conn.close()
+        if not items: return 0
+        now = datetime.now(timezone.utc)
+        resolved = 0
+        for p in items:
+            try:
+                if not p.get("fired_at"): continue
+                fired = datetime.fromisoformat(p["fired_at"])
+                if fired.tzinfo is None: fired = fired.replace(tzinfo=timezone.utc)
+                # 15M window-based expiry
+                m15 = (fired.minute // 15) * 15
+                window_start = fired.replace(minute=m15, second=0, microsecond=0)
+                expiry = window_start + timedelta(minutes=15)
+                if now < expiry + timedelta(minutes=2): continue
+
+                stake = float(p.get("stake") or 2.50)
+                order_filled = p.get("filled", False)
+
+                # Unfilled → return stake
+                if not order_filled and now > expiry:
+                    _poly_alpha4_state["balance"] = round(_poly_alpha4_state["balance"] + stake, 2)
+                    c4 = get_db()
+                    c4.run("UPDATE poly_alpha4_trades SET status='Returned',outcome='RETURNED',resolved_at=:r WHERE id=:i",
+                           r=now.isoformat(), i=p["id"])
+                    c4.close()
+                    resolved += 1; continue
+
+                # Check resolution via Gamma API
+                won = None
+                slug = p.get("slug", "")
+                bs = p.get("bet_side", "UP")
+                try:
+                    import requests as req
+                    if slug:
+                        r = req.get("{}/markets/slug/{}".format(POLY_GAMMA_API, slug), timeout=8)
+                        if r.status_code == 200:
+                            md = r.json()
+                            ops = md.get("outcomePrices")
+                            if isinstance(ops, str):
+                                try: ops = json.loads(ops)
+                                except: ops = None
+                            if isinstance(ops, list) and len(ops) >= 2:
+                                p0 = float(ops[0]); p1 = float(ops[1])
+                                _oc = md.get("outcomes")
+                                if isinstance(_oc, str):
+                                    try: _oc = json.loads(_oc)
+                                    except: _oc = None
+                                _up_idx = 0
+                                if isinstance(_oc, list) and len(_oc) >= 2:
+                                    o0 = str(_oc[0]).lower().strip()
+                                    if o0 in ("no", "down", "below"): _up_idx = 1
+                                if _up_idx == 0:
+                                    if p0 >= 0.95: won = (bs == "UP")
+                                    elif p1 >= 0.95: won = (bs == "DOWN")
+                                else:
+                                    if p1 >= 0.95: won = (bs == "UP")
+                                    elif p0 >= 0.95: won = (bs == "DOWN")
+                except: pass
+
+                if won is None:
+                    if now > expiry + timedelta(hours=1): won = False
+                    else: continue
+
+                fill = float(p.get("fill_price") or 0.50)
+                payout = round(stake / fill, 4) if won else 0
+                status = "Won" if won else "Lost"
+
+                c4 = get_db()
+                c4.run("UPDATE poly_alpha4_trades SET status=:s,outcome=:o,resolved_at=:r,payout=:p,filled=TRUE WHERE id=:i",
+                       s=status, o="WIN" if won else "LOSS", r=now.isoformat(), p=payout, i=p["id"])
+                c4.close()
+                resolved += 1
+
+                if won:
+                    _poly_alpha4_state["balance"] = round(_poly_alpha4_state["balance"] + payout, 2)
+                    _poly_alpha4_state["wins_today"] += 1
+                    _poly_alpha4_state["profit_today"] = round(_poly_alpha4_state["profit_today"] + (payout - stake), 2)
+                else:
+                    _poly_alpha4_state["losses_today"] += 1
+                    _poly_alpha4_state["profit_today"] = round(_poly_alpha4_state["profit_today"] - stake, 2)
+
+                if _poly_alpha4_state["balance"] > _poly_alpha4_state["peak_balance"]:
+                    _poly_alpha4_state["peak_balance"] = _poly_alpha4_state["balance"]
+                if _poly_alpha4_state["balance"] <= _poly_alpha4_state["floor_balance"]:
+                    _poly_alpha4_state["enabled"] = False
+                    send_telegram("🚨 SNIPER A4 STOPPED — Floor ${:.2f}".format(_poly_alpha4_state["balance"]))
+
+                _pnl = "+${:.2f}".format(payout - stake) if won else "-${:.2f}".format(stake)
+                print("SNIPER A4 #{} {}: ${:.2f} → {} | pool=${:.2f}".format(
+                    p["id"], "WIN" if won else "LOSS", stake, _pnl, _poly_alpha4_state["balance"]))
+
+            except Exception as e:
+                print("SNIPER A4 resolve error #{}: {}".format(p.get("id"), e))
+        return resolved
+    except Exception as e:
+        print("SNIPER A4 resolve error: {}".format(e))
+        return 0
+
+
+
+# ═══════════════════════════════════════════════════════════
+# LIMITLESS SNIPER — P2.1 at Window Boundary + P2.3 Momentum Carry-Over
+# Two-tier staking: HIGH (P2.1 + momentum agree) vs BASE (P2.1 only)
+# Fires at exact :00/:15/:30/:45 on Limitless CLOB at 50¢
+# ═══════════════════════════════════════════════════════════
+
+_limitless_sniper_state = {
+    "enabled": True,
+    "balance": 30.0,
+    "peak_balance": 30.0,
+    "starting_balance": 30.0,
+    "floor_balance": 5.0,
+    "trades_today": 0,
+    "wins_today": 0,
+    "losses_today": 0,
+    "profit_today": 0.0,
+}
+_limitless_sniper_traded = set()
+_limitless_prev_momentum = {}  # {asset: {"direction": "BUY"/"SELL", "confirmed": True/False}}
+
+def _limitless_sniper_stake(pool, tier):
+    """Tier 1 (HIGH): 2.5% of pool. Tier 2 (BASE): 2% of pool."""
+    if tier == "HIGH":
+        stake = round(pool * 0.025, 2)
+        stake = max(stake, 1.25)
+        stake = min(stake, 7.50)
+    else:
+        stake = round(pool * 0.02, 2)
+        stake = max(stake, 1.00)
+        stake = min(stake, 5.00)
+    if stake > pool * 0.10:
+        return 0
+    return stake
+
+def _limitless_sniper_get_momentum(asset):
+    """Check if previous window had P2.3-confirmed momentum for this asset.
+    Returns ("BUY"/"SELL", True) if P2.3 confirmed, ("BUY"/"SELL", False) if only P2.1.
+    """
+    return _limitless_prev_momentum.get(asset.upper(), {}).get("direction"), \
+           _limitless_prev_momentum.get(asset.upper(), {}).get("confirmed", False)
+
+def _limitless_update_momentum(asset, direction, p23_confirmed):
+    """Update momentum cache at end of each window."""
+    _limitless_prev_momentum[asset.upper()] = {
+        "direction": direction,
+        "confirmed": p23_confirmed,
+    }
+
+def _limitless_sniper_thread():
+    """Limitless sniper — fires at exact 15M window boundaries.
+    Uses P2.1 direction + P2.3 momentum carry-over for two-tier staking.
+    """
+    import time as _time
+    import requests as _req
+    from eth_account import Account as _Account
+    from eth_account.messages import encode_typed_data as _encode_typed_data
+    from web3 import Web3 as _Web3
+
+    SNIPER_ASSETS = ["BTC", "ETH", "SOL", "XRP"]
+    CHAIN_ID = 8453  # Base
+    ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
+    MAX_FILL = 0.52  # 52¢ max
+
+    print("LIMITLESS SNIPER THREAD STARTED — waiting for first boundary...")
+
+    while True:
+        try:
+            if not _limitless_sniper_state["enabled"]:
+                _time.sleep(30)
+                continue
+
+            if not LIMITLESS_TOKEN_ID or not LIMITLESS_PRIV_KEY:
+                _time.sleep(30)
+                continue
+
+            # ── Calculate time to next 15M boundary ──
+            now = datetime.now(timezone.utc)
+            current_minute = now.minute
+            current_second = now.second
+
+            mins_to_next = 15 - (current_minute % 15)
+            if mins_to_next == 15:
+                mins_to_next = 0
+            secs_to_boundary = mins_to_next * 60 - current_second
+
+            if secs_to_boundary > 35:
+                _time.sleep(min(secs_to_boundary - 35, 60))
+                continue
+
+            # ── T-30s: Read indicators for all assets ──
+            snipe_targets = []
+            for asset in SNIPER_ASSETS:
+                direction, signals_agree, ind_str = _sniper_get_direction(asset)
+                if direction and signals_agree >= 2:
+                    # Check momentum carry-over from previous window
+                    prev_dir, prev_confirmed = _limitless_sniper_get_momentum(asset)
+                    
+                    if prev_dir == ("BUY" if direction == "UP" else "SELL") and prev_confirmed:
+                        tier = "HIGH"  # P2.1 + P2.3 momentum agree
+                    else:
+                        tier = "BASE"  # P2.1 only
+                    
+                    snipe_targets.append({
+                        "asset": asset,
+                        "direction": direction,
+                        "signals_agree": signals_agree,
+                        "indicators": ind_str,
+                        "tier": tier,
+                    })
+
+            if not snipe_targets:
+                _time.sleep(max(secs_to_boundary + 5, 5))
+                continue
+
+            # ── T-20s: Find Limitless 15M markets from /markets/active ──
+            market_data = {}
+            _lmts_headers = {
+                "X-API-Key": LIMITLESS_TOKEN_ID,
+                "Content-Type": "application/json",
+            }
+            target_assets = set(t["asset"] for t in snipe_targets)
+
+            try:
+                r = _req.get("{}/markets/active".format(LIMITLESS_API),
+                             headers=_lmts_headers, timeout=10)
+                if r.status_code == 200:
+                    all_markets = r.json()
+                    if isinstance(all_markets, list):
+                        for m in all_markets:
+                            slug = m.get("slug", "")
+                            stable = m.get("stableSlug", "")
+                            title = m.get("title", "") or m.get("question", "")
+                            # Match 15M markets
+                            if "15min" not in stable.lower() and "15min" not in slug.lower():
+                                continue
+                            if not m.get("positionIds") or len(m.get("positionIds", [])) < 2:
+                                continue
+                            venue = m.get("venue", {})
+                            if not venue or not venue.get("exchange"):
+                                continue
+                            # Match asset
+                            title_upper = title.upper()
+                            slug_lower = slug.lower()
+                            matched_asset = None
+                            for ast_name in target_assets:
+                                if ast_name.lower() in slug_lower or ast_name in title_upper:
+                                    matched_asset = ast_name
+                                    break
+                            if matched_asset and matched_asset not in market_data:
+                                market_data[matched_asset] = {
+                                    "slug": slug,
+                                    "title": title,
+                                    "venue_exchange": venue["exchange"],
+                                    "position_ids": m["positionIds"],
+                                }
+                else:
+                    print("LMTS SNIPER: /markets/active returned {}".format(r.status_code))
+            except Exception as e:
+                print("LMTS SNIPER market fetch error: {}".format(e))
+
+            if not market_data:
+                print("LMTS SNIPER: no markets found — skipping boundary")
+                _time.sleep(max(secs_to_boundary + 5, 5))
+                continue
+
+            # ── Wait until T+0 ──
+            next_boundary = now.replace(second=0, microsecond=0)
+            next_min = ((now.minute // 15) + 1) * 15
+            if next_min >= 60:
+                next_boundary = next_boundary.replace(minute=0) + timedelta(hours=1)
+            else:
+                next_boundary = next_boundary.replace(minute=next_min)
+
+            now2 = datetime.now(timezone.utc)
+            wait_secs = (next_boundary - now2).total_seconds()
+            if 0 < wait_secs < 120:
+                print("LMTS SNIPER: {} targets ready, waiting {:.1f}s...".format(len(market_data), wait_secs))
+                _time.sleep(max(wait_secs - 0.5, 0))
+
+            # ── T+0: FIRE ORDERS ──
+            account = _Account.from_key(LIMITLESS_PRIV_KEY)
+            maker_address = account.address
+            fired_count = 0
+
+            for target in snipe_targets:
+                asset = target["asset"]
+                if asset not in market_data:
+                    continue
+
+                mkt = market_data[asset]
+                market_key = "lmts_sniper_{}_15M_{}".format(asset, int(next_boundary.timestamp()))
+                if market_key in _limitless_sniper_traded:
+                    continue
+
+                tier = target["tier"]
+                stake = _limitless_sniper_stake(_limitless_sniper_state["balance"], tier)
+                if stake <= 0 or stake > _limitless_sniper_state["balance"]:
+                    continue
+
+                direction = target["direction"]
+                # YES = positionIds[0], NO = positionIds[1]
+                token_id = mkt["position_ids"][0] if direction == "UP" else mkt["position_ids"][1]
+                order_price = 0.50
+
+                # Build order
+                import time as _t2
+                num_shares = stake / order_price
+                maker_amount = int(order_price * num_shares * 1e6)  # USDC
+                taker_amount = int(num_shares * 1e6)  # Shares
+                salt = int(_t2.time() * 1000)
+
+                order_data = {
+                    "salt": salt,
+                    "maker": _Web3.to_checksum_address(maker_address),
+                    "signer": _Web3.to_checksum_address(maker_address),
+                    "taker": ZERO_ADDRESS,
+                    "tokenId": int(token_id),
+                    "makerAmount": maker_amount,
+                    "takerAmount": taker_amount,
+                    "expiration": 0,
+                    "nonce": 0,
+                    "feeRateBps": 0,
+                    "side": 0,  # BUY
+                    "signatureType": 0,  # EOA
+                }
+
+                # EIP-712 sign
+                try:
+                    domain = {
+                        "name": "Limitless CTF Exchange",
+                        "version": "1",
+                        "chainId": CHAIN_ID,
+                        "verifyingContract": _Web3.to_checksum_address(mkt["venue_exchange"]),
+                    }
+                    types = {
+                        "EIP712Domain": [
+                            {"name": "name", "type": "string"},
+                            {"name": "version", "type": "string"},
+                            {"name": "chainId", "type": "uint256"},
+                            {"name": "verifyingContract", "type": "address"},
+                        ],
+                        "Order": [
+                            {"name": "salt", "type": "uint256"},
+                            {"name": "maker", "type": "address"},
+                            {"name": "signer", "type": "address"},
+                            {"name": "taker", "type": "address"},
+                            {"name": "tokenId", "type": "uint256"},
+                            {"name": "makerAmount", "type": "uint256"},
+                            {"name": "takerAmount", "type": "uint256"},
+                            {"name": "expiration", "type": "uint256"},
+                            {"name": "nonce", "type": "uint256"},
+                            {"name": "feeRateBps", "type": "uint256"},
+                            {"name": "side", "type": "uint8"},
+                            {"name": "signatureType", "type": "uint8"},
+                        ],
+                    }
+                    typed_data = {
+                        "types": types,
+                        "primaryType": "Order",
+                        "domain": domain,
+                        "message": order_data,
+                    }
+                    encoded = _encode_typed_data(typed_data)
+                    signed = _Account.sign_message(encoded, private_key=LIMITLESS_PRIV_KEY)
+                    signature = signed.signature.hex()
+
+                    # Get owner ID
+                    owner_id = 0
+                    try:
+                        pr = _req.get("{}/profiles/{}".format(LIMITLESS_API, maker_address), headers=headers, timeout=8)
+                        if pr.status_code == 200:
+                            owner_id = pr.json().get("id", 0)
+                    except:
+                        pass
+
+                    # Submit order
+                    order_payload = {
+                        "order": {**order_data, "signature": signature},
+                        "ownerId": owner_id,
+                        "orderType": "GTC",
+                        "marketSlug": mkt["slug"],
+                    }
+                    resp = _req.post(
+                        "{}/orders".format(LIMITLESS_API),
+                        headers=headers,
+                        json=order_payload,
+                        timeout=10,
+                    )
+
+                    order_id = None
+                    filled = False
+                    if resp.status_code in (200, 201):
+                        rdata = resp.json()
+                        order_id = rdata.get("id") or rdata.get("orderId")
+                        filled = rdata.get("status", "").upper() in ("MATCHED", "FILLED")
+
+                    # Update pool
+                    _limitless_sniper_state["balance"] = round(_limitless_sniper_state["balance"] - stake, 2)
+                    _limitless_sniper_state["trades_today"] += 1
+                    _limitless_sniper_traded.add(market_key)
+                    if _limitless_sniper_state["balance"] > _limitless_sniper_state["peak_balance"]:
+                        _limitless_sniper_state["peak_balance"] = _limitless_sniper_state["balance"]
+
+                    # Save to DB
+                    try:
+                        c_lmts = get_db()
+                        c_lmts.run("""INSERT INTO limitless_sniper_trades
+                            (market_id,title,asset,timeframe,bet_side,tier,stake,fill_price,
+                             pool_after,order_id,slug,filled,status,indicators,signals_agree,fired_at)
+                            VALUES(:mid,:ttl,:ast,:tf,:bs,:tier,:stake,:fill,:pool,:oid,:slg,:filled,'Pending',
+                                   :ind,:sa,:now)""",
+                            mid=market_key, ttl=mkt.get("title",""), ast=asset,
+                            tf="15M", bs=direction, tier=tier, stake=stake,
+                            fill=round(order_price, 4), pool=_limitless_sniper_state["balance"],
+                            oid=str(order_id or ""), slg=mkt.get("slug",""),
+                            filled=filled, ind=target["indicators"],
+                            sa=target["signals_agree"],
+                            now=datetime.now(timezone.utc).isoformat())
+                        c_lmts.close()
+                    except Exception as e:
+                        print("LMTS SNIPER DB error: {}".format(e))
+
+                    fl_tag = "FILLED" if filled else "MAKER"
+                    print("LMTS SNIPER: {} {} {} 15M ${:.2f} @50¢ [{}] {} | pool=${:.2f}".format(
+                        tier, direction, asset, stake, fl_tag,
+                        target["indicators"], _limitless_sniper_state["balance"]))
+                    send_telegram("🎯 <b>LMTS SNIPER</b>\n{} {} {} ${:.2f} @50¢\n{}\nPool: ${:.2f}".format(
+                        tier, direction, asset, stake,
+                        target["indicators"], _limitless_sniper_state["balance"]))
+
+                    fired_count += 1
+
+                except Exception as e:
+                    print("LMTS SNIPER order {} error: {}".format(asset, e))
+
+            if fired_count > 0:
+                print("LMTS SNIPER: fired {} orders at boundary".format(fired_count))
+                _save_bot_balance("limitless_sniper", _limitless_sniper_state)
+
+            # Update momentum cache for next window
+            for target in snipe_targets:
+                asset = target["asset"]
+                p21_dir = "BUY" if target["direction"] == "UP" else "SELL"
+                # Check if P2.3 would have confirmed this direction
+                # (P2.3 uses distance math — if signals are strong, momentum is confirmed)
+                p23_confirmed = target["signals_agree"] >= 3
+                _limitless_update_momentum(asset, p21_dir, p23_confirmed)
+
+            _time.sleep(60)
+
+        except Exception as e:
+            print("LMTS SNIPER thread error: {}".format(e))
+            _time.sleep(30)
+
+
+
+def _resolve_limitless_sniper_trades():
+    """Resolve Limitless sniper trades using Limitless API."""
+    try:
+        conn = get_db()
+        rows = conn.run("SELECT * FROM limitless_sniper_trades WHERE status='Pending' ORDER BY id")
+        cols = [c['name'] for c in conn.columns]
+        items = [dict(zip(cols, r)) for r in rows]
+        conn.close()
+        if not items: return 0
+        now = datetime.now(timezone.utc)
+        resolved = 0
+        for p in items:
+            try:
+                if not p.get("fired_at"): continue
+                fired = datetime.fromisoformat(p["fired_at"])
+                if fired.tzinfo is None: fired = fired.replace(tzinfo=timezone.utc)
+                m15 = (fired.minute // 15) * 15
+                window_start = fired.replace(minute=m15, second=0, microsecond=0)
+                expiry = window_start + timedelta(minutes=15)
+                if now < expiry + timedelta(minutes=2): continue
+                stake = float(p.get("stake") or 1.0)
+                order_filled = p.get("filled", False)
+                if not order_filled and now > expiry:
+                    _limitless_sniper_state["balance"] = round(_limitless_sniper_state["balance"] + stake, 2)
+                    c = get_db()
+                    c.run("UPDATE limitless_sniper_trades SET status='Returned',outcome='RETURNED',resolved_at=:r WHERE id=:i", r=now.isoformat(), i=p["id"])
+                    c.close()
+                    resolved += 1; continue
+                # Check resolution via Limitless API
+                won = None
+                slug = p.get("slug", "")
+                bs = p.get("bet_side", "UP")
+                try:
+                    import requests as req
+                    if slug:
+                        hdrs = {"X-API-Key": LIMITLESS_TOKEN_ID, "Content-Type": "application/json"}
+                        r = req.get("{}/markets/{}".format(LIMITLESS_API, slug), headers=hdrs, timeout=10)
+                        if r.status_code == 200:
+                            md = r.json()
+                            status = md.get("status", "").lower()
+                            if status in ("resolved", "closed"):
+                                winner = md.get("winner", "").lower()
+                                if winner == "yes": won = (bs == "UP")
+                                elif winner == "no": won = (bs == "DOWN")
+                            elif md.get("outcomePrices"):
+                                ops = md["outcomePrices"]
+                                if isinstance(ops, str):
+                                    try: ops = json.loads(ops)
+                                    except: ops = None
+                                if isinstance(ops, list) and len(ops) >= 2:
+                                    p0 = float(ops[0]); p1 = float(ops[1])
+                                    if p0 >= 0.95: won = (bs == "UP")
+                                    elif p1 >= 0.95: won = (bs == "DOWN")
+                except: pass
+                if won is None:
+                    if now > expiry + timedelta(hours=1): won = False
+                    else: continue
+                fill = float(p.get("fill_price") or 0.50)
+                payout = round(stake / fill, 4) if won else 0
+                status_str = "Won" if won else "Lost"
+                c = get_db()
+                c.run("UPDATE limitless_sniper_trades SET status=:s,outcome=:o,resolved_at=:r,payout=:p,filled=TRUE WHERE id=:i",
+                      s=status_str, o="WIN" if won else "LOSS", r=now.isoformat(), p=payout, i=p["id"])
+                c.close()
+                resolved += 1
+                if won:
+                    _limitless_sniper_state["balance"] = round(_limitless_sniper_state["balance"] + payout, 2)
+                    _limitless_sniper_state["wins_today"] += 1
+                    _limitless_sniper_state["profit_today"] = round(_limitless_sniper_state["profit_today"] + (payout - stake), 2)
+                else:
+                    _limitless_sniper_state["losses_today"] += 1
+                    _limitless_sniper_state["profit_today"] = round(_limitless_sniper_state["profit_today"] - stake, 2)
+                if _limitless_sniper_state["balance"] > _limitless_sniper_state["peak_balance"]:
+                    _limitless_sniper_state["peak_balance"] = _limitless_sniper_state["balance"]
+                if _limitless_sniper_state["balance"] <= _limitless_sniper_state["floor_balance"]:
+                    _limitless_sniper_state["enabled"] = False
+                    send_telegram("LMTS SNIPER STOPPED — Floor ${:.2f}".format(_limitless_sniper_state["balance"]))
+                _pnl = "+${:.2f}".format(payout - stake) if won else "-${:.2f}".format(stake)
+                print("LMTS SNIPER #{} {}: ${:.2f} {} | pool=${:.2f}".format(p["id"], "WIN" if won else "LOSS", stake, _pnl, _limitless_sniper_state["balance"]))
+            except Exception as e:
+                print("LMTS SNIPER resolve error #{}: {}".format(p.get("id"), e))
+        return resolved
+    except Exception as e:
+        print("LMTS SNIPER resolve error: {}".format(e)); return 0
+
+def _poly_alpha_get_tier(asset, timeframe, p23_agrees=False):
+    """Poly Alpha v1 — PAUSED. Use Poly Alpha 2.0 instead."""
     return None
 
 def _poly_alpha_calc_stake(base_stake, pool_balance):
@@ -1125,6 +2040,29 @@ def init_db():
             fired_at TEXT, resolved_at TEXT, slug TEXT
         )
     """)
+    # Paper 2.8: P2.1 + Candle-at-Baseline (15M only)
+    conn.run("""
+        CREATE TABLE IF NOT EXISTS paper28_trades (
+            id SERIAL PRIMARY KEY, market_id TEXT, title TEXT, asset TEXT,
+            direction TEXT, baseline REAL, bet_odds REAL, bet_side TEXT,
+            current_price REAL, hours_left REAL, market_type TEXT,
+            indicators TEXT, score INTEGER, total_signals INTEGER,
+            simulated_stake REAL DEFAULT 1.0, simulated_payout REAL,
+            status TEXT DEFAULT 'Pending', outcome TEXT,
+            fired_at TEXT, resolved_at TEXT, slug TEXT
+        )
+    """)
+    conn.run("""
+        CREATE TABLE IF NOT EXISTS paper29_trades (
+            id SERIAL PRIMARY KEY, market_id TEXT, title TEXT, asset TEXT,
+            direction TEXT, baseline REAL, bet_odds REAL, bet_side TEXT,
+            current_price REAL, hours_left REAL, market_type TEXT,
+            indicators TEXT, score INTEGER, total_signals INTEGER,
+            simulated_stake REAL DEFAULT 1.0, simulated_payout REAL,
+            status TEXT DEFAULT 'Pending', outcome TEXT,
+            fired_at TEXT, resolved_at TEXT, slug TEXT
+        )
+    """)
     # ─── ALPHA unified trading system table ───
     conn.run("""
         CREATE TABLE IF NOT EXISTS alpha_trades (
@@ -1185,6 +2123,41 @@ def init_db():
             fired_at TEXT, resolved_at TEXT
         )
     """)
+    conn.run("""
+        CREATE TABLE IF NOT EXISTS poly_alpha3_trades (
+            id SERIAL PRIMARY KEY,
+            market_id TEXT, title TEXT, asset TEXT, timeframe TEXT,
+            bet_side TEXT, stake REAL, fill_price REAL,
+            pool_after REAL, payout REAL, order_id TEXT, token_id TEXT,
+            condition_id TEXT, slug TEXT, filled BOOLEAN DEFAULT FALSE,
+            status TEXT DEFAULT 'Pending', outcome TEXT,
+            fired_at TEXT, resolved_at TEXT
+        )
+    """)
+    conn.run("""
+        CREATE TABLE IF NOT EXISTS poly_alpha4_trades (
+            id SERIAL PRIMARY KEY,
+            market_id TEXT, title TEXT, asset TEXT, timeframe TEXT,
+            bet_side TEXT, stake REAL, fill_price REAL,
+            pool_after REAL, payout REAL, order_id TEXT, token_id TEXT,
+            condition_id TEXT, slug TEXT, filled BOOLEAN DEFAULT FALSE,
+            status TEXT DEFAULT 'Pending', outcome TEXT,
+            indicators TEXT, signals_agree INTEGER,
+            fired_at TEXT, resolved_at TEXT
+        )
+    """)
+    conn.run("""
+        CREATE TABLE IF NOT EXISTS limitless_sniper_trades (
+            id SERIAL PRIMARY KEY,
+            market_id TEXT, title TEXT, asset TEXT, timeframe TEXT,
+            bet_side TEXT, tier TEXT, stake REAL, fill_price REAL,
+            pool_after REAL, payout REAL, order_id TEXT, slug TEXT,
+            filled BOOLEAN DEFAULT FALSE,
+            status TEXT DEFAULT 'Pending', outcome TEXT,
+            indicators TEXT, signals_agree INTEGER,
+            fired_at TEXT, resolved_at TEXT
+        )
+    """)
     # Polymarket paper trades — single table for all sections/strategies
     conn.run("""
         CREATE TABLE IF NOT EXISTS poly_trades (
@@ -1228,6 +2201,7 @@ def send_telegram(message):
     _allowed = any(k in message for k in [
         "ALPHA", "Alpha", "alpha",           # All Alpha trade/resolution messages (Limitless + Poly)
         "POLY",                              # Polymarket Alpha notifications
+        "SNIPER", "Sniper", "LMTS",                  # Sniper Alpha 4.0 notifications
         "Auto-trading", "Kill switch",        # System control alerts
         "Auto-redeemed", "Redeemed",          # Redemption confirmations
         "Bot v4", "LIVE",                     # Startup message
@@ -2791,8 +3765,8 @@ def _execute_poly_trade(condition_id, token_id, side, stake, price):
             return False
 
         try:
-            from py_clob_client.order_builder.constants import BUY
-            from py_clob_client.clob_types import OrderArgs, MarketOrderArgs, OrderType
+            from py_clob_client_v2 import Side, OrderArgs, OrderType
+            BUY = Side.BUY
         except ImportError:
             from py_clob_client_v2 import Side, OrderArgs, OrderType
             BUY = Side.BUY
@@ -4171,18 +5145,18 @@ def _fast_trade_scan():
                         except:
                             pass
                     
-                    # ── ALPHA 1H: SOL and DOGE only ──
-                    # Paper trades still recorded above for all assets
-                    if asset in ("SOL", "DOGE") and parsed["market_id"] not in _alpha_traded_markets and _alpha_state["enabled"]:
-                        # Use P2.4 signal as primary (better 1H results)
-                        _h_scored = scored24 or scored34
+                    # ── ALPHA 1H: Model C — All 5 assets, $2 flat, P2.4 filter ──
+                    if asset in ("BTC", "ETH", "SOL", "XRP", "DOGE") and parsed["market_id"] not in _alpha_traded_markets and _alpha_state["enabled"]:
+                        # P2.4 signal required (65% WR over 510 trades)
+                        _h_scored = scored24
                         if _h_scored:
                             _h_side = _h_scored["bet_side"]
-                            _h_base = 1.00  # Both SOL and DOGE at $1.00 base
-                            _h_tier = "T2H" if asset == "SOL" else "T3H"
-                            _h_max_fill = 0.68 if asset == "SOL" else 0.64
-                            _h_scale = max(_alpha_state["balance"] / 100.0, 0.5)
-                            _h_stake = round(min(_h_base * _h_scale, _alpha_state["balance"] * 0.025), 2)
+                            _h_base = 2.00  # Model C: flat $2.00 for all assets
+                            _h_tier = "T1H"
+                            _h_max_fill = 0.70
+                            _h_stake = _h_base
+                            # Cap at 5% of pool
+                            _h_stake = min(_h_stake, round(_alpha_state["balance"] * 0.05, 2))
                             _h_stake = max(_h_stake, 1.00)
                             
                             if _alpha_state["balance"] > _alpha_state["floor_balance"] and \
@@ -4978,6 +5952,9 @@ def scan_loop():
             # Save Poly Alpha pool state
             _save_bot_balance("poly_alpha", _poly_alpha_state)
             _save_bot_balance("poly_alpha2", _poly_alpha2_state)
+            _save_bot_balance("poly_alpha3", _poly_alpha3_state)
+            _save_bot_balance("poly_alpha4", _poly_alpha4_state)
+            _save_bot_balance("limitless_sniper", _limitless_sniper_state)
         except Exception as e:
             print("Balance save error: {}".format(e))
         
@@ -5580,6 +6557,8 @@ def _calculate_indicators(asset, timeframe="1h"):
             "candle_open": candle_open,
             "_closes": closes.tolist() if hasattr(closes, 'tolist') else list(closes),
             "_opens": opens.tolist() if hasattr(opens, 'tolist') else list(opens),
+            "_highs": highs.tolist() if hasattr(highs, 'tolist') else list(highs),
+            "_lows": lows.tolist() if hasattr(lows, 'tolist') else list(lows),
         }
 
         _indicator_cache[cache_key] = {"data": result, "updated": datetime.now(timezone.utc)}
@@ -6721,8 +7700,8 @@ def _score_paper23_trade(p, price, indicators=None, ind_macro=None, expiry_minut
     if scored is None:
         return None
 
-    # Only 15M trades
-    if scored["market_type"] != "15M":
+    # 15M and 1H only (5M too noisy, Daily not applicable)
+    if scored["market_type"] not in ("15M", "1H"):
         return None
 
     # Get distance data from indicators
@@ -6864,6 +7843,487 @@ def _score_paper27_trade(p, price, indicators=None, ind_macro=None, expiry_minut
         "confidence": confidence, "indicators": ind_str,
         "market_type": scored["market_type"], "sim_payout": scored["sim_payout"],
     }
+
+# ═══════════════════════════════════════════════════════════
+# PAPER 2.8: P2.3 + Candle Contradiction Filter — 15M ONLY
+#
+# Simple concept: Run P2.3 first. If P2.3 says trade, check
+# the previous completed candle. If the candle CONTRADICTS
+# P2.3's direction, SKIP. Otherwise, TAKE the trade.
+#
+# Goal: Keep P2.3's 77% wins, filter out the 23% losses where
+# the candle was screaming the opposite direction.
+#
+# P2.3 says DOWN + prev candle = hammer        → SKIP
+# P2.3 says DOWN + prev candle = bear trap     → SKIP
+# P2.3 says DOWN + prev candle = strong green  → SKIP
+# P2.3 says DOWN + prev candle = anything else → TAKE
+#
+# P2.3 says UP + prev candle = shooting star   → SKIP
+# P2.3 says UP + prev candle = bull trap       → SKIP
+# P2.3 says UP + prev candle = strong red      → SKIP
+# P2.3 says UP + prev candle = anything else   → TAKE
+# ═══════════════════════════════════════════════════════════
+
+def _fetch_binance_candles_small(asset, interval="15m", limit=10):
+    """Fetch candles from Binance — works with any limit (no min-20 check)."""
+    import requests as req
+    BMAP = {"BTC": "BTCUSDT", "ETH": "ETHUSDT", "SOL": "SOLUSDT",
+            "XRP": "XRPUSDT", "DOGE": "DOGEUSDT"}
+    symbol = BMAP.get(asset.upper())
+    if not symbol:
+        return None
+    try:
+        r = req.get("https://api.binance.com/api/v3/klines",
+                     params={"symbol": symbol, "interval": interval, "limit": limit},
+                     timeout=3)
+        if r.status_code != 200:
+            return None
+        klines = r.json()
+        if not klines or len(klines) < 2:
+            return None
+        candles = []
+        for k in klines:
+            candles.append({
+                "ts": int(k[0]),
+                "open": float(k[1]),
+                "high": float(k[2]),
+                "low": float(k[3]),
+                "close": float(k[4]),
+                "volume": float(k[5]),
+            })
+        return candles
+    except Exception as e:
+        print("P28 Binance error {} {}: {}".format(asset, interval, e))
+        return None
+
+
+def _p28_read_prev_candle(asset, tf="15m"):
+    """Fetch the most recently completed candle and read its pattern.
+    tf: "5m", "15m", or "1h"
+    Primary: Binance API. Fallback: yfinance indicator cache.
+    Returns: dict with pattern name and key metrics, or None on failure.
+    """
+    tf_mins = {"5m": 5, "15m": 15, "1h": 60}.get(tf, 15)
+    
+    # Try Binance first
+    candles = _fetch_binance_candles_small(asset, tf, 4)
+    
+    # Fallback: extract from yfinance indicator cache (already fetched by scanner)
+    if not candles or len(candles) < 2:
+        try:
+            ind = _calculate_indicators(asset, tf)
+            if ind and ind.get("_opens") and ind.get("_closes") and ind.get("_highs") and ind.get("_lows"):
+                opens = ind["_opens"]
+                closes = ind["_closes"]
+                highs = ind["_highs"]
+                lows = ind["_lows"]
+                if len(opens) >= 2:
+                    # Use the second-to-last candle (last completed)
+                    candles = []
+                    for i in range(-3, 0):
+                        if abs(i) <= len(opens):
+                            candles.append({
+                                "ts": 0,  # Not needed for pattern reading
+                                "open": opens[i],
+                                "high": highs[i],
+                                "low": lows[i],
+                                "close": closes[i],
+                            })
+        except:
+            pass
+    
+    if not candles or len(candles) < 2:
+        return None
+    
+    from datetime import datetime, timezone
+    now_ts = int(datetime.now(timezone.utc).timestamp() * 1000)
+    
+    # If from Binance, filter to completed candles
+    if candles[0].get("ts", 0) > 0:
+        completed = []
+        for c in candles:
+            candle_close_ts = c["ts"] + (tf_mins * 60 * 1000)
+            if candle_close_ts <= now_ts:
+                completed.append(c)
+        if not completed:
+            return None
+        prev = completed[-1]
+    else:
+        # From yfinance cache — second-to-last is the last completed
+        prev = candles[-2]
+    o, h, l, c = prev["open"], prev["high"], prev["low"], prev["close"]
+    
+    body = abs(c - o)
+    total_range = h - l
+    
+    if total_range == 0:
+        return {"pattern": "doji", "body_ratio": 0, "upper_wick_ratio": 0,
+                "lower_wick_ratio": 0, "is_green": False, "is_red": False}
+    
+    upper_wick = h - max(o, c)
+    lower_wick = min(o, c) - l
+    body_ratio = body / total_range
+    upper_wick_ratio = upper_wick / total_range
+    lower_wick_ratio = lower_wick / total_range
+    is_green = c > o
+    is_red = c < o
+    
+    pattern = "unclear"
+    
+    if body_ratio < 0.1:
+        pattern = "doji"
+    elif lower_wick_ratio > 0.6 and body_ratio < 0.35:
+        pattern = "hammer"
+    elif upper_wick_ratio > 0.6 and body_ratio < 0.35:
+        pattern = "shooting_star"
+    elif is_green and upper_wick > body * 2 and upper_wick_ratio > 0.45:
+        pattern = "bull_trap"
+    elif is_red and lower_wick > body * 2 and lower_wick_ratio > 0.45:
+        pattern = "bear_trap"
+    elif is_red and body_ratio > 0.7:
+        pattern = "red_no_lower_wick" if lower_wick_ratio < 0.05 else "strong_red"
+    elif is_green and body_ratio > 0.7:
+        pattern = "green_no_upper_wick" if upper_wick_ratio < 0.05 else "strong_green"
+    elif is_red and body_ratio > 0.4:
+        pattern = "moderate_red"
+    elif is_green and body_ratio > 0.4:
+        pattern = "moderate_green"
+    
+    return {
+        "pattern": pattern,
+        "body_ratio": round(body_ratio, 2),
+        "upper_wick_ratio": round(upper_wick_ratio, 2),
+        "lower_wick_ratio": round(lower_wick_ratio, 2),
+        "is_green": is_green,
+        "is_red": is_red,
+    }
+
+
+def _score_paper28_trade(p, price, indicators=None, ind_macro=None, expiry_minute=None, expiry_hour=None):
+    """Paper 2.8: CANDLE-FIRST strategy.
+    Reads previous candle pattern as the primary signal.
+    Strong patterns (hammer, shooting star, strong red/green) trade immediately.
+    Moderate candles use P2.1 or price position as confirmation.
+    """
+    if price is None:
+        return None
+    mtype = p.get("timeframe") or ("15M" if p.get("is_15m_market") else "1H" if p.get("is_hourly_market") else "Daily")
+    if mtype == "Daily":
+        return None
+    asset = p["asset"]
+    baseline = p.get("baseline", 0)
+    if not baseline or baseline <= 0:
+        return None
+    yes_odds = p["yes_odds"]
+    no_odds = 100 - yes_odds
+    if not (15 <= yes_odds <= 80 or 15 <= no_odds <= 80):
+        return None
+
+    candle_tf = "15m"
+    if mtype == "1H": candle_tf = "1h"
+    elif p.get("timeframe") == "5M": candle_tf = "5m"
+
+    candle = _p28_read_prev_candle(asset, candle_tf)
+    if not candle:
+        return None
+    pattern = candle["pattern"]
+    if pattern in ("doji", "unclear"):
+        return None
+
+    candle_dir = None
+    candle_strong = False
+    if pattern in ("strong_red", "red_no_lower_wick"):
+        candle_dir = "DOWN"; candle_strong = True
+    elif pattern in ("strong_green", "green_no_upper_wick"):
+        candle_dir = "UP"; candle_strong = True
+    elif pattern == "shooting_star":
+        candle_dir = "DOWN"; candle_strong = True
+    elif pattern == "hammer":
+        candle_dir = "UP"; candle_strong = True
+    elif pattern == "bull_trap":
+        candle_dir = "DOWN"; candle_strong = True
+    elif pattern == "bear_trap":
+        candle_dir = "UP"; candle_strong = True
+    elif pattern == "moderate_red":
+        candle_dir = "DOWN"; candle_strong = False
+    elif pattern == "moderate_green":
+        candle_dir = "UP"; candle_strong = False
+    if candle_dir is None:
+        return None
+
+    scored21 = _score_paper21_trade(p, price, indicators=indicators, ind_macro=ind_macro,
+                                     expiry_minute=expiry_minute, expiry_hour=expiry_hour)
+    p21_dir = None
+    if scored21:
+        p21_side = scored21["bet_side"]
+        p21_dir = "UP" if (p21_side == "YES" and p["direction"] == "above") or \
+                          (p21_side == "NO" and p["direction"] != "above") else "DOWN"
+
+    price_above = price > baseline
+    confidence = None; tag = ""
+    if candle_strong:
+        if p21_dir == candle_dir: confidence = "HIGH"; tag = "STRONG+P21"
+        elif p21_dir is not None and p21_dir != candle_dir: confidence = "MEDIUM"; tag = "STRONG>P21"
+        else: confidence = "MEDIUM"; tag = "STRONG_SOLO"
+    else:
+        if p21_dir == candle_dir: confidence = "MEDIUM"; tag = "MOD+P21"
+        elif p21_dir is not None and p21_dir != candle_dir: return None
+        else:
+            if (candle_dir == "UP" and price_above) or (candle_dir == "DOWN" and not price_above):
+                confidence = "LOW"; tag = "MOD+PRICE"
+            else: return None
+    if confidence is None: return None
+
+    if candle_dir == "UP": bet_side = "YES" if p["direction"] == "above" else "NO"
+    else: bet_side = "NO" if p["direction"] == "above" else "YES"
+    effective_odds = yes_odds if bet_side == "YES" else no_odds
+    sim_payout = round(1.0 / (effective_odds / 100.0), 4) if effective_odds > 0 else 0
+    ind_str = "CANDLE={}({}) b={:.0f}% | {}".format(pattern, candle_dir, candle["body_ratio"]*100, tag)
+    if p21_dir: ind_str += " | P2.1={}".format(p21_dir)
+    return {
+        "bet_side": bet_side, "bet_odds": effective_odds, "confidence": confidence,
+        "score": 2 if confidence in ("HIGH","MEDIUM") else 1, "total_signals": 2,
+        "signals_agree": 2 if confidence == "HIGH" else 1, "p23_agrees": False,
+        "indicators": ind_str, "market_type": mtype, "sim_payout": sim_payout,
+        "tv_dir": candle_dir, "sma_dir": p21_dir or "—", "btc_dir": "—",
+    }
+
+
+def _score_paper29_trade(p, price, indicators=None, ind_macro=None, expiry_minute=None, expiry_hour=None):
+    """Paper 2.9: P2.1 ENHANCED — indicators for direction, candle for confidence.
+    
+    P2.1 runs first (TV + SMA + BTC). If no signal → don't trade.
+    If P2.1 has direction → read previous candle to adjust confidence:
+    
+    P2.1 DOWN + strong red candle    → HIGH (momentum confirms)
+    P2.1 DOWN + moderate red         → HIGH (same direction)
+    P2.1 DOWN + small green (bounce) → MEDIUM (bounce trap, P2.1 says it's fake)
+    P2.1 DOWN + doji                 → MEDIUM (no momentum, trust indicators)
+    P2.1 DOWN + strong green         → LOW (momentum opposes, risky but P2.1 might catch reversal)
+    P2.1 DOWN + hammer after reds    → SKIP (real reversal pattern overrides P2.1)
+    
+    Then price position adjusts confidence:
+    Price on correct side of baseline → boost
+    Price on wrong side              → reduce but still trade
+    """
+    if price is None or not indicators:
+        return None
+
+    mtype = p.get("timeframe") or ("15M" if p.get("is_15m_market") else "1H" if p.get("is_hourly_market") else "Daily")
+    if mtype == "Daily":
+        return None
+
+    asset = p["asset"]
+    baseline = p.get("baseline", 0)
+    if not baseline or baseline <= 0:
+        return None
+
+    yes_odds = p["yes_odds"]
+    no_odds = 100 - yes_odds
+    if not (15 <= yes_odds <= 80 or 15 <= no_odds <= 80):
+        return None
+
+    # ══════════════════════════════════════════════════════
+    # STEP 1: P2.1 — indicators decide direction
+    # If P2.1 returns None, we DON'T TRADE. No edge without indicator agreement.
+    # ══════════════════════════════════════════════════════
+    scored21 = _score_paper21_trade(p, price, indicators=indicators, ind_macro=ind_macro,
+                                     expiry_minute=expiry_minute, expiry_hour=expiry_hour)
+    if not scored21:
+        return None  # No indicator agreement = no trade
+
+    p21_side = scored21["bet_side"]
+    p21_dir = "UP" if (p21_side == "YES" and p["direction"] == "above") or \
+                      (p21_side == "NO" and p["direction"] != "above") else "DOWN"
+    p21_score = scored21.get("score", 2)  # 3 = strong (3/3), 2 = weak (2/3)
+    p21_confidence = scored21.get("confidence", "MEDIUM")
+
+    # ══════════════════════════════════════════════════════
+    # STEP 2: Read previous candle — adjust confidence, don't change direction
+    # ══════════════════════════════════════════════════════
+    candle_tf = "15m"
+    if mtype == "1H":
+        candle_tf = "1h"
+    elif mtype == "5M":
+        candle_tf = "5m"
+
+    candle = _p28_read_prev_candle(asset, candle_tf)
+
+    # Candle analysis
+    candle_confirms = False      # Candle agrees with P2.1
+    candle_opposes_strong = False # Strong candle against P2.1
+    candle_reversal = False      # Reversal pattern that should override P2.1
+    candle_tag = "NO_CANDLE"
+
+    if candle:
+        pattern = candle["pattern"]
+        body_ratio = candle["body_ratio"]
+        is_green = candle["is_green"]
+        is_red = candle["is_red"]
+
+        if p21_dir == "DOWN":
+            if pattern == "hammer":
+                # Check if this is after extended selling (check trend)
+                trend_data = _p28_read_candle_series(asset, candle_tf, count=5)
+                recent_reds = 0
+                if trend_data and len(trend_data) >= 4:
+                    for tc in trend_data[-4:-1]:
+                        if tc["close"] < tc["open"]:
+                            recent_reds += 1
+                if recent_reds >= 3:
+                    candle_reversal = True
+                    candle_tag = "HAMMER_AFTER_DROP"
+                else:
+                    candle_confirms = False
+                    candle_tag = "HAMMER_WEAK"
+            elif is_red and body_ratio > 0.5:
+                candle_confirms = True
+                candle_tag = "STRONG_RED_CONFIRMS"
+            elif is_red:
+                candle_confirms = True
+                candle_tag = "RED_CONFIRMS"
+            elif is_green and body_ratio < 0.5:
+                candle_tag = "BOUNCE_TRAP"  # Small green in down = fake bounce
+            elif is_green and body_ratio >= 0.5:
+                candle_opposes_strong = True
+                candle_tag = "STRONG_GREEN_OPPOSES"
+            elif pattern == "doji":
+                candle_tag = "DOJI_NEUTRAL"
+            else:
+                candle_tag = "UNCLEAR"
+
+        elif p21_dir == "UP":
+            if pattern == "shooting_star":
+                trend_data = _p28_read_candle_series(asset, candle_tf, count=5)
+                recent_greens = 0
+                if trend_data and len(trend_data) >= 4:
+                    for tc in trend_data[-4:-1]:
+                        if tc["close"] > tc["open"]:
+                            recent_greens += 1
+                if recent_greens >= 3:
+                    candle_reversal = True
+                    candle_tag = "STAR_AFTER_RALLY"
+                else:
+                    candle_confirms = False
+                    candle_tag = "STAR_WEAK"
+            elif is_green and body_ratio > 0.5:
+                candle_confirms = True
+                candle_tag = "STRONG_GREEN_CONFIRMS"
+            elif is_green:
+                candle_confirms = True
+                candle_tag = "GREEN_CONFIRMS"
+            elif is_red and body_ratio < 0.5:
+                candle_tag = "PULLBACK_TRAP"  # Small red in up = fake pullback
+            elif is_red and body_ratio >= 0.5:
+                candle_opposes_strong = True
+                candle_tag = "STRONG_RED_OPPOSES"
+            elif pattern == "doji":
+                candle_tag = "DOJI_NEUTRAL"
+            else:
+                candle_tag = "UNCLEAR"
+
+    # ══════════════════════════════════════════════════════
+    # STEP 3: Reversal override — the ONE case candle beats P2.1
+    # ══════════════════════════════════════════════════════
+    if candle_reversal:
+        return None  # Hammer after 3+ reds or shooting star after 3+ greens = skip
+
+    # ══════════════════════════════════════════════════════
+    # STEP 4: Build confidence from P2.1 + candle + price position
+    # ══════════════════════════════════════════════════════
+    price_above = price > baseline
+    price_confirms = (p21_dir == "DOWN" and not price_above) or (p21_dir == "UP" and price_above)
+
+    # Start from P2.1's base confidence
+    if candle_confirms and price_confirms:
+        # Triple confirmation: indicators + candle + price
+        confidence = "HIGH"
+        tag = "TRIPLE_{}".format(candle_tag)
+    elif candle_confirms:
+        # Indicators + candle agree, price hasn't crossed yet
+        confidence = "HIGH" if p21_score >= 3 else "MEDIUM"
+        tag = "P21+CANDLE_{}".format(candle_tag)
+    elif candle_opposes_strong:
+        # Strong candle against P2.1 — risky but P2.1 might be catching reversal
+        if p21_score >= 3 and price_confirms:
+            confidence = "LOW"
+            tag = "P21_STRONG_VS_{}".format(candle_tag)
+        else:
+            return None  # Weak P2.1 + strong opposing candle = no edge
+    elif price_confirms:
+        # Candle neutral/bounce but price on right side
+        confidence = "MEDIUM" if p21_score >= 3 else "LOW"
+        tag = "P21+PRICE_{}".format(candle_tag)
+    else:
+        # Candle neutral, price on wrong side — only P2.1
+        if p21_score >= 3:
+            confidence = "LOW"
+            tag = "P21_ONLY_{}".format(candle_tag)
+        else:
+            return None  # Weak P2.1, no candle help, price wrong = no edge
+
+    # ══════════════════════════════════════════════════════
+    # STEP 5: Build the trade
+    # ══════════════════════════════════════════════════════
+    bet_side = p21_side  # Direction comes from P2.1
+    effective_odds = yes_odds if bet_side == "YES" else no_odds
+    sim_payout = round(1.0 / (effective_odds / 100.0), 4) if effective_odds > 0 else 0
+
+    # Indicator string showing the full picture
+    p21_indicators = scored21.get("indicators", "")
+    ind_str = "P2.1={} ({}) | CANDLE={} | PRICE {} base | {}".format(
+        p21_dir, p21_confidence, candle_tag,
+        "CONFIRMS" if price_confirms else "OPPOSES",
+        tag)
+
+    return {
+        "bet_side": bet_side,
+        "bet_odds": effective_odds,
+        "confidence": confidence,
+        "score": 3 if confidence == "HIGH" else 2 if confidence == "MEDIUM" else 1,
+        "total_signals": 3,
+        "signals_agree": 3 if confidence == "HIGH" else 2 if confidence == "MEDIUM" else 1,
+        "p23_agrees": False,
+        "indicators": ind_str,
+        "market_type": mtype,
+        "sim_payout": sim_payout,
+        "tv_dir": scored21.get("tv_dir", "—"),
+        "sma_dir": scored21.get("sma_dir", "—"),
+        "btc_dir": scored21.get("btc_dir", "—"),
+    }
+
+
+def _p28_read_candle_series(asset, tf="15m", count=6):
+    """Fetch a series of candles for trend analysis.
+    Returns list of dicts with open/high/low/close, or None on failure.
+    """
+    candles = _fetch_binance_candles_small(asset, tf, count)
+    if candles and len(candles) >= count:
+        return candles
+    try:
+        ind = _calculate_indicators(asset, tf)
+        if ind and ind.get("_opens") and ind.get("_closes") and ind.get("_highs") and ind.get("_lows"):
+            opens = ind["_opens"]
+            closes = ind["_closes"]
+            highs = ind["_highs"]
+            lows = ind["_lows"]
+            n = min(len(opens), len(closes), len(highs), len(lows))
+            if n >= count:
+                result = []
+                for i in range(-count, 0):
+                    result.append({
+                        "ts": 0,
+                        "open": opens[i],
+                        "high": highs[i],
+                        "low": lows[i],
+                        "close": closes[i],
+                    })
+                return result
+    except:
+        pass
+    return None
+
 
 # ═══════════════════════════════════════════════════════════
 # PAPER 3.3: Bot 3.1 + Distance Calculator — MIXED MODE
@@ -8181,6 +9641,16 @@ def run_paper34_scan():
             p37_ids = set(str(row[0]) for row in p37_rows)
         except:
             p37_ids = set()
+        try:
+            p28_rows = conn.run("SELECT market_id FROM paper28_trades WHERE fired_at::timestamptz > NOW() - INTERVAL '30 hours'")
+            p28_ids = set(str(row[0]) for row in p28_rows)
+        except:
+            p28_ids = set()
+        try:
+            p29_rows = conn.run("SELECT market_id FROM paper29_trades WHERE fired_at::timestamptz > NOW() - INTERVAL '30 hours'")
+            p29_ids = set(str(row[0]) for row in p29_rows)
+        except:
+            p29_ids = set()
         # Get Bot 1 and Bot 2 market IDs to avoid overlap
         try:
             bot12_rows = conn.run("""SELECT market_id FROM limitless_predictions WHERE created_at > NOW() - INTERVAL '30 hours'
@@ -8210,6 +9680,8 @@ def run_paper34_scan():
         p36_count = 0
         p27_count = 0
         p37_count = 0
+        p28_count = 0
+        p29_count = 0
 
         for market in markets:
             try:
@@ -8959,11 +10431,65 @@ def run_paper34_scan():
                         except Exception as e:
                             print("Paper37 save error: {}".format(e))
 
+                # ── Paper 2.8 (P2.1 + Candle-at-Baseline) ──
+                if parsed["market_id"] not in p28_ids:
+                    scored28 = _score_paper28_trade(parsed, price, indicators=ind, ind_macro=ind_macro, expiry_minute=expiry_minute, expiry_hour=expiry_hour)
+                    if scored28:
+                        try:
+                            c28 = get_db()
+                            c28.run(
+                                """INSERT INTO paper28_trades
+                                (market_id, title, asset, direction, baseline, bet_odds, bet_side,
+                                 current_price, hours_left, market_type, indicators, score,
+                                 total_signals, simulated_stake, simulated_payout, status, fired_at, slug)
+                                VALUES (:mid, :ttl, :ast, :dir, :base, :odds, :bs,
+                                        :pr, :hrs, :mt, :ind, :sc, :ts, 1.0, :sp, 'Pending', :now, :slg)""",
+                                mid=parsed["market_id"], ttl=parsed["title"], ast=asset,
+                                dir=parsed["direction"], base=parsed["baseline"],
+                                odds=scored28["bet_odds"], bs=scored28["bet_side"],
+                                pr=price, hrs=round(parsed["hours_left"], 2),
+                                mt=scored28["market_type"],
+                                ind="[{}] {}".format(scored28["confidence"], scored28["indicators"]),
+                                sc=scored28["score"], ts=scored28["total_signals"],
+                                sp=scored28["sim_payout"], now=now, slg=parsed["slug"])
+                            c28.close()
+                            p28_ids.add(parsed["market_id"])
+                            p28_count += 1
+                        except Exception as e:
+                            print("Paper28 save error: {}".format(e))
+
+                # ── Paper 2.9 (BlackRock Trader — trend + candle + price) ──
+                if parsed["market_id"] not in p29_ids:
+                    scored29 = _score_paper29_trade(parsed, price, indicators=ind, ind_macro=ind_macro, expiry_minute=expiry_minute, expiry_hour=expiry_hour)
+                    if scored29:
+                        try:
+                            c29 = get_db()
+                            c29.run(
+                                """INSERT INTO paper29_trades
+                                (market_id, title, asset, direction, baseline, bet_odds, bet_side,
+                                 current_price, hours_left, market_type, indicators, score,
+                                 total_signals, simulated_stake, simulated_payout, status, fired_at, slug)
+                                VALUES (:mid, :ttl, :ast, :dir, :base, :odds, :bs,
+                                        :pr, :hrs, :mt, :ind, :sc, :ts, 1.0, :sp, 'Pending', :now, :slg)""",
+                                mid=parsed["market_id"], ttl=parsed["title"], ast=asset,
+                                dir=parsed["direction"], base=parsed["baseline"],
+                                odds=scored29["bet_odds"], bs=scored29["bet_side"],
+                                pr=price, hrs=round(parsed["hours_left"], 2),
+                                mt=scored29["market_type"],
+                                ind="[{}] {}".format(scored29["confidence"], scored29["indicators"]),
+                                sc=scored29["score"], ts=scored29["total_signals"],
+                                sp=scored29["sim_payout"], now=now, slg=parsed["slug"])
+                            c29.close()
+                            p29_ids.add(parsed["market_id"])
+                            p29_count += 1
+                        except Exception as e:
+                            print("Paper29 save error: {}".format(e))
+
             except Exception as e:
                 print("Paper345 market error: {}".format(e))
 
-        if p3_count > 0 or p4_count > 0 or p5_count > 0 or p24_count > 0 or p34_count > 0 or p25_count > 0 or p35_count > 0 or p26_count > 0 or p36_count > 0 or p27_count > 0 or p37_count > 0:
-            print("P3:{} P4:{} P5:{} P3.1:{} P2.1:{} P5.1:{} P2.2:{} P3.2:{} P2.3:{} P3.3:{} P2.4:{} P3.4:{} P2.5:{} P3.5:{} P2.6:{} P3.6:{} P2.7:{} P3.7:{}".format(p3_count, p4_count, p5_count, p31_count, p21_count, p51_count, p22_count, p32_count, p23_count, p33_count, p24_count, p34_count, p25_count, p35_count, p26_count, p36_count, p27_count, p37_count))
+        if p3_count > 0 or p4_count > 0 or p5_count > 0 or p24_count > 0 or p34_count > 0 or p25_count > 0 or p35_count > 0 or p26_count > 0 or p36_count > 0 or p27_count > 0 or p37_count > 0 or p28_count > 0 or p29_count > 0:
+            print("P3:{} P4:{} P5:{} P3.1:{} P2.1:{} P5.1:{} P2.2:{} P3.2:{} P2.3:{} P3.3:{} P2.4:{} P3.4:{} P2.5:{} P3.5:{} P2.6:{} P3.6:{} P2.7:{} P3.7:{} P2.8:{} P2.9:{}".format(p3_count, p4_count, p5_count, p31_count, p21_count, p51_count, p22_count, p32_count, p23_count, p33_count, p24_count, p34_count, p25_count, p35_count, p26_count, p36_count, p27_count, p37_count, p28_count, p29_count))
         else:
             # Count how many assets we got indicators for
             ind_ok = sum(1 for v in indicator_cache_local.values() if v is not None)
@@ -9265,6 +10791,8 @@ def resolve_paper34_trades():
     r36 = _resolve_paper_table("paper36_trades")
     r27 = _resolve_paper_table("paper27_trades")
     r37 = _resolve_paper_table("paper37_trades")
+    r28 = _resolve_paper_table("paper28_trades")
+    r29 = _resolve_paper_table("paper29_trades")
     ra = _resolve_alpha_trades()
     if r3 or r4 or r5 or r24 or r34 or r25 or r35 or r26 or r36 or ra:
         print("Resolved: P3={} P4={} P5={} P3.1={} P2.1={} P5.1={} P2.2={} P3.2={} P2.3={} P3.3={} P2.4={} P3.4={} P2.5={} P3.5={} P2.6={} P3.6={} ALPHA={}".format(r3, r4, r5, r31, r21, r51, r22, r32, r23, r33, r24, r34, r25, r35, r26, r36, ra))
@@ -13708,12 +15236,13 @@ tr:hover td{background:#fafaf7}
 
     return paper_html
 
-def _build_paper_page(table_name, page_title, subtitle, description, extra_cols, nav_active):
+def _build_paper_page(table_name, page_title, subtitle, description, extra_cols, nav_active, where_clause=""):
     """Generic page builder for Paper 3 and Paper 4."""
     try:
         conn = get_db()
         # Fetch ALL trades for accurate stats
-        all_rows = conn.run("SELECT * FROM {} ORDER BY id DESC".format(table_name))
+        q = "SELECT * FROM {} {} ORDER BY id DESC".format(table_name, where_clause)
+        all_rows = conn.run(q)
         cols = [c['name'] for c in conn.columns]
         all_trades = [dict(zip(cols, r)) for r in all_rows]
         conn.close()
@@ -13835,6 +15364,13 @@ td{padding:8px 12px;border-bottom:1px solid #f4f3ed;color:var(--ink-2)}tr:last-c
     <a href="/app/paper36" class="nav-tab""" + (" active" if nav_active == "paper36" else "") + """">Paper 3.6</a>
     <a href="/app/paper27" class="nav-tab""" + (" active" if nav_active == "paper27" else "") + """">Paper 2.7</a>
     <a href="/app/paper37" class="nav-tab""" + (" active" if nav_active == "paper37" else "") + """">Paper 3.7</a>
+    <a href="/app/paper28" class="nav-tab""" + (" active" if nav_active == "paper28" else "") + """">Paper 2.8</a>
+    <a href="/app/paper28poly" class="nav-tab""" + (" active" if nav_active == "paper28poly" else "") + """">P2.8 Poly</a>
+    <a href="/app/paper29" class="nav-tab""" + (" active" if nav_active == "paper29" else "") + """">Paper 2.9</a>
+    <a href="/app/paper29poly" class="nav-tab""" + (" active" if nav_active == "paper29poly" else "") + """">P2.9 Poly</a>
+    <a href="/app/poly-alpha3" class="nav-tab""" + (" active" if nav_active == "poly-alpha3" else "") + """">⚡ Poly A3</a>
+    <a href="/app/poly-alpha4" class="nav-tab""" + (" active" if nav_active == "poly-alpha4" else "") + """">🎯 Sniper A4</a>
+    <a href="/app/lmts-sniper" class="nav-tab""" + (" active" if nav_active == "lmts-sniper" else "") + """">🎯 LMTS Sniper</a>
     <a href="/app/paper4" class="nav-tab""" + (" active" if nav_active == "paper4" else "") + """">Paper 4</a>
     <a href="/app/paper5" class="nav-tab""" + (" active" if nav_active == "paper5" else "") + """">Paper 5</a>
     <a href="/app/paper51" class="nav-tab""" + (" active" if nav_active == "paper51" else "") + """">Paper 5.1</a>
@@ -14138,9 +15674,9 @@ try:
         _alpha_state["peak_balance"] = 100.0
     _alpha_state["starting_balance"] = 100.0
     _alpha_state["floor_balance"] = 5.0
-    _alpha_state["enabled"] = True
-    print("ALPHA LIVE: ${:.2f} pool{} | Strategy F: ETH/BTC $4 SOL $2 | 1H SOL/DOGE $1 | Floor=$5 | P2.3 only trigger".format(
-        _alpha_state["balance"], " (restored)" if _alpha_restored else " (fresh)"))
+    _alpha_state["enabled"] = False  # PAUSED — replaced by LMTS Sniper
+    print("ALPHA LIMITLESS: ${:.2f} pool | PAUSED (replaced by LMTS Sniper)".format(
+        _alpha_state["balance"]))
     
     # Restore Poly Alpha balance from DB
     _poly_alpha_restored = False
@@ -14165,16 +15701,32 @@ try:
         _poly_alpha2_state["peak_balance"] = _saved_pa2.get("peak_balance", _saved_pa2["balance"])
         _poly_alpha2_restored = True
     if not _poly_alpha2_restored:
-        _poly_alpha2_state["balance"] = 70.0
-        _poly_alpha2_state["peak_balance"] = 70.0
-    _poly_alpha2_state["balance"] = 70.0  # RESET — testing outcomes fix
-    _poly_alpha2_state["peak_balance"] = 70.0
-    _poly_alpha2_state["starting_balance"] = 70.0
-    _poly_alpha2_state["floor_balance"] = 10.0
-    _poly_alpha2_state["enabled"] = True
-    print("POLY ALPHA 2.0: ${:.2f} pool{} | P2.1 base $2.50 + P2.3 boost $3.00 | 5M+15M | Floor=$10".format(
+        _poly_alpha2_state["balance"] = 60.0
+        _poly_alpha2_state["peak_balance"] = 60.0
+    _poly_alpha2_state["starting_balance"] = 60.0
+    _poly_alpha2_state["floor_balance"] = 5.0
+    _poly_alpha2_state["enabled"] = False  # PAUSED — replaced by Alpha 3.0
+    print("POLY ALPHA 2.0: ${:.2f} pool{} | PA15+ 15M only | Floor=$10".format(
         _poly_alpha2_state["balance"], " (restored)" if _poly_alpha2_restored else " (fresh)"))
     _poly_alpha2_load_recent()
+
+    # ── POLY ALPHA 3.0 init ──
+    _poly_alpha3_restored = False
+    _saved_pa3 = _saved_balances.get("poly_alpha3", {})
+    if _saved_pa3 and _saved_pa3.get("balance", 0) > 0:
+        _poly_alpha3_state["balance"] = _saved_pa3["balance"]
+        _poly_alpha3_state["peak_balance"] = _saved_pa3.get("peak_balance", _saved_pa3["balance"])
+        _poly_alpha3_restored = True
+    if not _poly_alpha3_restored:
+        _poly_alpha3_state["balance"] = 60.0
+        _poly_alpha3_state["peak_balance"] = 60.0
+    _poly_alpha3_state["starting_balance"] = 60.0
+    _poly_alpha3_state["floor_balance"] = 5.0
+    _poly_alpha3_state["enabled"] = False  # PAUSED — replaced by Sniper A4
+    print("POLY ALPHA 3.0: ${:.2f} pool{} | PAUSED (replaced by Sniper A4)".format(
+        _poly_alpha3_state["balance"], " (restored)" if _poly_alpha3_restored else " (fresh)"))
+    _poly_alpha3_load_recent()
+
     _poly_alpha_load_recent_trades()
     # Warm trading credentials for sniper
     threading.Thread(target=_warm_credentials, daemon=True).start()
@@ -14189,6 +15741,26 @@ threading.Thread(target=football_loop, daemon=True).start()
 threading.Thread(target=otp_loop, daemon=True).start()
 if SIGNALS_DB_URL:
     threading.Thread(target=_signals_poll_loop, daemon=True).start()
+    threading.Thread(target=_sniper_thread, daemon=True).start()
+    print("SNIPER A4 thread launched")
+
+    # ── LIMITLESS SNIPER init ──
+    _lmts_sniper_restored = False
+    _saved_lmts = _saved_balances.get("limitless_sniper", {})
+    if _saved_lmts and _saved_lmts.get("balance", 0) > 0:
+        _limitless_sniper_state["balance"] = _saved_lmts["balance"]
+        _limitless_sniper_state["peak_balance"] = _saved_lmts.get("peak_balance", _saved_lmts["balance"])
+        _lmts_sniper_restored = True
+    if not _lmts_sniper_restored:
+        _limitless_sniper_state["balance"] = 30.0
+        _limitless_sniper_state["peak_balance"] = 30.0
+    _limitless_sniper_state["starting_balance"] = 30.0
+    _limitless_sniper_state["floor_balance"] = 5.0
+    _limitless_sniper_state["enabled"] = True
+    print("LMTS SNIPER: ${:.2f} pool{} | P2.1+momentum | 15M | 50¢ | 2-tier".format(
+        _limitless_sniper_state["balance"], " (restored)" if _lmts_sniper_restored else " (fresh)"))
+    threading.Thread(target=_limitless_sniper_thread, daemon=True).start()
+    print("LMTS SNIPER thread launched")
 
 # ═══════════════════════════════════════════════════════════
 # POLYMARKET MODULE — Paper trading on crypto Up/Down markets
@@ -14233,16 +15805,20 @@ def _rtds_loop():
     
     def _store_ptb(asset, price, ts_sec):
         """Store Price to Beat at window boundaries.
-        Captures the first Chainlink price within 60 seconds of window start.
-        First price is closest to the actual PTB used for resolution."""
-        for tf_label, tf_sec in [("5M", 300), ("15M", 900), ("1H", 3600)]:
+        The PTB is the FIRST Chainlink price at the exact window boundary.
+        Per Polymarket developer: 'crypto_prices_chainlink matches the 
+        Price To Beat exactly, at +0ms from window boundary.'
+        We capture the first tick within a tight window of the boundary.
+        5M: within 5 seconds (ticks every ~1s, allows for 1-2 gaps)
+        15M/1H: within 10 seconds (same reason, less frequent boundaries)"""
+        for tf_label, tf_sec, max_delay in [("5M", 300, 5), ("15M", 900, 10), ("1H", 3600, 10)]:
             window_start = (ts_sec // tf_sec) * tf_sec
             window_end = window_start + tf_sec
             key = "{}_{}".format(asset, tf_label)
             existing = _chainlink_ptb.get(key)
             
-            # Store if within first 60 seconds of window AND this is a new window
-            if ts_sec - window_start <= 60:
+            # Capture FIRST tick near boundary — once stored, don't overwrite
+            if ts_sec - window_start <= max_delay:
                 if not existing or existing[0] != window_end:
                     _chainlink_ptb[key] = (window_end, price)
                     print("PTB {} {} = ${:,.2f}".format(asset, tf_label, price))
@@ -14424,33 +16000,37 @@ def _poly_parse_market(market, timeframe_hint=None):
                     break
 
         if not asset:
+            if "updown" in slug_lower or "up or down" in q_lower:
+                print("POLY PARSE NO ASSET: q='{}' slug='{}'".format(q_lower[:60], slug_lower[:40]))
             return None
-
-        # Must be an Up or Down market (Polymarket format)
-        # Do NOT accept "above/below" — those are Limitless markets on the same API
         if "up or down" not in q_lower and "updown" not in slug_lower:
+            print("POLY PARSE REJECT: q='{}' slug='{}'".format(q_lower[:60], slug_lower[:40]))
             return None
 
         # Get expiry FIRST (needed for duration-based timeframe detection)
+        now = datetime.now(timezone.utc)
         end_date = market.get("endDate") or market.get("end_date_iso") or ""
         exp_ts = market.get("expirationTimestamp") or market.get("expiration_timestamp")
         expiry_dt = None
         if exp_ts:
-            if isinstance(exp_ts, str):
-                exp_ts = int(exp_ts)
-            if exp_ts > 1e12:
-                exp_ts = exp_ts / 1000
-            expiry_dt = datetime.fromtimestamp(exp_ts, tz=timezone.utc)
-        elif end_date:
+            try:
+                if isinstance(exp_ts, str):
+                    exp_ts = int(exp_ts)
+                if exp_ts > 1e12:
+                    exp_ts = exp_ts / 1000
+                expiry_dt = datetime.fromtimestamp(exp_ts, tz=timezone.utc)
+            except:
+                exp_ts = None
+        if not expiry_dt and end_date:
             try:
                 expiry_dt = datetime.fromisoformat(end_date.replace("Z", "+00:00"))
                 exp_ts = int(expiry_dt.timestamp())
             except:
                 return None
-        else:
+        if not expiry_dt:
+            if "updown" in slug_lower:
+                print("POLY PARSE NO EXPIRY: slug='{}' keys={}".format(slug_lower[:40], list(market.keys())[:10]))
             return None
-
-        now = datetime.now(timezone.utc)
         mins_left = (expiry_dt - now).total_seconds() / 60
         if mins_left <= 0:
             return None
@@ -14535,8 +16115,8 @@ def _poly_parse_market(market, timeframe_hint=None):
             o0 = str(outcomes_raw[0]).lower().strip()
             o1 = str(outcomes_raw[1]).lower().strip()
             # Log outcomes for debugging
-            if tf in ("5M", "15M"):
-                print("POLY OUTCOMES {}: [{}] up_idx={} down_idx={}".format(asset, ", ".join(str(x) for x in outcomes_raw), up_index, down_index))
+            if timeframe in ("5M", "15M", "1H"):
+                print("POLY OUTCOMES {}: [{}] up_idx={} down_idx={} tf={}".format(asset, ", ".join(str(x) for x in outcomes_raw), up_index, down_index, timeframe))
             # Check for reversed ordering
             if o0 in ("no", "down", "below") and o1 in ("yes", "up", "above"):
                 up_index = 1
@@ -14550,49 +16130,31 @@ def _poly_parse_market(market, timeframe_hint=None):
         market_id = str(market.get("id") or condition_id or slug)
 
         # Extract the "Price to Beat" (baseline) from the API data
-        # Try multiple sources in order of reliability
+        # For crypto Up/Down markets, the PTB comes from Chainlink RTDS
+        # captured at the exact window boundary (handled by _poly_get_baseline).
+        # Here we check if the API fields contain a dollar amount as backup.
         baseline = None
         
-        # Source 1: Check all text fields for dollar amounts
-        description = market.get("description") or ""
-        
-        # Source 2: Check for specific price-related metadata
-        # Some markets have customData, metadata, or resolution details
-        for field in ["description", "resolutionSource", "rules", "customData"]:
+        # Check all text fields for dollar amounts ($XX,XXX.XX format)
+        for field in ["question", "description", "resolutionSource", "rules", "customData", "title"]:
             text = str(market.get(field) or "")
             if text and "$" in text:
-                # Find all dollar amounts
                 all_prices = re.findall(r'\$([0-9,]+\.?\d*)', text)
                 for p in all_prices:
                     try:
                         val = float(p.replace(",", ""))
-                        # Sanity check: must be a reasonable crypto price
                         if asset == "BTC" and 10000 < val < 200000:
-                            baseline = val
-                            break
+                            baseline = val; break
                         elif asset == "ETH" and 500 < val < 10000:
-                            baseline = val
-                            break
+                            baseline = val; break
                         elif asset == "SOL" and 5 < val < 500:
-                            baseline = val
-                            break
+                            baseline = val; break
                         elif asset == "XRP" and 0.1 < val < 10:
-                            baseline = val
-                            break
+                            baseline = val; break
                     except:
                         pass
                 if baseline:
                     break
-
-        # Source 3: Check the title/question itself for a price
-        if not baseline:
-            for text in [question, market.get("title") or ""]:
-                price_in_title = re.search(r'\$([0-9,]+\.?\d*)', text)
-                if price_in_title:
-                    try:
-                        baseline = float(price_in_title.group(1).replace(",", ""))
-                    except:
-                        pass
 
         # Log what we found for debugging
         if baseline:
@@ -14627,297 +16189,172 @@ def _poly_parse_market(market, timeframe_hint=None):
             "expiry_hour": expiry_hour,
         }
     except Exception as e:
+        print("POLY PARSE EXCEPTION: {} — {}".format(market.get("slug", "?")[:30], e))
         return None
 
 def _poly_fetch_markets():
     """Fetch active crypto Up/Down markets from Polymarket.
-    Uses deterministic slug construction + Gamma API lookup.
-    Slug pattern: {asset}-updown-{tf}-{unix_end_ts}
-    """
+    Public search FIRST (1 call), then slug lookups if needed."""
     import requests as req
     now = datetime.now(timezone.utc)
     markets = []
-
-    # Assets and timeframes to scan
-    assets = [
-        ("btc", "BTC"), ("eth", "ETH"), ("sol", "SOL"), ("xrp", "XRP")
-    ]
-    timeframes = [
-        ("5m", 300, "5M"),   # 5 minutes = 300 seconds
-        ("15m", 900, "15M"), # 15 minutes = 900 seconds
-        ("1h", 3600, "1H"),  # 1 hour = 3600 seconds
-    ]
-
     current_ts = int(now.timestamp())
 
-    for asset_slug, asset_name in assets:
-        for tf_slug, tf_seconds, tf_label in timeframes:
-            # Calculate current window START timestamp (Polymarket uses START in slug)
-            # Windows are aligned to epoch: 5m at :00,:05,:10... 15m at :00,:15,:30,:45
-            window_start = (current_ts // tf_seconds) * tf_seconds
-            window_end = window_start + tf_seconds
-            prev_window_start = window_start - tf_seconds
+    # STRATEGY 1: Public search (1 API call, most efficient)
+    try:
+        r = req.get("{}/public-search".format(POLY_GAMMA_API),
+                    params={"query": "up or down", "limit": 50}, timeout=12)
+        if r.status_code == 200:
+            data = r.json()
+            items = data if isinstance(data, list) else data.get("events", data.get("markets", data.get("data", []))) if isinstance(data, dict) else []
+            for item in items:
+                item_markets = []
+                if isinstance(item, dict):
+                    if item.get("markets"):
+                        item_markets = item["markets"]
+                    elif item.get("clobTokenIds") or item.get("conditionId"):
+                        item_markets = [item]
+                for m in item_markets:
+                    q = (m.get("question") or m.get("title") or "").lower()
+                    if ("up" in q and "down" in q) or "updown" in q:
+                        parsed = _poly_parse_market(m)
+                        if parsed:
+                            markets.append(parsed)
+            if markets:
+                print("Poly search: {} Up/Down markets".format(len(markets)))
+                return markets
+            print("Poly search: {} results, 0 Up/Down".format(len(items)))
+        else:
+            print("Poly search status: {}".format(r.status_code))
+    except Exception as e:
+        print("Poly search error: {}".format(e))
 
-            # Try current window and previous window
-            for start_ts in [window_start, prev_window_start]:
-                this_end = start_ts + tf_seconds
-                mins_left = (this_end - current_ts) / 60.0
-                if mins_left <= 0 or mins_left > (tf_seconds / 60.0) + 2:
-                    continue
+    # STRATEGY 2: Slug lookup (current window only, 5M+15M+1H)
+    assets = [("btc", "BTC"), ("eth", "ETH"), ("sol", "SOL"), ("xrp", "XRP")]
+    # 1H uses date-based slug: "bitcoin-up-or-down-april-29-2026-2pm-et"
+    # Confirmed from: dappboris-dev/polymarket-trading-bot & live Polymarket URLs
+    _1h_full_names = {"btc": "bitcoin", "eth": "ethereum", "sol": "solana", "xrp": "xrp"}
+    try:
+        from zoneinfo import ZoneInfo
+        _ET = ZoneInfo("America/New_York")
+    except Exception:
+        _ET = timezone(timedelta(hours=-4))
+    now_et = now.astimezone(_ET)
+    _1h_start = now_et.replace(minute=0, second=0, microsecond=0)
+    _1h_h12 = _1h_start.hour % 12 or 12
+    _1h_ap = "am" if _1h_start.hour < 12 else "pm"
+    _1h_mo = _1h_start.strftime("%B").lower()
+    _1h_dy = _1h_start.day
+    _1h_yr = _1h_start.year
 
-                # Polymarket slug format: btc-updown-5m-{window_start}
-                slug = "{}-updown-{}-{}".format(asset_slug, tf_slug, start_ts)
+    for asset_slug, _ in assets:
+        slugs_to_try = []
+        # 5M and 15M: timestamp-based slug
+        for tf_slug, tf_sec in [("5m", 300), ("15m", 900)]:
+            ws = (current_ts // tf_sec) * tf_sec
+            slugs_to_try.append("{}-updown-{}-{}".format(asset_slug, tf_slug, ws))
+        # 1H: date-based slug — try WITH year first (current format), then WITHOUT year (old format)
+        _1h_name = _1h_full_names.get(asset_slug, asset_slug)
+        slugs_to_try.append("{}-up-or-down-{}-{}-{}-{}{}-et".format(
+            _1h_name, _1h_mo, _1h_dy, _1h_yr, _1h_h12, _1h_ap))
+        slugs_to_try.append("{}-up-or-down-{}-{}-{}{}-et".format(
+            _1h_name, _1h_mo, _1h_dy, _1h_h12, _1h_ap))
 
-                # Look up via /events endpoint (Polymarket indexes by event slug)
+        for slug in slugs_to_try:
+            _is_1h_slug = "-up-or-down-" in slug
+            
+            # Try path-based endpoint: /events/slug/{slug}, then query: /events?slug={slug}
+            for url in ["{}/events/slug/{}".format(POLY_GAMMA_API, slug),
+                        "{}/events".format(POLY_GAMMA_API)]:
                 try:
-                    r = req.get(
-                        "{}/events".format(POLY_GAMMA_API),
-                        params={"slug": slug},
-                        timeout=10
-                    )
+                    params = {"slug": slug} if "/slug/" not in url else {}
+                    r = req.get(url, params=params, timeout=8)
                     if r.status_code == 200:
                         data = r.json()
-                        event_markets = []
+                        em = []
                         if isinstance(data, list) and data:
-                            event_markets = data[0].get("markets", []) if isinstance(data[0], dict) else []
+                            em = data[0].get("markets", []) if isinstance(data[0], dict) else []
                         elif isinstance(data, dict):
-                            event_markets = data.get("markets", [])
-
-                        for market in event_markets:
-                            parsed = _poly_parse_market(market)
+                            em = data.get("markets", [])
+                        if em:
+                            print("POLY FOUND: {} → {} markets via {}".format(slug, len(em), "path" if "/slug/" in url else "query"))
+                        for market in em:
+                            parsed = _poly_parse_market(market, timeframe_hint="1H" if _is_1h_slug else None)
                             if parsed:
                                 markets.append(parsed)
-                    elif tf_label in ("5M", "15M") and asset_slug == "btc":
-                        print("POLY SLUG DEBUG: {} → status {}".format(slug, r.status_code))
-                except Exception as e:
-                    if tf_label in ("5M", "15M"):
-                        print("POLY SLUG ERROR: {} → {}".format(slug, e))
-
-                # Try alternative slug formats (V2 may have changed)
-                if not any(m.get("slug") == slug for m in markets):
-                    alt_slugs = [
-                        "{}-updown-{}-{}".format(asset_slug, tf_slug, start_ts),
-                        "{}-up-or-down-{}-{}".format(asset_slug, tf_slug, start_ts),
-                        "{}-{}-price".format(asset_slug, "15min" if tf_label == "15M" else "5min" if tf_label == "5M" else "hourly"),
-                    ]
-                    for alt_slug in alt_slugs:
-                        if any(m.get("slug") == alt_slug for m in markets):
-                            continue
-                        try:
-                            r = req.get("{}/events".format(POLY_GAMMA_API),
-                                        params={"slug": alt_slug}, timeout=5)
-                            if r.status_code == 200:
-                                data = r.json()
-                                em = []
-                                if isinstance(data, list) and data:
-                                    em = data[0].get("markets", []) if isinstance(data[0], dict) else []
-                                elif isinstance(data, dict):
-                                    em = data.get("markets", [])
-                                for market in em:
-                                    parsed = _poly_parse_market(market)
-                                    if parsed:
-                                        markets.append(parsed)
-                                        if tf_label in ("5M", "15M"):
-                                            print("POLY V2 FOUND via alt slug: {} → {} markets".format(alt_slug, len(em)))
-                                if em:
-                                    break
-                        except Exception as _ae:
-                            if tf_label in ("5M", "15M"):
-                                print("POLY ALT SLUG ERROR: {} → {}".format(alt_slug, _ae))
-
-                # Also try /markets endpoint as fallback
-                if not any(m.get("slug") == slug for m in markets):
-                    try:
-                        r = req.get(
-                            "{}/markets".format(POLY_GAMMA_API),
-                            params={"slug": slug},
-                            timeout=10
-                        )
-                        if r.status_code == 200:
-                            data = r.json()
-                            if isinstance(data, list) and data:
-                                market = data[0]
-                            elif isinstance(data, dict) and data.get("id"):
-                                market = data
-                            else:
-                                continue
-
-                            parsed = _poly_parse_market(market)
-                            if parsed:
-                                markets.append(parsed)
-                    except Exception as _me:
-                        if tf_label in ("5M", "15M"):
-                            print("POLY MARKETS ENDPOINT ERROR: {} → {}".format(slug, _me))
-
-    if not markets:
-        # Fallback: try broad search
-        try:
-            r = req.get(
-                "{}/markets".format(POLY_GAMMA_API),
-                params={"active": "true", "closed": "false", "limit": 100,
-                        "order": "volume24hr", "ascending": "false"},
-                timeout=15
-            )
-            if r.status_code == 200:
-                batch = r.json()
-                if isinstance(batch, list):
-                    for m in batch:
-                        q = (m.get("question") or m.get("title") or "").lower()
-                        if "up or down" in q:
-                            parsed = _poly_parse_market(m)
-                            if parsed:
-                                markets.append(parsed)
-                print("Poly fallback: {} raw, {} parsed".format(
-                    len(batch) if isinstance(batch, list) else 0, len(markets)))
-                if isinstance(batch, list) and len(markets) == 0 and len(batch) > 0:
-                    for _dm in batch[:3]:
-                        _dq = (_dm.get("question") or _dm.get("title") or "NO_TITLE")[:80]
-                        print("  RAW MARKET: {}".format(_dq))
-                    # Also check for any crypto-related markets
-                    _crypto_found = [(_dm.get("question") or "")[:80] for _dm in batch 
-                                     if any(k in (_dm.get("question") or "").lower() 
-                                            for k in ["btc", "bitcoin", "eth", "sol", "xrp", "crypto", "above", "up or down", "updown"])]
-                    if _crypto_found:
-                        print("  CRYPTO in batch: {}".format(len(_crypto_found)))
-                        for _cf in _crypto_found[:5]:
-                            print("    → {}".format(_cf))
-                    else:
-                        print("  NO crypto Up/Down markets in {} results".format(len(batch)))
-            else:
-                print("Poly API status: {}".format(r.status_code))
-        except Exception as e:
-            print("Poly fetch error: {}".format(e))
-
-    # Also fetch 1H markets — these use event slugs like "bitcoin-up-or-down-april-22-2026-2pm-et"
-    # and resolve via Binance BTC/USDT, NOT Chainlink
-    hourly_found = sum(1 for m in markets if m.get("timeframe") == "1H")
-    if hourly_found == 0:
-        try:
-            now_et = now - timedelta(hours=4)  # UTC to ET
-            month_names = ["", "january", "february", "march", "april", "may", "june",
-                          "july", "august", "september", "october", "november", "december"]
-            month = month_names[now_et.month]
-            day = now_et.day
-            year = now_et.year
-
-            for asset_name, asset_code in [("bitcoin", "BTC"), ("ethereum", "ETH"), ("solana", "SOL"), ("xrp", "XRP")]:
-                for hour_offset in [0, 1]:
-                    target = now_et + timedelta(hours=hour_offset)
-                    target_hour = target.hour
-                    am_pm = "am" if target_hour < 12 else "pm"
-                    display_hour = target_hour if target_hour <= 12 else target_hour - 12
-                    if display_hour == 0:
-                        display_hour = 12
-
-                    event_slug = "{}-up-or-down-{}-{}-{}-{}{}-et".format(
-                        asset_name, month, target.day, year, display_hour, am_pm)
-
-                    try:
-                        r = req.get("{}/events".format(POLY_GAMMA_API),
-                                    params={"slug": event_slug}, timeout=5)
-                        if r.status_code == 200:
-                            data = r.json()
-                            event_markets = []
-                            if isinstance(data, list) and data:
-                                event_markets = data[0].get("markets", []) if isinstance(data[0], dict) else []
-                            elif isinstance(data, dict):
-                                event_markets = data.get("markets", [])
-                            for m in event_markets:
-                                # First try normal parsing
-                                parsed = _poly_parse_market(m, timeframe_hint="1H")
-                                if not parsed:
-                                    # The market inside the event might not have "up or down" in question
-                                    # but we KNOW it's an Up/Down event from the event slug
-                                    # Force-inject "up or down" into the question for parsing
-                                    m_copy = dict(m)
-                                    orig_q = m_copy.get("question") or m_copy.get("title") or ""
-                                    if "up or down" not in orig_q.lower():
-                                        m_copy["question"] = "{} Up or Down".format(orig_q)
-                                    parsed = _poly_parse_market(m_copy, timeframe_hint="1H")
-                                if parsed:
-                                    parsed["timeframe"] = "1H"
-                                    markets.append(parsed)
-                    except:
-                        pass
-
-            # Fallback: tag search
-            if sum(1 for m in markets if m.get("timeframe") == "1H") == 0:
-                try:
-                    r = req.get("{}/markets".format(POLY_GAMMA_API),
-                                params={"active": "true", "closed": "false", "tag_id": 102175, "limit": 50},
-                                timeout=15)
-                    if r.status_code == 200:
-                        batch = r.json()
-                        if isinstance(batch, list):
-                            existing_ids = set(m.get("market_id") for m in markets)
-                            for m in batch:
-                                q = (m.get("question") or m.get("title") or "").lower()
-                                if "up or down" in q or "above" in q:
-                                    parsed = _poly_parse_market(m, timeframe_hint="1H")
-                                    if parsed and parsed["market_id"] not in existing_ids:
-                                        if not parsed.get("timeframe"):
-                                            parsed["timeframe"] = "1H"
-                                        markets.append(parsed)
+                            elif _is_1h_slug:
+                                _mslug = (market.get("slug") or "")[:60]
+                                _mq = (market.get("question") or "")[:80]
+                                print("POLY 1H PARSE FAIL: slug={} q={}".format(_mslug, _mq))
+                        if em:
+                            break  # Found via this URL format — skip the other format
+                    elif r.status_code == 429:
+                        print("Poly slug: rate limited")
+                        break
                 except:
                     pass
-
-            hourly_total = sum(1 for m in markets if m.get("timeframe") == "1H")
-            if hourly_total > 0:
-                print("Poly 1H: {} hourly markets found".format(hourly_total))
-        except Exception as e:
-            print("Poly 1H error: {}".format(e))
-
+    
     if markets:
-        print("Poly scan: {} markets found".format(len(markets)))
-    else:
-        print("Poly scan: 0 markets from API")
+        print("Poly slug: {} markets across {} assets".format(len(markets), len(set(m.get("asset","") for m in markets))))
+        return markets
 
+    # STRATEGY 3: Broad scan (1 call)
+    try:
+        r = req.get("{}/markets".format(POLY_GAMMA_API),
+                    params={"active": "true", "closed": "false", "limit": 100,
+                            "order": "volume24hr", "ascending": "false"}, timeout=15)
+        if r.status_code == 200:
+            batch = r.json() if isinstance(r.json(), list) else []
+            for m in batch:
+                q = (m.get("question") or "").lower()
+                if "up or down" in q or "updown" in q:
+                    parsed = _poly_parse_market(m)
+                    if parsed:
+                        markets.append(parsed)
+            print("Poly broad: {} raw, {} Up/Down".format(len(batch), len(markets)))
+            if not markets:
+                crypto = [(m.get("question") or "?")[:70] for m in batch if any(k in (m.get("question") or "").lower() for k in ["bitcoin", "btc", "eth", "up or down"])]
+                if crypto:
+                    for c in crypto[:3]:
+                        print("  -> {}".format(c))
+        else:
+            print("Poly broad status: {}".format(r.status_code))
+    except Exception as e:
+        print("Poly broad error: {}".format(e))
+
+    if not markets:
+        print("Poly: 0 markets (all strategies failed)")
     return markets
 
+
 def _poly_get_baseline(parsed, price, indicators):
-    """Get the Price to Beat from Polymarket's official PTB endpoint.
-    Priority: 1. Polymarket PTB API (EXACT match with resolution)
-              2. Baseline from market title/description (parsed)
-              3. Chainlink PTB captured at window boundary (fallback)"""
-    import requests as _req
+    """Get the Price to Beat for crypto Up/Down markets.
+    Priority: (1) Exact PTB from market title/question — matches Polymarket display
+              (2) Chainlink boundary capture — close but not exact
+              (3) Latest Chainlink stream — last resort"""
     asset = parsed.get("asset", "")
     tf = parsed.get("timeframe", "")
-    slug = parsed.get("slug", "")
     
-    # Source 1: Polymarket's official Price-to-Beat endpoint (EXACT)
-    if slug:
-        try:
-            ptb_url = "https://polymarket.com/api/equity/price-to-beat/{}".format(slug)
-            r = _req.get(ptb_url, timeout=5)
-            if r.status_code == 200:
-                ptb_data = r.json()
-                ptb_val = None
-                if isinstance(ptb_data, dict):
-                    ptb_val = ptb_data.get("price") or ptb_data.get("value") or ptb_data.get("price_to_beat")
-                elif isinstance(ptb_data, (int, float)):
-                    ptb_val = float(ptb_data)
-                if ptb_val and float(ptb_val) > 0:
-                    ptb_val = float(ptb_val)
-                    print("POLY PTB (API): {} {} = ${:,.4f}".format(asset, tf, ptb_val))
-                    return ptb_val
-        except:
-            pass
-    
-    # Source 2: Baseline already extracted from market title/description
+    # Source 1: Baseline from market title (EXACT — same as Polymarket displays)
+    # e.g. "BTC above $76,354.75" → baseline = 76354.75
     if parsed.get("baseline") and parsed["baseline"] > 0:
+        print("POLY PTB (title): {} {} = ${:,.4f}".format(asset, tf, parsed["baseline"]))
+        parsed["_ptb_source"] = "title"
         return parsed["baseline"]
     
-    # Source 3: Chainlink PTB from window boundary (fallback only)
+    # Source 2: Chainlink PTB captured at window boundary (close but not exact)
     key = "{}_{}".format(asset, tf)
     entry = _chainlink_ptb.get(key)
     if entry:
-        print("POLY PTB (Chainlink fallback): {} {} = ${:,.4f}".format(asset, tf, entry[1]))
+        print("POLY PTB (chainlink): {} {} = ${:,.4f}".format(asset, tf, entry[1]))
+        parsed["_ptb_source"] = "chainlink"
         return entry[1]
     
-    # Source 4: Latest Chainlink streaming price (worst fallback)
+    # Source 3: Latest Chainlink streaming price (approximate)
     chainlink = _chainlink_prices.get(asset)
     if chainlink:
-        print("POLY PTB (streaming fallback): {} {} = ${:,.4f}".format(asset, tf, chainlink))
+        print("POLY PTB (latest stream): {} {} = ${:,.4f}".format(asset, tf, chainlink))
+        parsed["_ptb_source"] = "stream"
         return chainlink
     return None
 
@@ -14943,7 +16380,7 @@ def run_poly_scan():
         conn.close()
 
         poly_counts = {"btc5m": 0, "all5m": 0, "all15m": 0, "hourly24": 0}
-        strategies = ["p21", "p23", "p31", "p33", "p24", "p34", "p25", "p35", "p26", "p36", "bot2"]
+        strategies = ["p21", "p23", "p31", "p33", "p24", "p34", "p25", "p35", "p26", "p36", "p28", "p29", "bot2"]
         # BUG 3 FIX: Batch inserts with single connection
         inserts = []
         _pa_pending_signals = {}  # Track P2.1 signals per market for tiered trading
@@ -14968,10 +16405,9 @@ def run_poly_scan():
             # Determine which sections this market belongs to
             sections = []
             if tf == "5M":
-                # 5M: BTC only
-                if asset == "BTC":
-                    sections.append("btc5m")
-                # Skip non-BTC 5M markets entirely
+                # Model C: ALL assets on 5M (not just BTC)
+                if asset in ("BTC", "ETH", "SOL", "XRP"):
+                    sections.append("all5m")
             elif tf == "15M":
                 sections.append("all15m")
             elif tf == "1H":
@@ -15006,10 +16442,10 @@ def run_poly_scan():
             for section in sections:
                 for strat in strategies:
                     # Section-strategy filtering:
-                    # hourly24: only P2.4, P3.4, P2.5, P3.5 (1H candle strategies)
+                    # hourly24: P2.4, P3.4, P2.5, P3.5, P2.8 (1H strategies)
                     # P2.5/P3.5 are 1H only — skip on 15M and 5M sections
                     # P2.6/P3.6 are 15M only — skip on 1H sections
-                    if section == "hourly24" and strat not in ("p24", "p34", "p25", "p35"):
+                    if section == "hourly24" and strat not in ("p21", "p23", "p24", "p34", "p25", "p35", "p28", "p29"):
                         continue
                     if section in ("btc5m", "all15m") and strat in ("p24", "p34", "p25", "p35"):
                         continue
@@ -15079,6 +16515,16 @@ def run_poly_scan():
                                                           ind_macro=ind_macro,
                                                           expiry_minute=expiry_minute,
                                                           expiry_hour=expiry_hour)
+                        elif strat == "p28":
+                            scored = _score_paper28_trade(parsed, price, indicators=ind,
+                                                          ind_macro=ind_macro,
+                                                          expiry_minute=expiry_minute,
+                                                          expiry_hour=expiry_hour)
+                        elif strat == "p29":
+                            scored = _score_paper29_trade(parsed, price, indicators=ind,
+                                                          ind_macro=ind_macro,
+                                                          expiry_minute=expiry_minute,
+                                                          expiry_hour=expiry_hour)
                         elif strat == "bot2":
                             scored = _score_paper_trade(parsed, price)
                     except Exception as e:
@@ -15120,6 +16566,77 @@ def run_poly_scan():
                     if strat == "p23":
                         print("POLY_P23_SCORED: {} tf={} sec={} side={} odds={:.0f}%".format(
                             asset, tf, section, poly_side, effective_odds))
+
+                    # ─── POLYMARKET ALPHA 3.0 — Pure P2.3 with Compounding ───
+                    # Fires directly when P2.3 scores on 15M or 1H — no pending, no mixing
+                    if strat == "p23" and tf == "15M":
+                        _pa3_mkey = parsed["market_id"]
+                        if _pa3_mkey not in _poly_alpha3_traded_markets and _poly_alpha3_state["enabled"] and _poly_has_creds():
+                            _pa3_stake = _poly_alpha3_calc_stake(_poly_alpha3_state["balance"])
+                            _pa3_max_fill = 0.62
+                            if _pa3_stake > 0 and _pa3_stake <= _poly_alpha3_state["balance"] and share_price <= _pa3_max_fill:
+                                clob_toks = parsed.get("clob_tokens", [])
+                                cid = parsed.get("condition_id", "")
+                                _pa3_tid = None
+                                if clob_toks and len(clob_toks) >= 2:
+                                    up_idx = parsed.get("up_token_index", 0); down_idx = parsed.get("down_token_index", 1)
+                                    _pa3_tid = clob_toks[up_idx] if poly_side == "UP" else clob_toks[down_idx]
+                                elif cid:
+                                    _pa3_tid = _get_poly_token_id(cid, poly_side)
+                                if _pa3_tid:
+                                    try:
+                                        client = _get_poly_client()
+                                        if client:
+                                            from py_clob_client_v2 import Side, OrderArgs, OrderType
+                                            BUY = Side.BUY
+                                            _pa3_best = min(share_price + 0.03, _pa3_max_fill)  # Aggressive default
+                                            try:
+                                                book = client.get_order_book(str(_pa3_tid))
+                                                if book and book.get("asks") and len(book["asks"]) > 0:
+                                                    # Take ask + 1¢ to guarantee fill
+                                                    _pa3_ask = round(float(book["asks"][0]["price"]), 2)
+                                                    _pa3_best = min(_pa3_ask + 0.01, _pa3_max_fill)
+                                                elif book and book.get("bids") and len(book["bids"]) > 0:
+                                                    _pa3_bid = round(float(book["bids"][0]["price"]), 2)
+                                                    _pa3_best = min(_pa3_bid + 0.03, _pa3_max_fill)
+                                            except:
+                                                pass
+                                            _pa3_shares = max(5.0, round(_pa3_stake / _pa3_best, 2))
+                                            oa = OrderArgs(token_id=str(_pa3_tid), price=round(_pa3_best, 2), size=_pa3_shares, side=BUY)
+                                            signed = client.create_order(oa)
+                                            resp = client.post_order(signed, OrderType.GTC)
+                                            _pa3_oid = resp.get("orderID") or resp.get("order_id") if resp else None
+                                            _pa3_filled = (resp.get("status") or "").upper() in ("MATCHED", "FILLED") if resp else False
+                                            _poly_alpha3_state["balance"] = round(_poly_alpha3_state["balance"] - _pa3_stake, 2)
+                                            _poly_alpha3_state["trades_today"] += 1
+                                            _poly_alpha3_traded_markets.add(_pa3_mkey)
+                                            if _poly_alpha3_state["balance"] > _poly_alpha3_state["peak_balance"]:
+                                                _poly_alpha3_state["peak_balance"] = _poly_alpha3_state["balance"]
+                                            try:
+                                                _c3 = get_db()
+                                                _c3.run("""INSERT INTO poly_alpha3_trades
+                                                    (market_id,title,asset,timeframe,bet_side,stake,fill_price,
+                                                     pool_after,order_id,token_id,condition_id,slug,filled,status,fired_at)
+                                                    VALUES(:mid,:ttl,:ast,:tf,:bs,:stake,:fill,:pool,:oid,:tid,:cid,:slg,:filled,'Pending',:now)""",
+                                                    mid=_pa3_mkey, ttl=parsed["title"], ast=asset,
+                                                    tf=tf, bs=poly_side, stake=_pa3_stake,
+                                                    fill=round(share_price, 4),
+                                                    pool=_poly_alpha3_state["balance"],
+                                                    oid=_pa3_oid, tid=str(_pa3_tid)[:50], cid=cid,
+                                                    slg=parsed.get("slug",""), filled=_pa3_filled,
+                                                    now=datetime.now(timezone.utc).isoformat())
+                                                _c3.close()
+                                            except:
+                                                pass
+                                            _fl = "FILLED" if _pa3_filled else "MAKER"
+                                            print("POLY A3: {} {} {} ${:.2f} @{:.0f}% [{}] P2.3 | pool=${:.2f}".format(
+                                                poly_side, asset, tf, _pa3_stake, share_price*100,
+                                                _fl, _poly_alpha3_state["balance"]))
+                                            send_telegram("⚡ <b>POLY A3</b>\n{} {} {} ${:.2f} @{:.0f}%\nP2.3 pure\nPool: ${:.2f}".format(
+                                                poly_side, asset, tf, _pa3_stake, share_price*100,
+                                                _poly_alpha3_state["balance"]))
+                                    except Exception as _e3:
+                                        print("POLY A3 error: {}".format(_e3))
 
                     # ─── POLYMARKET ALPHA v1 — PAUSED ───
                     if strat == "p21" and tf in ("5M", "15M"):
@@ -15187,10 +16704,24 @@ def run_poly_scan():
                                         try:
                                             client = _get_poly_client()
                                             if client:
-                                                from py_clob_client.order_builder.constants import BUY
-                                                from py_clob_client.clob_types import OrderArgs, OrderType
-                                                _pa2_shares = max(5.0, round(_pa2_stake / _pa2_share, 2))
-                                                oa = OrderArgs(token_id=str(tid), price=round(_pa2_share, 2), size=_pa2_shares, side=BUY)
+                                                from py_clob_client_v2 import Side, OrderArgs, OrderType
+                                                BUY = Side.BUY
+                                                # Aggressive fill — take ask + 1¢ for instant execution
+                                                _pa2_best_price = min(_pa2_share + 0.03, _pa2_max)
+                                                try:
+                                                    book = client.get_order_book(str(tid))
+                                                    if book and book.get("asks") and len(book["asks"]) > 0:
+                                                        best_ask = float(book["asks"][0]["price"])
+                                                        _pa2_best_price = round(best_ask + 0.01, 2)
+                                                        _pa2_best_price = min(_pa2_best_price, _pa2_max)
+                                                    elif book and book.get("bids") and len(book["bids"]) > 0:
+                                                        best_bid = float(book["bids"][0]["price"])
+                                                        _pa2_best_price = round(best_bid + 0.03, 2)
+                                                        _pa2_best_price = min(_pa2_best_price, _pa2_max)
+                                                except:
+                                                    pass
+                                                _pa2_shares = max(5.0, round(_pa2_stake / _pa2_best_price, 2))
+                                                oa = OrderArgs(token_id=str(tid), price=round(_pa2_best_price, 2), size=_pa2_shares, side=BUY)
                                                 signed = client.create_order(oa)
                                                 resp = client.post_order(signed, OrderType.GTC)
                                                 _pa2_oid = resp.get("orderID") or resp.get("order_id") if resp else None
@@ -15224,6 +16755,75 @@ def run_poly_scan():
                                                     _pa2_stake, _pa2_share*100, _boost, _poly_alpha2_state["balance"]))
                                         except Exception as _e2:
                                             print("POLY A2 error: {}".format(_e2))
+
+                    # ─── POLY ALPHA 2.0: 1H P2.4 trades (ULTIMATE model) ───
+                    # P2.4 fires directly for 1H — no pending/boost needed
+                    if strat == "p24" and tf == "1H":
+                        _pa2_mkey = parsed["market_id"]
+                        if _pa2_mkey not in _poly_alpha2_traded_markets and _poly_alpha2_state["enabled"] and _poly_has_creds():
+                            _pa2_tier = _poly_alpha2_get_tier(asset, tf, p24_agrees=True)
+                            if _pa2_tier:
+                                _pa2_name, _pa2_base, _pa2_max = _pa2_tier
+                                _pa2_stake = _poly_alpha2_calc_stake(_pa2_base, _poly_alpha2_state["balance"])
+                                _pa2_share = share_price
+                                _pa2_side = poly_side
+                                _pa2_p = dict(parsed)
+                                if _pa2_stake > 0 and _pa2_stake <= _poly_alpha2_state["balance"] and _pa2_share <= _pa2_max:
+                                    clob_toks = _pa2_p.get("clob_tokens", [])
+                                    cid = _pa2_p.get("condition_id", "")
+                                    tid = None
+                                    if clob_toks and len(clob_toks) >= 2:
+                                        up_idx = _pa2_p.get("up_token_index", 0); down_idx = _pa2_p.get("down_token_index", 1)
+                                        tid = clob_toks[up_idx] if _pa2_side == "UP" else clob_toks[down_idx]
+                                    elif cid:
+                                        tid = _get_poly_token_id(cid, _pa2_side)
+                                    if tid:
+                                        try:
+                                            client = _get_poly_client()
+                                            if client:
+                                                from py_clob_client_v2 import Side, OrderArgs, OrderType
+                                                BUY = Side.BUY
+                                                _pa2_best = _pa2_share
+                                                try:
+                                                    book = client.get_order_book(str(tid))
+                                                    if book and book.get("asks"):
+                                                        _pa2_best = min(round(float(book["asks"][0]["price"]), 2), _pa2_max)
+                                                except:
+                                                    pass
+                                                _pa2_shares = max(5.0, round(_pa2_stake / _pa2_best, 2))
+                                                oa = OrderArgs(token_id=str(tid), price=round(_pa2_best, 2), size=_pa2_shares, side=BUY)
+                                                signed = client.create_order(oa)
+                                                resp = client.post_order(signed, OrderType.GTC)
+                                                _pa2_oid = resp.get("orderID") or resp.get("order_id") if resp else None
+                                                _pa2_filled = (resp.get("status") or "").upper() in ("MATCHED", "FILLED") if resp else False
+                                                _poly_alpha2_state["balance"] = round(_poly_alpha2_state["balance"] - _pa2_stake, 2)
+                                                _poly_alpha2_state["trades_today"] += 1
+                                                _poly_alpha2_traded_markets.add(_pa2_mkey)
+                                                try:
+                                                    _c2 = get_db()
+                                                    _c2.run("""INSERT INTO poly_alpha2_trades
+                                                        (market_id,title,asset,timeframe,bet_side,tier,stake,fill_price,
+                                                         pool_after,order_id,token_id,condition_id,slug,filled,status,fired_at)
+                                                        VALUES(:mid,:ttl,:ast,:tf,:bs,:tier,:stake,:fill,:pool,:oid,:tid,:cid,:slg,:filled,'Pending',:now)""",
+                                                        mid=_pa2_mkey, ttl=_pa2_p["title"], ast=asset,
+                                                        tf=tf, bs=_pa2_side, tier=_pa2_name,
+                                                        stake=_pa2_stake, fill=round(_pa2_share, 4),
+                                                        pool=_poly_alpha2_state["balance"],
+                                                        oid=_pa2_oid, tid=str(tid)[:50], cid=cid,
+                                                        slg=_pa2_p.get("slug",""), filled=_pa2_filled,
+                                                        now=datetime.now(timezone.utc).isoformat())
+                                                    _c2.close()
+                                                except:
+                                                    pass
+                                                _fl = "FILLED" if _pa2_filled else "MAKER"
+                                                print("POLY A2 {}: {} {} {} ${:.2f} @{:.0f}% [{}] P2.4 | pool=${:.2f}".format(
+                                                    _pa2_name, _pa2_side, asset, tf,
+                                                    _pa2_stake, _pa2_share*100, _fl, _poly_alpha2_state["balance"]))
+                                                send_telegram("⚡ <b>POLY A2 {}</b>\n{} {} {} ${:.2f} @{:.0f}%\nP2.4\nPool: ${:.2f}".format(
+                                                    _pa2_name, _pa2_side, asset, tf,
+                                                    _pa2_stake, _pa2_share*100, _poly_alpha2_state["balance"]))
+                                        except Exception as _e1h:
+                                            print("POLY A2 1H error: {}".format(_e1h))
         # Process remaining P2.1-only signals (P2.3 didn't score for these markets)
         for _pa_mkey, _pa_sig in list(_pa_pending_signals.items()):
             if _pa_mkey in _poly_alpha_traded_markets or not _poly_alpha_state["enabled"]:
@@ -15254,8 +16854,8 @@ def run_poly_scan():
             try:
                 client = _get_poly_client()
                 if client:
-                    from py_clob_client.order_builder.constants import BUY
-                    from py_clob_client.clob_types import OrderArgs, OrderType
+                    from py_clob_client_v2 import Side, OrderArgs, OrderType
+                    BUY = Side.BUY
                     _pa_shares = max(5.0, round(_pa_stake / _pa_share, 2))
                     order_args = OrderArgs(token_id=str(token_id), price=round(_pa_share, 2), size=_pa_shares, side=BUY)
                     signed = client.create_order(order_args)
@@ -15325,10 +16925,19 @@ def run_poly_scan():
                     continue
                 client = _get_poly_client()
                 if client:
-                    from py_clob_client.order_builder.constants import BUY
-                    from py_clob_client.clob_types import OrderArgs, OrderType
-                    _pa2_shares = max(5.0, round(_pa2_stake / _pa2_share, 2))
-                    oa = OrderArgs(token_id=str(tid), price=round(_pa2_share, 2), size=_pa2_shares, side=BUY)
+                    from py_clob_client_v2 import Side, OrderArgs, OrderType
+                    BUY = Side.BUY
+                    # Get best ask for immediate fill
+                    _pa2_best = _pa2_share
+                    try:
+                        _fb_book = client.get_order_book(str(tid))
+                        if _fb_book and _fb_book.get("asks"):
+                            _fb_ask = float(_fb_book["asks"][0]["price"])
+                            _pa2_best = min(round(_fb_ask, 2), _pa2_max)
+                    except:
+                        pass
+                    _pa2_shares = max(5.0, round(_pa2_stake / _pa2_best, 2))
+                    oa = OrderArgs(token_id=str(tid), price=round(_pa2_best, 2), size=_pa2_shares, side=BUY)
                     signed = client.create_order(oa)
                     resp = client.post_order(signed, OrderType.GTC)
                     _pa2_oid = resp.get("orderID") or resp.get("order_id") if resp else None
@@ -15649,8 +17258,18 @@ def _resolve_poly_alpha_trades():
                 if fired.tzinfo is None:
                     fired = fired.replace(tzinfo=timezone.utc)
                 tf = p.get("timeframe", "15M")
-                expiry_hours = 0.25 if tf == "15M" else (1.0/12)  # 5 min
-                expiry = fired + timedelta(hours=expiry_hours)
+                # Calculate actual market window end time
+                if tf == "1H":
+                    window_start = fired.replace(minute=0, second=0, microsecond=0)
+                    expiry = window_start + timedelta(hours=1)
+                elif tf == "5M":
+                    m5 = (fired.minute // 5) * 5
+                    window_start = fired.replace(minute=m5, second=0, microsecond=0)
+                    expiry = window_start + timedelta(minutes=5)
+                else:
+                    m15 = (fired.minute // 15) * 15
+                    window_start = fired.replace(minute=m15, second=0, microsecond=0)
+                    expiry = window_start + timedelta(minutes=15)
                 if now < expiry + timedelta(minutes=2):
                     continue
 
@@ -15806,8 +17425,22 @@ def _resolve_poly_alpha2_trades():
                 if fired.tzinfo is None:
                     fired = fired.replace(tzinfo=timezone.utc)
                 tf = p.get("timeframe", "15M")
-                expiry_hours = 0.25 if tf == "15M" else (1.0/12)
-                expiry = fired + timedelta(hours=expiry_hours)
+                # Calculate when the market window actually ends
+                # 5M=5min, 15M=15min, 1H=60min from WINDOW START (not from fired_at)
+                if tf == "1H":
+                    # 1H window: round fired_at DOWN to the hour boundary
+                    window_start = fired.replace(minute=0, second=0, microsecond=0)
+                    expiry = window_start + timedelta(hours=1)
+                elif tf == "5M":
+                    # 5M window: round fired_at DOWN to 5-min boundary
+                    m5 = (fired.minute // 5) * 5
+                    window_start = fired.replace(minute=m5, second=0, microsecond=0)
+                    expiry = window_start + timedelta(minutes=5)
+                else:
+                    # 15M window: round fired_at DOWN to 15-min boundary
+                    m15 = (fired.minute // 15) * 15
+                    window_start = fired.replace(minute=m15, second=0, microsecond=0)
+                    expiry = window_start + timedelta(minutes=15)
                 if now < expiry + timedelta(minutes=2):
                     continue
                 stake = float(p.get("stake") or 2.50)
@@ -15897,6 +17530,103 @@ def _resolve_poly_alpha2_trades():
     except Exception as e:
         print("Poly A2 resolve error: {}".format(e)); return 0
 
+def _resolve_poly_alpha3_trades():
+    """Resolve Alpha 3.0 trades using Gamma API outcome prices."""
+    try:
+        conn = get_db()
+        rows = conn.run("SELECT * FROM poly_alpha3_trades WHERE status='Pending' ORDER BY id")
+        cols = [c['name'] for c in conn.columns]
+        items = [dict(zip(cols, r)) for r in rows]
+        conn.close()
+        if not items: return 0
+        now = datetime.now(timezone.utc)
+        resolved = 0
+        for p in items:
+            try:
+                if not p.get("fired_at"): continue
+                fired = datetime.fromisoformat(p["fired_at"])
+                if fired.tzinfo is None: fired = fired.replace(tzinfo=timezone.utc)
+                tf = p.get("timeframe", "15M")
+                if tf == "1H":
+                    window_start = fired.replace(minute=0, second=0, microsecond=0)
+                    expiry = window_start + timedelta(hours=1)
+                elif tf == "5M":
+                    m5 = (fired.minute // 5) * 5
+                    window_start = fired.replace(minute=m5, second=0, microsecond=0)
+                    expiry = window_start + timedelta(minutes=5)
+                else:
+                    m15 = (fired.minute // 15) * 15
+                    window_start = fired.replace(minute=m15, second=0, microsecond=0)
+                    expiry = window_start + timedelta(minutes=15)
+                if now < expiry + timedelta(minutes=2): continue
+                stake = float(p.get("stake") or 2.50)
+                order_filled = p.get("filled", False)
+                market_expired = now > expiry
+                if not order_filled and market_expired:
+                    _poly_alpha3_state["balance"] = round(_poly_alpha3_state["balance"] + stake, 2)
+                    c3 = get_db(); c3.run("UPDATE poly_alpha3_trades SET status='Returned',outcome='RETURNED',resolved_at=:r WHERE id=:i", r=now.isoformat(), i=p["id"]); c3.close()
+                    resolved += 1; continue
+                won = None
+                slug = p.get("slug", "")
+                cid = p.get("condition_id", "")
+                bs = p.get("bet_side", "UP")
+                try:
+                    import requests as req
+                    if slug:
+                        r = req.get("{}/markets/slug/{}".format(POLY_GAMMA_API, slug), timeout=8)
+                        if r.status_code == 200:
+                            md = r.json()
+                            ops = md.get("outcomePrices")
+                            if ops:
+                                if isinstance(ops, str):
+                                    try: ops = json.loads(ops)
+                                    except: ops = None
+                                if isinstance(ops, list) and len(ops) >= 2:
+                                    p0 = float(ops[0]); p1 = float(ops[1])
+                                    _oc = md.get("outcomes")
+                                    if isinstance(_oc, str):
+                                        try: _oc = json.loads(_oc)
+                                        except: _oc = None
+                                    _up_idx = 0
+                                    if isinstance(_oc, list) and len(_oc) >= 2:
+                                        o0 = str(_oc[0]).lower().strip()
+                                        if o0 in ("no", "down", "below"): _up_idx = 1
+                                    if _up_idx == 0:
+                                        if p0>=0.95: won=(bs=="UP")
+                                        elif p1>=0.95: won=(bs=="DOWN")
+                                    else:
+                                        if p1>=0.95: won=(bs=="UP")
+                                        elif p0>=0.95: won=(bs=="DOWN")
+                except: pass
+                if won is None:
+                    if now > expiry + timedelta(hours=1): won = False
+                    else: continue
+                fill = float(p.get("fill_price") or 0.50)
+                payout = round(stake / fill, 4) if won else 0
+                status = "✅ Won" if won else "❌ Lost"
+                c3 = get_db(); c3.run("UPDATE poly_alpha3_trades SET status=:s,outcome=:o,resolved_at=:r,payout=:p,filled=TRUE WHERE id=:i", s=status, o="WIN" if won else "LOSS", r=now.isoformat(), p=payout, i=p["id"]); c3.close()
+                resolved += 1
+                if won:
+                    _poly_alpha3_state["balance"] = round(_poly_alpha3_state["balance"] + payout, 2)
+                    _poly_alpha3_state["wins_today"] += 1
+                    _poly_alpha3_state["profit_today"] = round(_poly_alpha3_state["profit_today"] + (payout - stake), 2)
+                else:
+                    _poly_alpha3_state["losses_today"] += 1
+                    _poly_alpha3_state["profit_today"] = round(_poly_alpha3_state["profit_today"] - stake, 2)
+                if _poly_alpha3_state["balance"] > _poly_alpha3_state["peak_balance"]:
+                    _poly_alpha3_state["peak_balance"] = _poly_alpha3_state["balance"]
+                if _poly_alpha3_state["balance"] <= _poly_alpha3_state["floor_balance"]:
+                    _poly_alpha3_state["enabled"] = False
+                    send_telegram("🚨 <b>POLY A3 STOPPED — Floor</b>\nPool: ${:.2f}".format(_poly_alpha3_state["balance"]))
+                _pnl = "+${:.2f}".format(payout - stake) if won else "-${:.2f}".format(stake)
+                print("POLY A3 #{} {}: ${:.2f} → {} | pool=${:.2f}".format(p["id"], "WIN" if won else "LOSS", stake, _pnl, _poly_alpha3_state["balance"]))
+                send_telegram("{} <b>POLY A3 {}</b>\n{} {} ${:.2f}\nPool: ${:.2f}".format("✅" if won else "❌", "WIN" if won else "LOSS", _pnl, p.get("asset", "?"), stake, _poly_alpha3_state["balance"]))
+            except Exception as e:
+                print("Poly A3 resolve error #{}: {}".format(p.get("id"), e))
+        return resolved
+    except Exception as e:
+        print("Poly A3 resolve error: {}".format(e)); return 0
+
 def _poly_scan_loop():
     """Background thread for Polymarket scanning and resolving."""
     time.sleep(60)  # Wait for init
@@ -15921,8 +17651,26 @@ def _poly_scan_loop():
                 print("Poly Alpha2 resolved: {}".format(_pa2_resolved))
         except Exception as e:
             print("Poly Alpha2 resolve error: {}".format(e))
+        try:
+            _pa3_resolved = _resolve_poly_alpha3_trades()
+            if _pa3_resolved:
+                print("Poly Alpha3 resolved: {}".format(_pa3_resolved))
+        except Exception as e:
+            print("Poly Alpha3 resolve error: {}".format(e))
         # BUG 4 FIX: 60 seconds for 5M market coverage
+        try:
+            _pa4_resolved = _resolve_poly_alpha4_trades()
+            if _pa4_resolved:
+                print("Sniper Alpha4 resolved: {}".format(_pa4_resolved))
+        except Exception as e:
+            print("Sniper Alpha4 resolve error: {}".format(e))
         time.sleep(60)
+        try:
+            _lmts_resolved = _resolve_limitless_sniper_trades()
+            if _lmts_resolved:
+                print("LMTS Sniper resolved: {}".format(_lmts_resolved))
+        except Exception as e:
+            print("LMTS Sniper resolve error: {}".format(e))
 
 # ═══════════════════════════════════════════════════════════
 # POLYMARKET PAGES
@@ -15936,6 +17684,8 @@ def _build_poly_page(section, page_title, subtitle, description):
             ("p34", "Paper 3.4", "P3.1 + Distance Math + 15M Candle Pattern (1H Only)"),
             ("p25", "Paper 2.5", "P2.1 + Candle Sequence (1H Only)"),
             ("p35", "Paper 3.5", "P3.1 + Candle Sequence (1H Only)"),
+            ("p28", "Paper 2.8", "Candle-First (single candle + P2.1 optional)"),
+            ("p29", "Paper 2.9", "BlackRock Trader (trend + candle + price)"),
         ]
     else:
         strategies = [
@@ -15945,6 +17695,8 @@ def _build_poly_page(section, page_title, subtitle, description):
             ("p33", "Paper 3.3", "P3.1 + Distance Math (Mixed Mode)"),
             ("p26", "Paper 2.6", "P2.1 + Candle Position Context (15M)"),
             ("p36", "Paper 3.6", "P3.1 + Candle Position Context (15M)"),
+            ("p28", "Paper 2.8", "Candle-First (single candle + P2.1 optional)"),
+            ("p29", "Paper 2.9", "BlackRock Trader (trend + candle + price)"),
         ]
 
     try:
@@ -16239,6 +17991,380 @@ th{{background:#f0f0f0;padding:6px 4px;text-align:left;font-size:12px}}td{{paddi
         _poly_alpha2_state["trades_today"], _poly_alpha2_state["wins_today"],
         _poly_alpha2_state["losses_today"], tier_html, asset_html, trade_rows)
 
+@app.route("/app/poly-alpha3")
+def poly_alpha3_page():
+    """Polymarket Alpha 3.0 — Pure P2.3 with Compounding."""
+    try:
+        conn = get_db()
+        rows = conn.run("SELECT * FROM poly_alpha3_trades ORDER BY id DESC LIMIT 200")
+        cols = [c['name'] for c in conn.columns]
+        trades = [dict(zip(cols, r)) for r in rows]
+        conn.close()
+    except:
+        trades = []
+
+    total = len(trades)
+    wins = sum(1 for t in trades if t.get("outcome") == "WIN")
+    losses = sum(1 for t in trades if t.get("outcome") == "LOSS")
+    pending = sum(1 for t in trades if t.get("status") == "Pending")
+    resolved = wins + losses
+    wr = round(wins / resolved * 100, 1) if resolved > 0 else 0
+    total_pnl = 0
+    for t in trades:
+        if t.get("outcome") == "WIN":
+            total_pnl += float(t.get("payout") or 0) - float(t.get("stake") or 0)
+        elif t.get("outcome") == "LOSS":
+            total_pnl -= float(t.get("stake") or 0)
+    total_pnl = round(total_pnl, 2)
+    pnlc = "color:#1a7046" if total_pnl >= 0 else "color:#b4322e"
+
+    # By asset
+    asset_stats = {}
+    for t in trades:
+        a = t.get("asset", "?")
+        if a not in asset_stats: asset_stats[a] = {"w": 0, "l": 0, "pnl": 0}
+        if t.get("outcome") == "WIN":
+            asset_stats[a]["w"] += 1
+            asset_stats[a]["pnl"] += float(t.get("payout") or 0) - float(t.get("stake") or 0)
+        elif t.get("outcome") == "LOSS":
+            asset_stats[a]["l"] += 1
+            asset_stats[a]["pnl"] -= float(t.get("stake") or 0)
+
+    # By timeframe
+    tf_stats = {}
+    for t in trades:
+        tf = t.get("timeframe", "15M")
+        if tf not in tf_stats: tf_stats[tf] = {"w": 0, "l": 0, "pnl": 0}
+        if t.get("outcome") == "WIN":
+            tf_stats[tf]["w"] += 1
+            tf_stats[tf]["pnl"] += float(t.get("payout") or 0) - float(t.get("stake") or 0)
+        elif t.get("outcome") == "LOSS":
+            tf_stats[tf]["l"] += 1
+            tf_stats[tf]["pnl"] -= float(t.get("stake") or 0)
+
+    asset_html = ""
+    for a in sorted(asset_stats.keys()):
+        s = asset_stats[a]
+        awr = round(s["w"] / (s["w"] + s["l"]) * 100, 1) if (s["w"] + s["l"]) > 0 else 0
+        asset_html += "<tr><td>{}</td><td>{}W/{}L</td><td>{}%</td><td>${:.2f}</td></tr>".format(a, s["w"], s["l"], awr, s["pnl"])
+
+    tf_html = ""
+    for tf in sorted(tf_stats.keys()):
+        s = tf_stats[tf]
+        twr = round(s["w"] / (s["w"] + s["l"]) * 100, 1) if (s["w"] + s["l"]) > 0 else 0
+        tf_html += "<tr><td>{}</td><td>{}W/{}L</td><td>{}%</td><td>${:.2f}</td></tr>".format(tf, s["w"], s["l"], twr, s["pnl"])
+
+    trade_rows = ""
+    for t in trades[:100]:
+        outcome = t.get("outcome", "")
+        icon = "✅" if outcome == "WIN" else "❌" if outcome == "LOSS" else "⏭" if outcome == "RETURNED" else "⏳"
+        pnl_str = ""
+        if outcome == "WIN":
+            pnl_str = "+${:.2f}".format(float(t.get("payout") or 0) - float(t.get("stake") or 0))
+        elif outcome == "LOSS":
+            pnl_str = "-${:.2f}".format(float(t.get("stake") or 0))
+        elif outcome == "RETURNED":
+            pnl_str = "returned"
+        fired = (t.get("fired_at") or "")[:16].replace("T", " ")
+        trade_rows += "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>${:.2f}</td><td>{}</td><td>{}</td><td>{}</td><td>${:.2f}</td></tr>".format(
+            t.get("id",""), icon, t.get("asset","?"), t.get("timeframe","?"),
+            float(t.get("stake") or 0), t.get("bet_side","?"), fired, pnl_str,
+            float(t.get("pool_after") or 0))
+
+    return """<!DOCTYPE html><html><head><title>Poly Alpha 3.0</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>body{{font-family:-apple-system,sans-serif;max-width:900px;margin:0 auto;padding:10px;background:#0a0a0a;color:#e0e0e0}}
+h1{{color:#00d4aa}}h2{{color:#888;font-size:14px}}
+.stats{{display:grid;grid-template-columns:repeat(auto-fit,minmax(100px,1fr));gap:8px;margin:10px 0}}
+.stat{{background:#1a1a2e;padding:12px;border-radius:8px;text-align:center}}
+.stat .val{{font-size:24px;font-weight:700;color:#00d4aa}}.stat .lbl{{font-size:11px;color:#888}}
+table{{width:100%;border-collapse:collapse;font-size:13px;margin:10px 0}}
+th,td{{padding:6px 8px;border-bottom:1px solid #222;text-align:left}}
+th{{background:#1a1a2e;color:#888;font-size:11px}}
+.nav{{display:flex;gap:4px;flex-wrap:wrap;margin:10px 0}}
+.nav-tab{{padding:6px 12px;background:#1a1a2e;color:#888;text-decoration:none;border-radius:4px;font-size:12px}}
+.nav-tab.active{{background:#00d4aa;color:#000}}
+a{{color:#00d4aa}}
+</style></head><body>
+<div class="nav">
+<a href="/app/poly-alpha3" class="nav-tab active">⚡ Poly A3</a>
+    <a href="/app/poly-alpha4" class="nav-tab""" + (" active" if nav_active == "poly-alpha4" else "") + """">🎯 Sniper A4</a>
+<a href="/app/poly-alpha2" class="nav-tab">⚡ Poly A2</a>
+<a href="/app/paper28poly" class="nav-tab">P2.8 Poly</a>
+<a href="/app/paper29poly" class="nav-tab">P2.9 Poly</a>
+<a href="/" class="nav-tab">Home</a>
+</div>
+<h1>⚡ Poly Alpha 3.0</h1>
+<h2>Pure P2.3 · 15M Only · Compounding 5% · Max Fill 62¢ · Aggressive Fills</h2>
+<div class="stats">
+<div class="stat"><div class="val">${:.2f}</div><div class="lbl">Pool</div></div>
+<div class="stat"><div class="val">{}%</div><div class="lbl">Win Rate</div></div>
+<div class="stat"><div class="val">{}</div><div class="lbl">Trades</div></div>
+<div class="stat"><div class="val" style="{}">${:.2f}</div><div class="lbl">P&L</div></div>
+<div class="stat"><div class="val">${:.2f}</div><div class="lbl">Peak</div></div>
+<div class="stat"><div class="val">{}</div><div class="lbl">Today</div></div>
+</div>
+<h2>By Timeframe</h2><table><tr><th>TF</th><th>Record</th><th>WR</th><th>P&L</th></tr>{}</table>
+<h2>By Asset</h2><table><tr><th>Asset</th><th>Record</th><th>WR</th><th>P&L</th></tr>{}</table>
+<h2>Trade History</h2><table><tr><th>#</th><th></th><th>Asset</th><th>TF</th><th>Stake</th><th>Side</th><th>Time</th><th>P&L</th><th>Pool</th></tr>{}</table>
+<p style="color:#444;font-size:11px">Pure P2.3 · Compounding stakes · Auto-refresh 60s</p>
+<script>setTimeout(()=>location.reload(),60000)</script>
+</body></html>""".format(
+        _poly_alpha3_state["balance"], wr, total,
+        pnlc, total_pnl, _poly_alpha3_state["peak_balance"],
+        "{}T {}W {}L".format(_poly_alpha3_state["trades_today"], _poly_alpha3_state["wins_today"], _poly_alpha3_state["losses_today"]),
+        tf_html, asset_html, trade_rows)
+
+
+
+@app.route("/app/lmts-sniper")
+def lmts_sniper_page():
+    """Limitless Sniper dashboard."""
+    try:
+        conn = get_db()
+        rows = conn.run("SELECT * FROM limitless_sniper_trades ORDER BY id DESC LIMIT 200")
+        cols = [c['name'] for c in conn.columns]
+        trades = [dict(zip(cols, r)) for r in rows]
+        conn.close()
+    except:
+        trades = []
+
+    total = len(trades)
+    wins = sum(1 for t in trades if t.get("outcome") == "WIN")
+    losses = sum(1 for t in trades if t.get("outcome") == "LOSS")
+    pending = sum(1 for t in trades if t.get("status") == "Pending")
+    resolved = wins + losses
+    wr = round(wins / resolved * 100, 1) if resolved > 0 else 0
+    total_pnl = 0
+    for t in trades:
+        if t.get("outcome") == "WIN":
+            total_pnl += float(t.get("payout") or 0) - float(t.get("stake") or 0)
+        elif t.get("outcome") == "LOSS":
+            total_pnl -= float(t.get("stake") or 0)
+    total_pnl = round(total_pnl, 2)
+    pnlc = "color:#1a7046" if total_pnl >= 0 else "color:#b4322e"
+
+    tier_stats = {}
+    for t in trades:
+        tier = t.get("tier", "BASE")
+        if tier not in tier_stats: tier_stats[tier] = {"w": 0, "l": 0, "pnl": 0}
+        if t.get("outcome") == "WIN":
+            tier_stats[tier]["w"] += 1
+            tier_stats[tier]["pnl"] += float(t.get("payout") or 0) - float(t.get("stake") or 0)
+        elif t.get("outcome") == "LOSS":
+            tier_stats[tier]["l"] += 1
+            tier_stats[tier]["pnl"] -= float(t.get("stake") or 0)
+
+    asset_stats = {}
+    for t in trades:
+        a = t.get("asset", "?")
+        if a not in asset_stats: asset_stats[a] = {"w": 0, "l": 0, "pnl": 0}
+        if t.get("outcome") == "WIN":
+            asset_stats[a]["w"] += 1
+            asset_stats[a]["pnl"] += float(t.get("payout") or 0) - float(t.get("stake") or 0)
+        elif t.get("outcome") == "LOSS":
+            asset_stats[a]["l"] += 1
+            asset_stats[a]["pnl"] -= float(t.get("stake") or 0)
+
+    tier_html = ""
+    for tier in sorted(tier_stats.keys()):
+        d = tier_stats[tier]
+        twr = round(d["w"] / (d["w"] + d["l"]) * 100, 1) if (d["w"] + d["l"]) > 0 else 0
+        tier_html += "<tr><td>{}</td><td>{}W/{}L</td><td>{}%</td><td>${:.2f}</td></tr>".format(tier, d["w"], d["l"], twr, d["pnl"])
+
+    asset_html = ""
+    for a in sorted(asset_stats.keys()):
+        d = asset_stats[a]
+        awr = round(d["w"] / (d["w"] + d["l"]) * 100, 1) if (d["w"] + d["l"]) > 0 else 0
+        asset_html += "<tr><td>{}</td><td>{}W/{}L</td><td>{}%</td><td>${:.2f}</td></tr>".format(a, d["w"], d["l"], awr, d["pnl"])
+
+    trade_rows = ""
+    for t in trades[:100]:
+        outcome = t.get("outcome", "")
+        icon = "\u2705" if outcome == "WIN" else "\u274c" if outcome == "LOSS" else "\u23ed" if outcome == "RETURNED" else "\u23f3"
+        pnl_str = ""
+        if outcome == "WIN": pnl_str = "+${:.2f}".format(float(t.get("payout") or 0) - float(t.get("stake") or 0))
+        elif outcome == "LOSS": pnl_str = "-${:.2f}".format(float(t.get("stake") or 0))
+        elif outcome == "RETURNED": pnl_str = "returned"
+        fired = (t.get("fired_at") or "")[:16].replace("T", " ")
+        trade_rows += "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>${:.2f}</td><td>{}</td><td>{}</td><td>{}</td><td>${:.2f}</td></tr>".format(
+            t.get("id",""), icon, t.get("asset","?"), t.get("tier","?"),
+            float(t.get("stake") or 0), t.get("bet_side","?"),
+            fired, pnl_str, float(t.get("pool_after") or 0))
+
+    return """<!DOCTYPE html><html><head><title>Limitless Sniper</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>body{{font-family:-apple-system,sans-serif;max-width:900px;margin:0 auto;padding:10px;background:#0a0a0a;color:#e0e0e0}}
+h1{{color:#00d4aa}}h2{{color:#888;font-size:14px}}
+.stats{{display:grid;grid-template-columns:repeat(auto-fit,minmax(100px,1fr));gap:8px;margin:10px 0}}
+.stat{{background:#1a1a2e;padding:12px;border-radius:8px;text-align:center}}
+.stat .val{{font-size:24px;font-weight:700;color:#00d4aa}}.stat .lbl{{font-size:11px;color:#888}}
+table{{width:100%;border-collapse:collapse;font-size:13px;margin:10px 0}}
+th,td{{padding:6px 8px;border-bottom:1px solid #222;text-align:left}}
+th{{background:#1a1a2e;color:#888;font-size:11px}}
+.nav{{display:flex;gap:4px;flex-wrap:wrap;margin:10px 0}}
+.nav-tab{{padding:6px 12px;background:#1a1a2e;color:#888;text-decoration:none;border-radius:4px;font-size:12px}}
+.nav-tab.active{{background:#00d4aa;color:#000}}
+a{{color:#00d4aa}}
+</style></head><body>
+<div class="nav">
+<a href="/app/lmts-sniper" class="nav-tab active">\U0001f3af LMTS Sniper</a>
+<a href="/app/poly-alpha4" class="nav-tab">\U0001f3af Poly Sniper</a>
+<a href="/" class="nav-tab">Home</a>
+</div>
+<h1>\U0001f3af Limitless Sniper</h1>
+<h2>P2.1 + P2.3 Momentum · 15M · 50\u00a2 Target · Two-Tier Staking</h2>
+<div class="stats">
+<div class="stat"><div class="val">${:.2f}</div><div class="lbl">Pool</div></div>
+<div class="stat"><div class="val">{}%</div><div class="lbl">Win Rate</div></div>
+<div class="stat"><div class="val">{}</div><div class="lbl">Trades</div></div>
+<div class="stat"><div class="val" style="{}">${:.2f}</div><div class="lbl">P&L</div></div>
+<div class="stat"><div class="val">${:.2f}</div><div class="lbl">Peak</div></div>
+<div class="stat"><div class="val">{}</div><div class="lbl">Today</div></div>
+</div>
+<h2>By Tier</h2><table><tr><th>Tier</th><th>Record</th><th>WR</th><th>P&L</th></tr>{}</table>
+<h2>By Asset</h2><table><tr><th>Asset</th><th>Record</th><th>WR</th><th>P&L</th></tr>{}</table>
+<h2>Trade History</h2><table><tr><th>#</th><th></th><th>Asset</th><th>Tier</th><th>Stake</th><th>Side</th><th>Time</th><th>P&L</th><th>Pool</th></tr>{}</table>
+<p style="color:#444;font-size:11px">Limitless Sniper · Fires at window boundary · Two-tier staking · Auto-refresh 60s</p>
+<script>setTimeout(()=>location.reload(),60000)</script>
+</body></html>""".format(
+        _limitless_sniper_state["balance"], wr, total,
+        pnlc, total_pnl, _limitless_sniper_state["peak_balance"],
+        "{}T {}W {}L".format(_limitless_sniper_state["trades_today"], _limitless_sniper_state["wins_today"], _limitless_sniper_state["losses_today"]),
+        tier_html, asset_html, trade_rows)
+
+
+@app.route("/app/poly-alpha4")
+def poly_alpha4_page():
+    """Polymarket Alpha 4.0 — The Sniper."""
+    try:
+        conn = get_db()
+        rows = conn.run("SELECT * FROM poly_alpha4_trades ORDER BY id DESC LIMIT 200")
+        cols = [c['name'] for c in conn.columns]
+        trades = [dict(zip(cols, r)) for r in rows]
+        conn.close()
+    except:
+        trades = []
+
+    total = len(trades)
+    wins = sum(1 for t in trades if t.get("outcome") == "WIN")
+    losses = sum(1 for t in trades if t.get("outcome") == "LOSS")
+    returned = sum(1 for t in trades if t.get("outcome") == "RETURNED")
+    pending = sum(1 for t in trades if t.get("status") == "Pending")
+    resolved = wins + losses
+    wr = round(wins / resolved * 100, 1) if resolved > 0 else 0
+    total_pnl = 0
+    for t in trades:
+        if t.get("outcome") == "WIN":
+            total_pnl += float(t.get("payout") or 0) - float(t.get("stake") or 0)
+        elif t.get("outcome") == "LOSS":
+            total_pnl -= float(t.get("stake") or 0)
+    total_pnl = round(total_pnl, 2)
+    pnlc = "color:#1a7046" if total_pnl >= 0 else "color:#b4322e"
+
+    asset_stats = {}
+    for t in trades:
+        a = t.get("asset", "?")
+        if a not in asset_stats: asset_stats[a] = {"w": 0, "l": 0, "pnl": 0}
+        if t.get("outcome") == "WIN":
+            asset_stats[a]["w"] += 1
+            asset_stats[a]["pnl"] += float(t.get("payout") or 0) - float(t.get("stake") or 0)
+        elif t.get("outcome") == "LOSS":
+            asset_stats[a]["l"] += 1
+            asset_stats[a]["pnl"] -= float(t.get("stake") or 0)
+
+    score_stats = {}
+    for t in trades:
+        sa = t.get("signals_agree") or 0
+        key = "{}/3".format(sa)
+        if key not in score_stats: score_stats[key] = {"w": 0, "l": 0, "pnl": 0}
+        if t.get("outcome") == "WIN":
+            score_stats[key]["w"] += 1
+            score_stats[key]["pnl"] += float(t.get("payout") or 0) - float(t.get("stake") or 0)
+        elif t.get("outcome") == "LOSS":
+            score_stats[key]["l"] += 1
+            score_stats[key]["pnl"] -= float(t.get("stake") or 0)
+
+    asset_html = ""
+    for a in sorted(asset_stats.keys()):
+        d = asset_stats[a]
+        awr = round(d["w"] / (d["w"] + d["l"]) * 100, 1) if (d["w"] + d["l"]) > 0 else 0
+        asset_html += "<tr><td>{}</td><td>{}W/{}L</td><td>{}%</td><td>${:.2f}</td></tr>".format(a, d["w"], d["l"], awr, d["pnl"])
+
+    score_html = ""
+    for sc in sorted(score_stats.keys()):
+        d = score_stats[sc]
+        swr = round(d["w"] / (d["w"] + d["l"]) * 100, 1) if (d["w"] + d["l"]) > 0 else 0
+        score_html += "<tr><td>{}</td><td>{}W/{}L</td><td>{}%</td><td>${:.2f}</td></tr>".format(sc, d["w"], d["l"], swr, d["pnl"])
+
+    trade_rows = ""
+    for t in trades[:100]:
+        outcome = t.get("outcome", "")
+        icon = "\u2705" if outcome == "WIN" else "\u274c" if outcome == "LOSS" else "\u23ed" if outcome == "RETURNED" else "\u23f3"
+        pnl_str = ""
+        if outcome == "WIN":
+            pnl_str = "+${:.2f}".format(float(t.get("payout") or 0) - float(t.get("stake") or 0))
+        elif outcome == "LOSS":
+            pnl_str = "-${:.2f}".format(float(t.get("stake") or 0))
+        elif outcome == "RETURNED":
+            pnl_str = "returned"
+        fired = (t.get("fired_at") or "")[:16].replace("T", " ")
+        trade_rows += "<tr><td>{}</td><td>{}</td><td>{}</td><td>${:.2f}</td><td>{}</td><td>{:.0f}&#162;</td><td>{}</td><td>{}</td><td>${:.2f}</td></tr>".format(
+            t.get("id",""), icon, t.get("asset","?"),
+            float(t.get("stake") or 0), t.get("bet_side","?"),
+            float(t.get("fill_price") or 0.50) * 100,
+            fired, pnl_str,
+            float(t.get("pool_after") or 0))
+
+    fill_rate = 0
+    filled_count = sum(1 for t in trades if t.get("filled"))
+    total_orders = sum(1 for t in trades if t.get("outcome") != "RETURNED")
+    if total_orders > 0:
+        fill_rate = round(filled_count / len(trades) * 100, 1)
+
+    return """<!DOCTYPE html><html><head><title>Sniper Alpha 4.0</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>body{{font-family:-apple-system,sans-serif;max-width:900px;margin:0 auto;padding:10px;background:#0a0a0a;color:#e0e0e0}}
+h1{{color:#00d4aa}}h2{{color:#888;font-size:14px}}
+.stats{{display:grid;grid-template-columns:repeat(auto-fit,minmax(100px,1fr));gap:8px;margin:10px 0}}
+.stat{{background:#1a1a2e;padding:12px;border-radius:8px;text-align:center}}
+.stat .val{{font-size:24px;font-weight:700;color:#00d4aa}}.stat .lbl{{font-size:11px;color:#888}}
+table{{width:100%;border-collapse:collapse;font-size:13px;margin:10px 0}}
+th,td{{padding:6px 8px;border-bottom:1px solid #222;text-align:left}}
+th{{background:#1a1a2e;color:#888;font-size:11px}}
+.nav{{display:flex;gap:4px;flex-wrap:wrap;margin:10px 0}}
+.nav-tab{{padding:6px 12px;background:#1a1a2e;color:#888;text-decoration:none;border-radius:4px;font-size:12px}}
+.nav-tab.active{{background:#00d4aa;color:#000}}
+a{{color:#00d4aa}}
+</style></head><body>
+<div class="nav">
+<a href="/app/poly-alpha4" class="nav-tab active">\U0001f3af Sniper A4</a>
+<a href="/app/poly-alpha3" class="nav-tab">\u26a1 Poly A3</a>
+<a href="/app/poly-alpha2" class="nav-tab">\u26a1 Poly A2</a>
+<a href="/" class="nav-tab">Home</a>
+</div>
+<h1>\U0001f3af Sniper Alpha 4.0</h1>
+<h2>P2.1 at Window Boundary · 15M Only · 50\u00a2 Target · Compounding 5%</h2>
+<div class="stats">
+<div class="stat"><div class="val">${:.2f}</div><div class="lbl">Pool</div></div>
+<div class="stat"><div class="val">{}%</div><div class="lbl">Win Rate</div></div>
+<div class="stat"><div class="val">{}</div><div class="lbl">Trades</div></div>
+<div class="stat"><div class="val" style="{}">${:.2f}</div><div class="lbl">P&L</div></div>
+<div class="stat"><div class="val">${:.2f}</div><div class="lbl">Peak</div></div>
+<div class="stat"><div class="val">{}</div><div class="lbl">Today</div></div>
+</div>
+<h2>By Signal Strength</h2><table><tr><th>Score</th><th>Record</th><th>WR</th><th>P&L</th></tr>{}</table>
+<h2>By Asset</h2><table><tr><th>Asset</th><th>Record</th><th>WR</th><th>P&L</th></tr>{}</table>
+<h2>Trade History</h2><table><tr><th>#</th><th></th><th>Asset</th><th>Stake</th><th>Side</th><th>Fill</th><th>Time</th><th>P&L</th><th>Pool</th></tr>{}</table>
+<p style="color:#444;font-size:11px">Sniper · Fires at window boundary · 50\u00a2 target · Auto-refresh 60s</p>
+<script>setTimeout(()=>location.reload(),60000)</script>
+</body></html>""".format(
+        _poly_alpha4_state["balance"], wr, total,
+        pnlc, total_pnl, _poly_alpha4_state["peak_balance"],
+        "{}T {}W {}L".format(_poly_alpha4_state["trades_today"], _poly_alpha4_state["wins_today"], _poly_alpha4_state["losses_today"]),
+        score_html, asset_html, trade_rows)
+
+
 @app.route("/app/poly-alpha")
 def poly_alpha_page():
     """Polymarket Alpha dashboard — Strategy P tracking."""
@@ -16463,6 +18589,103 @@ def paper37_page():
         "P3.3 + ADX + RSI + Volume + Parabolic SAR — 15M Only",
         "P3.3 strategy (P3.1 + DIST mixed mode) filtered through trend strength (ADX>20), momentum confirmation (RSI), volume above average, and Parabolic SAR direction. Needs 2/3 confirmations + ADX gate.",
         extra_cols=[], nav_active="paper37")
+
+@app.route("/app/paper28")
+def paper28_page():
+    return _build_paper_page("paper28_trades", "Paper 2.8",
+        "P2.1 + Candle-at-Baseline — 15M Only",
+        "CANDLE-FIRST strategy. Reads previous completed candle to determine direction — strong patterns (hammer, shooting star, strong red/green, bull/bear trap) trade immediately without needing P2.1. Moderate candles need P2.1 agreement or price confirmation. Much higher volume than filter-based approach.",
+        extra_cols=[], nav_active="paper28")
+
+@app.route("/app/paper28poly")
+def paper28poly_page():
+    return _build_paper_page("poly_trades", "P2.8 Poly",
+        "Candle-First on Polymarket",
+        "CANDLE-FIRST strategy on Polymarket Up/Down markets. Reads previous candle to determine direction — strong patterns trade immediately, moderate candles need P2.1 or price confirmation.",
+        extra_cols=[], nav_active="paper28poly",
+        where_clause="WHERE strategy='p28'")
+
+@app.route("/app/paper29")
+def paper29_page():
+    return _build_paper_page("paper29_trades", "Paper 2.9",
+        "BlackRock Trader — Trend + Candle + Price",
+        "Reads 4 candles for trend context, then makes the call. Counter-candles in trends are bounce/pullback traps. Trades choppy markets too. Only skips doji at baseline.",
+        extra_cols=[], nav_active="paper29")
+
+@app.route("/app/paper29poly")
+def paper29poly_page():
+    return _build_paper_page("poly_trades", "P2.9 Poly",
+        "BlackRock Trader on Polymarket",
+        "Trend context + candle reading on Polymarket Up/Down markets. Reads 4 candles for trend, identifies bounce traps and pullback traps, trades choppy markets with price position.",
+        extra_cols=[], nav_active="paper29poly",
+        where_clause="WHERE strategy='p29'")
+
+
+@app.route("/api/p21-score-breakdown")
+def p21_score_breakdown():
+    """Show P2.1 win rate breakdown by score (2/3 vs 3/3) from Limitless paper data."""
+    try:
+        conn = get_db()
+        
+        # Limitless paper21_trades
+        rows = conn.run("SELECT score, outcome FROM paper21_trades WHERE outcome IN ('WIN','LOSS')")
+        cols = [c['name'] for c in conn.columns]
+        trades = [dict(zip(cols, r)) for r in rows]
+        
+        # Also get Polymarket poly_trades for p21
+        poly_rows = conn.run("SELECT score, outcome FROM poly_trades WHERE strategy='p21' AND outcome IN ('WIN','LOSS')")
+        poly_cols = [c['name'] for c in conn.columns]
+        poly_trades = [dict(zip(poly_cols, r)) for r in poly_rows]
+        
+        conn.close()
+        
+        # Limitless breakdown
+        lim_scores = {}
+        for t in trades:
+            sc = int(t.get("score") or 0)
+            if sc not in lim_scores:
+                lim_scores[sc] = {"w": 0, "l": 0}
+            if t["outcome"] == "WIN":
+                lim_scores[sc]["w"] += 1
+            else:
+                lim_scores[sc]["l"] += 1
+        
+        # Poly breakdown
+        poly_scores = {}
+        for t in poly_trades:
+            sc = int(t.get("score") or 0)
+            if sc not in poly_scores:
+                poly_scores[sc] = {"w": 0, "l": 0}
+            if t["outcome"] == "WIN":
+                poly_scores[sc]["w"] += 1
+            else:
+                poly_scores[sc]["l"] += 1
+        
+        result = "<html><body style='background:#0a0a0a;color:#e0e0e0;font-family:monospace;padding:20px'>"
+        result += "<h1 style='color:#00d4aa'>P2.1 Score Breakdown: 2/3 vs 3/3</h1>"
+        
+        result += "<h2>Limitless Paper (paper21_trades)</h2>"
+        result += "<table border=1 cellpadding=8><tr><th>Score</th><th>Wins</th><th>Losses</th><th>Total</th><th>WR</th></tr>"
+        for sc in sorted(lim_scores.keys()):
+            d = lim_scores[sc]
+            total = d["w"] + d["l"]
+            wr = round(d["w"] / total * 100, 1) if total > 0 else 0
+            result += "<tr><td>{}/3</td><td>{}</td><td>{}</td><td>{}</td><td>{}%</td></tr>".format(sc, d["w"], d["l"], total, wr)
+        result += "</table>"
+        
+        result += "<h2>Polymarket Paper (poly_trades strategy=p21)</h2>"
+        result += "<table border=1 cellpadding=8><tr><th>Score</th><th>Wins</th><th>Losses</th><th>Total</th><th>WR</th></tr>"
+        for sc in sorted(poly_scores.keys()):
+            d = poly_scores[sc]
+            total = d["w"] + d["l"]
+            wr = round(d["w"] / total * 100, 1) if total > 0 else 0
+            result += "<tr><td>{}/3</td><td>{}</td><td>{}</td><td>{}</td><td>{}%</td></tr>".format(sc, d["w"], d["l"], total, wr)
+        result += "</table>"
+        
+        result += "</body></html>"
+        return result
+    except Exception as e:
+        return "Error: {}".format(e), 500
 
 @app.route("/app/alpha")
 def alpha_page():
