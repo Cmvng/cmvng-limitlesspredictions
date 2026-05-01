@@ -483,81 +483,91 @@ def _poly_alpha4_calc_stake(pool_balance):
 
 def _sniper_get_direction(asset, timeframe="15m"):
     """Limitless P2.1 logic for sniper.
-    
-    Reads ALL indicators from the correct timeframe:
-      - 15m indicators for Polymarket 15M sniper
-      - 1h indicators for Limitless 1H sniper
-    
+
+    SMA and BTC always read from the 1H cache — matching the proven Paper 2.1
+    strategy (65.4% WR). TV comes from _tv_trends (TradingView, 1H/4H based).
+
+    For 15M sniper: TV + 1H SMA must agree. BTC from 1H confirms or ignored.
+    For 1H sniper:  TV + 1H SMA must agree. BTC from 1H confirms or ignored.
+
+    UT Bot and Squeeze read from the timeframe-specific cache (micro filter).
+
     Rules:
-      1. Read TV + SMA for this asset from the correct timeframe
-      2. If both agree → direction. BTC confirms or gets ignored.
-      3. If both DISAGREE → SKIP (no tiebreaker)
-      4. If only one exists → use it, BTC as second signal
-      5. During weak periods → UT Bot can flip the trade
-    
+      1. TV + 1H SMA agree → direction. BTC 1H confirms or gets ignored.
+      2. TV + 1H SMA DISAGREE → SKIP (same as Paper 2.1 — this is why paper 2.1
+         skips some assets per window). Sniper now does the same.
+      3. During weak periods → UT Bot can flip the trade
+
     Returns (direction, signals_agree, ind_str, confidence) or (None, 0, "", None)
     """
     asset_upper = asset.upper()
 
-    # ── Read indicators from the CORRECT timeframe cache ──
-    ind_entry = _indicator_cache.get("{}_{}".format(asset_upper, timeframe))
-    ind_data = ind_entry.get("data") if ind_entry else None
+    # ── SMA and BTC always from 1H cache — matches Paper 2.1 proven strategy ──
+    # Using 15M SMA caused sniper to fire all 4 assets every window because
+    # correlated crypto all bounce together on 15M. 1H SMA filters correctly.
+    ind_1h_entry = _indicator_cache.get("{}_1h".format(asset_upper))
+    ind_1h_data = ind_1h_entry.get("data") if ind_1h_entry else None
 
-    # Also read BTC indicators from the same timeframe
-    btc_ind_entry = _indicator_cache.get("BTC_{}".format(timeframe))
-    btc_ind_data = btc_ind_entry.get("data") if btc_ind_entry else None
+    btc_1h_entry = _indicator_cache.get("BTC_1h")
+    btc_1h_data = btc_1h_entry.get("data") if btc_1h_entry else None
 
-    # ── TV signal from signals DB (asset-specific) ──
+    # ── UT Bot and Squeeze from timeframe-specific cache (micro filter) ──
+    ind_tf_entry = _indicator_cache.get("{}_{}".format(asset_upper, timeframe))
+    ind_tf_data = ind_tf_entry.get("data") if ind_tf_entry else None
+
+    # ── TV signal from signals DB (TradingView — 1H/4H based) ──
     tv = _tv_trends.get(asset_upper)
     tv_dir = tv["dir"] if tv else None
 
-    # ── SMA from the TIMEFRAME-CORRECT indicator cache ──
-    # NOT from _pair_sma_cache which is 1H
+    # ── SMA from 1H cache (same as Paper 2.1) ──
     sma_dir = None
-    if ind_data:
-        sma_trend = ind_data.get("sma_trend")
+    if ind_1h_data:
+        sma_trend = ind_1h_data.get("sma_trend")
         if sma_trend:
             sma_dir = sma_trend
         else:
-            # Fallback: compute from SMA values in cache
-            sma10 = ind_data.get("sma10")
-            sma20 = ind_data.get("sma20")
-            current = ind_data.get("current")
+            sma10 = ind_1h_data.get("sma10")
+            current = ind_1h_data.get("current")
             if sma10 and current:
                 sma_dir = "BUY" if current > sma10 else "SELL"
+    # Fallback to _pair_sma_cache if 1H indicator cache not warm yet
+    if not sma_dir:
+        cached_sma = _pair_sma_cache.get(asset_upper, {})
+        sma_dir = cached_sma.get("trend")
 
-    # ── BTC trend from the TIMEFRAME-CORRECT cache ──
-    # NOT from _btc_trend_cache which is 1H
+    # ── BTC trend from 1H cache (same as Paper 2.1) ──
     btc_trend = None
-    if btc_ind_data:
-        btc_sma_trend = btc_ind_data.get("sma_trend")
+    if btc_1h_data:
+        btc_sma_trend = btc_1h_data.get("sma_trend")
         if btc_sma_trend:
             btc_trend = btc_sma_trend
         else:
-            btc_sma10 = btc_ind_data.get("sma10")
-            btc_current = btc_ind_data.get("current")
+            btc_sma10 = btc_1h_data.get("sma10")
+            btc_current = btc_1h_data.get("current")
             if btc_sma10 and btc_current:
                 btc_trend = "BUY" if btc_current > btc_sma10 else "SELL"
-    
-    # If no timeframe-specific BTC data, fall back to global (1H)
+    # Fallback to global 1H BTC cache
     if not btc_trend:
         btc_trend = _btc_trend_cache.get("trend")
 
-    # ── UT Bot and Squeeze from same timeframe cache ──
+    # ── UT Bot and Squeeze from timeframe-specific cache ──
     ut_trend = None
     sqz_dir = None
-    if ind_data:
-        ut_trend = ind_data.get("ut_trend")
-        sqz_val = ind_data.get("squeeze_val")
+    if ind_tf_data:
+        ut_trend = ind_tf_data.get("ut_trend")
+        sqz_val = ind_tf_data.get("squeeze_val")
         if sqz_val is not None:
             sqz_dir = "BUY" if sqz_val > 0 else "SELL" if sqz_val < 0 else None
+    # Fallback UT to 1H if TF cache not available
+    if not ut_trend and ind_1h_data:
+        ut_trend = ind_1h_data.get("ut_trend")
 
-    # ── Pair direction: TV + SMA (Limitless P2.1 rules) ──
+    # ── Pair direction: TV + 1H SMA (Limitless P2.1 rules) ──
     if tv_dir and sma_dir:
         if tv_dir == sma_dir:
             pair_dir = tv_dir
         else:
-            # TV and SMA DISAGREE → SKIP
+            # TV and 1H SMA DISAGREE → SKIP (same as Paper 2.1)
             return None, 0, "", None
     elif tv_dir:
         pair_dir = tv_dir
@@ -618,16 +628,6 @@ def _sniper_get_direction(asset, timeframe="15m"):
         parts.append("UT={}".format(ut_trend))
     if sqz_dir:
         parts.append("SQZ={}".format(sqz_dir))
-    parts.append("BTC:{}".format(btc_role))
-    if is_weak:
-        parts.append("WEAK")
-    if flipped:
-        parts.append("FLIP")
-
-    ind_str = "[{}] {} | {}/{}".format(confidence, " | ".join(parts), signals_agree, total_signals)
-
-    return bet_direction, signals_agree, ind_str, confidence
-
 
 def _sniper_thread():
     """Dedicated sniper thread — fires at exact 15M window boundaries.
@@ -2857,13 +2857,26 @@ def _score_paper210_trade(p, price, indicators=None, ind_macro=None, expiry_minu
         parts.append("WEAK")
     if flipped:
         parts.append("FLIP")
-    
+
+    # Calculate effective odds and payout
+    yes_odds = p.get("yes_odds", 50)
+    no_odds = 100 - yes_odds
+    effective_odds = yes_odds if bet_side == "YES" else no_odds
+    mtype = "15M" if p.get("is_15m_market") else "1H" if p.get("is_hourly_market") else "15M"
+    share_price = effective_odds / 100.0
+    if bet_side == "NO":
+        share_price = 1.0 - (yes_odds / 100.0)
+    sim_payout = round(1.0 / share_price, 4) if share_price > 0 else 0
+
     return {
         "bet_side": bet_side,
+        "bet_odds": effective_odds,
         "confidence": confidence,
         "score": signals_agree,
         "total_signals": total_signals,
         "indicators": " | ".join(parts),
+        "market_type": mtype,
+        "sim_payout": sim_payout,
     }
 
 # ═══════════════════════════════════════════════════════════
