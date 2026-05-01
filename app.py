@@ -422,9 +422,9 @@ def _poly_alpha3_load_recent():
         _poly_alpha4_state["peak_balance"] = _saved_pa4.get("peak_balance", _saved_pa4["balance"])
         _poly_alpha4_restored = True
     # RESET to $60 fresh
-    _poly_alpha4_state["balance"] = 60.0
-    _poly_alpha4_state["peak_balance"] = 60.0
-    _poly_alpha4_state["starting_balance"] = 60.0
+    _poly_alpha4_state["balance"] = 50.0
+    _poly_alpha4_state["peak_balance"] = 50.0
+    _poly_alpha4_state["starting_balance"] = 50.0
     _poly_alpha4_restored = False  # Force fresh start
     _poly_alpha4_state["floor_balance"] = 5.0
     _poly_alpha4_state["enabled"] = True
@@ -473,10 +473,16 @@ _poly_alpha4_state = {
 _poly_alpha4_traded_markets = set()
 
 def _poly_alpha4_calc_stake(pool_balance):
-    """Compounding: 5% of pool, min $2.50, max $8.00."""
+    """Compounding: 5% of pool.
+    - Min stake: $2.50 (at 50c fill = 5 shares minimum)
+    - Max stake: $3.00 until pool exceeds $100, then compounds at 5% naturally
+    - Safety: never more than 15% of pool in one trade
+    """
     stake = round(pool_balance * 0.05, 2)
     stake = max(stake, 2.50)
-    stake = min(stake, 8.00)
+    if pool_balance < 100.0:
+        stake = min(stake, 3.00)   # cap at $3 while building up
+    # above $100 the 5% compounds freely — no artificial cap
     if stake > pool_balance * 0.15:
         return 0
     return stake
@@ -930,7 +936,7 @@ def _resolve_poly_alpha4_trades():
                 m15 = (fired.minute // 15) * 15
                 window_start = fired.replace(minute=m15, second=0, microsecond=0)
                 expiry = window_start + timedelta(minutes=15)
-                if now < expiry + timedelta(minutes=2): continue
+                if now < expiry + timedelta(minutes=3): continue
 
                 stake = float(p.get("stake") or 2.50)
                 order_filled = p.get("filled", False)
@@ -1311,7 +1317,7 @@ def _resolve_limitless_sniper_trades():
                 if fired.tzinfo is None: fired = fired.replace(tzinfo=timezone.utc)
                 window_start = fired.replace(minute=0, second=0, microsecond=0)
                 expiry = window_start + timedelta(hours=1)
-                if now < expiry + timedelta(minutes=2): continue
+                if now < expiry + timedelta(minutes=3): continue
                 stake = float(p.get("stake") or 1.0)
                 order_filled = p.get("filled", False)
                 if not order_filled and now > expiry:
