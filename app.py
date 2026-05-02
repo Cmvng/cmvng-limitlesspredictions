@@ -963,9 +963,19 @@ def _resolve_poly_alpha4_trades():
                 if not p.get("fired_at"): continue
                 fired = datetime.fromisoformat(p["fired_at"])
                 if fired.tzinfo is None: fired = fired.replace(tzinfo=timezone.utc)
-                # 15M window-based expiry
-                m15 = (fired.minute // 15) * 15
-                window_start = fired.replace(minute=m15, second=0, microsecond=0)
+                # ── Correct expiry calculation ──
+                # Sniper fires ~30s BEFORE the boundary (e.g. fires at 10:14:30
+                # for the 10:15 boundary). So fired_at minute=14 falls in the
+                # PREVIOUS 15M window. We must use the NEXT boundary after fired_at.
+                # Round UP to next 15M boundary, not down to current window.
+                fired_minute = fired.minute
+                fired_second = fired.second
+                # Next 15M boundary after fired_at
+                next_boundary_minute = ((fired_minute // 15) + 1) * 15
+                if next_boundary_minute >= 60:
+                    window_start = fired.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+                else:
+                    window_start = fired.replace(minute=next_boundary_minute, second=0, microsecond=0)
                 expiry = window_start + timedelta(minutes=15)
                 if now < expiry + timedelta(minutes=3): continue
 
