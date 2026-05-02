@@ -568,22 +568,39 @@ def _sniper_get_direction(asset, timeframe="15m"):
     if not ut_trend and ind_1h_data:
         ut_trend = ind_1h_data.get("ut_trend")
 
-    # ── Pair direction: TV + 1H SMA must BOTH be present and agree ──
-    # TV=None means TradingView has no signal yet — do not trade on SMA alone.
-    # P2.1 on Limitless has both signals available; sniper must too.
+    # ── Pair direction — 3 valid paths (matching Paper 2.1) ──
+    #
+    # Path 1+2: TV + SMA both present
+    #   Both agree → pair_dir = that direction (HIGH signal)
+    #   Disagree   → SKIP (tiebreaker = 48% WR = losing at 50c)
+    #
+    # Path 4: TV missing, SMA + BTC both present and agree
+    #   BTC confirms SMA → pair_dir = SMA direction (65% WR)
+    #   BTC opposes SMA  → SKIP (conflicting without TV to decide)
+    #   (XRP/DOGE often have TV=None — this recovers those trades)
+    #
+    # SMA always required — never trade on BTC alone
+    if not sma_dir:
+        return None, 0, "", None
+
     if tv_dir and sma_dir:
         if tv_dir == sma_dir:
-            pair_dir = tv_dir
+            pair_dir = tv_dir          # Path 1+2: HIGH signal
         else:
-            # TV and 1H SMA DISAGREE → SKIP (same as Paper 2.1)
-            return None, 0, "", None
+            return None, 0, "", None   # Tiebreaker → SKIP
+    elif not tv_dir and sma_dir and btc_trend:
+        if btc_trend == sma_dir:
+            pair_dir = sma_dir         # Path 4: BTC confirms SMA
+        else:
+            return None, 0, "", None   # BTC conflicts with SMA → SKIP
     else:
-        # Either TV or SMA is missing — SKIP, not enough signal
-        return None, 0, "", None
+        return None, 0, "", None       # Not enough data
 
     # ── BTC role: confirm or ignore ──
     btc_confirms = (btc_trend == pair_dir) if btc_trend else False
-    if btc_confirms:
+    if not tv_dir and btc_confirms:
+        btc_role = "CONFIRM"           # Path 4: BTC is the confirmer
+    elif btc_confirms:
         btc_role = "CONFIRM"
     elif btc_trend and btc_trend != pair_dir:
         btc_role = "IGNORED"
@@ -636,14 +653,26 @@ def _sniper_get_direction(asset, timeframe="15m"):
     confidence = "HIGH" if btc_confirms else "MEDIUM"
     flipped = False
 
-    # ── UT Bot gatekeeper during weak periods ──
-    if is_weak and ut_trend:
+    # ── UT Bot + Squeeze gatekeeper during weak periods ──
+    # Matches Paper 2.1's 4-path weak period logic:
+    #   UT opposes → flip direction
+    #   SQZ only opposes (no UT) → SKIP (worst weak-period trades)
+    #   Neither opposes → follow trend
+    if is_weak:
         ut_opposes = (ut_trend == "SELL" and direction == "BUY") or \
-                     (ut_trend == "BUY" and direction == "SELL")
+                     (ut_trend == "BUY" and direction == "SELL") if ut_trend else False
+        sqz_opposes = (sqz_dir == "SELL" and direction == "BUY") or \
+                      (sqz_dir == "BUY" and direction == "SELL") if sqz_dir else False
+
         if ut_opposes:
+            # UT opposes → flip direction (pullback trade)
             direction = "SELL" if direction == "BUY" else "BUY"
-            confidence = "HIGH" if (sqz_dir and sqz_dir != pair_dir) else "MEDIUM"
+            confidence = "HIGH" if sqz_opposes else "MEDIUM"
             flipped = True
+        elif sqz_opposes and not ut_opposes:
+            # Squeeze only opposes, UT absent/agrees → SKIP
+            # (P2.1 skips these — historically worst weak-period trades)
+            return None, 0, "", None
 
     # ── Map to UP/DOWN ──
     bet_direction = "UP" if direction == "BUY" else "DOWN"
