@@ -734,25 +734,56 @@ def _sniper_thread():
                     })
 
             if not snipe_targets:
-                print("SNIPER: 0 targets at boundary (all filtered by P2.1) | cache: {}".format(
+                print("SNIPER: 0 targets at boundary | cache: {}".format(
                     {a: bool(_indicator_cache.get("{}_15m".format(a))) for a in SNIPER_ASSETS}))
-                _time.sleep(60)  # Wait 60s before checking again — avoids spam
+
+                # SV2 still runs even when live sniper has no targets
+                # Build minimal token_map for SV2 use
+                try:
+                    import requests as _sv2_req0
+                    import json as _sv2_json0
+                    _sv2_now0 = datetime.now(timezone.utc).isoformat()
+                    _sv2_map0 = {}
+                    for _sv2_a0 in SNIPER_ASSETS:
+                        if _sv2_state["balance"] <= 5.0: break
+                        try:
+                            _sv2_s0 = SNIPER_SLUGS[_sv2_a0].format(window_ts)
+                            _sv2_r0 = _sv2_req0.get(
+                                "{}/markets/slug/{}".format(GAMMA_API, _sv2_s0), timeout=5)
+                            if _sv2_r0.status_code == 200:
+                                _sv2_md0 = _sv2_r0.json()
+                                _sv2_t0 = _sv2_md0.get("clobTokenIds")
+                                if isinstance(_sv2_t0, str):
+                                    try: _sv2_t0 = _sv2_json0.loads(_sv2_t0)
+                                    except: _sv2_t0 = None
+                                _sv2_oc0 = _sv2_md0.get("outcomes")
+                                if isinstance(_sv2_oc0, str):
+                                    try: _sv2_oc0 = _sv2_json0.loads(_sv2_oc0)
+                                    except: _sv2_oc0 = None
+                                if isinstance(_sv2_t0, list) and len(_sv2_t0) >= 2:
+                                    _up0 = 0
+                                    if isinstance(_sv2_oc0, list) and len(_sv2_oc0) >= 2:
+                                        if str(_sv2_oc0[0]).lower().strip() in ("no","down","below"):
+                                            _up0 = 1
+                                    _sv2_map0[_sv2_a0] = {
+                                        "up_token": _sv2_t0[_up0], "down_token": _sv2_t0[1-_up0],
+                                        "condition_id": _sv2_md0.get("conditionId",""),
+                                        "slug": _sv2_s0, "title": _sv2_md0.get("question",""),
+                                    }
+                        except: pass
+                    _sv2_cnt0 = 0
+                    for _sv2_a0, _sv2_e0 in _sv2_map0.items():
+                        if _sv2_score_and_record(_sv2_a0, _sv2_e0, window_ts, _sv2_now0):
+                            _sv2_cnt0 += 1
+                    if _sv2_cnt0:
+                        print("SV2: {} paper trades (no live targets) | pool=${:.2f}".format(
+                            _sv2_cnt0, _sv2_state["balance"]))
+                except Exception as _sv2e0:
+                    print("SV2 no-target error: {}".format(_sv2e0))
+
+                _time.sleep(60)
                 continue
 
-            # ── Paper Sniper V2: score all assets at boundary (independent of live sniper) ──
-            try:
-                _sv2_now_str = datetime.now(timezone.utc).isoformat()
-                _sv2_scored = 0
-                for _sv2_asset in SNIPER_ASSETS:
-                    _sv2_entry = token_map.get(_sv2_asset)
-                    if _sv2_entry and _sv2_state["balance"] > 5.0:
-                        if _sv2_score_and_record(_sv2_asset, _sv2_entry, window_ts, _sv2_now_str):
-                            _sv2_scored += 1
-                if _sv2_scored:
-                    print("SV2: {} paper trades recorded | pool=${:.2f}".format(
-                        _sv2_scored, _sv2_state["balance"]))
-            except Exception as _sv2e:
-                print("SV2 error: {}".format(_sv2e))
             else:
                 print("SNIPER: {} targets qualified: {}".format(len(snipe_targets), ", ".join(_sniper_debug)))
 
@@ -860,6 +891,58 @@ def _sniper_thread():
 
             from py_clob_client_v2 import Side, OrderArgs, OrderType
             BUY = Side.BUY
+
+            # ── Paper Sniper V2: Score ALL assets independently at boundary ──
+            # Runs regardless of whether live sniper has targets
+            # Fetches token_map entries for assets not covered by live sniper
+            try:
+                _sv2_now_str = datetime.now(timezone.utc).isoformat()
+                _sv2_scored = 0
+                for _sv2_asset in SNIPER_ASSETS:
+                    if _sv2_state["balance"] <= 5.0:
+                        break
+                    # Get token_map entry — fetch if not already in map
+                    _sv2_entry = token_map.get(_sv2_asset)
+                    if not _sv2_entry:
+                        try:
+                            import requests as _sv2_req
+                            _sv2_slug = SNIPER_SLUGS[_sv2_asset].format(window_ts)
+                            _sv2_r = _sv2_req.get(
+                                "{}/markets/slug/{}".format(GAMMA_API, _sv2_slug), timeout=5)
+                            if _sv2_r.status_code == 200:
+                                _sv2_md = _sv2_r.json()
+                                _sv2_toks = _sv2_md.get("clobTokenIds")
+                                if isinstance(_sv2_toks, str):
+                                    import json as _sv2_json
+                                    try: _sv2_toks = _sv2_json.loads(_sv2_toks)
+                                    except: _sv2_toks = None
+                                _sv2_oc = _sv2_md.get("outcomes")
+                                if isinstance(_sv2_oc, str):
+                                    try: _sv2_oc = _sv2_json.loads(_sv2_oc)
+                                    except: _sv2_oc = None
+                                if isinstance(_sv2_toks, list) and len(_sv2_toks) >= 2:
+                                    _sv2_up_idx = 0
+                                    if isinstance(_sv2_oc, list) and len(_sv2_oc) >= 2:
+                                        if str(_sv2_oc[0]).lower().strip() in ("no","down","below"):
+                                            _sv2_up_idx = 1
+                                    _sv2_entry = {
+                                        "up_token": _sv2_toks[_sv2_up_idx],
+                                        "down_token": _sv2_toks[1-_sv2_up_idx],
+                                        "condition_id": _sv2_md.get("conditionId",""),
+                                        "slug": _sv2_slug,
+                                        "title": _sv2_md.get("question",""),
+                                    }
+                                    token_map[_sv2_asset] = _sv2_entry
+                        except Exception as _sv2_fe:
+                            pass
+                    if _sv2_entry and _sv2_score_and_record(
+                            _sv2_asset, _sv2_entry, window_ts, _sv2_now_str):
+                        _sv2_scored += 1
+                if _sv2_scored:
+                    print("SV2: {} paper trades recorded | pool=${:.2f}".format(
+                        _sv2_scored, _sv2_state["balance"]))
+            except Exception as _sv2e:
+                print("SV2 error: {}".format(_sv2e))
 
             fired_results = []  # collect results for post-fire logging
             fire_time = datetime.now(timezone.utc)
