@@ -960,26 +960,7 @@ def _sniper_thread():
                 if stake <= 0 or stake > _poly_alpha4_state["balance"]:
                     continue
 
-                # Get direction from this target first (required for PTB check below)
                 direction = target["direction"]
-
-                # ── Momentum PTB check ──
-                # The sniper fires ~30s before boundary. In that window price can move
-                # against direction. If the market opens with momentum BELOW the baseline
-                # (red candle open for UP bets, green for DOWN bets) → skip this asset.
-                # We use the live Chainlink price vs the PTB for this exact window.
-                _live_px = _rtds_current_price(asset)
-                _ptb_px  = _rtds_price_to_beat(asset, "15M", window_ts)
-                if _live_px and _ptb_px:
-                    _px_below_ptb = _live_px < _ptb_px
-                    if direction == "UP" and _px_below_ptb:
-                        print("SNIPER PTB SKIP: {} UP but price {:.4f} < baseline {:.4f} (red open)".format(
-                            asset, _live_px, _ptb_px))
-                        continue
-                    if direction == "DOWN" and not _px_below_ptb:
-                        print("SNIPER PTB SKIP: {} DOWN but price {:.4f} > baseline {:.4f} (green open)".format(
-                            asset, _live_px, _ptb_px))
-                        continue
 
                 tdata = token_map[asset]
                 token_id = tdata["up_token"] if direction == "UP" else tdata["down_token"]
