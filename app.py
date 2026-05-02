@@ -424,6 +424,7 @@ def _poly_alpha3_load_recent():
     print("SNIPER A4: ${:.2f} pool (restored from DB) | P2.1 at boundary | 15M | 50¢ fills".format(
         _poly_alpha4_state["balance"]))
     _sv2_load_balance()  # Load SV2 paper pool from DB
+    _save_bot_balance("sv2_paper", _sv2_state)  # Ensure row exists in DB
 
     try:
         conn = get_db()
