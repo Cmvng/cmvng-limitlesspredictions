@@ -1094,8 +1094,12 @@ def _sv2_get_tier(asset, direction, signals_agree, confidence, ind_data):
 
     adx_strong   = adx is not None and adx > 25
     adx_moderate = adx is not None and adx > 20
-    candle_confirms = (candle_dir == direction) if candle_dir else None
-    candle_opposes  = (candle_dir != direction) if candle_dir else False
+    # Convert candle BUY/SELL to UP/DOWN to match direction vocabulary
+    candle_up_down = None
+    if candle_dir == "BUY":  candle_up_down = "UP"
+    elif candle_dir == "SELL": candle_up_down = "DOWN"
+    candle_confirms = (candle_up_down == direction) if candle_up_down else None
+    candle_opposes  = (candle_up_down != direction) if candle_up_down else False
 
     # Tier classification
     if signals_agree == 3 and adx_strong and candle_confirms:
@@ -19248,15 +19252,23 @@ def sniper_v2_page():
         return {"T1": 0.75, "T2": 0.68, "T3": 0.58}[tier]
 
     t1_wr, t2_wr, t3_wr = tier_wr("T1"), tier_wr("T2"), tier_wr("T3")
-    # Daily volume estimates per tier
+    # Daily volume estimates per tier (trades/day)
     t1_daily, t2_daily, t3_daily = 20, 60, 40
-    # Daily EV (at current pool stake scaling)
+
     def daily_ev(p):
-        sc = max(1.0, p / 100.0) if p > 200 else 1.0
-        t1s = min(5.00 * sc, p * 0.08)
-        t2s = min(2.50 * sc, p * 0.05)
-        t3s = min(1.25 * sc, p * 0.025)
-        t1s, t2s, t3s = max(t1s, 2.50), max(t2s, 2.50), max(t3s, 2.50)
+        # Stake per trade = 5% of pool (same as live sniper)
+        # Cap so total deployed per day never exceeds pool
+        stake_per_trade = max(2.50, round(p * 0.05, 2))
+        total_trades = t1_daily + t2_daily + t3_daily  # 120
+        max_daily_deploy = p * 0.80  # never deploy more than 80% of pool in a day
+        # Scale down if needed
+        if total_trades * stake_per_trade > max_daily_deploy:
+            stake_per_trade = round(max_daily_deploy / total_trades, 2)
+            stake_per_trade = max(stake_per_trade, 2.50)
+        # T1 gets 2x stake, T2 gets 1x, T3 gets 0.5x (relative sizing)
+        t1s = min(stake_per_trade * 2.0, p * 0.08)
+        t2s = stake_per_trade
+        t3s = max(stake_per_trade * 0.5, 2.50)
         ev  = (t1_daily * t1s * (t1_wr*(wp50c-1) + (1-t1_wr)*(-1)) +
                t2_daily * t2s * (t2_wr*(wp50c-1) + (1-t2_wr)*(-1)) +
                t3_daily * t3s * (t3_wr*(wp50c-1) + (1-t3_wr)*(-1)))
