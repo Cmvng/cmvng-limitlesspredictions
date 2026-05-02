@@ -466,20 +466,28 @@ _poly_alpha4_state = {
 }
 _poly_alpha4_traded_markets = set()
 
-def _poly_alpha4_calc_stake(pool_balance):
-    """Compounding: 5% of pool.
-    - Min stake: $2.50 (at 50c fill = 5 shares minimum)
-    - Max stake: $3.00 until pool exceeds $100, then compounds at 5% naturally
-    - Safety: never more than 15% of pool in one trade
+def _poly_alpha4_calc_stake(pool_balance, tier="T2"):
+    """Variable stake by signal strength — one pool, three rates.
+
+    T1 (3/3 + candle confirms): pool × 2.0% — best signal, bigger bet
+    T2 (2/3 + candle OK):       pool × 1.5% — normal signal
+    T3 (2/3 + candle opposes):  pool × 1.0% — weak signal, smaller bet
+
+    Hard limits:
+    - Min: $2.50 (Polymarket minimum)
+    - Max: $25.00 (safety cap at large pools)
+    - Never more than 5% of pool (safety cap)
     """
-    stake = round(pool_balance * 0.05, 2)
-    stake = max(stake, 2.50)
-    if pool_balance < 100.0:
-        stake = min(stake, 3.00)   # cap at $3 while building up
-    # above $100 the 5% compounds freely — no artificial cap
-    if stake > pool_balance * 0.15:
+    rates = {"T1": 0.020, "T2": 0.015, "T3": 0.010}
+    rate = rates.get(tier, 0.015)
+    stake = round(pool_balance * rate, 2)
+    stake = max(stake, 2.50)           # Poly minimum
+    stake = min(stake, 25.00)          # safety cap
+    stake = min(stake, pool_balance * 0.05)  # never more than 5% of pool
+    stake = max(stake, 2.50)           # re-apply min after 5% cap
+    if stake > pool_balance - 5:       # floor protection
         return 0
-    return stake
+    return round(stake, 2)
 
 def _sniper_get_direction(asset, timeframe="15m"):
     """Combined Bot2 + Paper 2.1 sniper direction logic.
@@ -945,11 +953,35 @@ def _sniper_thread():
                 if market_key in _poly_alpha4_traded_markets:
                     continue
 
-                stake = _poly_alpha4_calc_stake(_poly_alpha4_state["balance"])
+                direction = target["direction"]
+                signals_agree = target.get("signals_agree", 2)
+                confidence = target.get("confidence", "MEDIUM")
+
+                # Determine tier from signal strength + candle direction
+                _ind_entry = _indicator_cache.get("{}_15m".format(asset.upper()))
+                _ind_data = _ind_entry.get("data") if _ind_entry else None
+                _candle_dir = None
+                if _ind_data:
+                    _c_open  = _ind_data.get("candle_open")
+                    _c_close = _ind_data.get("current")
+                    if _c_open and _c_close:
+                        _candle_raw = "UP" if _c_close > _c_open else "DOWN"
+                        _candle_dir = _candle_raw
+                _candle_confirms = (_candle_dir == direction) if _candle_dir else None
+                _candle_opposes  = (_candle_dir != direction) if _candle_dir else False
+
+                if signals_agree == 3 and _candle_confirms:
+                    _trade_tier = "T1"
+                elif signals_agree == 3:
+                    _trade_tier = "T2"
+                elif signals_agree >= 2 and not _candle_opposes:
+                    _trade_tier = "T2"
+                else:
+                    _trade_tier = "T3"
+
+                stake = _poly_alpha4_calc_stake(_poly_alpha4_state["balance"], _trade_tier)
                 if stake <= 0 or stake > _poly_alpha4_state["balance"]:
                     continue
-
-                direction = target["direction"]
 
                 tdata = token_map[asset]
                 token_id = tdata["up_token"] if direction == "UP" else tdata["down_token"]
@@ -1011,9 +1043,9 @@ def _sniper_thread():
                     print("SNIPER DB save error: {}".format(e))
 
                 fl_tag = "FILLED" if filled else "MAKER"
-                print("SNIPER A4: {} {} 15M ${:.2f} @50c [{}] {} | pool=${:.2f}".format(
+                print("SNIPER A4: {} {} 15M ${:.2f} @50c [{}] {} | {} | pool=${:.2f}".format(
                     direction, asset, stake, fl_tag,
-                    target["indicators"], _poly_alpha4_state["balance"]))
+                    target["indicators"], _trade_tier, _poly_alpha4_state["balance"]))
                 send_telegram("🎯 <b>SNIPER A4</b>\n{} {} 15M ${:.2f} @50¢\n{}\nPool: ${:.2f}".format(
                     direction, asset, stake,
                     target["indicators"], _poly_alpha4_state["balance"]))
@@ -1468,11 +1500,26 @@ _limitless_sniper_traded = set()
 _limitless_prev_momentum = {}  # {asset: {"direction": "BUY"/"SELL", "confirmed": True/False}}
 
 def _limitless_sniper_stake(pool, tier):
-    """Flat $1 per trade. Tier kept for tracking but stake is fixed."""
-    stake = 1.00
-    if stake > pool - 5.0:  # Don't trade below floor
+    """Variable stake by signal strength — same formula as Poly A4.
+
+    T1 (3/3 + candle confirms): pool × 2.0%
+    T2 (2/3 + candle OK):       pool × 1.5%
+    T3 (2/3 + candle opposes):  pool × 1.0%
+
+    Min: $1.00 (Limitless minimum)
+    Max: $10.00 (safety cap)
+    Never more than 5% of pool
+    """
+    rates = {"T1": 0.020, "T2": 0.015, "T3": 0.010}
+    rate = rates.get(tier, 0.015)
+    stake = round(pool * rate, 2)
+    stake = max(stake, 1.00)           # Limitless minimum
+    stake = min(stake, 10.00)          # safety cap
+    stake = min(stake, pool * 0.05)    # never more than 5% of pool
+    stake = max(stake, 1.00)           # re-apply min after 5% cap
+    if stake > pool - 5.0:             # floor protection
         return 0
-    return stake
+    return round(stake, 2)
 
 def _limitless_sniper_get_momentum(asset):
     """Check if previous window had P2.3-confirmed momentum for this asset.
