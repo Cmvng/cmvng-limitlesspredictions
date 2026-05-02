@@ -18581,14 +18581,12 @@ def _poly_scan_loop():
                 print("Poly Alpha3 resolved: {}".format(_pa3_resolved))
         except Exception as e:
             print("Poly Alpha3 resolve error: {}".format(e))
-        # BUG 4 FIX: 60 seconds for 5M market coverage
         try:
             _pa4_resolved = _resolve_poly_alpha4_trades()
             if _pa4_resolved:
                 print("Sniper Alpha4 resolved: {}".format(_pa4_resolved))
         except Exception as e:
             print("Sniper Alpha4 resolve error: {}".format(e))
-        time.sleep(60)
         try:
             _lmts_resolved = _resolve_limitless_sniper_trades()
             if _lmts_resolved:
@@ -18601,6 +18599,7 @@ def _poly_scan_loop():
                 print("SV2 paper resolved: {}".format(_sv2_resolved))
         except Exception as e:
             print("SV2 resolve error: {}".format(e))
+        time.sleep(60)  # Wait 60s before next scan+resolve cycle
 
 # ═══════════════════════════════════════════════════════════
 # POLYMARKET PAGES
