@@ -431,12 +431,6 @@ def _poly_alpha3_load_recent():
         _poly_alpha4_state["balance"] = _funded_pa4
         _poly_alpha4_state["peak_balance"] = max(_poly_alpha4_state.get("peak_balance", 0), _funded_pa4)
         _save_bot_balance("poly_alpha4", _poly_alpha4_state)
-    if _funded_lmts > 0 and abs(_limitless_sniper_state["balance"] - _funded_lmts) > 0.50:
-        print("LMTS SNIPER: balance updated from ${:.2f} → ${:.2f} (funded)".format(
-            _limitless_sniper_state["balance"], _funded_lmts))
-        _limitless_sniper_state["balance"] = _funded_lmts
-        _limitless_sniper_state["peak_balance"] = max(_limitless_sniper_state.get("peak_balance", 0), _funded_lmts)
-        _save_bot_balance("limitless_sniper", _limitless_sniper_state)
     # ────────────────────────────────
 
     print("SNIPER A4: ${:.2f} pool (restored from DB) | P2.1 at boundary | 15M | 50¢ fills".format(
@@ -16783,6 +16777,12 @@ if SIGNALS_DB_URL:
         _limitless_sniper_state["peak_balance"] = _saved_lmts.get("peak_balance", _saved_lmts["balance"])
     _limitless_sniper_state["floor_balance"] = 5.0
     _limitless_sniper_state["enabled"] = True
+    # ── Manual top-up override for LMTS ──
+    # Force balance to $30 (funded amount)
+    _limitless_sniper_state["balance"] = 30.00
+    _limitless_sniper_state["peak_balance"] = max(_limitless_sniper_state.get("peak_balance", 0), 30.00)
+    _save_bot_balance("limitless_sniper", _limitless_sniper_state)
+    # ───────────────────────────────────
     print("LMTS SNIPER: ${:.2f} pool (restored from DB) | P2.1+momentum | 1H | 50¢ | 2-tier".format(
         _limitless_sniper_state["balance"]))
     threading.Thread(target=_limitless_sniper_thread, daemon=True).start()
