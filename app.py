@@ -415,20 +415,13 @@ _poly_alpha3_traded_markets = set()
 def _poly_alpha3_load_recent():
 
     # ── POLY ALPHA 4.0 SNIPER init ──
-    _poly_alpha4_restored = False
     _saved_pa4 = _saved_balances.get("poly_alpha4", {})
     if _saved_pa4 and _saved_pa4.get("balance", 0) > 0:
         _poly_alpha4_state["balance"] = _saved_pa4["balance"]
         _poly_alpha4_state["peak_balance"] = _saved_pa4.get("peak_balance", _saved_pa4["balance"])
-        _poly_alpha4_restored = True
-    # Balance corrected to $46 — actual balance confirmed by user
-    _poly_alpha4_state["balance"] = 46.0
-    _poly_alpha4_state["peak_balance"] = 55.70  # keep historical peak
-    _poly_alpha4_state["starting_balance"] = 46.0
-    _poly_alpha4_restored = False
     _poly_alpha4_state["floor_balance"] = 5.0
     _poly_alpha4_state["enabled"] = True
-    print("SNIPER A4: ${:.2f} pool (corrected) | P2.1 at boundary | 15M | 50¢ fills".format(
+    print("SNIPER A4: ${:.2f} pool (restored from DB) | P2.1 at boundary | 15M | 50¢ fills".format(
         _poly_alpha4_state["balance"]))
 
     try:
@@ -1427,6 +1420,8 @@ def _resolve_poly_alpha4_trades():
                 send_telegram("{} <b>SNIPER A4</b> {} {}\n${:.2f} → {}\nPool: ${:.2f}".format(
                     _emoji, p.get("asset","?"), "WIN" if won else "LOSS",
                     stake, _pnl, _poly_alpha4_state["balance"]))
+                # Save balance to DB immediately after each resolution
+                _save_bot_balance("poly_alpha4", _poly_alpha4_state)
 
             except Exception as e:
                 print("SNIPER A4 resolve error #{}: {}".format(p.get("id"), e))
@@ -16657,16 +16652,13 @@ if SIGNALS_DB_URL:
     print("SNIPER A4 thread launched")
 
     # ── LIMITLESS SNIPER init ──
-    _lmts_sniper_restored = False
-    # Pool reset to $13 — actual on-chain balance after unrecorded losses
-    # Previous 18 trades all showed RETURNED in DB but actually filled and lost
-    # The $30 pool was incorrect — real wallet balance confirmed at $13
-    _limitless_sniper_state["balance"] = 13.0
-    _limitless_sniper_state["peak_balance"] = 30.0  # keep historical peak
-    _limitless_sniper_state["starting_balance"] = 13.0
+    _saved_lmts = _saved_balances.get("limitless_sniper", {})
+    if _saved_lmts and _saved_lmts.get("balance", 0) > 0:
+        _limitless_sniper_state["balance"] = _saved_lmts["balance"]
+        _limitless_sniper_state["peak_balance"] = _saved_lmts.get("peak_balance", _saved_lmts["balance"])
     _limitless_sniper_state["floor_balance"] = 5.0
     _limitless_sniper_state["enabled"] = True
-    print("LMTS SNIPER: ${:.2f} pool (corrected — real balance after losses) | P2.1+momentum | 1H | 50¢ | 2-tier".format(
+    print("LMTS SNIPER: ${:.2f} pool (restored from DB) | P2.1+momentum | 1H | 50¢ | 2-tier".format(
         _limitless_sniper_state["balance"]))
     threading.Thread(target=_limitless_sniper_thread, daemon=True).start()
     print("LMTS SNIPER thread launched")
