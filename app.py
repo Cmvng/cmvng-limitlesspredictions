@@ -14485,6 +14485,135 @@ def manual_otp_scan():
     return {"status": "OTP scan triggered"}, 200
 
 
+
+@app.route("/debug/check-returned-orders")
+def debug_check_returned_orders():
+    """Check fill status of returned trades 311-319 using the server's CLOB client."""
+    import requests as req
+    results = []
+    
+    try:
+        conn = get_db()
+        rows = conn.run("""
+            SELECT id, asset, bet_side, stake, order_id, filled, status, slug
+            FROM poly_alpha4_trades
+            WHERE id BETWEEN 311 AND 319
+            ORDER BY id
+        """)
+        cols = [c['name'] for c in conn.columns]
+        trades = [dict(zip(cols, r)) for r in rows]
+        conn.close()
+    except Exception as e:
+        return "DB error: {}".format(e)
+    
+    fee = 0.03
+    corrections = []
+    
+    for t in trades:
+        order_id = t.get("order_id")
+        if not order_id:
+            results.append("#{} {} — no order_id".format(t["id"], t["asset"]))
+            continue
+        
+        # Check CLOB for fill status
+        filled = False
+        size_matched = 0
+        clob_status = "unknown"
+        try:
+            r = req.get(
+                "https://clob.polymarket.com/order/{}".format(order_id),
+                timeout=8
+            )
+            if r.status_code == 200:
+                d = r.json()
+                clob_status = d.get("status", "?").upper()
+                size_matched = float(d.get("size_matched") or 0)
+                filled = clob_status in ("MATCHED", "FILLED") or size_matched > 0
+        except Exception as ce:
+            clob_status = "error: {}".format(ce)
+        
+        # Also check Gamma for market outcome
+        slug = t.get("slug", "")
+        won = None
+        if slug:
+            try:
+                import json as _j
+                rg = req.get(
+                    "https://gamma-api.polymarket.com/markets/slug/{}".format(slug),
+                    timeout=8
+                )
+                if rg.status_code == 200:
+                    md = rg.json()
+                    ops = md.get("outcomePrices")
+                    if isinstance(ops, str):
+                        try: ops = _j.loads(ops)
+                        except: ops = None
+                    if isinstance(ops, list) and len(ops) >= 2:
+                        p0, p1 = float(ops[0]), float(ops[1])
+                        oc = md.get("outcomes")
+                        if isinstance(oc, str):
+                            try: oc = _j.loads(oc)
+                            except: oc = None
+                        up_idx = 0
+                        if isinstance(oc, list) and str(oc[0]).lower() in ("no","down","below"):
+                            up_idx = 1
+                        up_p = p0 if up_idx == 0 else p1
+                        dn_p = p1 if up_idx == 0 else p0
+                        if up_p >= 0.95: won = (t["bet_side"] == "UP")
+                        elif dn_p >= 0.95: won = (t["bet_side"] == "DOWN")
+            except: pass
+        
+        line = "#{} {} {} | CLOB={} matched={:.1f} | filled={} | market_won={} | slug={}".format(
+            t["id"], t["asset"], t["bet_side"],
+            clob_status, size_matched, filled, won, slug[-25:] if slug else "none"
+        )
+        results.append(line)
+        
+        # If filled AND market resolved AND wrongly marked RETURNED → correct it
+        if filled and won is not None:
+            corrections.append((t["id"], won, float(t.get("stake") or 2.50)))
+    
+    # Apply corrections
+    corrected = []
+    for trade_id, won, stake in corrections:
+        payout = round(stake / 0.50 * (1 - fee), 4) if won else 0
+        pnl = round(payout - stake, 4) if won else round(-stake, 4)
+        status = "Won" if won else "Lost"
+        try:
+            c = get_db()
+            c.run("""UPDATE poly_alpha4_trades
+                     SET status=:s, outcome=:o, payout=:p
+                     WHERE id=:i""",
+                  s=status, o="WIN" if won else "LOSS", p=payout, i=trade_id)
+            c.close()
+            
+            # Update pool
+            if won:
+                _poly_alpha4_state["balance"] = round(
+                    _poly_alpha4_state["balance"] + payout, 2)
+            
+            corrected.append("#{} → {} payout=${:.4f} pnl=${:.4f}".format(
+                trade_id, status, payout, pnl))
+        except Exception as ce:
+            corrected.append("#{} correction failed: {}".format(trade_id, ce))
+    
+    html = "<pre style='font-family:monospace;padding:20px;font-size:13px'>"
+    html += "Order fill check — trades 311-319\n"
+    html += "=" * 80 + "\n"
+    for r in results:
+        html += r + "\n"
+    if corrections:
+        html += "\n" + "=" * 80 + "\n"
+        html += "CORRECTIONS APPLIED:\n"
+        for c in corrected:
+            html += c + "\n"
+        html += "Pool after corrections: ${:.2f}\n".format(
+            _poly_alpha4_state["balance"])
+    else:
+        html += "\nNo corrections needed (all genuinely returned or unresolved)\n"
+    html += "</pre>"
+    return html
+
 @app.route("/debug/sniper-trades")
 def debug_sniper_trades():
     """Check order_ids and status for recent sniper trades."""
