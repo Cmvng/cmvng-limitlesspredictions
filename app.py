@@ -590,6 +590,34 @@ def _sniper_get_direction(asset, timeframe="15m"):
     else:
         btc_role = "NONE"
 
+    # ── 4H macro filter — same as Paper 2.1 Limitless uses ──
+    # Require at least 2/4 macro signals to agree with pair direction
+    # This filters out trades that go against the macro trend
+    ind_4h_entry = _indicator_cache.get("{}_4h".format(asset_upper))
+    ind_4h_data = ind_4h_entry.get("data") if ind_4h_entry else None
+    if ind_4h_data:
+        m_sma = ind_4h_data.get("sma_trend")
+        m_ut = ind_4h_data.get("ut_trend")
+        m_ema = ind_4h_data.get("ema_stack")
+        btc_4h_entry = _indicator_cache.get("BTC_4h")
+        btc_4h_data = btc_4h_entry.get("data") if btc_4h_entry else None
+        m_btc = None
+        if btc_4h_data:
+            m_btc = btc_4h_data.get("sma_trend") or (
+                "BUY" if (btc_4h_data.get("current", 0) > (btc_4h_data.get("sma10") or 0)) else "SELL"
+                if btc_4h_data.get("sma10") else None)
+        m_signals = [x for x in [m_sma, m_ut, m_ema, m_btc] if x is not None]
+        if len(m_signals) >= 2:
+            m_buy = sum(1 for x in m_signals if x in ("BUY", "STRONG_BUY"))
+            m_sell = sum(1 for x in m_signals if x in ("SELL", "STRONG_SELL"))
+            m_total = m_buy + m_sell
+            if m_total >= 2:
+                macro_agrees = (pair_dir == "BUY" and m_buy >= m_sell) or \
+                               (pair_dir == "SELL" and m_sell >= m_buy)
+                if not macro_agrees:
+                    # 4H macro opposes direction → SKIP (same as P2.1 on Limitless)
+                    return None, 0, "", None
+
     # ── Weak period check ──
     now = datetime.now(timezone.utc)
     if timeframe == "15m":
@@ -810,7 +838,10 @@ def _sniper_thread():
                 print("SNIPER: {} targets ready, waiting {:.1f}s for boundary...".format(len(token_map), wait_secs))
                 _time.sleep(max(wait_secs - 0.5, 0))  # Fire 0.5s early to account for network latency
 
-            # ── T+0: FIRE ALL ORDERS ──
+            # ── T+0: FIRE ALL ORDERS — speed-optimised ──
+            # Phase 1: Place ALL orders as fast as possible (no DB/Telegram in loop)
+            # Phase 2: Log, save to DB, send Telegram after all orders are placed
+            # This ensures all assets fire within ~1s of each other at boundary
             client = _get_poly_client()
             if not client:
                 print("SNIPER: no CLOB client — skipping")
@@ -820,13 +851,15 @@ def _sniper_thread():
             from py_clob_client_v2 import Side, OrderArgs, OrderType
             BUY = Side.BUY
 
-            fired_count = 0
+            fired_results = []  # collect results for post-fire logging
+            fire_time = datetime.now(timezone.utc)
+
             for target in snipe_targets:
                 asset = target["asset"]
                 if asset not in token_map:
                     continue
 
-                market_key = "sniper_{}_{}_{}".format(asset, "15M", window_ts)
+                market_key = "sniper_{}_{}_{}" .format(asset, "15M", window_ts)
                 if market_key in _poly_alpha4_traded_markets:
                     continue
 
@@ -834,77 +867,94 @@ def _sniper_thread():
                 if stake <= 0 or stake > _poly_alpha4_state["balance"]:
                     continue
 
-                tdata = token_map[asset]
+                # ── Price position confirmation (zero latency — in-memory reads) ──
+                # Only fire when live price confirms the signal direction vs PTB.
+                # This filters trades where price hasn't yet moved to confirm signal.
+                live_price = _chainlink_prices.get(asset.upper())
+                ptb_entry = _chainlink_ptb.get("{}_15M".format(asset.upper()))
+                ptb_price = ptb_entry[1] if ptb_entry else None
+
                 direction = target["direction"]
+                if live_price and ptb_price and ptb_price > 0:
+                    pct_from_ptb = (live_price - ptb_price) / ptb_price * 100
+                    # Allow 0.05% buffer — price very close to PTB is fine
+                    if direction == "DOWN" and pct_from_ptb > 0.05:
+                        print("SNIPER SKIP {} {}: live={:.2f} above PTB={:.2f} (+{:.3f}%) not confirmed".format(
+                            direction, asset, live_price, ptb_price, pct_from_ptb))
+                        continue
+                    if direction == "UP" and pct_from_ptb < -0.05:
+                        print("SNIPER SKIP {} {}: live={:.2f} below PTB={:.2f} ({:.3f}%) not confirmed".format(
+                            direction, asset, live_price, ptb_price, pct_from_ptb))
+                        continue
+
+                tdata = token_map[asset]
                 token_id = tdata["up_token"] if direction == "UP" else tdata["down_token"]
 
-                # Order at 50¢ — or check order book for best ask up to 52¢
-                order_price = 0.50
-                try:
-                    book = client.get_order_book(str(token_id))
-                    if book and book.get("asks") and len(book["asks"]) > 0:
-                        best_ask = round(float(book["asks"][0]["price"]), 2)
-                        if best_ask <= SNIPER_MAX_FILL:
-                            order_price = best_ask
-                        else:
-                            order_price = 0.50  # Place at 50¢ as maker
-                except:
-                    pass  # Order book not available yet — place at 50¢
-
-                shares = max(5.0, round(stake / order_price, 2))
+                # Always 50c — no order book call (saves 100-200ms per asset)
+                # At boundary market always opens ~50/50, takers fill immediately
+                shares = max(5.0, round(stake / 0.50, 2))
 
                 try:
-                    oa = OrderArgs(token_id=str(token_id), price=round(order_price, 2), size=shares, side=BUY)
+                    oa = OrderArgs(token_id=str(token_id), price=0.50, size=shares, side=BUY)
                     signed = client.create_order(oa)
                     resp = client.post_order(signed, OrderType.GTC)
                     order_id = resp.get("orderID") or resp.get("order_id") if resp else None
                     filled = (resp.get("status") or "").upper() in ("MATCHED", "FILLED") if resp else False
 
-                    # Update pool
+                    # Update pool immediately so next stake calc is correct
                     _poly_alpha4_state["balance"] = round(_poly_alpha4_state["balance"] - stake, 2)
                     _poly_alpha4_state["trades_today"] += 1
                     _poly_alpha4_traded_markets.add(market_key)
                     if _poly_alpha4_state["balance"] > _poly_alpha4_state["peak_balance"]:
                         _poly_alpha4_state["peak_balance"] = _poly_alpha4_state["balance"]
 
-                    # Save to DB
-                    try:
-                        c4 = get_db()
-                        c4.run("""INSERT INTO poly_alpha4_trades
-                            (market_id,title,asset,timeframe,bet_side,stake,fill_price,
-                             pool_after,order_id,token_id,condition_id,slug,filled,status,
-                             indicators,signals_agree,fired_at)
-                            VALUES(:mid,:ttl,:ast,:tf,:bs,:stake,:fill,:pool,:oid,:tid,:cid,:slg,:filled,'Pending',
-                                   :ind,:sa,:now)""",
-                            mid=market_key, ttl=tdata.get("title", ""),
-                            ast=asset, tf="15M", bs=direction, stake=stake,
-                            fill=round(order_price, 4), pool=_poly_alpha4_state["balance"],
-                            oid=order_id, tid=str(token_id)[:50],
-                            cid=tdata.get("condition_id", ""),
-                            slg=tdata.get("slug", ""),
-                            filled=filled,
-                            ind=target["indicators"],
-                            sa=target["signals_agree"],
-                            now=datetime.now(timezone.utc).isoformat())
-                        c4.close()
-                    except Exception as e:
-                        print("SNIPER DB save error: {}".format(e))
-
-                    fl_tag = "FILLED" if filled else "MAKER"
-                    print("SNIPER A4: {} {} 15M ${:.2f} @{:.0f}¢ [{}] {} | pool=${:.2f}".format(
-                        direction, asset, stake, order_price * 100,
-                        fl_tag, target["indicators"], _poly_alpha4_state["balance"]))
-                    send_telegram("🎯 <b>SNIPER A4</b>\n{} {} 15M ${:.2f} @{:.0f}¢\n{}\nPool: ${:.2f}".format(
-                        direction, asset, stake, order_price * 100,
-                        target["indicators"], _poly_alpha4_state["balance"]))
-
-                    fired_count += 1
+                    fired_results.append((asset, direction, stake,
+                                          order_id, filled, tdata, market_key, target))
 
                 except Exception as e:
                     print("SNIPER order {} error: {}".format(asset, e))
 
+            # ── Phase 2: DB + Telegram after all orders placed ──
+            fired_count = len(fired_results)
             if fired_count > 0:
-                print("SNIPER: fired {} orders at boundary {}".format(fired_count, window_ts))
+                elapsed = (datetime.now(timezone.utc) - fire_time).total_seconds()
+                print("SNIPER: fired {} orders at boundary {} in {:.2f}s".format(
+                    fired_count, window_ts, elapsed))
+
+            for (asset, direction, stake,
+                 order_id, filled, tdata, market_key, target) in fired_results:
+                try:
+                    c4 = get_db()
+                    c4.run("""INSERT INTO poly_alpha4_trades
+                        (market_id,title,asset,timeframe,bet_side,stake,fill_price,
+                         pool_after,order_id,token_id,condition_id,slug,filled,status,
+                         indicators,signals_agree,fired_at)
+                        VALUES(:mid,:ttl,:ast,:tf,:bs,:stake,:fill,:pool,:oid,:tid,:cid,:slg,:filled,'Pending',
+                               :ind,:sa,:now)""",
+                        mid=market_key, ttl=tdata.get("title", ""),
+                        ast=asset, tf="15M", bs=direction, stake=stake,
+                        fill=0.5000, pool=_poly_alpha4_state["balance"],
+                        oid=order_id,
+                        tid=str(tdata.get("up_token" if direction=="UP" else "down_token",""))[:50],
+                        cid=tdata.get("condition_id", ""),
+                        slg=tdata.get("slug", ""),
+                        filled=filled,
+                        ind=target["indicators"],
+                        sa=target["signals_agree"],
+                        now=fire_time.isoformat())
+                    c4.close()
+                except Exception as e:
+                    print("SNIPER DB save error: {}".format(e))
+
+                fl_tag = "FILLED" if filled else "MAKER"
+                print("SNIPER A4: {} {} 15M ${:.2f} @50c [{}] {} | pool=${:.2f}".format(
+                    direction, asset, stake, fl_tag,
+                    target["indicators"], _poly_alpha4_state["balance"]))
+                send_telegram("🎯 <b>SNIPER A4</b>\n{} {} 15M ${:.2f} @50¢\n{}\nPool: ${:.2f}".format(
+                    direction, asset, stake,
+                    target["indicators"], _poly_alpha4_state["balance"]))
+
+            if fired_count > 0:
                 _save_bot_balance("poly_alpha4", _poly_alpha4_state)
             _save_bot_balance("limitless_sniper", _limitless_sniper_state)
 
@@ -939,10 +989,35 @@ def _resolve_poly_alpha4_trades():
                 if now < expiry + timedelta(minutes=3): continue
 
                 stake = float(p.get("stake") or 2.50)
-                order_filled = p.get("filled", False)
+                order_id = p.get("order_id")
+
+                # ── Check actual fill status from Polymarket API ──
+                # GTC maker orders are placed at 50¢ and filled LATER by takers.
+                # The saved `filled` column only reflects the immediate placement
+                # response, not the eventual fill. We must check the order status.
+                actual_filled = p.get("filled", False)
+                if not actual_filled and order_id:
+                    try:
+                        import requests as req
+                        r_ord = req.get(
+                            "https://clob.polymarket.com/order/{}".format(order_id),
+                            timeout=5)
+                        if r_ord.status_code == 200:
+                            ord_data = r_ord.json()
+                            ord_status = (ord_data.get("status") or "").upper()
+                            size_matched = float(ord_data.get("size_matched") or 0)
+                            if ord_status in ("MATCHED", "FILLED") or size_matched > 0:
+                                actual_filled = True
+                                # Update the DB so future checks don't re-query
+                                c_upd = get_db()
+                                c_upd.run("UPDATE poly_alpha4_trades SET filled=TRUE WHERE id=:i",
+                                          i=p["id"])
+                                c_upd.close()
+                    except:
+                        pass  # Can't reach API — fall back to saved value
 
                 # Unfilled → return stake
-                if not order_filled and now > expiry:
+                if not actual_filled and now > expiry:
                     _poly_alpha4_state["balance"] = round(_poly_alpha4_state["balance"] + stake, 2)
                     c4 = get_db()
                     c4.run("UPDATE poly_alpha4_trades SET status='Returned',outcome='RETURNED',resolved_at=:r WHERE id=:i",
@@ -2796,17 +2871,14 @@ def _score_paper210_trade(p, price, indicators=None, ind_macro=None, expiry_minu
     btc_trend = indicators.get("btc_trend")
     
     # ── Pair direction: Limitless P2.1 rules ──
+    # Both TV and SMA must be present and agree — no single-signal fallback
     if tv_dir and sma_trend:
         if tv_dir == sma_trend:
             pair_dir = tv_dir
         else:
             return None  # TV and SMA DISAGREE → SKIP
-    elif tv_dir:
-        pair_dir = tv_dir
-    elif sma_trend:
-        pair_dir = sma_trend
     else:
-        return None
+        return None  # Either signal missing → SKIP
     
     # BTC role
     btc_confirms = (btc_trend == pair_dir) if btc_trend else False
@@ -5668,6 +5740,7 @@ def _precalc_indicators():
             get_price(asset)
             _calculate_indicators(asset, "15m")
             _calculate_indicators(asset, "1h")
+            _calculate_indicators(asset, "4h")  # 4H macro for sniper filter
         except:
             pass
 
