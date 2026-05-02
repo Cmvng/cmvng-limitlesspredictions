@@ -15359,7 +15359,20 @@ def paper_page():
     """Paper trading results page — simulated trades at lower odds with trend alignment."""
     try:
         conn = get_db()
-        # All paper trades ordered by newest first
+        # ── Full stats from ALL trades (not just last 200) ──
+        stats_rows = conn.run("""
+            SELECT outcome, market_type, asset,
+                   simulated_payout, simulated_stake, bet_odds
+            FROM paper_trades
+            WHERE outcome IN ('WIN','LOSS')
+        """)
+        stats_cols = [c['name'] for c in conn.columns]
+        all_resolved = [dict(zip(stats_cols, r)) for r in stats_rows]
+
+        # Pending count
+        pending_count = conn.run("SELECT COUNT(*) FROM paper_trades WHERE status='Pending'")[0][0]
+
+        # Last 200 for trade log display only
         rows = conn.run("SELECT * FROM paper_trades ORDER BY id DESC LIMIT 200")
         cols = [c['name'] for c in conn.columns]
         trades = [dict(zip(cols, r)) for r in rows]
@@ -15367,27 +15380,29 @@ def paper_page():
     except Exception as e:
         print("Paper page error: {}".format(e))
         trades = []
+        all_resolved = []
+        pending_count = 0
 
-    # Calculate stats
-    total = len(trades)
-    wins = sum(1 for t in trades if t.get("outcome") == "WIN")
-    losses = sum(1 for t in trades if t.get("outcome") == "LOSS")
-    pending = sum(1 for t in trades if t.get("status") == "Pending")
+    # ── Calculate stats from ALL resolved trades ──
+    wins   = sum(1 for t in all_resolved if t.get("outcome") == "WIN")
+    losses = sum(1 for t in all_resolved if t.get("outcome") == "LOSS")
     resolved = wins + losses
+    pending = pending_count
+    total = resolved + pending
     win_rate = round(wins / resolved * 100, 1) if resolved > 0 else 0
 
-    # Simulated P&L
+    # Simulated P&L from all trades
     total_profit = 0
-    for t in trades:
+    for t in all_resolved:
         if t.get("outcome") == "WIN":
             total_profit += float(t.get("simulated_payout") or 0) - float(t.get("simulated_stake") or 1)
         elif t.get("outcome") == "LOSS":
             total_profit -= float(t.get("simulated_stake") or 1)
     total_profit = round(total_profit, 2)
 
-    # Stats by market type
+    # Stats by market type — from all trades
     type_stats = {}
-    for t in trades:
+    for t in all_resolved:
         mt = t.get("market_type") or "Unknown"
         if mt not in type_stats:
             type_stats[mt] = {"w": 0, "l": 0, "p": 0, "profit": 0.0}
@@ -15397,12 +15412,10 @@ def paper_page():
         elif t.get("outcome") == "LOSS":
             type_stats[mt]["l"] += 1
             type_stats[mt]["profit"] -= float(t.get("simulated_stake") or 1)
-        else:
-            type_stats[mt]["p"] += 1
 
-    # Stats by asset
+    # Stats by asset — from all trades
     asset_stats = {}
-    for t in trades:
+    for t in all_resolved:
         a = t.get("asset") or "?"
         if a not in asset_stats:
             asset_stats[a] = {"w": 0, "l": 0, "profit": 0.0}
