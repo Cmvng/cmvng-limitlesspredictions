@@ -867,25 +867,11 @@ def _sniper_thread():
                 if stake <= 0 or stake > _poly_alpha4_state["balance"]:
                     continue
 
-                # ── Price position confirmation (zero latency — in-memory reads) ──
-                # Only fire when live price confirms the signal direction vs PTB.
-                # This filters trades where price hasn't yet moved to confirm signal.
-                live_price = _chainlink_prices.get(asset.upper())
-                ptb_entry = _chainlink_ptb.get("{}_15M".format(asset.upper()))
-                ptb_price = ptb_entry[1] if ptb_entry else None
-
+                # PTB filter removed — at T+0 live price IS the PTB by definition
+                # (Limitless sets baseline = current price at boundary open)
+                # The filter was blocking ~90% of trades with no quality benefit
+                # Quality gate is TV+SMA+4H agreement — that's sufficient
                 direction = target["direction"]
-                if live_price and ptb_price and ptb_price > 0:
-                    pct_from_ptb = (live_price - ptb_price) / ptb_price * 100
-                    # Allow 0.05% buffer — price very close to PTB is fine
-                    if direction == "DOWN" and pct_from_ptb > 0.05:
-                        print("SNIPER SKIP {} {}: live={:.2f} above PTB={:.2f} (+{:.3f}%) not confirmed".format(
-                            direction, asset, live_price, ptb_price, pct_from_ptb))
-                        continue
-                    if direction == "UP" and pct_from_ptb < -0.05:
-                        print("SNIPER SKIP {} {}: live={:.2f} below PTB={:.2f} ({:.3f}%) not confirmed".format(
-                            direction, asset, live_price, ptb_price, pct_from_ptb))
-                        continue
 
                 tdata = token_map[asset]
                 token_id = tdata["up_token"] if direction == "UP" else tdata["down_token"]
