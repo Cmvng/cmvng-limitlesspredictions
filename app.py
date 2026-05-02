@@ -960,6 +960,9 @@ def _sniper_thread():
                 if stake <= 0 or stake > _poly_alpha4_state["balance"]:
                     continue
 
+                # Get direction from this target first (required for PTB check below)
+                direction = target["direction"]
+
                 # ── Momentum PTB check ──
                 # The sniper fires ~30s before boundary. In that window price can move
                 # against direction. If the market opens with momentum BELOW the baseline
@@ -977,12 +980,6 @@ def _sniper_thread():
                         print("SNIPER PTB SKIP: {} DOWN but price {:.4f} > baseline {:.4f} (green open)".format(
                             asset, _live_px, _ptb_px))
                         continue
-
-                # PTB filter removed for cases where PTB data unavailable — at T+0 live price IS the PTB by definition
-                # (Limitless sets baseline = current price at boundary open)
-                # The filter was blocking ~90% of trades with no quality benefit
-                # Quality gate is TV+SMA+4H agreement — that's sufficient
-                direction = target["direction"]
 
                 tdata = token_map[asset]
                 token_id = tdata["up_token"] if direction == "UP" else tdata["down_token"]
