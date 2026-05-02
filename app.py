@@ -421,15 +421,15 @@ def _poly_alpha3_load_recent():
         _poly_alpha4_state["balance"] = _saved_pa4["balance"]
         _poly_alpha4_state["peak_balance"] = _saved_pa4.get("peak_balance", _saved_pa4["balance"])
         _poly_alpha4_restored = True
-    # RESET to $60 fresh
-    _poly_alpha4_state["balance"] = 50.0
-    _poly_alpha4_state["peak_balance"] = 50.0
-    _poly_alpha4_state["starting_balance"] = 50.0
-    _poly_alpha4_restored = False  # Force fresh start
+    # Balance corrected to $46 — actual balance confirmed by user
+    _poly_alpha4_state["balance"] = 46.0
+    _poly_alpha4_state["peak_balance"] = 55.70  # keep historical peak
+    _poly_alpha4_state["starting_balance"] = 46.0
+    _poly_alpha4_restored = False
     _poly_alpha4_state["floor_balance"] = 5.0
     _poly_alpha4_state["enabled"] = True
-    print("SNIPER A4: ${:.2f} pool{} | P2.1 at boundary | 15M | 50¢ fills".format(
-        _poly_alpha4_state["balance"], " (restored)" if _poly_alpha4_restored else " (fresh)"))
+    print("SNIPER A4: ${:.2f} pool (corrected) | P2.1 at boundary | 15M | 50¢ fills".format(
+        _poly_alpha4_state["balance"]))
 
     try:
         conn = get_db()
@@ -1394,7 +1394,34 @@ def _resolve_limitless_sniper_trades():
                 expiry = window_start + timedelta(hours=1)
                 if now < expiry + timedelta(minutes=3): continue
                 stake = float(p.get("stake") or 1.0)
+                order_id = p.get("order_id")
                 order_filled = p.get("filled", False)
+
+                # ── Check actual fill status from Limitless API ──
+                # GTC at 50c fills LATER when counterparty arrives (not at T+0)
+                # The saved filled=False only reflects placement response, not actual fill
+                if not order_filled and order_id:
+                    try:
+                        import requests as req
+                        hdrs = {"X-API-Key": LIMITLESS_TOKEN_ID, "Content-Type": "application/json"}
+                        r_ord = req.get(
+                            "{}/orders/{}".format(LIMITLESS_API, order_id),
+                            headers=hdrs, timeout=5)
+                        if r_ord.status_code == 200:
+                            ord_data = r_ord.json()
+                            ord_status = (ord_data.get("status") or "").upper()
+                            size_matched = float(ord_data.get("filledAmount") or
+                                                 ord_data.get("sizeMatched") or
+                                                 ord_data.get("size_matched") or 0)
+                            if ord_status in ("MATCHED", "FILLED", "CLOSED") or size_matched > 0:
+                                order_filled = True
+                                c_upd = get_db()
+                                c_upd.run("UPDATE limitless_sniper_trades SET filled=TRUE WHERE id=:i",
+                                          i=p["id"])
+                                c_upd.close()
+                    except:
+                        pass  # Can't reach API — fall back to saved value
+
                 if not order_filled and now > expiry:
                     _limitless_sniper_state["balance"] = round(_limitless_sniper_state["balance"] + stake, 2)
                     c = get_db()
@@ -16100,19 +16127,16 @@ if SIGNALS_DB_URL:
 
     # ── LIMITLESS SNIPER init ──
     _lmts_sniper_restored = False
-    _saved_lmts = _saved_balances.get("limitless_sniper", {})
-    if _saved_lmts and _saved_lmts.get("balance", 0) > 0:
-        _limitless_sniper_state["balance"] = _saved_lmts["balance"]
-        _limitless_sniper_state["peak_balance"] = _saved_lmts.get("peak_balance", _saved_lmts["balance"])
-        _lmts_sniper_restored = True
-    if not _lmts_sniper_restored:
-        _limitless_sniper_state["balance"] = 30.0
-        _limitless_sniper_state["peak_balance"] = 30.0
-    _limitless_sniper_state["starting_balance"] = 30.0
+    # Pool reset to $13 — actual on-chain balance after unrecorded losses
+    # Previous 18 trades all showed RETURNED in DB but actually filled and lost
+    # The $30 pool was incorrect — real wallet balance confirmed at $13
+    _limitless_sniper_state["balance"] = 13.0
+    _limitless_sniper_state["peak_balance"] = 30.0  # keep historical peak
+    _limitless_sniper_state["starting_balance"] = 13.0
     _limitless_sniper_state["floor_balance"] = 5.0
     _limitless_sniper_state["enabled"] = True
-    print("LMTS SNIPER: ${:.2f} pool{} | P2.1+momentum | 1H | 50¢ | 2-tier".format(
-        _limitless_sniper_state["balance"], " (restored)" if _lmts_sniper_restored else " (fresh)"))
+    print("LMTS SNIPER: ${:.2f} pool (corrected — real balance after losses) | P2.1+momentum | 1H | 50¢ | 2-tier".format(
+        _limitless_sniper_state["balance"]))
     threading.Thread(target=_limitless_sniper_thread, daemon=True).start()
     print("LMTS SNIPER thread launched")
 
