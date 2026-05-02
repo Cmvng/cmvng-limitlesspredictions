@@ -488,217 +488,183 @@ def _poly_alpha4_calc_stake(pool_balance):
     return stake
 
 def _sniper_get_direction(asset, timeframe="15m"):
-    """Limitless P2.1 logic for sniper.
+    """Combined Bot2 + Paper 2.1 sniper direction logic.
 
-    SMA and BTC always read from the 1H cache — matching the proven Paper 2.1
-    strategy (65.4% WR). TV comes from _tv_trends (TradingView, 1H/4H based).
+    SIGNAL MODEL (Bot2 proven 70.4% WR + P2.1 proven 68.3% WR):
+      Direction = majority vote of TV + SMA + BTC (need 2/3 minimum)
 
-    For 15M sniper: TV + 1H SMA must agree. BTC from 1H confirms or ignored.
-    For 1H sniper:  TV + 1H SMA must agree. BTC from 1H confirms or ignored.
+      Path 1: TV=X  SMA=X  BTC=X   → X (HIGH 3/3)       — all agree
+      Path 2: TV=X  SMA=X  BTC=!X  → X (MEDIUM 2/3)     — TV+SMA lead, BTC ignored
+      Path 3: TV=X  SMA=!X BTC=X   → X (MEDIUM 2/3)     — tiebreaker, BTC+TV beat SMA
+      Path 4: TV=!X SMA=X  BTC=X   → X (MEDIUM 2/3)     — tiebreaker, BTC+SMA beat TV
+      Path 5: TV=None SMA=X BTC=X  → X (MEDIUM 2/3)     — no TV, BTC confirms SMA
+      Path 6: TV=None SMA=X BTC=!X → SKIP               — conflicting, no TV to decide
+      Path 7: TV=None SMA=None     → SKIP               — SMA always required
+      Path 8: only 1/3 agree       → SKIP               — insufficient consensus
 
-    UT Bot and Squeeze read from the timeframe-specific cache (micro filter).
+    PERIOD LOGIC (P2.1 proven):
+      Strong period (:15/:45 expiry) — clean momentum, follow signal
+      Weak period   (:00/:30 expiry) — use UT Bot + Squeeze gatekeeper
 
-    Rules:
-      1. TV + 1H SMA agree → direction. BTC 1H confirms or gets ignored.
-      2. TV + 1H SMA DISAGREE → SKIP (same as Paper 2.1 — this is why paper 2.1
-         skips some assets per window). Sniper now does the same.
-      3. During weak periods → UT Bot can flip the trade
+    NO 4H macro filter on 15M — Bot2 doesn't use it and gets 70.4% WR
+    4H macro filter applied to 1H timeframe only (P2.1 proven for 1H)
 
     Returns (direction, signals_agree, ind_str, confidence) or (None, 0, "", None)
     """
     asset_upper = asset.upper()
 
-    # ── SMA and BTC always from 1H cache — matches Paper 2.1 proven strategy ──
-    # Using 15M SMA caused sniper to fire all 4 assets every window because
-    # correlated crypto all bounce together on 15M. 1H SMA filters correctly.
+    # ── Read all signal caches ──
     ind_1h_entry = _indicator_cache.get("{}_1h".format(asset_upper))
-    ind_1h_data = ind_1h_entry.get("data") if ind_1h_entry else None
-
+    ind_1h_data  = ind_1h_entry.get("data") if ind_1h_entry else None
     btc_1h_entry = _indicator_cache.get("BTC_1h")
-    btc_1h_data = btc_1h_entry.get("data") if btc_1h_entry else None
-
-    # ── UT Bot and Squeeze from timeframe-specific cache (micro filter) ──
+    btc_1h_data  = btc_1h_entry.get("data") if btc_1h_entry else None
     ind_tf_entry = _indicator_cache.get("{}_{}".format(asset_upper, timeframe))
-    ind_tf_data = ind_tf_entry.get("data") if ind_tf_entry else None
+    ind_tf_data  = ind_tf_entry.get("data") if ind_tf_entry else None
 
-    # ── TV signal from signals DB (TradingView — 1H/4H based) ──
-    tv = _tv_trends.get(asset_upper)
+    # ── TV signal (TradingView 1H/4H composite) ──
+    tv     = _tv_trends.get(asset_upper)
     tv_dir = tv["dir"] if tv else None
 
-    # ── SMA from 1H cache (same as Paper 2.1) ──
+    # ── SMA from 1H cache ──
     sma_dir = None
     if ind_1h_data:
-        sma_trend = ind_1h_data.get("sma_trend")
-        if sma_trend:
-            sma_dir = sma_trend
-        else:
-            sma10 = ind_1h_data.get("sma10")
+        sma_dir = ind_1h_data.get("sma_trend")
+        if not sma_dir:
+            sma10   = ind_1h_data.get("sma10")
             current = ind_1h_data.get("current")
             if sma10 and current:
                 sma_dir = "BUY" if current > sma10 else "SELL"
-    # Fallback to _pair_sma_cache if 1H indicator cache not warm yet
     if not sma_dir:
-        cached_sma = _pair_sma_cache.get(asset_upper, {})
-        sma_dir = cached_sma.get("trend")
+        sma_dir = _pair_sma_cache.get(asset_upper, {}).get("trend")
 
-    # ── BTC trend from 1H cache (same as Paper 2.1) ──
-    btc_trend = None
-    if btc_1h_data:
-        btc_sma_trend = btc_1h_data.get("sma_trend")
-        if btc_sma_trend:
-            btc_trend = btc_sma_trend
-        else:
-            btc_sma10 = btc_1h_data.get("sma10")
-            btc_current = btc_1h_data.get("current")
-            if btc_sma10 and btc_current:
-                btc_trend = "BUY" if btc_current > btc_sma10 else "SELL"
-    # Fallback to global 1H BTC cache
-    if not btc_trend:
-        btc_trend = _btc_trend_cache.get("trend")
-
-    # ── UT Bot and Squeeze from timeframe-specific cache ──
-    ut_trend = None
-    sqz_dir = None
-    if ind_tf_data:
-        ut_trend = ind_tf_data.get("ut_trend")
-        sqz_val = ind_tf_data.get("squeeze_val")
-        if sqz_val is not None:
-            sqz_dir = "BUY" if sqz_val > 0 else "SELL" if sqz_val < 0 else None
-    # Fallback UT to 1H if TF cache not available
-    if not ut_trend and ind_1h_data:
-        ut_trend = ind_1h_data.get("ut_trend")
-
-    # ── Pair direction — 3 valid paths (matching Paper 2.1) ──
-    #
-    # Path 1+2: TV + SMA both present
-    #   Both agree → pair_dir = that direction (HIGH signal)
-    #   Disagree   → SKIP (tiebreaker = 48% WR = losing at 50c)
-    #
-    # Path 4: TV missing, SMA + BTC both present and agree
-    #   BTC confirms SMA → pair_dir = SMA direction (65% WR)
-    #   BTC opposes SMA  → SKIP (conflicting without TV to decide)
-    #   (XRP/DOGE often have TV=None — this recovers those trades)
-    #
-    # SMA always required — never trade on BTC alone
+    # SMA always required
     if not sma_dir:
         return None, 0, "", None
 
-    if tv_dir and sma_dir:
-        if tv_dir == sma_dir:
-            pair_dir = tv_dir          # Path 1+2: HIGH signal
-        else:
-            return None, 0, "", None   # Tiebreaker → SKIP
-    elif not tv_dir and sma_dir and btc_trend:
-        if btc_trend == sma_dir:
-            pair_dir = sma_dir         # Path 4: BTC confirms SMA
-        else:
-            return None, 0, "", None   # BTC conflicts with SMA → SKIP
-    else:
-        return None, 0, "", None       # Not enough data
+    # ── BTC trend from 1H cache ──
+    btc_trend = None
+    if btc_1h_data:
+        btc_trend = btc_1h_data.get("sma_trend")
+        if not btc_trend:
+            btc_s10 = btc_1h_data.get("sma10")
+            btc_cur = btc_1h_data.get("current")
+            if btc_s10 and btc_cur:
+                btc_trend = "BUY" if btc_cur > btc_s10 else "SELL"
+    if not btc_trend:
+        btc_trend = _btc_trend_cache.get("trend")
 
-    # ── BTC role: confirm or ignore ──
-    btc_confirms = (btc_trend == pair_dir) if btc_trend else False
-    if not tv_dir and btc_confirms:
-        btc_role = "CONFIRM"           # Path 4: BTC is the confirmer
-    elif btc_confirms:
-        btc_role = "CONFIRM"
-    elif btc_trend and btc_trend != pair_dir:
-        btc_role = "IGNORED"
-    else:
-        btc_role = "NONE"
+    # ── UT Bot + Squeeze from timeframe-specific cache ──
+    ut_trend = None
+    sqz_dir  = None
+    if ind_tf_data:
+        ut_trend = ind_tf_data.get("ut_trend")
+        sqz_val  = ind_tf_data.get("squeeze_val")
+        if sqz_val is not None:
+            sqz_dir = "BUY" if sqz_val > 0 else "SELL" if sqz_val < 0 else None
+    if not ut_trend and ind_1h_data:
+        ut_trend = ind_1h_data.get("ut_trend")
 
-    # ── 4H macro filter — same as Paper 2.1 Limitless uses ──
-    # Require at least 2/4 macro signals to agree with pair direction
-    # This filters out trades that go against the macro trend
-    ind_4h_entry = _indicator_cache.get("{}_4h".format(asset_upper))
-    ind_4h_data = ind_4h_entry.get("data") if ind_4h_entry else None
-    if ind_4h_data:
-        m_sma = ind_4h_data.get("sma_trend")
-        m_ut = ind_4h_data.get("ut_trend")
-        m_ema = ind_4h_data.get("ema_stack")
-        btc_4h_entry = _indicator_cache.get("BTC_4h")
-        btc_4h_data = btc_4h_entry.get("data") if btc_4h_entry else None
-        m_btc = None
-        if btc_4h_data:
-            m_btc = btc_4h_data.get("sma_trend") or (
-                "BUY" if (btc_4h_data.get("current", 0) > (btc_4h_data.get("sma10") or 0)) else "SELL"
-                if btc_4h_data.get("sma10") else None)
-        m_signals = [x for x in [m_sma, m_ut, m_ema, m_btc] if x is not None]
-        if len(m_signals) >= 2:
-            m_buy = sum(1 for x in m_signals if x in ("BUY", "STRONG_BUY"))
-            m_sell = sum(1 for x in m_signals if x in ("SELL", "STRONG_SELL"))
-            m_total = m_buy + m_sell
-            if m_total >= 2:
-                macro_agrees = (pair_dir == "BUY" and m_buy >= m_sell) or \
+    # ══════════════════════════════════════════════════════
+    # DIRECTION — Bot2 + P2.1 majority vote (need 2/3)
+    # Bot2 proven: 70.4% WR | P2.1 proven: 68.3% WR
+    # All paths fire: HIGH(3/3) MEDIUM(2/3) tiebreak Path4
+    # ══════════════════════════════════════════════════════
+    active_signals = [sig for sig in [tv_dir, sma_dir, btc_trend] if sig is not None]
+    if len(active_signals) < 2:
+        return None, 0, "", None
+
+    buy_votes  = sum(1 for sig in active_signals if sig == "BUY")
+    sell_votes = sum(1 for sig in active_signals if sig == "SELL")
+
+    if buy_votes > sell_votes and buy_votes >= 2:
+        pair_dir = "BUY"
+    elif sell_votes > buy_votes and sell_votes >= 2:
+        pair_dir = "SELL"
+    else:
+        return None, 0, "", None  # Tie or insufficient votes
+
+    # ── BTC role ──
+    btc_role = "NONE"
+    if btc_trend:
+        btc_role = "CONFIRM" if btc_trend == pair_dir else "IGNORED"
+
+    # ══════════════════════════════════════════════════════
+    # 4H MACRO FILTER — 1H timeframe only
+    # P2.1 proven: only applies to 1H markets, not 15M
+    # Bot2 gets 70.4% WR on 15M WITHOUT 4H filter
+    # ══════════════════════════════════════════════════════
+    if timeframe == "1h":
+        ind_4h_entry = _indicator_cache.get("{}_4h".format(asset_upper))
+        ind_4h_data  = ind_4h_entry.get("data") if ind_4h_entry else None
+        if ind_4h_data:
+            m_sma = ind_4h_data.get("sma_trend")
+            m_ut  = ind_4h_data.get("ut_trend")
+            m_ema = ind_4h_data.get("ema_stack")
+            btc_4h_entry = _indicator_cache.get("BTC_4h")
+            btc_4h_data  = btc_4h_entry.get("data") if btc_4h_entry else None
+            m_btc = None
+            if btc_4h_data:
+                m_btc = btc_4h_data.get("sma_trend") or (
+                    "BUY" if btc_4h_data.get("current", 0) > (btc_4h_data.get("sma10") or 0)
+                    else "SELL" if btc_4h_data.get("sma10") else None)
+            m_sigs = [x for x in [m_sma, m_ut, m_ema, m_btc] if x]
+            if len(m_sigs) >= 2:
+                m_buy  = sum(1 for x in m_sigs if x in ("BUY", "STRONG_BUY"))
+                m_sell = sum(1 for x in m_sigs if x in ("SELL", "STRONG_SELL"))
+                if m_buy + m_sell >= 2:
+                    macro_ok = (pair_dir == "BUY" and m_buy >= m_sell) or \
                                (pair_dir == "SELL" and m_sell >= m_buy)
-                if not macro_agrees:
-                    # 4H macro opposes direction → SKIP (same as P2.1 on Limitless)
-                    return None, 0, "", None
+                    if not macro_ok:
+                        return None, 0, "", None
 
-    # ── Weak period check ──
+    # ══════════════════════════════════════════════════════
+    # WEAK PERIOD — P2.1 proven UT Bot + Squeeze gatekeeper
+    # Strong (:15/:45): follow signal freely
+    # Weak   (:00/:30): UT Bot can flip, SQZ-only skips
+    # ══════════════════════════════════════════════════════
     now = datetime.now(timezone.utc)
     if timeframe == "15m":
-        next_min = ((now.minute // 15) + 1) * 15
-        if next_min >= 60:
-            expiry_minute = 0
-        else:
-            expiry_minute = next_min
-        is_weak = expiry_minute in (0, 30)
+        next_min   = ((now.minute // 15) + 1) * 15
+        expiry_min = 0 if next_min >= 60 else next_min
+        is_weak    = expiry_min in (0, 30)
     else:
-        # 1H: weak when hour_in_4h is 2 or 3
-        hour_in_4h = now.hour % 4
-        is_weak = hour_in_4h in (2, 3)
+        is_weak = (now.hour % 4) in (2, 3)
 
-    direction = pair_dir
-    confidence = "HIGH" if btc_confirms else "MEDIUM"
-    flipped = False
+    direction  = pair_dir
+    confidence = "HIGH" if (buy_votes == 3 or sell_votes == 3) else "MEDIUM"
+    flipped    = False
 
-    # ── UT Bot + Squeeze gatekeeper during weak periods ──
-    # Matches Paper 2.1's 4-path weak period logic:
-    #   UT opposes → flip direction
-    #   SQZ only opposes (no UT) → SKIP (worst weak-period trades)
-    #   Neither opposes → follow trend
     if is_weak:
-        ut_opposes = (ut_trend == "SELL" and direction == "BUY") or \
-                     (ut_trend == "BUY" and direction == "SELL") if ut_trend else False
-        sqz_opposes = (sqz_dir == "SELL" and direction == "BUY") or \
-                      (sqz_dir == "BUY" and direction == "SELL") if sqz_dir else False
+        ut_opp  = bool(ut_trend and ((ut_trend == "SELL" and direction == "BUY") or
+                                      (ut_trend == "BUY"  and direction == "SELL")))
+        sqz_opp = bool(sqz_dir  and ((sqz_dir  == "SELL" and direction == "BUY") or
+                                      (sqz_dir  == "BUY"  and direction == "SELL")))
+        if ut_opp:
+            direction  = "SELL" if direction == "BUY" else "BUY"
+            confidence = "HIGH" if sqz_opp else "MEDIUM"
+            flipped    = True
+        elif sqz_opp:
+            return None, 0, "", None  # SQZ-only oppose → SKIP
 
-        if ut_opposes:
-            # UT opposes → flip direction (pullback trade)
-            direction = "SELL" if direction == "BUY" else "BUY"
-            confidence = "HIGH" if sqz_opposes else "MEDIUM"
-            flipped = True
-        elif sqz_opposes and not ut_opposes:
-            # Squeeze only opposes, UT absent/agrees → SKIP
-            # (P2.1 skips these — historically worst weak-period trades)
-            return None, 0, "", None
-
-    # ── Map to UP/DOWN ──
+    # ── Map + Count + Build string ──
     bet_direction = "UP" if direction == "BUY" else "DOWN"
-
-    # ── Count signals ──
     signals_agree = sum(1 for x in [tv_dir, sma_dir, btc_trend] if x == pair_dir)
-    total_signals = sum(1 for x in [tv_dir, sma_dir, btc_trend] if x is not None)
+    total_signals = len(active_signals)
 
-    # ── Build indicator string ──
-    parts = []
-    parts.append("TV={}".format(tv_dir or "\u2014"))
-    parts.append("SMA={}".format(sma_dir or "\u2014"))
-    parts.append("BTC={}".format(btc_trend or "\u2014"))
-    if ut_trend:
-        parts.append("UT={}".format(ut_trend))
-    if sqz_dir:
-        parts.append("SQZ={}".format(sqz_dir))
+    parts = [
+        "TV={}".format(tv_dir or "\u2014"),
+        "SMA={}".format(sma_dir),
+        "BTC={}".format(btc_trend or "\u2014"),
+    ]
+    if ut_trend:  parts.append("UT={}".format(ut_trend))
+    if sqz_dir:   parts.append("SQZ={}".format(sqz_dir))
     parts.append("BTC:{}".format(btc_role))
-    if is_weak:
-        parts.append("WEAK")
-    if flipped:
-        parts.append("FLIP")
+    if is_weak:   parts.append("WEAK")
+    if flipped:   parts.append("FLIP")
     parts.append("{}/{}".format(signals_agree, total_signals))
 
-    ind_str = " | ".join(parts)
-    return bet_direction, signals_agree, ind_str, confidence
+    return bet_direction, signals_agree, " | ".join(parts), confidence
+
 
 def _sniper_thread():
     """Dedicated sniper thread — fires at exact 15M window boundaries.
