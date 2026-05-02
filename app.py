@@ -1102,8 +1102,6 @@ def _sv2_get_tier(asset, direction, signals_agree, confidence, ind_data):
         if c_open and c_close:
             candle_dir = "BUY" if c_close > c_open else "SELL"
 
-    adx_strong   = adx is not None and adx > 25
-    adx_moderate = adx is not None and adx > 20
     # Convert candle BUY/SELL to UP/DOWN to match direction vocabulary
     candle_up_down = None
     if candle_dir == "BUY":  candle_up_down = "UP"
@@ -1111,18 +1109,21 @@ def _sv2_get_tier(asset, direction, signals_agree, confidence, ind_data):
     candle_confirms = (candle_up_down == direction) if candle_up_down else None
     candle_opposes  = (candle_up_down != direction) if candle_up_down else False
 
-    # Tier classification
-    if signals_agree == 3 and adx_strong and candle_confirms:
+    # Tier classification — ADX removed (not validated yet)
+    # Bot2 gets 70.9% WR with no ADX filter — keep it simple
+    #
+    # T1: 3/3 agree + candle confirms  → max stake, highest confidence
+    # T2: 3/3 agree (candle any)       → 3/3 always at least T2
+    #     OR 2/3 agree + candle OK     → normal stake
+    # T3: 2/3 agree + candle opposes   → small stake, weakest signal
+    if signals_agree == 3 and candle_confirms:
         return ("T1", t1_stake, 0.75, adx, candle_dir)
+    elif signals_agree == 3:
+        # 3/3 always at least T2 — strong signal overrides candle
+        return ("T2", t2_stake, 0.68, adx, candle_dir)
     elif signals_agree >= 2 and not candle_opposes:
-        # T2: 2/3+ agree, candle neutral or confirms, ADX not blocking
-        if adx_moderate or adx is None:
-            return ("T2", t2_stake, 0.68, adx, candle_dir)
-        else:
-            # ADX < 20 — downgrade to T3
-            return ("T3", t3_stake, 0.58, adx, candle_dir)
+        return ("T2", t2_stake, 0.68, adx, candle_dir)
     elif signals_agree >= 2 and candle_opposes:
-        # T3: signal says one thing, candle says another
         return ("T3", t3_stake, 0.58, adx, candle_dir)
     return None
 
@@ -19263,31 +19264,22 @@ def sniper_v2_page():
     # Daily volume estimates per tier (trades/day)
     t1_daily, t2_daily, t3_daily = 20, 60, 40
 
-    def daily_ev(p):
-        # Stake per trade = 5% of pool (same as live sniper)
-        # Cap so total deployed per day never exceeds pool
-        stake_per_trade = max(2.50, round(p * 0.05, 2))
-        total_trades = t1_daily + t2_daily + t3_daily  # 120
-        max_daily_deploy = p * 0.80  # never deploy more than 80% of pool in a day
-        # Scale down if needed
-        if total_trades * stake_per_trade > max_daily_deploy:
-            stake_per_trade = round(max_daily_deploy / total_trades, 2)
-            stake_per_trade = max(stake_per_trade, 2.50)
-        # T1 gets 2x stake, T2 gets 1x, T3 gets 0.5x (relative sizing)
-        t1s = min(stake_per_trade * 2.0, p * 0.08)
-        t2s = stake_per_trade
-        t3s = max(stake_per_trade * 0.5, 2.50)
-        ev  = (t1_daily * t1s * (t1_wr*(wp50c-1) + (1-t1_wr)*(-1)) +
-               t2_daily * t2s * (t2_wr*(wp50c-1) + (1-t2_wr)*(-1)) +
-               t3_daily * t3s * (t3_wr*(wp50c-1) + (1-t3_wr)*(-1)))
-        return round(ev, 2)
+    # Projection: fixed $2.50 stake (current pool level)
+    # 60 qualifying trades/day realistic estimate
+    # Does NOT compound stake — shows honest flat-stake projection
+    stake_fixed = 2.50
+    ev_per_trade = {
+        "T1": stake_fixed * (t1_wr*(wp50c-1) + (1-t1_wr)*(-1)),
+        "T2": stake_fixed * (t2_wr*(wp50c-1) + (1-t2_wr)*(-1)),
+        "T3": stake_fixed * (t3_wr*(wp50c-1) + (1-t3_wr)*(-1)),
+    }
+    # 60 trades/day: 15 T1 + 30 T2 + 15 T3
+    daily_ev_fixed = 15*ev_per_trade["T1"] + 30*ev_per_trade["T2"] + 15*ev_per_trade["T3"]
 
-    # 30-day compound projection (deterministic EV model)
     proj_pool = start
     proj_rows = []
     for day in range(1, 31):
-        ev = daily_ev(proj_pool)
-        proj_pool = round(proj_pool + ev, 2)
+        proj_pool = round(proj_pool + daily_ev_fixed, 2)
         if day in (1, 3, 7, 14, 21, 30):
             proj_rows.append({"day": day, "pool": proj_pool,
                                "pct": round((proj_pool/start - 1)*100, 1)})
@@ -19338,10 +19330,11 @@ def sniper_v2_page():
         proj_html += """<tr>
 <td style="padding:8px 12px">Day {}</td>
 <td style="padding:8px 12px;font-weight:700;color:#1a3d2e">${:.2f}</td>
-<td style="padding:8px 12px;color:#1a7046;font-weight:600">+{:.1f}%</td>
+<td style="padding:8px 12px;color:#1a7046;font-weight:600">{}{:.1f}%</td>
 <td style="padding:8px 12px;color:#555">${:.2f}</td>
-</tr>""".format(pr["day"], pr["pool"], pr["pct"],
-               daily_ev(pr["pool"] - (pr["pool"] - start)/pr["day"] * 1 if pr["day"] > 0 else start))
+</tr>""".format(pr["day"], pr["pool"],
+               "+" if pr["pct"] >= 0 else "",
+               pr["pct"], daily_ev_fixed)
 
     # Recent trade log
     trade_log_html = ""
