@@ -587,31 +587,9 @@ def _sniper_get_direction(asset, timeframe="15m"):
     # P2.1 proven: only applies to 1H markets, not 15M
     # Bot2 gets 70.4% WR on 15M WITHOUT 4H filter
     # ══════════════════════════════════════════════════════
-    if timeframe == "1h":
-        ind_4h_entry = _indicator_cache.get("{}_4h".format(asset_upper))
-        ind_4h_data  = ind_4h_entry.get("data") if ind_4h_entry else None
-        if ind_4h_data:
-            m_sma = ind_4h_data.get("sma_trend")
-            m_ut  = ind_4h_data.get("ut_trend")
-            m_ema = ind_4h_data.get("ema_stack")
-            btc_4h_entry = _indicator_cache.get("BTC_4h")
-            btc_4h_data  = btc_4h_entry.get("data") if btc_4h_entry else None
-            m_btc = None
-            if btc_4h_data:
-                m_btc = btc_4h_data.get("sma_trend") or (
-                    "BUY" if btc_4h_data.get("current", 0) > (btc_4h_data.get("sma10") or 0)
-                    else "SELL" if btc_4h_data.get("sma10") else None)
-            m_sigs = [x for x in [m_sma, m_ut, m_ema, m_btc] if x]
-            if len(m_sigs) >= 2:
-                m_buy  = sum(1 for x in m_sigs if x in ("BUY", "STRONG_BUY"))
-                m_sell = sum(1 for x in m_sigs if x in ("SELL", "STRONG_SELL"))
-                if m_buy + m_sell >= 2:
-                    macro_ok = (pair_dir == "BUY" and m_buy >= m_sell) or \
-                               (pair_dir == "SELL" and m_sell >= m_buy)
-                    if not macro_ok:
-                        return None, 0, "", None
-
-    # ══════════════════════════════════════════════════════
+    # 4H macro filter REMOVED — Bot2 gets 70.9% WR without it
+    # LMTS sniper now follows same Bot2 majority vote as Poly A4
+    # TV + SMA + BTC 2/3 minimum — no extra 4H requirement
     # WEAK PERIOD — P2.1 proven UT Bot + Squeeze gatekeeper
     # Strong (:15/:45): follow signal freely
     # Weak   (:00/:30): UT Bot can flip, SQZ-only skips
