@@ -738,6 +738,21 @@ def _sniper_thread():
                     {a: bool(_indicator_cache.get("{}_15m".format(a))) for a in SNIPER_ASSETS}))
                 _time.sleep(60)  # Wait 60s before checking again — avoids spam
                 continue
+
+            # ── Paper Sniper V2: score all assets at boundary (independent of live sniper) ──
+            try:
+                _sv2_now_str = datetime.now(timezone.utc).isoformat()
+                _sv2_scored = 0
+                for _sv2_asset in SNIPER_ASSETS:
+                    _sv2_entry = token_map.get(_sv2_asset)
+                    if _sv2_entry and _sv2_state["balance"] > 5.0:
+                        if _sv2_score_and_record(_sv2_asset, _sv2_entry, window_ts, _sv2_now_str):
+                            _sv2_scored += 1
+                if _sv2_scored:
+                    print("SV2: {} paper trades recorded | pool=${:.2f}".format(
+                        _sv2_scored, _sv2_state["balance"]))
+            except Exception as _sv2e:
+                print("SV2 error: {}".format(_sv2e))
             else:
                 print("SNIPER: {} targets qualified: {}".format(len(snipe_targets), ", ".join(_sniper_debug)))
 
@@ -945,6 +960,252 @@ def _sniper_thread():
         except Exception as e:
             print("SNIPER thread error: {}".format(e))
             _time.sleep(30)
+
+
+# ═══════════════════════════════════════════════════════════
+# PAPER SNIPER V2 — Tiered Stake System at T+0 50c Entry
+# Bot2+P2.1 combined signal | $100 paper capital | Polymarket 15M
+# Tier 1 ($5): 3/3 + ADX strong + candle confirms → ~75% WR
+# Tier 2 ($2.50): 2/3 + no opposing candle → ~68% WR
+# Tier 3 ($1.25): 2/3 + weak/opposing candle → ~58% WR
+# ═══════════════════════════════════════════════════════════
+
+_sv2_state = {
+    "balance": 100.0,
+    "peak_balance": 100.0,
+    "starting_balance": 100.0,
+    "trades_today": 0,
+}
+_sv2_fired_markets = set()  # dedup per boundary
+
+def _sv2_get_tier(asset, direction, signals_agree, confidence, ind_data):
+    """Classify a signal into Tier 1/2/3 based on confidence, ADX, and candle.
+
+    Tier 1 — MAX: 3/3 signals + ADX>25 strong trend + candle confirms direction
+    Tier 2 — NORMAL: 2/3 signals + no opposing candle (candle neutral or confirms)
+    Tier 3 — SMALL: 2/3 signals + candle opposes OR ADX weak (<20)
+    Skip: only 1/3 agree OR SQZ-only opposes in weak period (handled upstream)
+
+    Returns (tier_label, stake, expected_wr) or None to skip.
+    """
+    if not direction or signals_agree < 2:
+        return None
+
+    fee = 0.03
+    bal = _sv2_state["balance"]
+    # Stakes: T1=$5, T2=$2.50, T3=$1.25 — scaled with pool above $200
+    scale = max(1.0, bal / 100.0) if bal > 200 else 1.0
+    t1_stake = round(min(5.00 * scale, bal * 0.08), 2)
+    t2_stake = round(min(2.50 * scale, bal * 0.05), 2)
+    t3_stake = round(min(1.25 * scale, bal * 0.025), 2)
+    t1_stake = max(t1_stake, 2.50)
+    t2_stake = max(t2_stake, 2.50)
+    t3_stake = max(t3_stake, 2.50)  # Polymarket minimum $2.50
+
+    # Read ADX and candle from indicator cache
+    adx = None
+    candle_dir = None
+    if ind_data:
+        adx = ind_data.get("adx")
+        # Candle direction: compare last close vs open
+        c_open  = ind_data.get("candle_open") or ind_data.get("open")
+        c_close = ind_data.get("current") or ind_data.get("close")
+        if c_open and c_close:
+            candle_dir = "BUY" if c_close > c_open else "SELL"
+
+    adx_strong   = adx is not None and adx > 25
+    adx_moderate = adx is not None and adx > 20
+    candle_confirms = (candle_dir == direction) if candle_dir else None
+    candle_opposes  = (candle_dir != direction) if candle_dir else False
+
+    # Tier classification
+    if signals_agree == 3 and adx_strong and candle_confirms:
+        return ("T1", t1_stake, 0.75, adx, candle_dir)
+    elif signals_agree >= 2 and not candle_opposes:
+        # T2: 2/3+ agree, candle neutral or confirms, ADX not blocking
+        if adx_moderate or adx is None:
+            return ("T2", t2_stake, 0.68, adx, candle_dir)
+        else:
+            # ADX < 20 — downgrade to T3
+            return ("T3", t3_stake, 0.58, adx, candle_dir)
+    elif signals_agree >= 2 and candle_opposes:
+        # T3: signal says one thing, candle says another
+        return ("T3", t3_stake, 0.58, adx, candle_dir)
+    return None
+
+
+def _sv2_score_and_record(asset, token_map_entry, boundary_ts, now_str):
+    """Score one asset for Sniper V2 paper trade. Returns True if trade recorded."""
+    direction, signals_agree, ind_str, confidence = _sniper_get_direction(asset, "15m")
+    if not direction or signals_agree < 2:
+        return False
+
+    # Get indicator data for ADX + candle
+    ind_entry = _indicator_cache.get("{}_15m".format(asset.upper()))
+    ind_data  = ind_entry.get("data") if ind_entry else None
+
+    tier_result = _sv2_get_tier(asset, direction, signals_agree, confidence, ind_data)
+    if not tier_result:
+        return False
+
+    tier, stake, exp_wr, adx_val, candle_dir = tier_result
+
+    # Safety: don't deploy more than 15% of pool in one trade
+    if stake > _sv2_state["balance"] * 0.15:
+        stake = round(_sv2_state["balance"] * 0.10, 2)
+    if stake < 2.50 or stake > _sv2_state["balance"]:
+        return False
+
+    # Build market key
+    market_key = "sv2_{}_15M_{}".format(asset, boundary_ts)
+    if market_key in _sv2_fired_markets:
+        return False
+
+    # Get market info from token map
+    slug        = token_map_entry.get("slug", "")
+    condition_id = token_map_entry.get("condition_id", "")
+    title       = token_map_entry.get("title", "{} 15M".format(asset))
+
+    # Simulated payout at 50c fill
+    fee = 0.03
+    sim_payout = round(stake / 0.50 * (1 - fee), 4)
+
+    pool_before = _sv2_state["balance"]
+    _sv2_state["balance"] = round(pool_before - stake, 2)
+    _sv2_state["trades_today"] += 1
+    if _sv2_state["balance"] > _sv2_state["peak_balance"]:
+        _sv2_state["peak_balance"] = _sv2_state["balance"]
+
+    _sv2_fired_markets.add(market_key)
+
+    try:
+        c = get_db()
+        c.run("""INSERT INTO sniper_v2_paper_trades
+            (market_id, title, asset, bet_side, tier, stake, fill_price,
+             pool_after, payout, signals_agree, confidence, indicators,
+             adx, candle_dir, slug, condition_id, status, fired_at)
+            VALUES (:mid, :ttl, :ast, :bs, :tier, :stake, 0.50,
+                    :pool, :pay, :sa, :conf, :ind,
+                    :adx, :cdir, :slg, :cid, 'Pending', :now)""",
+            mid=market_key, ttl=title, ast=asset,
+            bs=direction, tier=tier, stake=stake,
+            pool=_sv2_state["balance"], pay=sim_payout,
+            sa=signals_agree, conf=confidence, ind=ind_str,
+            adx=adx_val, cdir=candle_dir,
+            slg=slug, cid=condition_id, now=now_str)
+        c.close()
+        print("SV2 {}: {} {} ${:.2f} ({:.0f}% WR est) | pool=${:.2f}".format(
+            tier, direction, asset, stake, exp_wr*100, _sv2_state["balance"]))
+        return True
+    except Exception as e:
+        print("SV2 DB error {}: {}".format(asset, e))
+        # Rollback pool
+        _sv2_state["balance"] = pool_before
+        _sv2_fired_markets.discard(market_key)
+        return False
+
+
+def _resolve_sv2_trades():
+    """Resolve Sniper V2 paper trades using Polymarket Gamma API."""
+    import requests as req
+    try:
+        conn = get_db()
+        rows = conn.run(
+            "SELECT * FROM sniper_v2_paper_trades WHERE status='Pending' ORDER BY id")
+        cols = [c['name'] for c in conn.columns]
+        items = [dict(zip(cols, r)) for r in rows]
+        conn.close()
+        if not items: return 0
+        now = datetime.now(timezone.utc)
+        resolved = 0
+        for p in items:
+            try:
+                if not p.get("fired_at"): continue
+                fired = datetime.fromisoformat(p["fired_at"])
+                if fired.tzinfo is None:
+                    fired = fired.replace(tzinfo=timezone.utc)
+                # Correct expiry: sniper fires ~30s before boundary → round UP
+                next_bm = ((fired.minute // 15) + 1) * 15
+                if next_bm >= 60:
+                    window_start = fired.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+                else:
+                    window_start = fired.replace(minute=next_bm, second=0, microsecond=0)
+                expiry = window_start + timedelta(minutes=15)
+                if now < expiry + timedelta(minutes=3):
+                    continue
+
+                stake    = float(p.get("stake") or 2.50)
+                bet_side = p.get("bet_side", "UP")
+                slug     = p.get("slug", "")
+                condition_id = p.get("condition_id", "")
+
+                won = None
+                for url in filter(None, [
+                    "{}/markets/slug/{}".format(POLY_GAMMA_API, slug) if slug else None,
+                    "{}/markets/{}".format(POLY_GAMMA_API, condition_id) if condition_id else None,
+                ]):
+                    try:
+                        r = req.get(url, timeout=8)
+                        if r.status_code != 200: continue
+                        md = r.json()
+                        ops = md.get("outcomePrices")
+                        if isinstance(ops, str):
+                            try: ops = json.loads(ops)
+                            except: ops = None
+                        if isinstance(ops, list) and len(ops) >= 2:
+                            p0, p1 = float(ops[0]), float(ops[1])
+                            oc = md.get("outcomes")
+                            if isinstance(oc, str):
+                                try: oc = json.loads(oc)
+                                except: oc = None
+                            up_idx = 0
+                            if isinstance(oc, list) and len(oc) >= 2:
+                                if str(oc[0]).lower().strip() in ("no", "down", "below"):
+                                    up_idx = 1
+                            ref_up = p0 if up_idx == 0 else p1
+                            ref_dn = p1 if up_idx == 0 else p0
+                            if ref_up >= 0.95: won = (bet_side == "UP")
+                            elif ref_dn >= 0.95: won = (bet_side == "DOWN")
+                        if won is not None: break
+                    except: pass
+
+                if won is None:
+                    if now > expiry + timedelta(hours=1):
+                        won = False
+                    else:
+                        continue
+
+                fee = 0.03
+                fill = float(p.get("fill_price") or 0.50)
+                payout = round(stake / fill * (1 - fee), 4) if won else 0
+                sim_pnl = round(payout - stake, 4) if won else round(-stake, 4)
+                status = "Won" if won else "Lost"
+
+                # Update pool
+                if won:
+                    _sv2_state["balance"] = round(_sv2_state["balance"] + payout, 2)
+                else:
+                    pass  # stake already deducted on entry
+
+                if _sv2_state["balance"] > _sv2_state["peak_balance"]:
+                    _sv2_state["peak_balance"] = _sv2_state["balance"]
+
+                c = get_db()
+                c.run("""UPDATE sniper_v2_paper_trades
+                    SET status=:s, outcome=:o, payout=:pay,
+                        sim_pnl=:pnl, resolved_at=:r WHERE id=:i""",
+                    s=status, o="WIN" if won else "LOSS",
+                    pay=payout, pnl=sim_pnl,
+                    r=now.isoformat(), i=p["id"])
+                c.close()
+                resolved += 1
+            except Exception as e:
+                print("SV2 resolve error {}: {}".format(p.get("id"), e))
+        return resolved
+    except Exception as e:
+        print("SV2 resolve loop error: {}".format(e))
+        return 0
+
 
 
 def _resolve_poly_alpha4_trades():
@@ -2303,6 +2564,22 @@ def init_db():
             filled BOOLEAN DEFAULT FALSE,
             status TEXT DEFAULT 'Pending', outcome TEXT,
             indicators TEXT, signals_agree INTEGER,
+            fired_at TEXT, resolved_at TEXT
+        )
+    """)
+    # Sniper V2 paper trades — tiered stake system at T+0 50c entry
+    conn.run("""
+        CREATE TABLE IF NOT EXISTS sniper_v2_paper_trades (
+            id SERIAL PRIMARY KEY,
+            market_id TEXT, title TEXT, asset TEXT,
+            bet_side TEXT, tier TEXT,
+            stake REAL, fill_price REAL DEFAULT 0.50,
+            pool_after REAL, payout REAL,
+            signals_agree INTEGER, confidence TEXT,
+            indicators TEXT, adx REAL, candle_dir TEXT,
+            slug TEXT, condition_id TEXT,
+            status TEXT DEFAULT 'Pending', outcome TEXT,
+            sim_pnl REAL,
             fired_at TEXT, resolved_at TEXT
         )
     """)
@@ -18076,6 +18353,12 @@ def _poly_scan_loop():
                 print("LMTS Sniper resolved: {}".format(_lmts_resolved))
         except Exception as e:
             print("LMTS Sniper resolve error: {}".format(e))
+        try:
+            _sv2_resolved = _resolve_sv2_trades()
+            if _sv2_resolved:
+                print("SV2 paper resolved: {}".format(_sv2_resolved))
+        except Exception as e:
+            print("SV2 resolve error: {}".format(e))
 
 # ═══════════════════════════════════════════════════════════
 # POLYMARKET PAGES
@@ -18637,6 +18920,329 @@ a{{color:#00d4aa}}
         pnlc, total_pnl, _limitless_sniper_state["peak_balance"],
         "{}T {}W {}L".format(_limitless_sniper_state["trades_today"], _limitless_sniper_state["wins_today"], _limitless_sniper_state["losses_today"]),
         tier_html, asset_html, trade_rows)
+
+
+@app.route("/app/sniper-v2")
+def sniper_v2_page():
+    """Paper Sniper V2 — Tiered Stake System at T+0 50c Entry."""
+    import json as _json, math
+    try:
+        conn = get_db()
+        all_rows = conn.run("""SELECT outcome, tier, stake, sim_pnl, asset, bet_side,
+                                      signals_agree, adx, candle_dir, indicators,
+                                      fired_at, status
+                               FROM sniper_v2_paper_trades
+                               WHERE outcome IN ('WIN','LOSS')""")
+        all_cols = [c['name'] for c in conn.columns]
+        all_trades = [dict(zip(all_cols, r)) for r in all_rows]
+
+        pending_count = conn.run(
+            "SELECT COUNT(*) FROM sniper_v2_paper_trades WHERE status='Pending'")[0][0]
+
+        recent_rows = conn.run(
+            "SELECT * FROM sniper_v2_paper_trades ORDER BY id DESC LIMIT 200")
+        rcols = [c['name'] for c in conn.columns]
+        recent = [dict(zip(rcols, r)) for r in recent_rows]
+        conn.close()
+    except Exception as e:
+        print("SV2 page error: {}".format(e))
+        all_trades, recent, pending_count = [], [], 0
+
+    # ── Full stats ──
+    total_resolved = len(all_trades)
+    total_trades   = total_resolved + pending_count
+    wins   = sum(1 for t in all_trades if t.get("outcome") == "WIN")
+    losses = sum(1 for t in all_trades if t.get("outcome") == "LOSS")
+    wr     = round(wins / total_resolved * 100, 1) if total_resolved > 0 else 0
+
+    total_pnl = sum(float(t.get("sim_pnl") or 0) for t in all_trades)
+    total_pnl = round(total_pnl, 2)
+
+    pool   = _sv2_state["balance"]
+    peak   = _sv2_state["peak_balance"]
+    start  = _sv2_state["starting_balance"]
+
+    # ── Tier stats ──
+    tier_stats = {}
+    for tier in ("T1", "T2", "T3"):
+        grp = [t for t in all_trades if t.get("tier") == tier]
+        tw = sum(1 for t in grp if t.get("outcome") == "WIN")
+        tl = len(grp) - tw
+        tpnl = round(sum(float(t.get("sim_pnl") or 0) for t in grp), 2)
+        twr  = round(tw / len(grp) * 100, 1) if grp else 0
+        tier_stats[tier] = {"w": tw, "l": tl, "wr": twr, "pnl": tpnl, "n": len(grp)}
+
+    # ── Asset stats ──
+    asset_stats = {}
+    for t in all_trades:
+        a = t.get("asset", "?")
+        if a not in asset_stats:
+            asset_stats[a] = {"w": 0, "l": 0, "pnl": 0.0}
+        if t.get("outcome") == "WIN":
+            asset_stats[a]["w"] += 1
+            asset_stats[a]["pnl"] += float(t.get("sim_pnl") or 0)
+        else:
+            asset_stats[a]["l"] += 1
+            asset_stats[a]["pnl"] += float(t.get("sim_pnl") or 0)
+
+    # ── Capital Distribution ──
+    t1_alloc = round(start * 0.40, 2)   # 40% → Tier 1 high confidence
+    t2_alloc = round(start * 0.40, 2)   # 40% → Tier 2 normal
+    t3_alloc = round(start * 0.20, 2)   # 20% → Tier 3 small/risky
+    # Tier allocations are per-trade limits, not reserved buckets
+
+    # ── Compounding Projection ──
+    fee = 0.03
+    wp50c = (1/0.50) * (1-fee)
+    # Use real WR if enough trades, else estimates
+    def tier_wr(tier):
+        ts = tier_stats.get(tier, {})
+        if ts.get("n", 0) >= 30:
+            return ts["wr"] / 100.0
+        return {"T1": 0.75, "T2": 0.68, "T3": 0.58}[tier]
+
+    t1_wr, t2_wr, t3_wr = tier_wr("T1"), tier_wr("T2"), tier_wr("T3")
+    # Daily volume estimates per tier
+    t1_daily, t2_daily, t3_daily = 20, 60, 40
+    # Daily EV (at current pool stake scaling)
+    def daily_ev(p):
+        sc = max(1.0, p / 100.0) if p > 200 else 1.0
+        t1s = min(5.00 * sc, p * 0.08)
+        t2s = min(2.50 * sc, p * 0.05)
+        t3s = min(1.25 * sc, p * 0.025)
+        t1s, t2s, t3s = max(t1s, 2.50), max(t2s, 2.50), max(t3s, 2.50)
+        ev  = (t1_daily * t1s * (t1_wr*(wp50c-1) + (1-t1_wr)*(-1)) +
+               t2_daily * t2s * (t2_wr*(wp50c-1) + (1-t2_wr)*(-1)) +
+               t3_daily * t3s * (t3_wr*(wp50c-1) + (1-t3_wr)*(-1)))
+        return round(ev, 2)
+
+    # 30-day compound projection (deterministic EV model)
+    proj_pool = start
+    proj_rows = []
+    for day in range(1, 31):
+        ev = daily_ev(proj_pool)
+        proj_pool = round(proj_pool + ev, 2)
+        if day in (1, 3, 7, 14, 21, 30):
+            proj_rows.append({"day": day, "pool": proj_pool,
+                               "pct": round((proj_pool/start - 1)*100, 1)})
+
+    # ── HTML ──
+    nav = """
+<nav style="background:#1a3d2e;padding:10px 20px;display:flex;align-items:center;gap:16px;flex-wrap:wrap">
+<a href="/" style="color:#c8f0d8;text-decoration:none;font-weight:600">Home</a>
+<a href="/app/poly-alpha4" style="color:#c8f0d8;text-decoration:none">🎯 Sniper A4</a>
+<a href="/app/lmts-sniper" style="color:#c8f0d8;text-decoration:none">🎯 LMTS</a>
+<a href="/app/sniper-v2" style="color:#fff;text-decoration:none;font-weight:700;border-bottom:2px solid #4ade80">📊 Sniper V2 Paper</a>
+<a href="/app/paper21" style="color:#c8f0d8;text-decoration:none">Paper 2.1</a>
+</nav>"""
+
+    def pnl_cell(v):
+        v = float(v or 0)
+        col = "#1a7046" if v > 0 else "#b4322e" if v < 0 else "#888"
+        return '<td style="color:{};font-weight:600">{}{:.2f}</td>'.format(
+            col, "+" if v > 0 else "", v)
+
+    # Tier rows
+    tier_html = ""
+    tier_labels = {"T1": "Tier 1 — Max ($5+)", "T2": "Tier 2 — Normal ($2.50)", "T3": "Tier 3 — Small ($1.25)"}
+    for tier, lbl in tier_labels.items():
+        ts = tier_stats.get(tier, {"w":0,"l":0,"wr":0,"pnl":0,"n":0})
+        wr_c = "#1a7046" if ts["wr"] >= 65 else "#b4322e" if ts["wr"] < 52 else "#8a6a2f"
+        tier_html += """<tr>
+<td style="padding:8px 12px">{}</td>
+<td style="padding:8px 12px;color:{};font-weight:700">{:.1f}%</td>
+<td style="padding:8px 12px">{}W / {}L</td>
+{}</tr>""".format(lbl, wr_c, ts["wr"], ts["w"], ts["l"], pnl_cell(ts["pnl"]))
+
+    # Asset rows
+    asset_html = ""
+    for a, st in sorted(asset_stats.items()):
+        n = st["w"] + st["l"]
+        awr = round(st["w"]/n*100, 1) if n else 0
+        wr_c = "#1a7046" if awr >= 60 else "#b4322e" if awr < 51 else "#8a6a2f"
+        asset_html += """<tr>
+<td style="padding:8px 12px;font-weight:600">{}</td>
+<td style="padding:8px 12px;color:{};font-weight:700">{:.1f}%</td>
+<td style="padding:8px 12px">{}W / {}L</td>
+{}</tr>""".format(a, wr_c, awr, st["w"], st["l"], pnl_cell(st["pnl"]))
+
+    # Projection rows
+    proj_html = ""
+    for pr in proj_rows:
+        proj_html += """<tr>
+<td style="padding:8px 12px">Day {}</td>
+<td style="padding:8px 12px;font-weight:700;color:#1a3d2e">${:.2f}</td>
+<td style="padding:8px 12px;color:#1a7046;font-weight:600">+{:.1f}%</td>
+<td style="padding:8px 12px;color:#555">${:.2f}</td>
+</tr>""".format(pr["day"], pr["pool"], pr["pct"],
+               daily_ev(pr["pool"] - (pr["pool"] - start)/pr["day"] * 1 if pr["day"] > 0 else start))
+
+    # Recent trade log
+    trade_log_html = ""
+    for t in recent[:100]:
+        outcome = t.get("outcome", "")
+        status  = t.get("status", "Pending")
+        if outcome == "WIN":
+            row_emoji = "✅"
+        elif outcome == "LOSS":
+            row_emoji = "❌"
+        else:
+            row_emoji = "⏳"
+        pnl_v = float(t.get("sim_pnl") or 0)
+        tier_badge_colors = {"T1": "#1a3d2e", "T2": "#2563eb", "T3": "#7c3aed"}
+        tier_col = tier_badge_colors.get(t.get("tier",""), "#555")
+        fired = (t.get("fired_at") or "")[:16].replace("T", " ")
+        trade_log_html += """<tr>
+<td style="padding:6px 10px">{}</td>
+<td style="padding:6px 10px"><span style="background:{};color:#fff;padding:2px 8px;border-radius:4px;font-size:12px">{}</span></td>
+<td style="padding:6px 10px;font-weight:600">{}</td>
+<td style="padding:6px 10px">{}</td>
+<td style="padding:6px 10px">${:.2f}</td>
+<td style="padding:6px 10px">{}</td>
+{}</tr>""".format(
+            row_emoji,
+            tier_col, t.get("tier","?"),
+            t.get("asset","?"),
+            t.get("bet_side","?"),
+            float(t.get("stake") or 0),
+            fired,
+            pnl_cell(pnl_v) if outcome else '<td style="padding:6px 10px;color:#888">—</td>')
+
+    pool_pnl = round(pool - start, 2)
+    pool_pnl_str = ("+" if pool_pnl >= 0 else "") + "${:.2f}".format(pool_pnl)
+    pool_pct = round((pool/start - 1)*100, 1)
+    wr_col = "#1a7046" if wr >= 65 else "#b4322e" if wr < 52 else "#8a6a2f"
+
+    html = """<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Paper Sniper V2 — CMVNG</title>
+<style>
+*{{box-sizing:border-box;margin:0;padding:0}}
+body{{font-family:'Inter Tight',-apple-system,sans-serif;background:#f8f9fa;color:#1a1a17}}
+.card{{background:#fff;border-radius:12px;border:1px solid #e8e8e6;padding:20px;margin:16px}}
+.metric{{text-align:center;padding:12px}}
+.metric .val{{font-size:28px;font-weight:700;font-family:monospace}}
+.metric .lbl{{font-size:12px;color:#666;margin-top:4px;text-transform:uppercase;letter-spacing:.5px}}
+table{{width:100%;border-collapse:collapse}}
+th{{background:#f0f0ee;padding:8px 12px;text-align:left;font-size:13px;color:#444;font-weight:600}}
+tr:nth-child(even){{background:#fafaf8}}
+td{{font-size:13px;border-bottom:1px solid #f0f0ee}}
+h2{{font-size:16px;font-weight:700;color:#1a3d2e;margin-bottom:12px}}
+.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px;padding:16px}}
+</style></head><body>
+{}
+<div style="max-width:1100px;margin:0 auto;padding:8px">
+<div style="padding:20px 16px 8px">
+  <h1 style="font-size:20px;font-weight:700;color:#1a3d2e">📊 Paper Sniper V2</h1>
+  <p style="color:#666;font-size:13px;margin-top:4px">
+    Tiered Stake System · T+0 50¢ Entry · Polymarket 15M · $100 Paper Capital
+  </p>
+</div>
+
+<!-- KPI Row -->
+<div class="card">
+<div class="grid">
+  <div class="metric"><div class="val" style="color:#1a3d2e">${:.2f}</div><div class="lbl">Pool</div></div>
+  <div class="metric"><div class="val" style="color:{}">{:.1f}%</div><div class="lbl">Win Rate</div></div>
+  <div class="metric"><div class="val">{}</div><div class="lbl">Trades</div></div>
+  <div class="metric"><div class="val" style="color:{}">{}</div><div class="lbl">P&amp;L</div></div>
+  <div class="metric"><div class="val" style="color:#888">${:.2f}</div><div class="lbl">Peak</div></div>
+  <div class="metric"><div class="val">{}P {}T</div><div class="lbl">Today</div></div>
+</div>
+</div>
+
+<!-- Capital Distribution -->
+<div class="card">
+<h2>💰 Capital Distribution</h2>
+<div class="grid" style="grid-template-columns:repeat(3,1fr)">
+  <div style="background:#e8f3ed;border-radius:10px;padding:16px;text-align:center">
+    <div style="font-size:22px;font-weight:700;color:#1a3d2e">${:.2f}</div>
+    <div style="font-size:12px;color:#1a7046;font-weight:600;margin-top:4px">TIER 1 — MAX</div>
+    <div style="font-size:11px;color:#555;margin-top:4px">3/3 + ADX + Candle</div>
+    <div style="font-size:11px;color:#1a7046">~75% WR est · $5/trade</div>
+    <div style="font-size:11px;color:#1a3d2e;font-weight:600;margin-top:6px">40% allocation</div>
+  </div>
+  <div style="background:#eff6ff;border-radius:10px;padding:16px;text-align:center">
+    <div style="font-size:22px;font-weight:700;color:#1e40af">${:.2f}</div>
+    <div style="font-size:12px;color:#2563eb;font-weight:600;margin-top:4px">TIER 2 — NORMAL</div>
+    <div style="font-size:11px;color:#555;margin-top:4px">2/3 + no opposing candle</div>
+    <div style="font-size:11px;color:#2563eb">~68% WR est · $2.50/trade</div>
+    <div style="font-size:11px;color:#1e40af;font-weight:600;margin-top:6px">40% allocation</div>
+  </div>
+  <div style="background:#f5f3ff;border-radius:10px;padding:16px;text-align:center">
+    <div style="font-size:22px;font-weight:700;color:#5b21b6">${:.2f}</div>
+    <div style="font-size:12px;color:#7c3aed;font-weight:600;margin-top:4px">TIER 3 — SMALL</div>
+    <div style="font-size:11px;color:#555;margin-top:4px">2/3 + weak/opposing candle</div>
+    <div style="font-size:11px;color:#7c3aed">~58% WR est · $1.25/trade</div>
+    <div style="font-size:11px;color:#5b21b6;font-weight:600;margin-top:6px">20% allocation</div>
+  </div>
+</div>
+<p style="font-size:11px;color:#888;margin-top:10px;padding:0 4px">
+  * Allocations are soft guidelines — each trade deducts from total pool.
+  At 50¢ fill, breakeven = 51.5% WR. Even Tier 3 at 58% WR is profitable.
+</p>
+</div>
+
+<!-- By Tier -->
+<div class="card">
+<h2>By Tier</h2>
+<table>
+<tr><th>Tier</th><th>Win Rate</th><th>Record</th><th>Sim P&amp;L</th></tr>
+{}
+</table>
+</div>
+
+<!-- By Asset -->
+<div class="card">
+<h2>By Asset</h2>
+<table>
+<tr><th>Asset</th><th>Win Rate</th><th>Record</th><th>Sim P&amp;L</th></tr>
+{}
+</table>
+</div>
+
+<!-- Compounding Projection -->
+<div class="card">
+<h2>📈 30-Day Compounding Projection</h2>
+<p style="font-size:12px;color:#666;margin-bottom:12px">
+  Based on: T1={}% WR · T2={}% WR · T3={}% WR (estimated until 30+ trades per tier)
+  · ~120 trades/day · 50¢ T+0 entry · 3% fee
+</p>
+<table>
+<tr><th>Period</th><th>Projected Pool</th><th>Return</th><th>Daily EV</th></tr>
+{}
+</table>
+</div>
+
+<!-- Recent Trades -->
+<div class="card">
+<h2>Recent Trades (last 100)</h2>
+<table>
+<tr><th></th><th>Tier</th><th>Asset</th><th>Side</th><th>Stake</th><th>Time</th><th>P&amp;L</th></tr>
+{}
+</table>
+</div>
+
+<p style="text-align:center;color:#aaa;font-size:11px;padding:16px">
+  Paper trading · $100 simulated capital · 50¢ T+0 entry · Polymarket 15M markets · Auto-refresh 60s
+</p>
+</div>
+<script>setTimeout(()=>location.reload(), 60000)</script>
+</body></html>""".format(
+        nav,
+        pool, wr_col, wr, total_trades,
+        "#1a7046" if pool_pnl >= 0 else "#b4322e", pool_pnl_str,
+        peak,
+        pending_count, _sv2_state["trades_today"],
+        t1_alloc, t2_alloc, t3_alloc,
+        tier_html, asset_html,
+        round(t1_wr*100), round(t2_wr*100), round(t3_wr*100),
+        proj_html, trade_log_html
+    )
+    return html
+
+
 
 
 @app.route("/app/poly-alpha4")
