@@ -1619,7 +1619,31 @@ def _limitless_sniper_thread():
                     print("LMTS SNIPER retry error: {}".format(e2))
                 
                 if not market_map:
-                    print("LMTS SNIPER: no 1H markets found after retry")
+                    # Second retry — Limitless sometimes deploys markets up to 30s after boundary
+                    _time.sleep(30)
+                    try:
+                        r3 = _req.get("{}/markets/active".format(LIMITLESS_API), timeout=10)
+                        if r3.status_code == 200:
+                            all_markets3 = r3.json().get("data", [])
+                            for m in all_markets3:
+                                parsed = parse_market(m)
+                                if not parsed: continue
+                                if not parsed.get("is_hourly_market"): continue
+                                if parsed.get("mins_left", 0) < 25: continue  # lower threshold on 2nd retry
+                                asset = parsed.get("asset", "")
+                                if asset not in [t["asset"] for t in snipe_targets]: continue
+                                if asset in market_map: continue
+                                tokens = m.get("tokens", {})
+                                has_yes = tokens.get("yes") or tokens.get("Yes") or tokens.get("YES")
+                                if not has_yes: continue
+                                slug = parsed.get("slug") or m.get("slug", "")
+                                if not slug: continue
+                                market_map[asset] = {"parsed": parsed, "slug": slug, "tokens": tokens}
+                    except Exception as e3:
+                        print("LMTS SNIPER 2nd retry error: {}".format(e3))
+
+                if not market_map:
+                    print("LMTS SNIPER: no 1H markets found after 2 retries — skipping hour")
                     _time.sleep(60)
                     continue
                 else:
