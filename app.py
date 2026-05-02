@@ -423,6 +423,7 @@ def _poly_alpha3_load_recent():
     _poly_alpha4_state["enabled"] = True
     print("SNIPER A4: ${:.2f} pool (restored from DB) | P2.1 at boundary | 15M | 50¢ fills".format(
         _poly_alpha4_state["balance"]))
+    _sv2_load_balance()  # Load SV2 paper pool from DB
 
     try:
         conn = get_db()
@@ -1065,7 +1066,23 @@ _sv2_state = {
     "starting_balance": 100.0,
     "trades_today": 0,
 }
-_sv2_fired_markets = set()  # dedup per boundary
+_sv2_fired_markets = set()  # dedup per boundary — resets on restart (intentional)
+
+def _sv2_load_balance():
+    """Load SV2 balance from DB on startup so deploys don't reset it."""
+    try:
+        _saved_sv2 = _saved_balances.get("sv2_paper", {})
+        if _saved_sv2 and _saved_sv2.get("balance", 0) > 0:
+            _sv2_state["balance"] = _saved_sv2["balance"]
+            _sv2_state["peak_balance"] = _saved_sv2.get("peak_balance",
+                                          _saved_sv2["balance"])
+            print("SV2: ${:.2f} pool (restored from DB)".format(
+                _sv2_state["balance"]))
+        else:
+            print("SV2: ${:.2f} pool (fresh start)".format(
+                _sv2_state["balance"]))
+    except Exception as e:
+        print("SV2 balance load error: {}".format(e))
 
 def _sv2_get_tier(asset, direction, signals_agree, confidence, ind_data):
     """Classify a signal into Tier 1/2/3 based on confidence, ADX, and candle.
@@ -1293,6 +1310,8 @@ def _resolve_sv2_trades():
                     r=now.isoformat(), i=p["id"])
                 c.close()
                 resolved += 1
+                # Save balance to DB after each resolution
+                _save_bot_balance("sv2_paper", _sv2_state)
             except Exception as e:
                 print("SV2 resolve error {}: {}".format(p.get("id"), e))
         return resolved
