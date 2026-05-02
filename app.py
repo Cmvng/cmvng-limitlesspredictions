@@ -711,7 +711,24 @@ def _sniper_thread():
                 _time.sleep(min(secs_to_boundary - 35, 60))
                 continue
 
-            # ── T-30s: Read indicators for all assets ──
+            # ── T-30s: Force fresh indicators for all assets ──
+            # MUST clear cache first — _calculate_indicators returns cached
+            # data if age < TTL (600s). Without clearing, the "refresh" is a no-op.
+            # Clear then recalculate guarantees fresh data at fire time.
+            for _asset in SNIPER_ASSETS:
+                _indicator_cache.pop("{}_15m".format(_asset), None)
+                _indicator_cache.pop("{}_1h".format(_asset), None)
+            _indicator_cache.pop("BTC_1h", None)  # BTC macro signal
+
+            for _asset in SNIPER_ASSETS:
+                try:
+                    _calculate_indicators(_asset, "15m")  # ~200ms via Binance
+                    _calculate_indicators(_asset, "1h")   # ~200ms via Binance
+                except Exception as _ce:
+                    print("SNIPER cache refresh error {}: {}".format(_asset, _ce))
+            # BTC 1H already refreshed in loop above (BTC is in SNIPER_ASSETS)
+            # Total time: ~1.6s for 8 Binance calls — well within 30s window
+
             snipe_targets = []
             _sniper_debug = []
             _sniper_reject = []
