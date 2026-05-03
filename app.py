@@ -694,88 +694,12 @@ def _sniper_thread():
 
             secs_to_boundary = mins_to_next * 60 - current_second
 
-            # Calculate next_boundary datetime here so it's available throughout
-            _now_nb = datetime.now(timezone.utc)
-            if mins_to_next == 0:
-                next_boundary = _now_nb.replace(second=0, microsecond=0) + timedelta(minutes=1)
-                # Round to next 15M boundary
-                next_boundary = next_boundary.replace(
-                    minute=(next_boundary.minute // 15) * 15, second=0, microsecond=0)
-                if next_boundary <= _now_nb:
-                    next_boundary += timedelta(minutes=15)
-            else:
-                _nbm = ((current_minute // 15) + 1) * 15
-                if _nbm >= 60:
-                    next_boundary = _now_nb.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
-                else:
-                    next_boundary = _now_nb.replace(minute=_nbm, second=0, microsecond=0)
-
             # If more than 35 seconds away, sleep and retry
             if secs_to_boundary > 35:
                 _time.sleep(min(secs_to_boundary - 35, 60))
                 continue
 
-            # ── T-30s: SV2 reads its OWN independent signal ──
-            # SV2 scores at T-30s with current cache (not yet cleared)
-            # Sniper then clears cache at T-15s and reads fresher signal
-            # This creates a genuine comparison experiment
-            _now_sv2_pre = datetime.now(timezone.utc)
-            _wait_to_t30 = secs_to_boundary - 30
-            if _wait_to_t30 > 0:
-                _time.sleep(_wait_to_t30)
-
-            # Score SV2 now at T-30s with current (pre-clear) cache
-            try:
-                _sv2_window_ts = int(next_boundary.timestamp())
-                _sv2_now_t30 = datetime.now(timezone.utc).isoformat()
-                _sv2_t30_map = {}
-                for _sv2_t30_asset in SNIPER_ASSETS:
-                    try:
-                        import requests as _sv2_req_t30, json as _sv2_json_t30
-                        _sv2_t30_slug = SNIPER_SLUGS[_sv2_t30_asset].format(_sv2_window_ts)
-                        _sv2_t30_r = _sv2_req_t30.get(
-                            "{}/markets/slug/{}".format(GAMMA_API, _sv2_t30_slug),
-                            timeout=5)
-                        if _sv2_t30_r.status_code == 200:
-                            _sv2_t30_md = _sv2_t30_r.json()
-                            _sv2_t30_toks = _sv2_t30_md.get("clobTokenIds")
-                            if isinstance(_sv2_t30_toks, str):
-                                try: _sv2_t30_toks = _sv2_json_t30.loads(_sv2_t30_toks)
-                                except: _sv2_t30_toks = None
-                            _sv2_t30_oc = _sv2_t30_md.get("outcomes")
-                            if isinstance(_sv2_t30_oc, str):
-                                try: _sv2_t30_oc = _sv2_json_t30.loads(_sv2_t30_oc)
-                                except: _sv2_t30_oc = None
-                            if isinstance(_sv2_t30_toks, list) and len(_sv2_t30_toks) >= 2:
-                                _up0_t30 = 0
-                                if isinstance(_sv2_t30_oc, list) and len(_sv2_t30_oc) >= 2:
-                                    if str(_sv2_t30_oc[0]).lower().strip() in ("no","down","below"):
-                                        _up0_t30 = 1
-                                _sv2_t30_map[_sv2_t30_asset] = {
-                                    "up_token": _sv2_t30_toks[_up0_t30],
-                                    "down_token": _sv2_t30_toks[1-_up0_t30],
-                                    "condition_id": _sv2_t30_md.get("conditionId",""),
-                                    "slug": _sv2_t30_slug,
-                                    "title": _sv2_t30_md.get("question",""),
-                                }
-                    except: pass
-                _sv2_t30_cnt = 0
-                for _sv2_t30_a, _sv2_t30_e in _sv2_t30_map.items():
-                    if _sv2_score_and_record(_sv2_t30_a, _sv2_t30_e, _sv2_window_ts, _sv2_now_t30):
-                        _sv2_t30_cnt += 1
-                if _sv2_t30_cnt:
-                    print("SV2 T-30s: {} paper trades | pool=${:.2f}".format(
-                        _sv2_t30_cnt, _sv2_state["balance"]))
-            except Exception as _sv2_t30_err:
-                print("SV2 T-30s error: {}".format(_sv2_t30_err))
-
-            # ── T-15s: Force fresh indicators for all assets ──
-            # Wait until exactly T-15s before clearing cache
-            _now_pre = datetime.now(timezone.utc)
-            _wait_to_t15 = (next_boundary - _now_pre).total_seconds() - 15
-            if _wait_to_t15 > 0:
-                _time.sleep(_wait_to_t15)
-
+            # ── T-30s: Force fresh indicators for all assets ──
             # MUST clear cache first — _calculate_indicators returns cached
             # data if age < TTL (600s). Without clearing, the "refresh" is a no-op.
             # Clear then recalculate guarantees fresh data at fire time.
