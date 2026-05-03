@@ -425,6 +425,7 @@ def _poly_alpha3_load_recent():
         _poly_alpha4_state["balance"]))
     _sv2_load_balance()  # Load SV2 paper pool from DB
     _save_bot_balance("sv2_paper", _sv2_state)  # Ensure row exists in DB
+    _save_bot_balance("sv3_paper", _sv3_state)  # Ensure SV3 row exists in DB
 
     try:
         conn = get_db()
@@ -647,6 +648,204 @@ def _sniper_get_direction(asset, timeframe="15m"):
     return bet_direction, signals_agree, " | ".join(parts), confidence
 
 
+
+def _sv3_score_and_record(asset, token_map_entry, boundary_ts, now_str):
+    """SV3 Paper Bot — T2.1 and T2.2 sub-tiers.
+
+    Uses P2.9 previous candle logic + price-to-beat location.
+
+    T2.1: Signal agrees + candle confirms + price near structure support
+          Signal=UP, prev candle green, price near prev LOW (pullback in trend)
+          Signal=DOWN, prev candle red, price near prev HIGH (bounce rejected)
+
+    T2.2: Signal fires BUT candle opposes + price at structural extreme
+          Signal=UP, prev candle red, BUT price near prev LOW (mean reversion)
+          Signal=DOWN, prev candle green, BUT price near prev HIGH (mean reversion)
+
+    Both fire at T-22s using stale cache (same as SV2)
+    Uses Chainlink RTDS price as price-to-beat estimate
+    """
+    fee = 0.03
+    wp = (1 / 0.50) * (1 - fee)
+
+    # ── Step 1: Get signal direction ──
+    direction, signals_agree, ind_str, confidence = _sniper_get_direction(asset, "15m")
+    if not direction or signals_agree < 2:
+        return False
+
+    # ── Step 2: Get previous candle via P2.9 logic ──
+    candle = _p28_read_prev_candle(asset, "15m")
+    if not candle:
+        return False
+
+    prev_high  = candle.get("high", 0)
+    prev_low   = candle.get("low", 0)
+    prev_close = candle.get("close", 0)
+    is_green   = candle.get("is_green", False)
+    is_red     = candle.get("is_red", False)
+    body_ratio = candle.get("body_ratio", 0)
+    pattern    = candle.get("pattern", "normal")
+    candle_tag = candle.get("tag", "")
+
+    if not prev_high or not prev_low or prev_high <= prev_low:
+        return False
+
+    # ── Step 3: Get current price (Chainlink RTDS estimate of price to beat) ──
+    rtds_price = _rtds_prices.get(asset.upper())
+    if not rtds_price:
+        return False
+
+    price_to_beat = rtds_price
+
+    # ── Step 4: Calculate price position within previous candle range ──
+    prev_range = prev_high - prev_low
+    if prev_range <= 0:
+        return False
+
+    price_position = (price_to_beat - prev_low) / prev_range
+    # 0.0 = at bottom of prev candle, 1.0 = at top
+
+    near_low  = price_position <= 0.30   # bottom 30% = support zone
+    near_high = price_position >= 0.70   # top 70% = resistance zone
+    in_middle = not near_low and not near_high
+
+    # ── Step 5: Skip reversal patterns (same as P2.9) ──
+    if pattern in ("hammer", "shooting_star", "engulfing"):
+        trend_data = _p28_read_candle_series(asset, "15m", count=5)
+        if trend_data and len(trend_data) >= 4:
+            recent_reds = sum(1 for c in trend_data[-4:-1] if c.get("close",0) < c.get("open",0))
+            recent_greens = sum(1 for c in trend_data[-4:-1] if c.get("close",0) > c.get("open",0))
+            if pattern == "hammer" and recent_reds >= 3:
+                return False  # Real reversal — skip
+            if pattern == "shooting_star" and recent_greens >= 3:
+                return False  # Real reversal — skip
+
+    # ── Step 6: Classify tier ──
+    # Support/resistance zones: near_low, near_high, in_middle
+    # Previous close position: where did prev candle close?
+    prev_close_pos = (prev_close - prev_low) / prev_range if prev_range > 0 else 0.5
+    prev_closed_high = prev_close_pos >= 0.65   # closed in upper 35%
+    prev_closed_low  = prev_close_pos <= 0.35   # closed in lower 35%
+    prev_closed_mid  = not prev_closed_high and not prev_closed_low
+    prev_was_doji    = pattern == "doji" or body_ratio < 0.15
+
+    tier = None
+
+    if direction == "UP":
+        if near_low:
+            if is_green:
+                tier = "T2.1"   # Uptrend + pullback to support
+            elif is_red:
+                tier = "T2.2"   # Mean reversion from support (candle opposes)
+        elif near_high:
+            if is_green:
+                return False    # Chasing momentum at resistance — no edge
+            elif is_red:
+                return False    # Signal UP but candle red at resistance — skip
+        elif in_middle:
+            if prev_was_doji or prev_closed_mid:
+                return False    # Previous candle flat + price in middle = no info
+            elif prev_closed_high and (is_green or body_ratio < 0.3):
+                tier = "T2.3"   # Prev closed high, price pulled to middle = retest continuation
+            elif prev_closed_low and not is_red:
+                tier = "T2.4"   # Prev closed low, price bouncing through middle = breakout
+            else:
+                return False
+
+    elif direction == "DOWN":
+        if near_high:
+            if is_red:
+                tier = "T2.1"   # Downtrend + bounce rejected at resistance
+            elif is_green:
+                tier = "T2.2"   # Mean reversion from resistance (candle opposes)
+        elif near_low:
+            if is_red:
+                return False    # Chasing momentum at support — no edge
+            elif is_green:
+                return False    # Signal DOWN but candle green at support — skip
+        elif in_middle:
+            if prev_was_doji or prev_closed_mid:
+                return False    # No structural info
+            elif prev_closed_low and (is_red or body_ratio < 0.3):
+                tier = "T2.3"   # Prev closed low, price bounced to middle = retest continuation
+            elif prev_closed_high and not is_green:
+                tier = "T2.4"   # Prev closed high, price falling through middle = breakout
+            else:
+                return False
+
+    if not tier:
+        return False
+
+    # ── Step 8: Stake calculation ──
+    bal = _sv3_state["balance"]
+    if tier == "T2.1":
+        stake = round(max(2.50, min(bal * 0.04, 5.00)), 2)   # Best setup — larger stake
+    elif tier == "T2.2":
+        stake = round(max(2.50, min(bal * 0.025, 2.50)), 2)  # Mean reversion — base stake
+    elif tier == "T2.3":
+        stake = round(max(2.50, min(bal * 0.03, 3.00)), 2)   # Retest continuation — medium
+    else:  # T2.4
+        stake = round(max(2.50, min(bal * 0.025, 2.50)), 2)  # Breakout middle — base stake
+
+    if stake > bal - 5:
+        return False
+
+    # ── Step 9: Dedup ──
+    market_key = "sv3_{}_15M_{}".format(asset, boundary_ts)
+    if market_key in _sv3_fired_markets:
+        return False
+    _sv3_fired_markets.add(market_key)
+
+    # ── Step 10: Update balance ──
+    pool_before = bal
+    _sv3_state["balance"] = round(bal - stake, 2)
+    _sv3_state["trades_today"] += 1
+
+    # ── Step 11: Save to DB ──
+    try:
+        c_sv3 = get_db()
+        c_sv3.run("""INSERT INTO sniper_v3_paper_trades
+            (market_id, title, asset, bet_side, tier, stake, fill_price,
+             pool_after, payout, signals_agree, indicators,
+             prev_candle_tag, prev_high, prev_low, prev_close,
+             price_to_beat, price_position, slug, condition_id,
+             status, fired_at)
+            VALUES (:mid, :ttl, :ast, :bs, :tier, :stake, 0.50,
+                    :pool, :payout, :sa, :ind,
+                    :ctag, :ph, :pl, :pc,
+                    :ptb, :pos, :slg, :cid,
+                    'Pending', :now)""",
+            mid=market_key,
+            ttl="{} {} 15M {}".format(asset, direction, boundary_ts),
+            ast=asset, bs=direction, tier=tier,
+            stake=stake, pool=_sv3_state["balance"],
+            payout=round(stake * wp, 2),
+            sa=signals_agree, ind=ind_str,
+            ctag=candle_tag or pattern,
+            ph=round(prev_high, 6), pl=round(prev_low, 6),
+            pc=round(prev_close, 6),
+            ptb=round(price_to_beat, 6),
+            pos=round(price_position, 3),
+            slg=token_map_entry.get("slug", ""),
+            cid=token_map_entry.get("condition_id", ""),
+            now=now_str)
+        c_sv3.close()
+
+        if _sv3_state["balance"] > _sv3_state["peak_balance"]:
+            _sv3_state["peak_balance"] = _sv3_state["balance"]
+
+        print("SV3 {}: {} {} ${:.2f} | prev={} pos={:.0f}% | pool=${:.2f}".format(
+            tier, direction, asset, stake,
+            candle_tag or pattern,
+            price_position * 100,
+            _sv3_state["balance"]))
+        return True
+
+    except Exception as e:
+        print("SV3 record error: {}".format(e))
+        _sv3_state["balance"] = pool_before
+        return False
+
 def _sniper_thread():
     """Dedicated sniper thread — fires at exact 15M window boundaries.
     Runs independently from the main scanner.
@@ -747,6 +946,49 @@ def _sniper_thread():
                 except Exception as _sv2e0:
                     print("SV2 no-target error: {}".format(_sv2e0))
 
+            # ── SV3 scores at same T-22s (pre-clear cache) ──
+            # T2.1 and T2.2: previous candle + price position logic
+            try:
+                _sv3_window_ts = int(next_boundary.timestamp())
+                _sv3_now_str = datetime.now(timezone.utc).isoformat()
+                _sv3_cnt = 0
+                for _sv3_asset in SNIPER_ASSETS:
+                    try:
+                        import requests as _sv3_req, json as _sv3_json
+                        _sv3_slug = SNIPER_SLUGS[_sv3_asset].format(_sv3_window_ts)
+                        _sv3_r = _sv3_req.get(
+                            "{}/markets/slug/{}".format(GAMMA_API, _sv3_slug),
+                            timeout=5)
+                        if _sv3_r.status_code == 200:
+                            _sv3_md = _sv3_r.json()
+                            _sv3_toks = _sv3_md.get("clobTokenIds")
+                            if isinstance(_sv3_toks, str):
+                                try: _sv3_toks = _sv3_json.loads(_sv3_toks)
+                                except: _sv3_toks = None
+                            _sv3_oc = _sv3_md.get("outcomes")
+                            if isinstance(_sv3_oc, str):
+                                try: _sv3_oc = _sv3_json.loads(_sv3_oc)
+                                except: _sv3_oc = None
+                            if isinstance(_sv3_toks, list) and len(_sv3_toks) >= 2:
+                                _sv3_up = 0
+                                if isinstance(_sv3_oc, list) and len(_sv3_oc) >= 2:
+                                    if str(_sv3_oc[0]).lower().strip() in ("no","down","below"):
+                                        _sv3_up = 1
+                                _sv3_entry = {
+                                    "up_token":     _sv3_toks[_sv3_up],
+                                    "down_token":   _sv3_toks[1-_sv3_up],
+                                    "condition_id": _sv3_md.get("conditionId",""),
+                                    "slug":         _sv3_slug,
+                                    "title":        _sv3_md.get("question",""),
+                                }
+                                if _sv3_score_and_record(_sv3_asset, _sv3_entry, _sv3_window_ts, _sv3_now_str):
+                                    _sv3_cnt += 1
+                    except: pass
+                if _sv3_cnt:
+                    print("SV3: {} paper trades | pool=${:.2f}".format(
+                        _sv3_cnt, _sv3_state["balance"]))
+            except Exception as _sv3_err:
+                print("SV3 error: {}".format(_sv3_err))
 
             # ── T-30s: Force fresh indicators for all assets ──
             # MUST clear cache first — _calculate_indicators returns cached
@@ -1083,7 +1325,18 @@ _sv2_state = {
     "starting_balance": 100.0,
     "trades_today": 0,
 }
-_sv2_fired_markets = set()  # dedup per boundary — resets on restart (intentional)
+_sv2_fired_markets = set()  # dedup per boundary — resets on restart (intentiona
+
+# ── SV3 Paper Bot state ──
+# Tests T2.1 (signal+candle+price agree) vs T2.2 (signal+price at structure, candle disagrees)
+# Fires at same T-22s as SV2, uses P2.9 candle logic + price-to-beat location
+_sv3_state = {
+    "balance": 100.0,
+    "peak_balance": 100.0,
+    "starting_balance": 100.0,
+    "trades_today": 0,
+}
+_sv3_fired_markets = set()
 
 def _sv2_load_balance():
     """Load SV2 balance from DB on startup so deploys don't reset it."""
@@ -1232,6 +1485,117 @@ def _sv2_score_and_record(asset, token_map_entry, boundary_ts, now_str):
         _sv2_fired_markets.discard(market_key)
         return False
 
+
+
+def _resolve_sv3_trades():
+    """Resolve pending SV3 paper trades using Polymarket outcomes."""
+    from datetime import datetime, timezone, timedelta
+    now = datetime.now(timezone.utc)
+    resolved = 0
+    try:
+        conn = get_db()
+        rows = conn.run("""
+            SELECT id, asset, bet_side, tier, stake, payout, slug,
+                   prev_candle_tag, price_position, fired_at
+            FROM sniper_v3_paper_trades
+            WHERE status='Pending'
+            ORDER BY id DESC LIMIT 100
+        """)
+        conn.close()
+    except Exception as e:
+        print("SV3 fetch error: {}".format(e))
+        return 0
+
+    fee = 0.03
+    wp = (1/0.50)*(1-fee)
+
+    for row in rows:
+        try:
+            tid, asset, bet_side, tier, stake, payout, slug = (
+                row[0], row[1], row[2], row[3], row[4], row[5], row[6])
+            fired_str = row[9]
+            if not fired_str:
+                continue
+
+            fired_at = datetime.fromisoformat(fired_str.replace("Z","").split("+")[0])
+            if fired_at.tzinfo is None:
+                fired_at = fired_at.replace(tzinfo=timezone.utc)
+
+            # Calculate expiry
+            fired_minute = fired_at.minute
+            next_bm = ((fired_minute // 15) + 1) * 15
+            if next_bm >= 60:
+                window_start = fired_at.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+            else:
+                window_start = fired_at.replace(minute=next_bm, second=0, microsecond=0)
+            expiry = window_start + timedelta(minutes=15)
+
+            if now < expiry + timedelta(minutes=3):
+                continue
+
+            # Check outcome via Polymarket
+            outcome = None
+            if slug:
+                try:
+                    import requests as _rq
+                    r = _rq.get("{}/markets/slug/{}".format(GAMMA_API, slug), timeout=5)
+                    if r.status_code == 200:
+                        mkt = r.json()
+                        winner = (mkt.get("winner") or "").upper()
+                        outcomes = mkt.get("outcomes")
+                        if isinstance(outcomes, str):
+                            import json
+                            try: outcomes = json.loads(outcomes)
+                            except: outcomes = None
+                        if winner and outcomes:
+                            if isinstance(outcomes, list) and len(outcomes) >= 2:
+                                if str(outcomes[0]).upper() in ("UP","YES","ABOVE"):
+                                    win_side = "UP" if winner == "YES" else "DOWN"
+                                else:
+                                    win_side = "DOWN" if winner == "YES" else "UP"
+                                outcome = "WIN" if win_side == bet_side else "LOSS"
+                except: pass
+
+            if not outcome:
+                if now > expiry + timedelta(hours=1):
+                    outcome = "RETURNED"
+                else:
+                    continue
+
+            # Update DB and balance
+            sim_pnl = 0.0
+            c_upd = get_db()
+            if outcome == "WIN":
+                sim_pnl = round(payout - stake, 2)
+                _sv3_state["balance"] = round(_sv3_state["balance"] + payout, 2)
+                c_upd.run("""UPDATE sniper_v3_paper_trades
+                    SET status='Resolved', outcome='WIN', sim_pnl=:p,
+                        resolved_at=:t
+                    WHERE id=:i""",
+                    p=sim_pnl, t=now.isoformat(), i=tid)
+            elif outcome == "LOSS":
+                sim_pnl = -stake
+                c_upd.run("""UPDATE sniper_v3_paper_trades
+                    SET status='Resolved', outcome='LOSS', sim_pnl=:p,
+                        resolved_at=:t
+                    WHERE id=:i""",
+                    p=sim_pnl, t=now.isoformat(), i=tid)
+            else:  # RETURNED
+                _sv3_state["balance"] = round(_sv3_state["balance"] + stake, 2)
+                c_upd.run("""UPDATE sniper_v3_paper_trades
+                    SET status='Resolved', outcome='RETURNED', sim_pnl=0,
+                        resolved_at=:t
+                    WHERE id=:i""",
+                    t=now.isoformat(), i=tid)
+            c_upd.close()
+            resolved += 1
+
+        except Exception as e:
+            print("SV3 resolve trade error: {}".format(e))
+
+    if resolved > 0:
+        _save_bot_balance("sv3_paper", _sv3_state)
+    return resolved
 
 def _resolve_sv2_trades():
     """Resolve Sniper V2 paper trades using Polymarket Gamma API."""
@@ -2771,6 +3135,24 @@ def init_db():
             pool_after REAL, payout REAL,
             signals_agree INTEGER, confidence TEXT,
             indicators TEXT, adx REAL, candle_dir TEXT,
+            slug TEXT, condition_id TEXT,
+            status TEXT DEFAULT 'Pending', outcome TEXT,
+            sim_pnl REAL,
+            fired_at TEXT, resolved_at TEXT
+        )
+    """)
+    conn.run("""
+        CREATE TABLE IF NOT EXISTS sniper_v3_paper_trades (
+            id SERIAL PRIMARY KEY,
+            market_id TEXT, title TEXT, asset TEXT,
+            bet_side TEXT, tier TEXT,
+            stake REAL, fill_price REAL DEFAULT 0.50,
+            pool_after REAL, payout REAL,
+            signals_agree INTEGER,
+            indicators TEXT,
+            prev_candle_tag TEXT,
+            prev_high REAL, prev_low REAL, prev_close REAL,
+            price_to_beat REAL, price_position REAL,
             slug TEXT, condition_id TEXT,
             status TEXT DEFAULT 'Pending', outcome TEXT,
             sim_pnl REAL,
@@ -14755,6 +15137,274 @@ def admin_set_balance():
        <a href="/app/lmts-sniper">View LMTS</a></p>
     """.format(bot, old, amount_f)
 
+
+@app.route("/app/sniper-v3")
+def sniper_v3_page():
+    """Paper Sniper V3 — T2.1/T2.2/T2.3/T2.4 with previous candle + price position."""
+    try:
+        conn = get_db()
+        rows = conn.run("""
+            SELECT id, asset, bet_side, tier, stake, fill_price,
+                   pool_after, payout, signals_agree,
+                   indicators, prev_candle_tag, price_position,
+                   prev_high, prev_low, prev_close, price_to_beat,
+                   status, outcome, sim_pnl, fired_at, resolved_at
+            FROM sniper_v3_paper_trades
+            ORDER BY id DESC LIMIT 300
+        """)
+        conn.close()
+    except:
+        rows = []
+
+    # Compute stats
+    fee = 0.03
+    wp = (1/0.50)*(1-fee)
+    bal = _sv3_state["balance"]
+    peak = _sv3_state["peak_balance"]
+
+    total_w = total_l = total_pnl = 0
+    tier_stats = {"T2.1":{"w":0,"l":0,"pnl":0.0},
+                  "T2.2":{"w":0,"l":0,"pnl":0.0},
+                  "T2.3":{"w":0,"l":0,"pnl":0.0},
+                  "T2.4":{"w":0,"l":0,"pnl":0.0}}
+    asset_stats = {}
+    today_trades = today_wins = today_losses = 0
+
+    from datetime import datetime, timezone
+    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    for row in rows:
+        outcome = row[17]
+        sim_pnl = row[18] or 0
+        tier = row[3] or "T2.1"
+        asset = row[1]
+        fired = (row[19] or "")[:10]
+
+        if outcome == "WIN":
+            total_w += 1
+            total_pnl += sim_pnl
+            if tier in tier_stats: tier_stats[tier]["w"] += 1; tier_stats[tier]["pnl"] += sim_pnl
+            if asset not in asset_stats: asset_stats[asset] = {"w":0,"l":0,"pnl":0.0}
+            asset_stats[asset]["w"] += 1; asset_stats[asset]["pnl"] += sim_pnl
+        elif outcome == "LOSS":
+            total_l += 1
+            total_pnl += sim_pnl
+            if tier in tier_stats: tier_stats[tier]["l"] += 1; tier_stats[tier]["pnl"] += sim_pnl
+            if asset not in asset_stats: asset_stats[asset] = {"w":0,"l":0,"pnl":0.0}
+            asset_stats[asset]["l"] += 1; asset_stats[asset]["pnl"] += sim_pnl
+
+        if fired == today_str:
+            today_trades += 1
+            if outcome == "WIN": today_wins += 1
+            elif outcome == "LOSS": today_losses += 1
+
+    total_resolved = total_w + total_l
+    wr = (total_w / total_resolved * 100) if total_resolved > 0 else 0
+    wr_color = "#1a7a4a" if wr >= 53 else "#c0392b" if wr < 51.5 else "#e67e22"
+    pnl_color = "#1a7a4a" if total_pnl >= 0 else "#c0392b"
+
+    # Tier rows
+    tier_rows_html = ""
+    tier_labels = {
+        "T2.1": "T2.1 — Trend+Structure",
+        "T2.2": "T2.2 — Mean Reversion",
+        "T2.3": "T2.3 — Retest Continuation",
+        "T2.4": "T2.4 — Breakout Middle",
+    }
+    for tier_key, label in tier_labels.items():
+        ts = tier_stats[tier_key]
+        n = ts["w"] + ts["l"]
+        twr = (ts["w"]/n*100) if n > 0 else 0
+        tpnl = ts["pnl"]
+        tc = "#1a7a4a" if tpnl >= 0 else "#c0392b"
+        tier_rows_html += """<tr>
+            <td style="padding:8px 12px;font-weight:600">{}</td>
+            <td style="padding:8px 12px">{:.1f}%</td>
+            <td style="padding:8px 12px">{}W / {}L</td>
+            <td style="padding:8px 12px;color:{}">{:+.2f}</td>
+        </tr>""".format(label, twr, ts["w"], ts["l"], tc, tpnl)
+
+    # Asset rows
+    asset_rows_html = ""
+    for asset in ["BTC","ETH","SOL","XRP"]:
+        if asset not in asset_stats:
+            asset_rows_html += "<tr><td style='padding:8px 12px'>{}</td><td colspan=3 style='padding:8px 12px;color:#999'>No trades</td></tr>".format(asset)
+            continue
+        ats = asset_stats[asset]
+        n = ats["w"] + ats["l"]
+        awr = (ats["w"]/n*100) if n > 0 else 0
+        apnl = ats["pnl"]
+        ac = "#1a7a4a" if apnl >= 0 else "#c0392b"
+        asset_rows_html += """<tr>
+            <td style="padding:8px 12px;font-weight:600">{}</td>
+            <td style="padding:8px 12px">{:.1f}%</td>
+            <td style="padding:8px 12px">{}W / {}L</td>
+            <td style="padding:8px 12px;color:{}">{:+.2f}</td>
+        </tr>""".format(asset, awr, ats["w"], ats["l"], ac, apnl)
+
+    # Trade rows (last 100)
+    trade_rows_html = ""
+    for row in rows[:100]:
+        outcome = row[17]
+        sim_pnl = row[18]
+        tier = row[3] or ""
+        asset = row[1]
+        side = row[2]
+        stake = row[4] or 0
+        candle_tag = row[10] or ""
+        price_pos = row[11]
+        fired = (row[19] or "")[:16].replace("T"," ")
+
+        if outcome == "WIN":
+            emoji = "✅"; pnl_str = "+${:.2f}".format(sim_pnl); pnl_c = "#1a7a4a"
+        elif outcome == "LOSS":
+            emoji = "❌"; pnl_str = "-${:.2f}".format(abs(sim_pnl)); pnl_c = "#c0392b"
+        elif outcome == "RETURNED":
+            emoji = "⏭"; pnl_str = "returned"; pnl_c = "#888"
+        else:
+            emoji = "⏳"; pnl_str = "—"; pnl_c = "#888"
+
+        pos_str = "{:.0f}%".format(price_pos*100) if price_pos is not None else "—"
+
+        trade_rows_html += """<tr>
+            <td style="padding:6px 12px;font-size:16px">{}</td>
+            <td style="padding:6px 12px;font-weight:600">{}</td>
+            <td style="padding:6px 12px">{}</td>
+            <td style="padding:6px 12px">{}</td>
+            <td style="padding:6px 12px">${:.2f}</td>
+            <td style="padding:6px 12px;font-size:11px;color:#666">{}</td>
+            <td style="padding:6px 12px;font-size:11px;color:#888">{}</td>
+            <td style="padding:6px 12px">{}</td>
+            <td style="padding:6px 12px;color:{}">{}</td>
+        </tr>""".format(emoji, tier, asset, side, stake,
+                       candle_tag[:12], pos_str, fired, pnl_c, pnl_str)
+
+    import importlib
+    nav_mod = s  # use existing nav
+    # Get nav html
+    nav_active = "sniper-v3"
+
+    HTML = """<!DOCTYPE html><html><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Sniper V3 Paper</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter+Tight:wght@400;600;700&display=swap" rel="stylesheet">
+<style>
+*{{box-sizing:border-box;margin:0;padding:0}}
+body{{font-family:'Inter Tight',-apple-system,sans-serif;background:#f8f9fa;color:#1a1a17}}
+.card{{background:#fff;border-radius:12px;border:1px solid #e8e8e6;padding:20px;margin:16px}}
+.metric{{text-align:center;padding:12px}}
+.metric .val{{font-size:28px;font-weight:700;font-family:monospace}}
+.metric .lbl{{font-size:12px;color:#666;margin-top:4px;text-transform:uppercase;letter-spacing:.5px}}
+table{{width:100%;border-collapse:collapse}}
+th{{background:#f0f0ee;padding:8px 12px;text-align:left;font-size:13px;color:#444;font-weight:600}}
+tr:nth-child(even){{background:#fafaf8}}
+td{{font-size:13px;border-bottom:1px solid #f0f0ee}}
+h2{{font-size:16px;font-weight:700;color:#1a3d2e;margin-bottom:12px}}
+.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px;padding:16px}}
+.tier-badge{{display:inline-block;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:700}}
+.t21{{background:#e8f5e9;color:#1a7a4a}}
+.t22{{background:#fff3e0;color:#e67e22}}
+.t23{{background:#e3f2fd;color:#1565c0}}
+.t24{{background:#f3e5f5;color:#7b1fa2}}
+</style></head><body>
+{nav}
+<div style="max-width:1100px;margin:0 auto;padding:8px">
+<div style="padding:20px 16px 8px">
+  <h1 style="font-size:20px;font-weight:700;color:#1a3d2e">📊 Paper Sniper V3</h1>
+  <p style="color:#666;font-size:13px;margin-top:4px">
+    P2.9 Candle + Price Position · T2.1/T2.2/T2.3/T2.4 · T-22s · Polymarket 15M · $100 Paper Capital
+  </p>
+</div>
+
+<!-- KPI Row -->
+<div class="card">
+<div class="grid">
+  <div class="metric"><div class="val" style="color:#1a3d2e">${bal:.2f}</div><div class="lbl">Pool</div></div>
+  <div class="metric"><div class="val" style="color:{wr_c}">{wr:.1f}%</div><div class="lbl">Win Rate</div></div>
+  <div class="metric"><div class="val" style="color:#555">{tot}</div><div class="lbl">Trades</div></div>
+  <div class="metric"><div class="val" style="color:{pnl_c}">{pnl:+.2f}</div><div class="lbl">P&L</div></div>
+  <div class="metric"><div class="val" style="color:#888">${peak:.2f}</div><div class="lbl">Peak</div></div>
+  <div class="metric"><div class="val" style="color:#555">{tt}T {tw}W {tl}L</div><div class="lbl">Today</div></div>
+</div>
+</div>
+
+<!-- Tier Breakdown -->
+<div class="card">
+<h2>By Tier</h2>
+<table>
+<thead><tr>
+  <th>Tier</th><th>Win Rate</th><th>Record</th><th>Sim P&L</th>
+</tr></thead>
+<tbody>{tier_rows}</tbody>
+</table>
+<p style="font-size:11px;color:#888;margin-top:8px;padding:0 4px">
+  T2.1: Signal+candle+price agree at structure · T2.2: Mean reversion at structure ·
+  T2.3: Retest continuation (prev closed high, price in middle) · T2.4: Breakout through middle (prev closed low)
+</p>
+</div>
+
+<!-- Asset Breakdown -->
+<div class="card">
+<h2>By Asset</h2>
+<table>
+<thead><tr>
+  <th>Asset</th><th>Win Rate</th><th>Record</th><th>Sim P&L</th>
+</tr></thead>
+<tbody>{asset_rows}</tbody>
+</table>
+</div>
+
+<!-- Trade Log -->
+<div class="card">
+<h2>Recent Trades (last 100)</h2>
+<div style="overflow-x:auto">
+<table>
+<thead><tr>
+  <th></th><th>Tier</th><th>Asset</th><th>Side</th><th>Stake</th>
+  <th>Candle</th><th>Price Pos</th><th>Time</th><th>P&L</th>
+</tr></thead>
+<tbody>{trade_rows}</tbody>
+</table>
+</div>
+</div>
+
+<p style="text-align:center;color:#999;font-size:12px;padding:16px">
+  Paper trading · $100 simulated capital · T-22s pre-clear cache · Polymarket 15M · Auto-refresh 60s
+</p>
+</div>
+<script>setTimeout(()=>location.reload(),60000)</script>
+</body></html>"""
+
+    # Get nav
+    from flask import request as flask_req
+    try:
+        nav_links = [
+            ("/app/poly-alpha4", "🎯 Sniper A4"),
+            ("/app/lmts-sniper", "🎯 LMTS"),
+            ("/app/sniper-v2",   "📊 Sniper V2"),
+            ("/app/sniper-v3",   "📊 Sniper V3"),
+            ("/app/paper21",     "Paper 2.1"),
+        ]
+        nav_html_str = """<nav style="background:#1a3d2e;padding:8px 16px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+  <span style="color:#fff;font-weight:700;margin-right:8px;font-size:14px">CMVNG</span>"""
+        for href, label in nav_links:
+            active = "background:rgba(255,255,255,0.15);color:#fff" if href == "/app/sniper-v3" else "color:rgba(255,255,255,0.7)"
+            nav_html_str += '<a href="{}" style="{}; text-decoration:none;padding:4px 10px;border-radius:6px;font-size:13px">{}</a>'.format(href, active, label)
+        nav_html_str += "</nav>"
+    except:
+        nav_html_str = ""
+
+    return HTML.format(
+        nav=nav_html_str,
+        bal=bal, wr_c=wr_color, wr=wr,
+        tot=total_resolved, pnl_c=pnl_color, pnl=total_pnl,
+        peak=peak, tt=today_trades, tw=today_wins, tl=today_losses,
+        tier_rows=tier_rows_html,
+        asset_rows=asset_rows_html,
+        trade_rows=trade_rows_html
+    )
+
 @app.route("/debug/sniper-trades")
 def debug_sniper_trades():
     """Check order_ids and status for recent sniper trades."""
@@ -16442,6 +17092,7 @@ td{padding:8px 12px;border-bottom:1px solid #f4f3ed;color:var(--ink-2)}tr:last-c
     <a href="/app/poly-alpha4" class="nav-tab""" + (" active" if nav_active == "poly-alpha4" else "") + """">🎯 Sniper A4</a>
     <a href="/app/lmts-sniper" class="nav-tab""" + (" active" if nav_active == "lmts-sniper" else "") + """">🎯 LMTS Sniper</a>
     <a href="/app/sniper-v2" class="nav-tab">📊 Sniper V2</a>
+    <a href="/app/sniper-v3" class="nav-tab""" + (" active" if nav_active == "sniper-v3" else "") + """">📊 Sniper V3</a>
     <a href="/app/paper4" class="nav-tab""" + (" active" if nav_active == "paper4" else "") + """">Paper 4</a>
     <a href="/app/paper5" class="nav-tab""" + (" active" if nav_active == "paper5" else "") + """">Paper 5</a>
     <a href="/app/paper51" class="nav-tab""" + (" active" if nav_active == "paper51" else "") + """">Paper 5.1</a>
@@ -18773,6 +19424,12 @@ def _poly_scan_loop():
                 print("SV2 paper resolved: {}".format(_sv2_resolved))
         except Exception as e:
             print("SV2 resolve error: {}".format(e))
+        try:
+            _sv3_resolved = _resolve_sv3_trades()
+            if _sv3_resolved:
+                print("SV3 paper resolved: {}".format(_sv3_resolved))
+        except Exception as e:
+            print("SV3 resolve error: {}".format(e))
         time.sleep(60)  # Wait 60s before next scan+resolve cycle
 
 # ═══════════════════════════════════════════════════════════
