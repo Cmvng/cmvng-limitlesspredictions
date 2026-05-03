@@ -734,42 +734,46 @@ def _sv3_score_and_record(asset, token_map_entry, boundary_ts, now_str):
     if direction == "UP":
         if near_low:
             if is_green:
-                tier = "T2.1"   # Uptrend + pullback to support
+                tier = "T2.1"   # Uptrend confirmed + pullback to support = best setup
             elif is_red:
-                tier = "T2.2"   # Mean reversion from support (candle opposes)
+                tier = "T2.2"   # Mean reversion from support (candle dipped to low)
         elif near_high:
             if is_green:
-                return False    # Chasing momentum at resistance — no edge
+                return False    # Chasing momentum AT resistance — no edge
             elif is_red:
-                return False    # Signal UP but candle red at resistance — skip
+                tier = "T2.2"   # Signal UP + candle pulled back TO resistance level
+                                # Price at resistance but signal says break higher
+                                # Mean reversion / breakout attempt
         elif in_middle:
             if prev_was_doji or prev_closed_mid:
-                return False    # Previous candle flat + price in middle = no info
+                return False    # No structural context — genuine skip
             elif prev_closed_high and (is_green or body_ratio < 0.3):
-                tier = "T2.3"   # Prev closed high, price pulled to middle = retest continuation
+                tier = "T2.3"   # Prev closed high, price retested middle = continuation
             elif prev_closed_low and not is_red:
-                tier = "T2.4"   # Prev closed low, price bouncing through middle = breakout
+                tier = "T2.4"   # Prev closed low, price breaking through middle = breakout
             else:
                 return False
 
     elif direction == "DOWN":
         if near_high:
             if is_red:
-                tier = "T2.1"   # Downtrend + bounce rejected at resistance
+                tier = "T2.1"   # Downtrend confirmed + bounce rejected at resistance = best setup
             elif is_green:
-                tier = "T2.2"   # Mean reversion from resistance (candle opposes)
+                tier = "T2.2"   # Mean reversion from resistance (candle bounced to high)
         elif near_low:
             if is_red:
-                return False    # Chasing momentum at support — no edge
+                tier = "T2.2"   # Signal DOWN + candle bounced TO support level
+                                # Price at support but signal says break lower
+                                # Mean reversion / breakdown attempt
             elif is_green:
-                return False    # Signal DOWN but candle green at support — skip
+                return False    # Chasing momentum AT support — no edge
         elif in_middle:
             if prev_was_doji or prev_closed_mid:
-                return False    # No structural info
+                return False    # No structural context — genuine skip
             elif prev_closed_low and (is_red or body_ratio < 0.3):
-                tier = "T2.3"   # Prev closed low, price bounced to middle = retest continuation
+                tier = "T2.3"   # Prev closed low, price retested middle = continuation
             elif prev_closed_high and not is_green:
-                tier = "T2.4"   # Prev closed high, price falling through middle = breakout
+                tier = "T2.4"   # Prev closed high, price breaking through middle = breakout
             else:
                 return False
 
