@@ -949,7 +949,7 @@ def _sniper_thread():
             # ── SV3 scores at same T-22s (pre-clear cache) ──
             # T2.1 and T2.2: previous candle + price position logic
             try:
-                _sv3_window_ts = int(next_boundary.timestamp())
+                _sv3_window_ts = window_ts  # use window_ts — already computed, avoids next_boundary scoping error
                 _sv3_now_str = datetime.now(timezone.utc).isoformat()
                 _sv3_cnt = 0
                 for _sv3_asset in SNIPER_ASSETS:
