@@ -699,10 +699,71 @@ def _sniper_thread():
                 _time.sleep(min(secs_to_boundary - 35, 60))
                 continue
 
-            # ── T-30s: Force fresh indicators for all assets ──
+            # ── T-30s: SV2 reads its OWN independent signal ──
+            # SV2 scores at T-30s with current cache (not yet cleared)
+            # Sniper then clears cache at T-15s and reads fresher signal
+            # This creates a genuine comparison experiment
+            _now_sv2_pre = datetime.now(timezone.utc)
+            _wait_to_t30 = secs_to_boundary - 30
+            if _wait_to_t30 > 0:
+                _time.sleep(_wait_to_t30)
+
+            # Score SV2 now at T-30s with current (pre-clear) cache
+            try:
+                _sv2_window_ts = int(next_boundary.timestamp())
+                _sv2_now_t30 = datetime.now(timezone.utc).isoformat()
+                _sv2_t30_map = {}
+                for _sv2_t30_asset in SNIPER_ASSETS:
+                    try:
+                        import requests as _sv2_req_t30, json as _sv2_json_t30
+                        _sv2_t30_slug = SNIPER_SLUGS[_sv2_t30_asset].format(_sv2_window_ts)
+                        _sv2_t30_r = _sv2_req_t30.get(
+                            "{}/markets/slug/{}".format(GAMMA_API, _sv2_t30_slug),
+                            timeout=5)
+                        if _sv2_t30_r.status_code == 200:
+                            _sv2_t30_md = _sv2_t30_r.json()
+                            _sv2_t30_toks = _sv2_t30_md.get("clobTokenIds")
+                            if isinstance(_sv2_t30_toks, str):
+                                try: _sv2_t30_toks = _sv2_json_t30.loads(_sv2_t30_toks)
+                                except: _sv2_t30_toks = None
+                            _sv2_t30_oc = _sv2_t30_md.get("outcomes")
+                            if isinstance(_sv2_t30_oc, str):
+                                try: _sv2_t30_oc = _sv2_json_t30.loads(_sv2_t30_oc)
+                                except: _sv2_t30_oc = None
+                            if isinstance(_sv2_t30_toks, list) and len(_sv2_t30_toks) >= 2:
+                                _up0_t30 = 0
+                                if isinstance(_sv2_t30_oc, list) and len(_sv2_t30_oc) >= 2:
+                                    if str(_sv2_t30_oc[0]).lower().strip() in ("no","down","below"):
+                                        _up0_t30 = 1
+                                _sv2_t30_map[_sv2_t30_asset] = {
+                                    "up_token": _sv2_t30_toks[_up0_t30],
+                                    "down_token": _sv2_t30_toks[1-_up0_t30],
+                                    "condition_id": _sv2_t30_md.get("conditionId",""),
+                                    "slug": _sv2_t30_slug,
+                                    "title": _sv2_t30_md.get("question",""),
+                                }
+                    except: pass
+                _sv2_t30_cnt = 0
+                for _sv2_t30_a, _sv2_t30_e in _sv2_t30_map.items():
+                    if _sv2_score_and_record(_sv2_t30_a, _sv2_t30_e, _sv2_window_ts, _sv2_now_t30):
+                        _sv2_t30_cnt += 1
+                if _sv2_t30_cnt:
+                    print("SV2 T-30s: {} paper trades | pool=${:.2f}".format(
+                        _sv2_t30_cnt, _sv2_state["balance"]))
+            except Exception as _sv2_t30_err:
+                print("SV2 T-30s error: {}".format(_sv2_t30_err))
+
+            # ── T-15s: Force fresh indicators for all assets ──
+            # Wait until exactly T-15s before clearing cache
+            _now_pre = datetime.now(timezone.utc)
+            _wait_to_t15 = (next_boundary - _now_pre).total_seconds() - 15
+            if _wait_to_t15 > 0:
+                _time.sleep(_wait_to_t15)
+
             # MUST clear cache first — _calculate_indicators returns cached
             # data if age < TTL (600s). Without clearing, the "refresh" is a no-op.
             # Clear then recalculate guarantees fresh data at fire time.
+            # T-15s gives 13s buffer even if Binance takes 500ms per call
             for _asset in SNIPER_ASSETS:
                 _indicator_cache.pop("{}_15m".format(_asset), None)
                 _indicator_cache.pop("{}_1h".format(_asset), None)
@@ -1576,7 +1637,24 @@ def _limitless_sniper_thread():
                 _time.sleep(min(secs_to_boundary - 45, 60))
                 continue
 
-            # ── T-40s: Read P2.1 direction ──
+            # ── T-15s: Clear cache + read fresh P2.1 direction ──
+            # Clear 1H cache first so signal is current at fire time
+            for _lmts_asset in SNIPER_ASSETS:
+                _indicator_cache.pop("{}_1h".format(_lmts_asset.upper()), None)
+                _indicator_cache.pop("{}_1h".format(_lmts_asset.lower()), None)
+            _indicator_cache.pop("BTC_1h", None)
+            for _lmts_asset in SNIPER_ASSETS:
+                try:
+                    _calculate_indicators(_lmts_asset, "1h")
+                except Exception as _lce:
+                    print("LMTS cache refresh {}: {}".format(_lmts_asset, _lce))
+
+            # Wait until T-15s before boundary
+            _now_pre = datetime.now(timezone.utc)
+            _wait_to_t15 = (next_boundary - _now_pre).total_seconds() - 15
+            if _wait_to_t15 > 0:
+                _time.sleep(_wait_to_t15)
+
             snipe_targets = []
             for asset in SNIPER_ASSETS:
                 direction, signals_agree, ind_str, _confidence = _sniper_get_direction(asset, "1h")
