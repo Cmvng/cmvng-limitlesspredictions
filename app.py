@@ -694,6 +694,22 @@ def _sniper_thread():
 
             secs_to_boundary = mins_to_next * 60 - current_second
 
+            # Calculate next_boundary datetime here so it's available throughout
+            _now_nb = datetime.now(timezone.utc)
+            if mins_to_next == 0:
+                next_boundary = _now_nb.replace(second=0, microsecond=0) + timedelta(minutes=1)
+                # Round to next 15M boundary
+                next_boundary = next_boundary.replace(
+                    minute=(next_boundary.minute // 15) * 15, second=0, microsecond=0)
+                if next_boundary <= _now_nb:
+                    next_boundary += timedelta(minutes=15)
+            else:
+                _nbm = ((current_minute // 15) + 1) * 15
+                if _nbm >= 60:
+                    next_boundary = _now_nb.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+                else:
+                    next_boundary = _now_nb.replace(minute=_nbm, second=0, microsecond=0)
+
             # If more than 35 seconds away, sleep and retry
             if secs_to_boundary > 35:
                 _time.sleep(min(secs_to_boundary - 35, 60))
