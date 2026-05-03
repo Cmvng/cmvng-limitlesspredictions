@@ -1110,14 +1110,14 @@ def _sv2_get_tier(asset, direction, signals_agree, confidence, ind_data):
 
     fee = 0.03
     bal = _sv2_state["balance"]
-    # Stakes: T1=$5, T2=$2.50, T3=$1.25 — scaled with pool above $200
-    scale = max(1.0, bal / 100.0) if bal > 200 else 1.0
-    t1_stake = round(min(5.00 * scale, bal * 0.08), 2)
-    t2_stake = round(min(2.50 * scale, bal * 0.05), 2)
-    t3_stake = round(min(1.25 * scale, bal * 0.025), 2)
-    t1_stake = max(t1_stake, 2.50)
-    t2_stake = max(t2_stake, 2.50)
-    t3_stake = max(t3_stake, 2.50)  # Polymarket minimum $2.50
+    # Percentage-based stakes — same compounding logic as live sniper
+    # Stakes reduce when pool drops, grow when pool grows
+    # T1: 4% of pool (max $5, min $2.50) — best signal gets bigger bet
+    # T2: 2.5% of pool (effectively $2.50 flat below $100)
+    # T3: 2.5% of pool (min $2.50)
+    t1_stake = round(max(2.50, min(bal * 0.04, 5.00)), 2)
+    t2_stake = round(max(2.50, min(bal * 0.025, 2.50)), 2)
+    t3_stake = round(max(2.50, min(bal * 0.025, 2.50)), 2)
 
     # Read ADX and candle from indicator cache
     adx = None
@@ -1738,8 +1738,9 @@ def _limitless_sniper_thread():
                 if not token_id:
                     continue
 
-                order_id = _place_gtc_order(mkt["slug"], target["bet_side"], token_id, stake, 0.50,
-                                            exchange_addr, profile_id, fee_bps)
+                order_id, immediately_filled = _place_gtc_order(
+                    mkt["slug"], target["bet_side"], token_id, stake, 0.50,
+                    exchange_addr, profile_id, fee_bps) or (None, False)
                 if order_id:
                     _limitless_sniper_state["balance"] = round(_limitless_sniper_state["balance"] - stake, 2)
                     _limitless_sniper_state["trades_today"] += 1
@@ -1758,7 +1759,7 @@ def _limitless_sniper_thread():
                             ast=asset, tf="1H", bs=target["bet_side"], tier=target["tier"], stake=stake,
                             fill=0.50, pool=_limitless_sniper_state["balance"],
                             oid=str(order_id or ""), slg=mkt["slug"],
-                            filled=True,  ind=target["indicators"],
+                            filled=immediately_filled, ind=target["indicators"],
                             sa=target["signals_agree"],
                             now=datetime.now(timezone.utc).isoformat())
                         c_lmts.close()
@@ -1814,9 +1815,36 @@ def _resolve_limitless_sniper_trades():
                 order_id = p.get("order_id")
                 order_filled = p.get("filled", False)
 
-                # T+0 50c GTC orders at Limitless ALWAYS fill — counterparty
-                # is always present at boundary open. Trust filled=True from DB.
-                # Skip order API check (unreliable status fields).
+                # Check if market has resolved — use this to determine fill
+                # More reliable than order fill status API
+                if not order_filled and order_id:
+                    try:
+                        import requests as _req_lmts
+                        _mkt_r = _req_lmts.get(
+                            "{}/markets/{}".format(LIMITLESS_API, p.get("slug", "")),
+                            headers={"X-API-Key": LIMITLESS_TOKEN_ID},
+                            timeout=5)
+                        if _mkt_r.status_code == 200:
+                            _mkt_data = _mkt_r.json()
+                            _mkt_status = (_mkt_data.get("status") or "").upper()
+                            _mkt_resolved = _mkt_status in ("RESOLVED", "SETTLED", "CLOSED")
+                            # Check if we have a position in this market
+                            _pos_r = _req_lmts.get(
+                                "{}/positions".format(LIMITLESS_API),
+                                headers={"X-API-Key": LIMITLESS_TOKEN_ID},
+                                params={"marketId": _mkt_data.get("id", "")},
+                                timeout=5)
+                            if _pos_r.status_code == 200:
+                                _positions = _pos_r.json().get("data", [])
+                                if _positions:
+                                    # We have a position — order filled
+                                    order_filled = True
+                                    c_upd = get_db()
+                                    c_upd.run("UPDATE limitless_sniper_trades SET filled=TRUE WHERE id=:i", i=p["id"])
+                                    c_upd.close()
+                    except Exception as _e_lmts:
+                        pass  # Can't check — will retry next cycle
+
                 if not order_filled and now > expiry:
                     _limitless_sniper_state["balance"] = round(_limitless_sniper_state["balance"] + stake, 2)
                     c = get_db()
@@ -4140,7 +4168,7 @@ def _place_gtc_order(slug, bet_side, token_id, stake, price_per_share, exchange_
     api_price_int = int(api_price * 1000)
     our_price_int = int(our_price * 1000)
     if api_price_int <= 0 or our_price_int <= 0:
-        return None
+        return None, False
 
     import math
     # Tick must satisfy both api_price and integer math
@@ -4177,7 +4205,7 @@ def _place_gtc_order(slug, bet_side, token_id, stake, price_per_share, exchange_
 
     signature = _sign_order(order_data, exchange_addr)
     if not signature:
-        return None
+        return None, False
 
     order_payload = {
         "order": {
@@ -4215,15 +4243,20 @@ def _place_gtc_order(slug, bet_side, token_id, stake, price_per_share, exchange_
         if r.status_code in (200, 201):
             result = r.json() if r.text else {}
             order_id = result.get("id") or result.get("orderId") or result.get("order", {}).get("id")
-            print("GTC order placed: {} @ ${:.4f} (api=${:.4f}) on {} (id={})".format(
-                bet_side, our_price, api_price, slug[:30], order_id))
-            return order_id
+            # Check if order filled immediately at placement
+            status = (result.get("status") or result.get("orderStatus") or "").upper()
+            filled_amount = float(result.get("filledAmount") or result.get("sizeMatched") or
+                                  result.get("filled") or 0)
+            immediately_filled = status in ("MATCHED", "FILLED", "CLOSED") or filled_amount > 0
+            print("GTC order placed: {} @ ${:.4f} on {} (id={} filled={})".format(
+                bet_side, our_price, slug[:30], order_id, immediately_filled))
+            return order_id, immediately_filled
         else:
             print("GTC order failed: {} - {}".format(r.status_code, r.text[:150]))
-            return None
+            return None, False
     except Exception as e:
         print("GTC order error: {}".format(e))
-        return None
+        return None, False
 
 def _cancel_order(order_id):
     """Cancel an order by ID. Returns True if cancelled, False if failed, 'FILLED' if already filled."""
@@ -4930,7 +4963,7 @@ def execute_trade(parsed_market, score, prediction_id, override_stake=None, bot_
                 # Place GTC at this phase price
                 print("Phase {}: placing GTC at ${:.3f} (ask was ${:.3f}, discount ${:.2f})".format(
                     phase_name, phase_price, fresh_ask, discount))
-                order_id = _place_gtc_order(slug, bet_side, token_id, stake, phase_price,
+                order_id, _ = _place_gtc_order(slug, bet_side, token_id, stake, phase_price,
                                              exchange_addr, profile_id, fee_bps)
                 
                 if not order_id:
@@ -5023,7 +5056,7 @@ def execute_trade(parsed_market, score, prediction_id, override_stake=None, bot_
                         continue
                     print("Phase {}: GTC at ${:.3f} (displayed={:.3f}, discount={:.2f})".format(
                         phase_name, phase_price, displayed_price, discount))
-                    order_id = _place_gtc_order(slug, bet_side, token_id, stake, phase_price,
+                    order_id, _ = _place_gtc_order(slug, bet_side, token_id, stake, phase_price,
                                                  exchange_addr, profile_id, fee_bps)
                     if not order_id:
                         continue
@@ -5089,7 +5122,7 @@ def execute_trade(parsed_market, score, prediction_id, override_stake=None, bot_
                     if phase_price >= ceiling:
                         continue
                     print("Phase {}: GTC at ${:.3f} (ref={:.3f})".format(phase_name, phase_price, ref_price))
-                    order_id = _place_gtc_order(slug, bet_side, token_id, stake, phase_price,
+                    order_id, _ = _place_gtc_order(slug, bet_side, token_id, stake, phase_price,
                                                  exchange_addr, profile_id, fee_bps)
                     if not order_id:
                         continue
@@ -6348,7 +6381,7 @@ def _snipe_place_gtc(market_data, parsed, bet_side, stake, best_ask, max_price=0
     if best_ask and best_ask <= max_price:
         # Match the ask — instant fill
         price = round(best_ask, 3)
-        order_id = _place_gtc_order(slug, bet_side, token_id, stake, price,
+        order_id, _ = _place_gtc_order(slug, bet_side, token_id, stake, price,
                                      exchange_addr, profile_id, fee_bps)
         if order_id:
             print("SNIPE @{:.0f}%: {} {} ${:.2f} on {}".format(
@@ -6363,7 +6396,7 @@ def _snipe_place_gtc(market_data, parsed, bet_side, stake, best_ask, max_price=0
     else:
         # No ask or too expensive — GTC at max_price
         price = max_price
-        order_id = _place_gtc_order(slug, bet_side, token_id, stake, price,
+        order_id, _ = _place_gtc_order(slug, bet_side, token_id, stake, price,
                                      exchange_addr, profile_id, fee_bps)
         if order_id:
             print("SNIPE MAX @{:.0f}%: {} {} ${:.2f} on {} (ask={})".format(
@@ -6499,7 +6532,7 @@ def _manage_snipe_orders():
             time.sleep(0.3)
             
             # Place new order at next price
-            new_order_id = _place_gtc_order(
+            new_order_id, _ = _place_gtc_order(
                 slug, order["bet_side"], order["token_id"], order["stake"],
                 next_price, order["exchange_addr"], order["profile_id"], order["fee_bps"])
             
@@ -16764,6 +16797,16 @@ if SIGNALS_DB_URL:
     if _saved_lmts and _saved_lmts.get("balance", 0) > 0:
         _limitless_sniper_state["balance"] = _saved_lmts["balance"]
         _limitless_sniper_state["peak_balance"] = _saved_lmts.get("peak_balance", _saved_lmts["balance"])
+    # ── Correct balance after fake losses from filled=True bug ──
+    # Real wallet balance confirmed at $24 after overnight
+    # DB showed $5 due to returned orders being marked as losses
+    if _limitless_sniper_state["balance"] < 20.0:
+        _limitless_sniper_state["balance"] = 24.00
+        _limitless_sniper_state["peak_balance"] = max(
+            _limitless_sniper_state.get("peak_balance", 0), 30.00)
+        _save_bot_balance("limitless_sniper", _limitless_sniper_state)
+        print("LMTS SNIPER: balance corrected to $24.00 (fake losses removed)")
+    # ────────────────────────────────────────────────────────────
     _limitless_sniper_state["floor_balance"] = 5.0
     _limitless_sniper_state["enabled"] = True
     print("LMTS SNIPER: ${:.2f} pool (restored from DB) | P2.1+momentum | 1H | 50¢ | 2-tier".format(
