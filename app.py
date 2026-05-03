@@ -694,12 +694,12 @@ def _sniper_thread():
 
             secs_to_boundary = mins_to_next * 60 - current_second
 
-            # If more than 35 seconds away, sleep and retry
-            if secs_to_boundary > 35:
-                _time.sleep(min(secs_to_boundary - 35, 60))
+            # If more than 27 seconds away, sleep and retry
+            if secs_to_boundary > 27:
+                _time.sleep(min(secs_to_boundary - 27, 60))
                 continue
 
-            # ── T-30s: SV2 scores FIRST with current (pre-clear) cache ──
+            # ── T-22s: SV2 scores FIRST with current (pre-clear) cache ──
             # SV2 reads at T-30s stale cache, sniper reads T-28s fresh cache
             # Genuine independent comparison experiment
             if True:  # SV2 pre-clear scoring block
