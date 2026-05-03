@@ -699,43 +699,10 @@ def _sniper_thread():
                 _time.sleep(min(secs_to_boundary - 35, 60))
                 continue
 
-            # ── T-30s: Force fresh indicators for all assets ──
-            # MUST clear cache first — _calculate_indicators returns cached
-            # data if age < TTL (600s). Without clearing, the "refresh" is a no-op.
-            # Clear then recalculate guarantees fresh data at fire time.
-            # T-15s gives 13s buffer even if Binance takes 500ms per call
-            for _asset in SNIPER_ASSETS:
-                _indicator_cache.pop("{}_15m".format(_asset), None)
-                _indicator_cache.pop("{}_1h".format(_asset), None)
-            _indicator_cache.pop("BTC_1h", None)  # BTC macro signal
-
-            for _asset in SNIPER_ASSETS:
-                try:
-                    _calculate_indicators(_asset, "15m")  # ~200ms via Binance
-                    _calculate_indicators(_asset, "1h")   # ~200ms via Binance
-                except Exception as _ce:
-                    print("SNIPER cache refresh error {}: {}".format(_asset, _ce))
-            # BTC 1H already refreshed in loop above (BTC is in SNIPER_ASSETS)
-            # Total time: ~1.6s for 8 Binance calls — well within 30s window
-
-            snipe_targets = []
-            _sniper_debug = []
-            _sniper_reject = []
-            for asset in SNIPER_ASSETS:
-                direction, signals_agree, ind_str, _confidence = _sniper_get_direction(asset, "15m")
-                if direction and signals_agree >= 2:
-                    _sniper_debug.append("{}={}".format(asset, direction))
-                    snipe_targets.append({
-                        "asset": asset,
-                        "direction": direction,
-                        "signals_agree": signals_agree,
-                        "indicators": ind_str,
-                    })
-
-            if not snipe_targets:
-                print("SNIPER: 0 targets at boundary | cache: {}".format(
-                    {a: bool(_indicator_cache.get("{}_15m".format(a))) for a in SNIPER_ASSETS}))
-
+            # ── T-30s: SV2 scores FIRST with current (pre-clear) cache ──
+            # SV2 reads at T-30s stale cache, sniper reads T-28s fresh cache
+            # Genuine independent comparison experiment
+            if True:  # SV2 pre-clear scoring block
                 # SV2 still runs even when live sniper has no targets
                 # Build minimal token_map for SV2 use
                 try:
@@ -779,6 +746,44 @@ def _sniper_thread():
                             _sv2_cnt0, _sv2_state["balance"]))
                 except Exception as _sv2e0:
                     print("SV2 no-target error: {}".format(_sv2e0))
+
+
+            # ── T-30s: Force fresh indicators for all assets ──
+            # MUST clear cache first — _calculate_indicators returns cached
+            # data if age < TTL (600s). Without clearing, the "refresh" is a no-op.
+            # Clear then recalculate guarantees fresh data at fire time.
+            # T-15s gives 13s buffer even if Binance takes 500ms per call
+            for _asset in SNIPER_ASSETS:
+                _indicator_cache.pop("{}_15m".format(_asset), None)
+                _indicator_cache.pop("{}_1h".format(_asset), None)
+            _indicator_cache.pop("BTC_1h", None)  # BTC macro signal
+
+            for _asset in SNIPER_ASSETS:
+                try:
+                    _calculate_indicators(_asset, "15m")  # ~200ms via Binance
+                    _calculate_indicators(_asset, "1h")   # ~200ms via Binance
+                except Exception as _ce:
+                    print("SNIPER cache refresh error {}: {}".format(_asset, _ce))
+            # BTC 1H already refreshed in loop above (BTC is in SNIPER_ASSETS)
+            # Total time: ~1.6s for 8 Binance calls — well within 30s window
+
+            snipe_targets = []
+            _sniper_debug = []
+            _sniper_reject = []
+            for asset in SNIPER_ASSETS:
+                direction, signals_agree, ind_str, _confidence = _sniper_get_direction(asset, "15m")
+                if direction and signals_agree >= 2:
+                    _sniper_debug.append("{}={}".format(asset, direction))
+                    snipe_targets.append({
+                        "asset": asset,
+                        "direction": direction,
+                        "signals_agree": signals_agree,
+                        "indicators": ind_str,
+                    })
+
+            if not snipe_targets:
+                print("SNIPER: 0 targets at boundary | cache: {}".format(
+                    {a: bool(_indicator_cache.get("{}_15m".format(a))) for a in SNIPER_ASSETS}))
 
                 _time.sleep(60)
                 continue
