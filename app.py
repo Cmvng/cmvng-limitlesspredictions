@@ -15143,6 +15143,23 @@ def sniper_v3_page():
     """Paper Sniper V3 — T2.1/T2.2/T2.3/T2.4 with previous candle + price position."""
     try:
         conn = get_db()
+        # Create table if not exists (handles first run)
+        conn.run("""CREATE TABLE IF NOT EXISTS sniper_v3_paper_trades (
+            id SERIAL PRIMARY KEY,
+            market_id TEXT, title TEXT, asset TEXT,
+            bet_side TEXT, tier TEXT,
+            stake REAL, fill_price REAL DEFAULT 0.50,
+            pool_after REAL, payout REAL,
+            signals_agree INTEGER,
+            indicators TEXT,
+            prev_candle_tag TEXT,
+            prev_high REAL, prev_low REAL, prev_close REAL,
+            price_to_beat REAL, price_position REAL,
+            slug TEXT, condition_id TEXT,
+            status TEXT DEFAULT 'Pending', outcome TEXT,
+            sim_pnl REAL,
+            fired_at TEXT, resolved_at TEXT
+        )""")
         rows = conn.run("""
             SELECT id, asset, bet_side, tier, stake, fill_price,
                    pool_after, payout, signals_agree,
@@ -15153,7 +15170,8 @@ def sniper_v3_page():
             ORDER BY id DESC LIMIT 300
         """)
         conn.close()
-    except:
+    except Exception as e:
+        print("SV3 dashboard DB error: {}".format(e))
         rows = []
 
     # Compute stats
@@ -15279,9 +15297,6 @@ def sniper_v3_page():
         </tr>""".format(emoji, tier, asset, side, stake,
                        candle_tag[:12], pos_str, fired, pnl_c, pnl_str)
 
-    import importlib
-    nav_mod = s  # use existing nav
-    # Get nav html
     nav_active = "sniper-v3"
 
     HTML = """<!DOCTYPE html><html><head>
