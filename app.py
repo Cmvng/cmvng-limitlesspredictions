@@ -426,12 +426,13 @@ def _poly_alpha3_load_recent():
     _sv2_load_balance()  # Load SV2 paper pool from DB
     _save_bot_balance("sv2_paper", _sv2_state)  # Ensure row exists in DB
     _save_bot_balance("sv3_paper", _sv3_state)  # Ensure SV3 row exists in DB
-    # Reset any RETURNED sv3 trades back to Pending so they re-resolve as WIN/LOSS
+    # Reset bad resolutions: LOSS trades fired before 07:00 (debug period) → Pending
     try:
         _conn_sv3_fix = get_db()
         _conn_sv3_fix.run("""UPDATE sniper_v3_paper_trades
             SET status='Pending', outcome=NULL, sim_pnl=NULL, resolved_at=NULL
-            WHERE status='Resolved' AND outcome='RETURNED'""")
+            WHERE status='Resolved' AND outcome='LOSS'
+            AND fired_at < '2026-05-04 07:00:00'""")
         _conn_sv3_fix.close()
     except: pass
 
@@ -1543,7 +1544,15 @@ def _resolve_sv3_trades():
 
             if won is None:
                 if now > expiry + timedelta(hours=1):
-                    won = False  # treat as loss after 1hr, not returned
+                    # Market data gone — mark as returned (excluded from WR)
+                    c = get_db()
+                    c.run("""UPDATE sniper_v3_paper_trades
+                        SET status='Resolved', outcome='RETURNED', sim_pnl=0,
+                            resolved_at=:t WHERE id=:i""",
+                        t=now.isoformat(), i=tid)
+                    c.close()
+                    resolved += 1
+                    continue
                 else:
                     continue
 
