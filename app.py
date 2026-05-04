@@ -1180,6 +1180,17 @@ def _sniper_thread():
             except Exception as _sv2e:
                 print("SV2 error: {}".format(_sv2e))
 
+            # ── A4: Re-read direction at T+0 (same moment as SV2) ──
+            _refreshed = []
+            for _tgt in snipe_targets:
+                _t0_dir, _t0_agree, _t0_ind, _t0_conf = _sniper_get_direction(_tgt["asset"], "15m")
+                if _t0_dir and _t0_agree >= 2:
+                    _tgt["direction"]     = _t0_dir
+                    _tgt["signals_agree"] = _t0_agree
+                    _tgt["indicators"]    = _t0_ind
+                    _refreshed.append(_tgt)
+            snipe_targets = _refreshed
+
             fired_results = []  # collect results for post-fire logging
             fire_time = datetime.now(timezone.utc)
 
