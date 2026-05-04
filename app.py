@@ -18414,17 +18414,41 @@ def run_poly_scan():
                                                             _a4d_filled = False
                                                             if _a4d_client:
                                                                 from py_clob_client_v2 import OrderArgs, OrderType, Side as _A4Side
-                                                                _a4d_order_args = OrderArgs(
-                                                                    token_id=str(_a4d_token),
-                                                                    price=round(_a4d_price, 2),
-                                                                    size=float(_a4d_shares),
-                                                                    side=_A4Side.BUY,
-                                                                )
-                                                                _a4d_signed = _a4d_client.create_order(_a4d_order_args)
-                                                                _a4d_resp = _a4d_client.post_order(_a4d_signed, OrderType.GTC)
-                                                                if _a4d_resp:
-                                                                    _a4d_oid = _a4d_resp.get("orderID") or _a4d_resp.get("id") or "placed"
-                                                                    _a4d_filled = bool(_a4d_resp.get("status") == "matched")
+                                                                # Read LIVE orderbook price
+                                                                _a4d_live_book = _a4d_client.get_order_book(str(_a4d_token))
+                                                                _a4d_live_price = None
+                                                                if _a4d_live_book and _a4d_live_book.get("asks") and len(_a4d_live_book["asks"]) > 0:
+                                                                    _a4d_live_price = round(float(_a4d_live_book["asks"][0]["price"]), 2)
+                                                                
+                                                                if _a4d_live_price and 0.35 <= _a4d_live_price <= 0.72:
+                                                                    # Recalculate tier and shares with LIVE price
+                                                                    _a4d_live_odds = round(_a4d_live_price * 100)
+                                                                    _a4d_tier, _a4d_max_stake = _a4_dynamic_tier(_a4d_live_odds, _poly_alpha4_state["balance"])
+                                                                    if _a4d_tier:
+                                                                        _a4d_shares, _a4d_cost = _a4_calc_shares(_a4d_max_stake, _a4d_live_price)
+                                                                        _a4d_price = _a4d_live_price
+                                                                        _a4d_odds = _a4d_live_odds
+                                                                        
+                                                                        if _a4d_shares > 0 and _a4d_cost <= _poly_alpha4_state["balance"] - 2:
+                                                                            _a4d_order_args = OrderArgs(
+                                                                                token_id=str(_a4d_token),
+                                                                                price=_a4d_live_price,
+                                                                                size=float(_a4d_shares),
+                                                                                side=_A4Side.BUY,
+                                                                            )
+                                                                            _a4d_signed = _a4d_client.create_order(_a4d_order_args)
+                                                                            _a4d_resp = _a4d_client.post_order(_a4d_signed, OrderType.FOK)
+                                                                            if _a4d_resp:
+                                                                                _a4d_oid = _a4d_resp.get("orderID") or _a4d_resp.get("id") or "placed"
+                                                                                _a4d_filled = bool(_a4d_resp.get("status") == "matched")
+                                                                                print("A4 DYN BOOK: {} {} live={}c (was {}c)".format(
+                                                                                    asset, _a4d_scan_dir, int(_a4d_live_price*100), int(effective_odds)))
+                                                                else:
+                                                                    if _a4d_live_price:
+                                                                        print("A4 DYN SKIP: {} {} live={}c outside 35-72% range".format(
+                                                                            asset, _a4d_scan_dir, int(_a4d_live_price*100)))
+                                                                    else:
+                                                                        print("A4 DYN SKIP: {} {} no orderbook asks".format(asset, _a4d_scan_dir))
                                                             
                                                             if _a4d_oid:
                                                                 _a4_dynamic_traded.add(_a4d_dedup_key)
