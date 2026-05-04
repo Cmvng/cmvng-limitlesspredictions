@@ -20994,6 +20994,112 @@ print("Limitless Bot v4 — {} threads running (Polymarket + Chainlink RTDS{})".
     7 if SIGNALS_DB_URL else 6,
     " + signals DB" if SIGNALS_DB_URL else ""))
 
+
+
+# ═══════════════════════════════════════════════════════════
+# CSV EXPORT ROUTES — Data analysis
+# ═══════════════════════════════════════════════════════════
+
+@app.route("/export/bot2")
+def export_bot2_csv():
+    try:
+        conn = get_db()
+        rows = conn.run("SELECT * FROM paper_trades ORDER BY id")
+        cols = [c['name'] for c in conn.columns]
+        conn.close()
+        import csv, io
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow(cols)
+        for r in rows:
+            writer.writerow(r)
+        return output.getvalue(), 200, {
+            'Content-Type': 'text/csv',
+            'Content-Disposition': 'attachment; filename=bot2_trades.csv'
+        }
+    except Exception as e:
+        return "Error: {}".format(e), 500
+
+@app.route("/export/paper21")
+def export_paper21_csv():
+    try:
+        conn = get_db()
+        rows = conn.run("SELECT * FROM paper21_trades ORDER BY id")
+        cols = [c['name'] for c in conn.columns]
+        conn.close()
+        import csv, io
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow(cols)
+        for r in rows:
+            writer.writerow(r)
+        return output.getvalue(), 200, {
+            'Content-Type': 'text/csv',
+            'Content-Disposition': 'attachment; filename=paper21_trades.csv'
+        }
+    except Exception as e:
+        return "Error: {}".format(e), 500
+
+@app.route("/export/sv2")
+def export_sv2_csv():
+    try:
+        conn = get_db()
+        rows = conn.run("SELECT * FROM sniper_v2_paper_trades ORDER BY id")
+        cols = [c['name'] for c in conn.columns]
+        conn.close()
+        import csv, io
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow(cols)
+        for r in rows:
+            writer.writerow(r)
+        return output.getvalue(), 200, {
+            'Content-Type': 'text/csv',
+            'Content-Disposition': 'attachment; filename=sv2_trades.csv'
+        }
+    except Exception as e:
+        return "Error: {}".format(e), 500
+
+@app.route("/export/a4")
+def export_a4_csv():
+    try:
+        conn = get_db()
+        rows = conn.run("SELECT * FROM poly_alpha4_trades ORDER BY id")
+        cols = [c['name'] for c in conn.columns]
+        conn.close()
+        import csv, io
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow(cols)
+        for r in rows:
+            writer.writerow(r)
+        return output.getvalue(), 200, {
+            'Content-Type': 'text/csv',
+            'Content-Disposition': 'attachment; filename=a4_trades.csv'
+        }
+    except Exception as e:
+        return "Error: {}".format(e), 500
+
+@app.route("/export/sv3")
+def export_sv3_csv():
+    try:
+        conn = get_db()
+        rows = conn.run("SELECT * FROM sniper_v3_paper_trades ORDER BY id")
+        cols = [c['name'] for c in conn.columns]
+        conn.close()
+        import csv, io
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow(cols)
+        for r in rows:
+            writer.writerow(r)
+        return output.getvalue(), 200, {
+            'Content-Type': 'text/csv',
+            'Content-Disposition': 'attachment; filename=sv3_trades.csv'
+        }
+    except Exception as e:
+        return "Error: {}".format(e), 500
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
