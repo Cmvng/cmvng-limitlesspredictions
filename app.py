@@ -1076,15 +1076,63 @@ def _sniper_thread():
                         "indicators": ind_str,
                     })
 
+            # ── Per-asset filter (data-proven 56% WR model) ──
+            _a4_pre_filter = len(snipe_targets)
+            _a4_filtered = []
+            for _tgt in snipe_targets:
+                _tgt_asset = _tgt["asset"]
+                _tgt_ind = _tgt["indicators"]
+                _tgt_agree = _tgt["signals_agree"]
+                _tgt_tv = "TV=BUY" in _tgt_ind or "TV=SELL" in _tgt_ind
+                _tgt_tv_dir = "BUY" if "TV=BUY" in _tgt_ind else "SELL" if "TV=SELL" in _tgt_ind else None
+                _tgt_sma_dir = "BUY" if "SMA=BUY" in _tgt_ind else "SELL" if "SMA=SELL" in _tgt_ind else None
+                _tgt_tv_sma_disagree = _tgt_tv_dir and _tgt_sma_dir and _tgt_tv_dir != _tgt_sma_dir
+                _tgt_is_weak = "WEAK" in _tgt_ind
+                _tgt_is_flip = "FLIP" in _tgt_ind
+                
+                _tgt_pass = False
+                if _tgt_asset == "BTC":
+                    # BTC: only 2/3 agree (not 3/3), strong period
+                    _tgt_pass = _tgt_agree == 2 and not _tgt_is_weak
+                elif _tgt_asset == "ETH":
+                    # ETH: TV+SMA must disagree, strong period
+                    _tgt_pass = _tgt_tv_sma_disagree and not _tgt_is_weak
+                elif _tgt_asset == "SOL":
+                    # SOL: 2/3 agree, no FLIP
+                    _tgt_pass = _tgt_agree == 2 and not _tgt_is_flip
+                elif _tgt_asset == "XRP":
+                    # XRP: WEAK period only, no FLIP
+                    _tgt_pass = _tgt_is_weak and not _tgt_is_flip
+                
+                if _tgt_pass:
+                    _a4_filtered.append(_tgt)
+                else:
+                    _sniper_reject.append("{}=SKIP({})".format(_tgt_asset, 
+                        "3/3" if _tgt_agree==3 and _tgt_asset=="BTC" else
+                        "weak" if _tgt_is_weak and _tgt_asset in ("BTC","ETH") else
+                        "flip" if _tgt_is_flip else
+                        "tv_sma_agree" if not _tgt_tv_sma_disagree and _tgt_asset=="ETH" else
+                        "strong" if not _tgt_is_weak and _tgt_asset=="XRP" else "filter"))
+            
+            snipe_targets = _a4_filtered
+            
             if not snipe_targets:
-                print("SNIPER: 0 targets at boundary | cache: {}".format(
-                    {a: bool(_indicator_cache.get("{}_15m".format(a))) for a in SNIPER_ASSETS}))
+                if _a4_pre_filter > 0:
+                    print("SNIPER: 0 targets after filter ({} pre-filter) | skipped: {}".format(
+                        _a4_pre_filter, ", ".join(_sniper_reject)))
+                else:
+                    print("SNIPER: 0 targets at boundary | cache: {}".format(
+                        {a: bool(_indicator_cache.get("{}_15m".format(a))) for a in SNIPER_ASSETS}))
 
                 _time.sleep(60)
                 continue
 
             else:
-                print("SNIPER: {} targets qualified: {}".format(len(snipe_targets), ", ".join(_sniper_debug)))
+                _filt_msg = " (filtered {}/{})".format(len(snipe_targets), _a4_pre_filter) if _a4_pre_filter != len(snipe_targets) else ""
+                print("SNIPER: {} targets qualified{}: {}{}".format(
+                    len(snipe_targets), _filt_msg,
+                    ", ".join("{}={}".format(t["asset"], t["direction"]) for t in snipe_targets),
+                    " | skipped: {}".format(", ".join(_sniper_reject)) if _sniper_reject else ""))
 
             # ── T-20s: Calculate next window's slug and timestamp ──
             # The NEXT window starts at the upcoming boundary
@@ -1097,46 +1145,9 @@ def _sniper_thread():
 
             window_ts = int(next_boundary.timestamp())
 
-            # ── A4 Dynamic Pricing: Lock directions at T+0 ──
-            # Instead of placing orders at fixed 50¢, lock the direction
-            # for each qualified asset. The scan loop will place orders
-            # at market odds when it confirms the signal 2-10 mins later.
-            _a4_lock_count = 0
-            for _lock_tgt in snipe_targets:
-                _lock_asset = _lock_tgt["asset"]
-                _lock_dir = _lock_tgt["direction"]
-                _lock_ind = _lock_tgt.get("indicators", "")
-                _lock_agree = _lock_tgt.get("signals_agree", 2)
-                
-                if window_ts not in _a4_direction_lock:
-                    _a4_direction_lock[window_ts] = {}
-                
-                _a4_direction_lock[window_ts][_lock_asset] = {
-                    "direction": _lock_dir,
-                    "indicators": _lock_ind,
-                    "signals_agree": _lock_agree,
-                    "locked_at": datetime.now(timezone.utc).isoformat(),
-                }
-                _a4_lock_count += 1
-            
-            # Clean old locks (keep only last 2 boundaries = 30 mins)
-            _old_boundaries = [k for k in _a4_direction_lock if k < window_ts - 1800]
-            for _ob in _old_boundaries:
-                _a4_direction_lock.pop(_ob, None)
-            
-            if _a4_lock_count > 0:
-                _lock_dirs = {t["asset"]: t["direction"] for t in snipe_targets}
-                print("A4 LOCK: {} directions at boundary {} | {}".format(
-                    _a4_lock_count, window_ts, 
-                    " ".join("{}={}".format(a,d) for a,d in _lock_dirs.items())))
-            else:
-                print("A4 LOCK: 0 directions at boundary {}".format(window_ts))
+            # ── A4 Dynamic Pricing DISABLED — using T+0 at 50¢ model ──
+            # Direction lock removed — A4 fires directly at T+0
 
-
-
-            
-            # ── T-15s: Fetch token IDs from Gamma API ──
-            import requests as _req
             token_map = {}  # {asset: {"up_token": ..., "down_token": ..., "condition_id": ...}}
 
             # SV3 pre-fetch token map for ALL assets (not just snipe_targets)
@@ -1264,6 +1275,106 @@ def _sniper_thread():
             BUY = Side.BUY
 
             # SV2 already scored at T-35s (before cache clear)
+
+            # ── T+0: FIRE A4 ORDERS at 50¢ ──
+            fired_results = []
+            for target in snipe_targets:
+                _fa4_asset = target["asset"]
+                _fa4_dir = target["direction"]
+                _fa4_ind = target["indicators"]
+                _fa4_agree = target["signals_agree"]
+                
+                # Get token info from token_map
+                _fa4_entry = token_map.get(_fa4_asset)
+                if not _fa4_entry:
+                    continue
+                
+                _fa4_token = _fa4_entry.get("up_token") if _fa4_dir == "UP" else _fa4_entry.get("down_token")
+                if not _fa4_token:
+                    continue
+                
+                # Fixed 50¢ entry, flat $1 stake
+                _fa4_price = 0.50
+                _fa4_shares = 2.0  # $1 stake at 50¢ = 2 shares
+                _fa4_cost = 1.00
+                
+                # Check pool balance
+                if _poly_alpha4_state["balance"] < _fa4_cost + 2:
+                    continue
+                
+                try:
+                    _fa4_args = OrderArgs(
+                        token_id=str(_fa4_token),
+                        price=_fa4_price,
+                        size=_fa4_shares,
+                        side=BUY,
+                    )
+                    _fa4_signed = client.create_order(_fa4_args)
+                    _fa4_resp = client.post_order(_fa4_signed, OrderType.GTC)
+                    _fa4_oid = None
+                    if _fa4_resp:
+                        _fa4_oid = _fa4_resp.get("orderID") or _fa4_resp.get("id") or "placed"
+                    
+                    fired_results.append({
+                        "asset": _fa4_asset, "direction": _fa4_dir,
+                        "indicators": _fa4_ind, "agree": _fa4_agree,
+                        "order_id": _fa4_oid, "cost": _fa4_cost,
+                        "price": _fa4_price, "shares": _fa4_shares,
+                        "token_id": _fa4_token,
+                        "slug": _fa4_entry.get("slug", ""),
+                        "condition_id": _fa4_entry.get("condition_id", ""),
+                    })
+                except Exception as _fa4_e:
+                    print("A4 order error {}: {}".format(_fa4_asset, _fa4_e))
+            
+            # Phase 2: Log results, update DB, send Telegram
+            for _fr in fired_results:
+                try:
+                    _poly_alpha4_state["balance"] = round(_poly_alpha4_state["balance"] - _fr["cost"], 2)
+                    print("A4: {} {} @50c ${:.2f} [{}] | pool=${:.2f}".format(
+                        _fr["direction"], _fr["asset"], _fr["cost"],
+                        _fr["indicators"][:40], _poly_alpha4_state["balance"]))
+                    
+                    # DB insert
+                    try:
+                        _fa4_db = _get_db()
+                        _fa4_db.run("""INSERT INTO poly_alpha4_trades
+                            (market_id,title,asset,timeframe,bet_side,stake,fill_price,
+                             pool_after,order_id,token_id,condition_id,slug,filled,
+                             status,outcome,indicators,signals_agree,fired_at)
+                            VALUES (:mid,:ttl,:ast,:tf,:bs,:stk,:fp,
+                             :pa,:oid,:tid,:cid,:slg,:fld,
+                             :sts,:out,:ind,:sa,:fa)""",
+                            mid="sniper_{}_15M_{}".format(_fr["asset"], window_ts),
+                            ttl="A4 {} {} 15M".format(_fr["asset"], _fr["direction"]),
+                            ast=_fr["asset"], tf="15M", bs=_fr["direction"],
+                            stk=_fr["cost"], fp=_fr["price"],
+                            pa=_poly_alpha4_state["balance"],
+                            oid=str(_fr["order_id"]) if _fr["order_id"] else "",
+                            tid=_fr["token_id"],
+                            cid=_fr["condition_id"], slg=_fr["slug"],
+                            fld=bool(_fr["order_id"]),
+                            sts="Pending", out="PENDING",
+                            ind=_fr["indicators"],
+                            sa=_fr["agree"],
+                            fa=datetime.now(timezone.utc).isoformat())
+                    except Exception as _fa4_dbe:
+                        print("A4 DB error: {}".format(_fa4_dbe))
+                    
+                    # Telegram
+                    try:
+                        send_telegram("SNIPER A4: {} {} @50c ${:.2f} [{}] | pool=${:.2f}".format(
+                            _fr["direction"], _fr["asset"], _fr["cost"],
+                            _fr["indicators"][:40], _poly_alpha4_state["balance"]))
+                    except: pass
+                    
+                except Exception as _fr_e:
+                    print("A4 post-fire error: {}".format(_fr_e))
+            
+            if fired_results:
+                _save_bot_balance("poly_alpha4", _poly_alpha4_state["balance"])
+                print("A4: fired {} orders at T+0 | pool=${:.2f}".format(
+                    len(fired_results), _poly_alpha4_state["balance"]))
 
                         # ── SV3: Record paper trades at T+0 (same boundary entry as sniper) ──
             try:
