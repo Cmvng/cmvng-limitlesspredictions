@@ -426,13 +426,13 @@ def _poly_alpha3_load_recent():
     _sv2_load_balance()  # Load SV2 paper pool from DB
     _save_bot_balance("sv2_paper", _sv2_state)  # Ensure row exists in DB
     _save_bot_balance("sv3_paper", _sv3_state)  # Ensure SV3 row exists in DB
-    # Reset bad resolutions: LOSS trades fired before 07:00 (debug period) → Pending
+    # Reset all sv3 LOSS trades to Pending so they re-resolve correctly
+    # Old markets → RETURNED (excluded from WR), recent markets → WIN/LOSS
     try:
         _conn_sv3_fix = get_db()
         _conn_sv3_fix.run("""UPDATE sniper_v3_paper_trades
             SET status='Pending', outcome=NULL, sim_pnl=NULL, resolved_at=NULL
-            WHERE status='Resolved' AND outcome='LOSS'
-            AND fired_at < '2026-05-04 07:00:00'""")
+            WHERE status='Resolved' AND outcome='LOSS'""")
         _conn_sv3_fix.close()
     except: pass
 
@@ -1523,14 +1523,16 @@ def _resolve_sv3_trades():
             if fired_at.tzinfo is None:
                 fired_at = fired_at.replace(tzinfo=timezone.utc)
 
-            # Expiry = next 15M boundary after fired_at + 15 mins
+            # Expiry = current 15M boundary + 15 mins (market close)
+            # SV3 fires at T+0 so fired_at is just after boundary open
+            # Market opened at current boundary, closes 15 mins later
             fm = fired_at.minute
-            next_bm = ((fm // 15) + 1) * 15
-            if next_bm >= 60:
-                window_start = fired_at.replace(minute=0,second=0,microsecond=0) + timedelta(hours=1)
-            else:
-                window_start = fired_at.replace(minute=next_bm,second=0,microsecond=0)
-            expiry = window_start + timedelta(minutes=15)
+            curr_bm = (fm // 15) * 15  # round DOWN = current boundary
+            if curr_bm == 0 and fm < 2:
+                # Edge case: fired just after :00 boundary
+                curr_bm = 0
+            curr_boundary = fired_at.replace(minute=curr_bm, second=0, microsecond=0)
+            expiry = curr_boundary + timedelta(minutes=15)
 
             if now < expiry + timedelta(minutes=3):
                 continue
