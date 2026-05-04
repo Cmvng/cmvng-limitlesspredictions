@@ -1543,8 +1543,8 @@ def _resolve_sv3_trades():
             won = None
             condition_id = p.get("condition_id", "")
             for url in filter(None, [
-                "{}/markets/slug/{}".format(GAMMA_API, slug) if slug else None,
-                "{}/markets/{}".format(GAMMA_API, condition_id) if condition_id else None,
+                "{}/markets/slug/{}".format(POLY_GAMMA_API, slug) if slug else None,
+                "{}/markets/{}".format(POLY_GAMMA_API, condition_id) if condition_id else None,
             ]):
                 try:
                     r = _rq.get(url, timeout=5)
