@@ -694,7 +694,7 @@ def _sv3_score_and_record(asset, token_map_entry, boundary_ts, now_str):
         return False
 
     # ── Step 3: Get current price (Chainlink RTDS estimate of price to beat) ──
-    rtds_price = _rtds_prices.get(asset.upper())
+    rtds_price = _chainlink_prices.get(asset.upper())
     if not rtds_price:
         print("SV3 SKIP {}: no RTDS price".format(asset))
         return False
