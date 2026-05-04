@@ -18474,6 +18474,13 @@ def run_poly_scan():
                                                                     _a4d_cost, _a4d_shares, _a4d_tier,
                                                                     _a4d_confirm_src,
                                                                     _poly_alpha4_state["balance"]))
+                                                                try:
+                                                                    send_telegram("SNIPER A4 DYN: {} {} @{}c ${:.2f} ({} shares) {} [{}] | pool=${:.2f}".format(
+                                                                        _a4d_scan_dir, asset, int(_a4d_odds),
+                                                                        _a4d_cost, _a4d_shares, _a4d_tier,
+                                                                        _a4d_confirm_src,
+                                                                        _poly_alpha4_state["balance"]))
+                                                                except: pass
                                                         except Exception as _a4d_oe:
                                                             print("A4 DYN order error {}: {}".format(asset, _a4d_oe))
                                     
