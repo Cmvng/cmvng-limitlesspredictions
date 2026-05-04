@@ -690,6 +690,7 @@ def _sv3_score_and_record(asset, token_map_entry, boundary_ts, now_str):
     candle_tag = candle.get("tag", "")
 
     if not prev_high or not prev_low or prev_high <= prev_low:
+        print("SV3 SKIP {}: bad candle range h={} l={}".format(asset, prev_high, prev_low))
         return False
 
     # ── Step 3: Get current price (Chainlink RTDS estimate of price to beat) ──
@@ -787,6 +788,10 @@ def _sv3_score_and_record(asset, token_map_entry, boundary_ts, now_str):
                 tier = "T2.4"   # Signal DOWN + green candle in middle = mean reversion
 
     if not tier:
+        print("SV3 SKIP {}: no tier (dir={} near_low={} near_high={} in_mid={} green={} red={} prev_h={} prev_l={})".format(
+            asset, direction, near_low, near_high, in_middle, is_green, is_red,
+            round(prev_closed_high,2) if isinstance(prev_closed_high,float) else prev_closed_high,
+            round(prev_closed_low,2) if isinstance(prev_closed_low,float) else prev_closed_low))
         return False
 
     # ── Step 8: Stake calculation ──
@@ -801,11 +806,13 @@ def _sv3_score_and_record(asset, token_map_entry, boundary_ts, now_str):
         stake = round(max(2.50, min(bal * 0.025, 2.50)), 2)  # Breakout middle — base stake
 
     if stake > bal - 5:
+        print("SV3 SKIP {}: insufficient balance bal={} stake={}".format(asset, bal, stake))
         return False
 
     # ── Step 9: Dedup ──
     market_key = "sv3_{}_15M_{}".format(asset, boundary_ts)
     if market_key in _sv3_fired_markets:
+        print("SV3 SKIP {}: already fired {}".format(asset, market_key))
         return False
     _sv3_fired_markets.add(market_key)
 
@@ -910,54 +917,6 @@ def _sniper_thread():
             if secs_to_boundary > 27:
                 _time.sleep(min(secs_to_boundary - 27, 60))
                 continue
-
-            # ── T-22s: SV2 scores FIRST with current (pre-clear) cache ──
-            # SV2 reads at T-30s stale cache, sniper reads T-28s fresh cache
-            # Genuine independent comparison experiment
-            if True:  # SV2 pre-clear scoring block
-                # SV2 still runs even when live sniper has no targets
-                # Build minimal token_map for SV2 use
-                try:
-                    import requests as _sv2_req0
-                    import json as _sv2_json0
-                    _sv2_now0 = datetime.now(timezone.utc).isoformat()
-                    _sv2_map0 = {}
-                    for _sv2_a0 in SNIPER_ASSETS:
-                        if _sv2_state["balance"] <= 5.0: break
-                        try:
-                            _sv2_s0 = SNIPER_SLUGS[_sv2_a0].format(window_ts)
-                            _sv2_r0 = _sv2_req0.get(
-                                "{}/markets/slug/{}".format(GAMMA_API, _sv2_s0), timeout=5)
-                            if _sv2_r0.status_code == 200:
-                                _sv2_md0 = _sv2_r0.json()
-                                _sv2_t0 = _sv2_md0.get("clobTokenIds")
-                                if isinstance(_sv2_t0, str):
-                                    try: _sv2_t0 = _sv2_json0.loads(_sv2_t0)
-                                    except: _sv2_t0 = None
-                                _sv2_oc0 = _sv2_md0.get("outcomes")
-                                if isinstance(_sv2_oc0, str):
-                                    try: _sv2_oc0 = _sv2_json0.loads(_sv2_oc0)
-                                    except: _sv2_oc0 = None
-                                if isinstance(_sv2_t0, list) and len(_sv2_t0) >= 2:
-                                    _up0 = 0
-                                    if isinstance(_sv2_oc0, list) and len(_sv2_oc0) >= 2:
-                                        if str(_sv2_oc0[0]).lower().strip() in ("no","down","below"):
-                                            _up0 = 1
-                                    _sv2_map0[_sv2_a0] = {
-                                        "up_token": _sv2_t0[_up0], "down_token": _sv2_t0[1-_up0],
-                                        "condition_id": _sv2_md0.get("conditionId",""),
-                                        "slug": _sv2_s0, "title": _sv2_md0.get("question",""),
-                                    }
-                        except: pass
-                    _sv2_cnt0 = 0
-                    for _sv2_a0, _sv2_e0 in _sv2_map0.items():
-                        if _sv2_score_and_record(_sv2_a0, _sv2_e0, window_ts, _sv2_now0):
-                            _sv2_cnt0 += 1
-                    if _sv2_cnt0:
-                        print("SV2: {} paper trades (no live targets) | pool=${:.2f}".format(
-                            _sv2_cnt0, _sv2_state["balance"]))
-                except Exception as _sv2e0:
-                    print("SV2 no-target error: {}".format(_sv2e0))
 
             # ── T-30s: Force fresh indicators for all assets ──
             # MUST clear cache first — _calculate_indicators returns cached
@@ -1163,10 +1122,12 @@ def _sniper_thread():
             try:
                 _sv3_now_str = datetime.now(timezone.utc).isoformat()
                 _sv3_cnt = 0
+                print("SV3 START: window_ts={} assets={}".format(window_ts, SNIPER_ASSETS))
                 for _sv3_asset in SNIPER_ASSETS:
                     try:
                         import requests as _sv3_req, json as _sv3_json
                         _sv3_slug = SNIPER_SLUGS[_sv3_asset].format(window_ts)
+                        print("SV3 FETCH {}: {}".format(_sv3_asset, _sv3_slug))
                         _sv3_r = _sv3_req.get(
                             "{}/markets/slug/{}".format(GAMMA_API, _sv3_slug),
                             timeout=5)
