@@ -18347,6 +18347,10 @@ def run_poly_scan():
                                 _a4d_scan_dir = poly_side  # "UP" or "DOWN"
                                 _a4d_dedup_key = "{}_{}_dyn".format(asset, _a4d_boundary_ts)
                                 
+                                if True:
+                                    print("A4 DYN EVAL: {} {} dir={} boundary={} lock={} dedup={}".format(
+                                        asset, strat, _a4d_scan_dir, _a4d_boundary_ts,
+                                        bool(_a4d_locks.get(asset)), _a4d_dedup_key in _a4_dynamic_traded))
                                 if _a4d_dedup_key not in _a4_dynamic_traded:
                                     # Check A4 direction lock
                                     _a4d_locks = _a4_direction_lock.get(_a4d_boundary_ts, {})
@@ -18466,7 +18470,7 @@ def run_poly_scan():
                                         run_poly_scan._a4d_confirms.pop(_oc, None)
                                         
                         except Exception as _a4d_e:
-                            pass  # Silent fail — don't break scan loop
+                            print("A4 DYN debug error: {} {} {}".format(asset, strat, _a4d_e))
                     existing_keys.add(key)
                     poly_counts[section] = poly_counts.get(section, 0) + 1
 
