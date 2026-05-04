@@ -1076,50 +1076,40 @@ def _sniper_thread():
                         "indicators": ind_str,
                     })
 
-            # ── Per-asset filter (data-proven 56% WR model) ──
-            _a4_pre_filter = len(snipe_targets)
-            _a4_filtered = []
+            # ── Disagreement filter (54.8% WR model) ──
+            # At T+0 at 50¢, consensus trades LOSE (market priced in)
+            # Edge = TV≠SMA, BTC breaks tie. Skip FLIP always.
+            _a4_pre = len(snipe_targets)
+            _a4_kept = []
             for _tgt in snipe_targets:
-                _tgt_asset = _tgt["asset"]
-                _tgt_ind = _tgt["indicators"]
-                _tgt_agree = _tgt["signals_agree"]
-                _tgt_tv = "TV=BUY" in _tgt_ind or "TV=SELL" in _tgt_ind
-                _tgt_tv_dir = "BUY" if "TV=BUY" in _tgt_ind else "SELL" if "TV=SELL" in _tgt_ind else None
-                _tgt_sma_dir = "BUY" if "SMA=BUY" in _tgt_ind else "SELL" if "SMA=SELL" in _tgt_ind else None
-                _tgt_tv_sma_disagree = _tgt_tv_dir and _tgt_sma_dir and _tgt_tv_dir != _tgt_sma_dir
-                _tgt_is_weak = "WEAK" in _tgt_ind
-                _tgt_is_flip = "FLIP" in _tgt_ind
+                _ta = _tgt["asset"]
+                _ti = _tgt["indicators"]
+                _tv_d = "BUY" if "TV=BUY" in _ti else "SELL" if "TV=SELL" in _ti else None
+                _sm_d = "BUY" if "SMA=BUY" in _ti else "SELL" if "SMA=SELL" in _ti else None
+                _is_flip = "FLIP" in _ti
+                _is_weak = "WEAK" in _ti
+                _tv_sma_dis = _tv_d and _sm_d and _tv_d != _sm_d
                 
-                _tgt_pass = False
-                if _tgt_asset == "BTC":
-                    # BTC: only 2/3 agree (not 3/3), strong period
-                    _tgt_pass = _tgt_agree == 2 and not _tgt_is_weak
-                elif _tgt_asset == "ETH":
-                    # ETH: TV+SMA must disagree, strong period
-                    _tgt_pass = _tgt_tv_sma_disagree and not _tgt_is_weak
-                elif _tgt_asset == "SOL":
-                    # SOL: 2/3 agree, no FLIP
-                    _tgt_pass = _tgt_agree == 2 and not _tgt_is_flip
-                elif _tgt_asset == "XRP":
-                    # XRP: WEAK period only, no FLIP
-                    _tgt_pass = _tgt_is_weak and not _tgt_is_flip
-                
-                if _tgt_pass:
-                    _a4_filtered.append(_tgt)
+                if _is_flip:
+                    _sniper_reject.append("{}=SKIP(flip)".format(_ta))
+                elif _ta == "XRP":
+                    if _is_weak:
+                        _a4_kept.append(_tgt)
+                    else:
+                        _sniper_reject.append("{}=SKIP(strong)".format(_ta))
+                elif _tv_sma_dis:
+                    _a4_kept.append(_tgt)
+                elif not _tv_d and _sm_d:
+                    _a4_kept.append(_tgt)
                 else:
-                    _sniper_reject.append("{}=SKIP({})".format(_tgt_asset, 
-                        "3/3" if _tgt_agree==3 and _tgt_asset=="BTC" else
-                        "weak" if _tgt_is_weak and _tgt_asset in ("BTC","ETH") else
-                        "flip" if _tgt_is_flip else
-                        "tv_sma_agree" if not _tgt_tv_sma_disagree and _tgt_asset=="ETH" else
-                        "strong" if not _tgt_is_weak and _tgt_asset=="XRP" else "filter"))
+                    _sniper_reject.append("{}=SKIP(consensus)".format(_ta))
             
-            snipe_targets = _a4_filtered
+            snipe_targets = _a4_kept
             
             if not snipe_targets:
-                if _a4_pre_filter > 0:
-                    print("SNIPER: 0 targets after filter ({} pre-filter) | skipped: {}".format(
-                        _a4_pre_filter, ", ".join(_sniper_reject)))
+                if _a4_pre > 0:
+                    print("SNIPER: 0 after filter ({} pre) | skipped: {}".format(
+                        _a4_pre, ", ".join(_sniper_reject)))
                 else:
                     print("SNIPER: 0 targets at boundary | cache: {}".format(
                         {a: bool(_indicator_cache.get("{}_15m".format(a))) for a in SNIPER_ASSETS}))
@@ -1128,9 +1118,9 @@ def _sniper_thread():
                 continue
 
             else:
-                _filt_msg = " (filtered {}/{})".format(len(snipe_targets), _a4_pre_filter) if _a4_pre_filter != len(snipe_targets) else ""
-                print("SNIPER: {} targets qualified{}: {}{}".format(
-                    len(snipe_targets), _filt_msg,
+                _fm = " (kept {}/{})".format(len(snipe_targets), _a4_pre) if _a4_pre != len(snipe_targets) else ""
+                print("SNIPER: {} targets{}: {}{}".format(
+                    len(snipe_targets), _fm,
                     ", ".join("{}={}".format(t["asset"], t["direction"]) for t in snipe_targets),
                     " | skipped: {}".format(", ".join(_sniper_reject)) if _sniper_reject else ""))
 
@@ -20638,224 +20628,126 @@ h2{{font-size:16px;font-weight:700;color:#1a3d2e;margin-bottom:12px}}
 
 @app.route("/app/poly-alpha4")
 def poly_alpha4_page():
-    """Polymarket Alpha 4.0 — The Sniper."""
+    """Sniper A4 dashboard — per-asset filter model, T+0 at 50¢."""
     try:
-        conn = get_db()
-        rows = conn.run("SELECT * FROM poly_alpha4_trades ORDER BY id DESC LIMIT 200")
-        cols = [c['name'] for c in conn.columns]
-        trades = [dict(zip(cols, r)) for r in rows]
-        conn.close()
-    except:
+        db = _get_db()
+        trades = db.run("SELECT * FROM poly_alpha4_trades ORDER BY fired_at DESC LIMIT 200")
+        cols = [d[0] for d in db._conn.description] if trades else []
+        trades = [dict(zip(cols, row)) for row in trades] if trades else []
+    except Exception as e:
+        print("A4 dashboard DB error: {}".format(e))
         trades = []
-
-    total = len(trades)
-    wins = sum(1 for t in trades if t.get("outcome") == "WIN")
-    losses = sum(1 for t in trades if t.get("outcome") == "LOSS")
-    returned = sum(1 for t in trades if t.get("outcome") == "RETURNED")
-    pending = sum(1 for t in trades if t.get("status") == "Pending")
-    resolved = wins + losses
-    wr = round(wins / resolved * 100, 1) if resolved > 0 else 0
-    total_pnl = 0
-    for t in trades:
-        if t.get("outcome") == "WIN":
-            total_pnl += float(t.get("payout") or 0) - float(t.get("stake") or 0)
-        elif t.get("outcome") == "LOSS":
-            total_pnl -= float(t.get("stake") or 0)
-    total_pnl = round(total_pnl, 2)
-    pnlc = "color:#1a7046" if total_pnl >= 0 else "color:#b4322e"
-
-    asset_stats = {}
-    for t in trades:
-        a = t.get("asset", "?")
-        if a not in asset_stats: asset_stats[a] = {"w": 0, "l": 0, "pnl": 0}
-        if t.get("outcome") == "WIN":
-            asset_stats[a]["w"] += 1
-            asset_stats[a]["pnl"] += float(t.get("payout") or 0) - float(t.get("stake") or 0)
-        elif t.get("outcome") == "LOSS":
-            asset_stats[a]["l"] += 1
-            asset_stats[a]["pnl"] -= float(t.get("stake") or 0)
-
-    score_stats = {}
-    for t in trades:
-        sa = t.get("signals_agree") or 0
-        key = "{}/3".format(sa)
-        if key not in score_stats: score_stats[key] = {"w": 0, "l": 0, "pnl": 0}
-        if t.get("outcome") == "WIN":
-            score_stats[key]["w"] += 1
-            score_stats[key]["pnl"] += float(t.get("payout") or 0) - float(t.get("stake") or 0)
-        elif t.get("outcome") == "LOSS":
-            score_stats[key]["l"] += 1
-            score_stats[key]["pnl"] -= float(t.get("stake") or 0)
-
-    asset_html = ""
-    for a in sorted(asset_stats.keys()):
-        d = asset_stats[a]
-        awr = round(d["w"] / (d["w"] + d["l"]) * 100, 1) if (d["w"] + d["l"]) > 0 else 0
-        asset_html += "<tr><td>{}</td><td>{}W/{}L</td><td>{}%</td><td>${:.2f}</td></tr>".format(a, d["w"], d["l"], awr, d["pnl"])
-
-    score_html = ""
-    for sc in sorted(score_stats.keys()):
-        d = score_stats[sc]
-        swr = round(d["w"] / (d["w"] + d["l"]) * 100, 1) if (d["w"] + d["l"]) > 0 else 0
-        score_html += "<tr><td>{}</td><td>{}W/{}L</td><td>{}%</td><td>${:.2f}</td></tr>".format(sc, d["w"], d["l"], swr, d["pnl"])
-
-    trade_rows = ""
-    for t in trades[:100]:
-        outcome = t.get("outcome", "")
-        icon = "\u2705" if outcome == "WIN" else "\u274c" if outcome == "LOSS" else "\u23ed" if outcome == "RETURNED" else "\u23f3"
-        pnl_str = ""
-        if outcome == "WIN":
-            pnl_str = "+${:.2f}".format(float(t.get("payout") or 0) - float(t.get("stake") or 0))
-        elif outcome == "LOSS":
-            pnl_str = "-${:.2f}".format(float(t.get("stake") or 0))
-        elif outcome == "RETURNED":
-            pnl_str = "returned"
-        fired = (t.get("fired_at") or "")[:16].replace("T", " ")
-        trade_rows += "<tr><td>{}</td><td>{}</td><td>{}</td><td>${:.2f}</td><td>{}</td><td>{:.0f}&#162;</td><td>{}</td><td>{}</td><td>${:.2f}</td></tr>".format(
-            t.get("id",""), icon, t.get("asset","?"),
-            float(t.get("stake") or 0), t.get("bet_side","?"),
-            float(t.get("fill_price") or 0.50) * 100,
-            fired, pnl_str,
-            float(t.get("pool_after") or 0))
-
-    fill_rate = 0
-    filled_count = sum(1 for t in trades if t.get("filled"))
-    total_orders = sum(1 for t in trades if t.get("outcome") != "RETURNED")
-    if total_orders > 0:
-        fill_rate = round(filled_count / len(trades) * 100, 1)
-
-    # ── Dynamic Pricing Stats ──
-    tier_stats = {}
-    confirm_stats = {}
-    odds_buckets = {"35-45": [0,0,0.0], "45-58": [0,0,0.0], "58-72": [0,0,0.0], "other": [0,0,0.0]}
     
-    for t in trades:
-        ind = str(t.get("indicators", ""))
-        fp = float(t.get("fill_price") or 0.50)
-        odds_pct = round(fp * 100)
-        
-        # Extract tier from indicators (e.g. "T1_GOLD", "T2_SILVER", "T3_BRONZE")
-        _tier = "LEGACY"
-        for _tn in ["T1_GOLD", "T2_SILVER", "T3_BRONZE"]:
-            if _tn in ind:
-                _tier = _tn
-                break
-        if _tier not in tier_stats:
-            tier_stats[_tier] = {"w": 0, "l": 0, "pnl": 0.0, "trades": 0}
-        tier_stats[_tier]["trades"] += 1
-        if t.get("outcome") == "WIN":
-            tier_stats[_tier]["w"] += 1
-            tier_stats[_tier]["pnl"] += float(t.get("payout") or 0) - float(t.get("stake") or 0)
-        elif t.get("outcome") == "LOSS":
-            tier_stats[_tier]["l"] += 1
-            tier_stats[_tier]["pnl"] -= float(t.get("stake") or 0)
-        
-        # Extract confirmation path
-        _conf = "LEGACY"
-        for _cn in ["A4+BOT2", "A4+P21", "BOT2+P21"]:
-            if _cn in ind:
-                _conf = _cn
-                break
-        if _conf not in confirm_stats:
-            confirm_stats[_conf] = {"w": 0, "l": 0, "pnl": 0.0}
-        if t.get("outcome") == "WIN":
-            confirm_stats[_conf]["w"] += 1
-            confirm_stats[_conf]["pnl"] += float(t.get("payout") or 0) - float(t.get("stake") or 0)
-        elif t.get("outcome") == "LOSS":
-            confirm_stats[_conf]["l"] += 1
-            confirm_stats[_conf]["pnl"] -= float(t.get("stake") or 0)
-        
-        # Odds distribution
-        if t.get("outcome") in ("WIN", "LOSS"):
-            if 35 <= odds_pct < 45:
-                bk = "35-45"
-            elif 45 <= odds_pct < 58:
-                bk = "45-58"
-            elif 58 <= odds_pct <= 72:
-                bk = "58-72"
-            else:
-                bk = "other"
-            if t.get("outcome") == "WIN":
-                odds_buckets[bk][0] += 1
-            else:
-                odds_buckets[bk][1] += 1
-            pnl_val = float(t.get("payout") or 0) - float(t.get("stake") or 0) if t.get("outcome") == "WIN" else -float(t.get("stake") or 0)
-            odds_buckets[bk][2] += pnl_val
-
-    tier_html = ""
-    for tn in ["T1_GOLD", "T2_SILVER", "T3_BRONZE", "LEGACY"]:
-        d = tier_stats.get(tn)
-        if not d or d["trades"] == 0: continue
-        resolved_t = d["w"] + d["l"]
-        twr = round(d["w"] / resolved_t * 100, 1) if resolved_t > 0 else 0
-        tier_html += "<tr><td>{}</td><td>{}W/{}L</td><td>{}%</td><td>${:.2f}</td></tr>".format(
-            tn, d["w"], d["l"], twr, d["pnl"])
-
-    confirm_html = ""
-    for cn in ["A4+BOT2", "A4+P21", "BOT2+P21", "LEGACY"]:
-        d = confirm_stats.get(cn)
-        if not d: continue
-        resolved_c = d["w"] + d["l"]
-        if resolved_c == 0: continue
-        cwr = round(d["w"] / resolved_c * 100, 1)
-        confirm_html += "<tr><td>{}</td><td>{}W/{}L</td><td>{}%</td><td>${:.2f}</td></tr>".format(
-            cn, d["w"], d["l"], cwr, d["pnl"])
-
-    odds_html = ""
-    for bk in ["35-45", "45-58", "58-72", "other"]:
-        w, l, p = odds_buckets[bk]
-        if w + l == 0: continue
-        bwr = round(w / (w+l) * 100, 1)
-        label = {"35-45": "Bronze 35-45%", "45-58": "Silver 45-58%", "58-72": "Gold 58-72%", "other": "Other"}.get(bk, bk)
-        odds_html += "<tr><td>{}</td><td>{}W/{}L</td><td>{}%</td><td>${:.2f}</td></tr>".format(
-            label, w, l, bwr, p)
-
-    return """<!DOCTYPE html><html><head><title>Sniper Alpha 4.0</title>
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<style>body{{font-family:-apple-system,sans-serif;max-width:900px;margin:0 auto;padding:10px;background:#0a0a0a;color:#e0e0e0}}
-h1{{color:#00d4aa}}h2{{color:#888;font-size:14px}}
-.stats{{display:grid;grid-template-columns:repeat(auto-fit,minmax(100px,1fr));gap:8px;margin:10px 0}}
-.stat{{background:#1a1a2e;padding:12px;border-radius:8px;text-align:center}}
-.stat .val{{font-size:24px;font-weight:700;color:#00d4aa}}.stat .lbl{{font-size:11px;color:#888}}
-table{{width:100%;border-collapse:collapse;font-size:13px;margin:10px 0}}
-th,td{{padding:6px 8px;border-bottom:1px solid #222;text-align:left}}
-th{{background:#1a1a2e;color:#888;font-size:11px}}
-.nav{{display:flex;gap:4px;flex-wrap:wrap;margin:10px 0}}
-.nav-tab{{padding:6px 12px;background:#1a1a2e;color:#888;text-decoration:none;border-radius:4px;font-size:12px}}
-.nav-tab.active{{background:#00d4aa;color:#000}}
-a{{color:#00d4aa}}
+    resolved = [t for t in trades if t.get("outcome") in ("WIN", "LOSS")]
+    pending = [t for t in trades if t.get("outcome") == "PENDING" or t.get("status") == "Pending"]
+    wins = sum(1 for t in resolved if t["outcome"] == "WIN")
+    losses = len(resolved) - wins
+    wr = round(wins / len(resolved) * 100, 1) if resolved else 0
+    pnl = round(sum(
+        (float(t.get("payout") or 0) - float(t.get("stake") or 0)) if t["outcome"] == "WIN"
+        else -float(t.get("stake") or 0)
+        for t in resolved
+    ), 2)
+    
+    # Per-asset stats
+    asset_stats = {}
+    for asset in ["BTC", "ETH", "SOL", "XRP"]:
+        at = [t for t in resolved if t.get("asset") == asset]
+        if at:
+            aw = sum(1 for t in at if t["outcome"] == "WIN")
+            asset_stats[asset] = {"trades": len(at), "wins": aw, "wr": round(aw/len(at)*100, 1)}
+    
+    asset_rows = ""
+    filter_rules = {
+        "BTC": "TV+SMA disagree · no FLIP",
+        "ETH": "TV+SMA disagree · no FLIP",
+        "SOL": "TV+SMA disagree · no FLIP",
+        "XRP": "WEAK period · no FLIP",
+    }
+    for asset in ["BTC", "ETH", "SOL", "XRP"]:
+        st = asset_stats.get(asset, {"trades": 0, "wins": 0, "wr": 0})
+        wr_c = "#4ade80" if st["wr"] >= 52 else "#f87171" if st["wr"] < 48 else "#fbbf24"
+        asset_rows += "<tr><td>{}</td><td>{}</td><td style=\"color:{}\">{}%</td><td>{}W/{}L</td></tr>\n".format(
+            asset, filter_rules.get(asset, ""), wr_c, st["wr"], st["wins"], st["trades"] - st["wins"])
+    
+    # Recent trades
+    trade_rows = ""
+    for t in trades[:50]:
+        outcome = t.get("outcome", "PENDING")
+        icon = "✅" if outcome == "WIN" else "❌" if outcome == "LOSS" else "⏳"
+        side = t.get("bet_side", "?")
+        asset = t.get("asset", "?")
+        stake = float(t.get("stake") or 0)
+        fired = (t.get("fired_at") or "")[:16]
+        payout = float(t.get("payout") or 0)
+        tpnl = round(payout - stake, 2) if outcome == "WIN" else round(-stake, 2) if outcome == "LOSS" else "—"
+        tpnl_c = "#4ade80" if outcome == "WIN" else "#f87171" if outcome == "LOSS" else "#888"
+        trade_rows += "<tr><td>{}</td><td>{}</td><td>{}</td><td>${:.2f}</td><td>{}</td><td style=\"color:{}\">{}</td></tr>\n".format(
+            icon, asset, side, stake, fired, tpnl_c, tpnl)
+    
+    bal = _poly_alpha4_state["balance"]
+    pnl_c = "#4ade80" if pnl >= 0 else "#f87171"
+    wr_c = "#4ade80" if wr >= 52 else "#f87171" if wr < 48 else "#fbbf24"
+    
+    nav = _get_nav_html()
+    
+    HTML = """<!DOCTYPE html>
+<html><head><title>Sniper Alpha 4.0</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+body {{ background: #0d1117; color: #e6edf3; font-family: -apple-system, sans-serif; margin: 0; padding: 16px; }}
+.card {{ background: #161b22; border: 1px solid #30363d; border-radius: 12px; padding: 20px; margin-bottom: 16px; }}
+.stat {{ display: inline-block; min-width: 120px; margin: 8px 16px 8px 0; }}
+.stat .val {{ font-size: 28px; font-weight: 700; }}
+.stat .lbl {{ font-size: 12px; color: #8b949e; }}
+table {{ width: 100%; border-collapse: collapse; font-size: 14px; }}
+th {{ text-align: left; color: #8b949e; padding: 8px; border-bottom: 1px solid #30363d; }}
+td {{ padding: 8px; border-bottom: 1px solid #21262d; }}
+h2 {{ color: #58a6ff; margin: 0 0 12px 0; font-size: 18px; }}
+.filter {{ background: #1c2333; border-radius: 8px; padding: 12px; margin: 4px 0; font-size: 13px; }}
+.filter .asset {{ font-weight: 700; color: #58a6ff; }}
+.filter .rule {{ color: #8b949e; }}
 </style></head><body>
-<div class="nav">
-<a href="/app/poly-alpha4" class="nav-tab active">\U0001f3af Sniper A4</a>
-<a href="/app/poly-alpha3" class="nav-tab">\u26a1 Poly A3</a>
-<a href="/app/poly-alpha2" class="nav-tab">\u26a1 Poly A2</a>
-<a href="/" class="nav-tab">Home</a>
-</div>
-<h1>\U0001f3af Sniper Alpha 4.0</h1>
-<h2>P2.1 at Window Boundary · 15M Only · 50\u00a2 Target · Compounding 5%</h2>
-<div class="stats">
-<div class="stat"><div class="val">${:.2f}</div><div class="lbl">Pool</div></div>
-<div class="stat"><div class="val">{}%</div><div class="lbl">Win Rate</div></div>
-<div class="stat"><div class="val">{}</div><div class="lbl">Trades</div></div>
-<div class="stat"><div class="val" style="{}">${:.2f}</div><div class="lbl">P&L</div></div>
-<div class="stat"><div class="val">${:.2f}</div><div class="lbl">Peak</div></div>
-<div class="stat"><div class="val">{}</div><div class="lbl">Today</div></div>
-</div>
-<h2>By Tier</h2><table><tr><th>Tier</th><th>Record</th><th>WR</th><th>P&L</th></tr>{}</table>
-<h2>By Confirmation Path</h2><table><tr><th>Path</th><th>Record</th><th>WR</th><th>P&L</th></tr>{}</table>
-<h2>By Entry Odds</h2><table><tr><th>Range</th><th>Record</th><th>WR</th><th>P&L</th></tr>{}</table>
-<h2>By Signal Strength</h2><table><tr><th>Score</th><th>Record</th><th>WR</th><th>P&L</th></tr>{}</table>
-<h2>By Asset</h2><table><tr><th>Asset</th><th>Record</th><th>WR</th><th>P&L</th></tr>{}</table>
-<h2>Trade History</h2><table><tr><th>#</th><th></th><th>Asset</th><th>Stake</th><th>Side</th><th>Fill</th><th>Time</th><th>P&L</th><th>Pool</th></tr>{}</table>
-<p style="color:#444;font-size:11px">Sniper · Fires at window boundary · 50\u00a2 target · Auto-refresh 60s</p>
-<script>setTimeout(()=>location.reload(),60000)</script>
-</body></html>""".format(
-        _poly_alpha4_state["balance"], wr, total,
-        pnlc, total_pnl, _poly_alpha4_state["peak_balance"],
-        "{}T {}W {}L".format(_poly_alpha4_state["trades_today"], _poly_alpha4_state["wins_today"], _poly_alpha4_state["losses_today"]),
-        tier_html, confirm_html, odds_html,
-        score_html, asset_html, trade_rows)
+{nav}
+<h1>Sniper A4 — Per-Asset Filter Model</h1>
+<p style="color:#8b949e">T+0 · 50¢ Entry · $1 Flat Stake · Polymarket 15M</p>
 
+<div class="card">
+<div class="stat"><div class="val">${bal:.2f}</div><div class="lbl">Pool</div></div>
+<div class="stat"><div class="val" style="color:{wr_c}">{wr}%</div><div class="lbl">Win Rate</div></div>
+<div class="stat"><div class="val">{tot}</div><div class="lbl">Trades</div></div>
+<div class="stat"><div class="val" style="color:{pnl_c}">${pnl:+.2f}</div><div class="lbl">P&L</div></div>
+<div class="stat"><div class="val">{pending}</div><div class="lbl">Pending</div></div>
+</div>
+
+<div class="card">
+<h2>Per-Asset Filters</h2>
+<div class="filter"><span class="asset">BTC:</span> <span class="rule">TV+SMA disagree (BTC tiebreaker) · No FLIP</span></div>
+<div class="filter"><span class="asset">ETH:</span> <span class="rule">TV+SMA disagree (BTC tiebreaker) · No FLIP</span></div>
+<div class="filter"><span class="asset">SOL:</span> <span class="rule">TV+SMA disagree (BTC tiebreaker) · No FLIP</span></div>
+<div class="filter"><span class="asset">XRP:</span> <span class="rule">WEAK period only · No FLIP</span></div>
+<p style="color:#8b949e;font-size:12px;margin-top:8px">Based on 1,237 T+0 trades: disagreement filter gives 54.8% WR vs 48% baseline</p>
+</div>
+
+<div class="card">
+<h2>By Asset</h2>
+<table><tr><th>Asset</th><th>Filter Rule</th><th>Win Rate</th><th>Record</th></tr>
+{asset_rows}
+</table></div>
+
+<div class="card">
+<h2>Recent Trades</h2>
+<table><tr><th></th><th>Asset</th><th>Side</th><th>Stake</th><th>Time</th><th>P&L</th></tr>
+{trade_rows}
+</table></div>
+
+<script>setTimeout(()=>location.reload(), 60000)</script>
+</body></html>"""
+    
+    return HTML.format(
+        nav=nav, bal=bal, wr_c=wr_c, wr=wr, tot=len(resolved),
+        pnl_c=pnl_c, pnl=pnl, pending=len(pending),
+        asset_rows=asset_rows, trade_rows=trade_rows)
 
 @app.route("/app/poly-alpha")
 def poly_alpha_page():
