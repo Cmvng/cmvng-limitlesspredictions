@@ -426,13 +426,14 @@ def _poly_alpha3_load_recent():
     _sv2_load_balance()  # Load SV2 paper pool from DB
     _save_bot_balance("sv2_paper", _sv2_state)  # Ensure row exists in DB
     _save_bot_balance("sv3_paper", _sv3_state)  # Ensure SV3 row exists in DB
-    # Reset all sv3 LOSS trades to Pending so they re-resolve correctly
-    # Old markets → RETURNED (excluded from WR), recent markets → WIN/LOSS
+    # Mark old unresolvable LOSS trades as RETURNED (excluded from WR)
+    # These are trades where outcomePrices data is gone from Polymarket
     try:
         _conn_sv3_fix = get_db()
         _conn_sv3_fix.run("""UPDATE sniper_v3_paper_trades
-            SET status='Pending', outcome=NULL, sim_pnl=NULL, resolved_at=NULL
-            WHERE status='Resolved' AND outcome='LOSS'""")
+            SET outcome='RETURNED', sim_pnl=0
+            WHERE status='Resolved' AND outcome='LOSS'
+            AND fired_at < '2026-05-04 07:00:00'""")
         _conn_sv3_fix.close()
     except: pass
 
