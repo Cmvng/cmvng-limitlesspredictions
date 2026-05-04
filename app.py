@@ -1118,51 +1118,6 @@ def _sniper_thread():
             except Exception as _sv2e:
                 print("SV2 error: {}".format(_sv2e))
 
-            # ── SV3 post-fire: scores using fresh cache + valid window_ts ──
-            try:
-                _sv3_now_str = datetime.now(timezone.utc).isoformat()
-                _sv3_cnt = 0
-                print("SV3 START: window_ts={} assets={}".format(window_ts, SNIPER_ASSETS))
-                for _sv3_asset in SNIPER_ASSETS:
-                    try:
-                        import requests as _sv3_req, json as _sv3_json
-                        _sv3_slug = SNIPER_SLUGS[_sv3_asset].format(window_ts)
-                        print("SV3 FETCH {}: {}".format(_sv3_asset, _sv3_slug))
-                        _sv3_r = _sv3_req.get(
-                            "{}/markets/slug/{}".format(GAMMA_API, _sv3_slug),
-                            timeout=5)
-                        if _sv3_r.status_code == 200:
-                            _sv3_md = _sv3_r.json()
-                            _sv3_toks = _sv3_md.get("clobTokenIds")
-                            if isinstance(_sv3_toks, str):
-                                try: _sv3_toks = _sv3_json.loads(_sv3_toks)
-                                except: _sv3_toks = None
-                            _sv3_oc = _sv3_md.get("outcomes")
-                            if isinstance(_sv3_oc, str):
-                                try: _sv3_oc = _sv3_json.loads(_sv3_oc)
-                                except: _sv3_oc = None
-                            if isinstance(_sv3_toks, list) and len(_sv3_toks) >= 2:
-                                _sv3_up = 0
-                                if isinstance(_sv3_oc, list) and len(_sv3_oc) >= 2:
-                                    if str(_sv3_oc[0]).lower().strip() in ("no","down","below"):
-                                        _sv3_up = 1
-                                _sv3_entry = {
-                                    "up_token":     _sv3_toks[_sv3_up],
-                                    "down_token":   _sv3_toks[1-_sv3_up],
-                                    "condition_id": _sv3_md.get("conditionId",""),
-                                    "slug":         _sv3_slug,
-                                    "title":        _sv3_md.get("question",""),
-                                }
-                                if _sv3_score_and_record(_sv3_asset, _sv3_entry, window_ts, _sv3_now_str):
-                                    _sv3_cnt += 1
-                    except Exception as _sv3_ie:
-                        print("SV3 inner error {}: {}".format(_sv3_asset, _sv3_ie))
-                if _sv3_cnt:
-                    print("SV3: {} paper trades | pool=${:.2f}".format(
-                        _sv3_cnt, _sv3_state["balance"]))
-            except Exception as _sv3_err:
-                print("SV3 error: {}".format(_sv3_err))
-
             fired_results = []  # collect results for post-fire logging
             fire_time = datetime.now(timezone.utc)
 
@@ -1275,6 +1230,51 @@ def _sniper_thread():
             if fired_count > 0:
                 _save_bot_balance("poly_alpha4", _poly_alpha4_state)
             _save_bot_balance("limitless_sniper", _limitless_sniper_state)
+
+            # ── SV3 post-fire: scores using fresh cache + valid window_ts ──
+            try:
+                _sv3_now_str = datetime.now(timezone.utc).isoformat()
+                _sv3_cnt = 0
+                print("SV3 START: window_ts={} assets={}".format(window_ts, SNIPER_ASSETS))
+                for _sv3_asset in SNIPER_ASSETS:
+                    try:
+                        import requests as _sv3_req, json as _sv3_json
+                        _sv3_slug = SNIPER_SLUGS[_sv3_asset].format(window_ts)
+                        print("SV3 FETCH {}: {}".format(_sv3_asset, _sv3_slug))
+                        _sv3_r = _sv3_req.get(
+                            "{}/markets/slug/{}".format(GAMMA_API, _sv3_slug),
+                            timeout=5)
+                        if _sv3_r.status_code == 200:
+                            _sv3_md = _sv3_r.json()
+                            _sv3_toks = _sv3_md.get("clobTokenIds")
+                            if isinstance(_sv3_toks, str):
+                                try: _sv3_toks = _sv3_json.loads(_sv3_toks)
+                                except: _sv3_toks = None
+                            _sv3_oc = _sv3_md.get("outcomes")
+                            if isinstance(_sv3_oc, str):
+                                try: _sv3_oc = _sv3_json.loads(_sv3_oc)
+                                except: _sv3_oc = None
+                            if isinstance(_sv3_toks, list) and len(_sv3_toks) >= 2:
+                                _sv3_up = 0
+                                if isinstance(_sv3_oc, list) and len(_sv3_oc) >= 2:
+                                    if str(_sv3_oc[0]).lower().strip() in ("no","down","below"):
+                                        _sv3_up = 1
+                                _sv3_entry = {
+                                    "up_token":     _sv3_toks[_sv3_up],
+                                    "down_token":   _sv3_toks[1-_sv3_up],
+                                    "condition_id": _sv3_md.get("conditionId",""),
+                                    "slug":         _sv3_slug,
+                                    "title":        _sv3_md.get("question",""),
+                                }
+                                if _sv3_score_and_record(_sv3_asset, _sv3_entry, window_ts, _sv3_now_str):
+                                    _sv3_cnt += 1
+                    except Exception as _sv3_ie:
+                        print("SV3 inner error {}: {}".format(_sv3_asset, _sv3_ie))
+                if _sv3_cnt:
+                    print("SV3: {} paper trades | pool=${:.2f}".format(
+                        _sv3_cnt, _sv3_state["balance"]))
+            except Exception as _sv3_err:
+                print("SV3 error: {}".format(_sv3_err))
 
             # Sleep until next cycle (at least 60s to avoid double-firing)
             _time.sleep(60)
@@ -9124,6 +9124,11 @@ def _p28_read_prev_candle(asset, tf="15m"):
         "lower_wick_ratio": round(lower_wick_ratio, 2),
         "is_green": is_green,
         "is_red": is_red,
+        "high": h,
+        "low": l,
+        "close": c,
+        "open": o,
+        "tag": pattern,
     }
 
 
