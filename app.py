@@ -1138,6 +1138,7 @@ def _sniper_thread():
             # ── A4 Dynamic Pricing DISABLED — using T+0 at 50¢ model ──
             # Direction lock removed — A4 fires directly at T+0
 
+            import requests as _req
             token_map = {}  # {asset: {"up_token": ..., "down_token": ..., "condition_id": ...}}
 
             # SV3 pre-fetch token map for ALL assets (not just snipe_targets)
