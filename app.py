@@ -2122,7 +2122,7 @@ def _limitless_sniper_thread():
                 if asset not in market_map:
                     continue
                 mkt = market_map[asset]
-                boundary_ts = int(_sv3_nb.timestamp())
+                boundary_ts = int(next_boundary.timestamp())
                 market_key = "lmts_sniper_{}_1H_{}".format(asset, boundary_ts)
                 if market_key in _limitless_sniper_traded:
                     continue
