@@ -1086,6 +1086,17 @@ def _sniper_thread():
             else:
                 print("SNIPER: {} targets qualified: {}".format(len(snipe_targets), ", ".join(_sniper_debug)))
 
+            # ── T-20s: Calculate next window's slug and timestamp ──
+            # The NEXT window starts at the upcoming boundary
+            next_boundary = now.replace(second=0, microsecond=0)
+            next_min = ((now.minute // 15) + 1) * 15
+            if next_min >= 60:
+                next_boundary = next_boundary.replace(minute=0) + timedelta(hours=1)
+            else:
+                next_boundary = next_boundary.replace(minute=next_min)
+
+            window_ts = int(next_boundary.timestamp())
+
             # ── A4 Dynamic Pricing: Lock directions at T+0 ──
             # Instead of placing orders at fixed 50¢, lock the direction
             # for each qualified asset. The scan loop will place orders
@@ -1123,17 +1134,7 @@ def _sniper_thread():
 
 
 
-            # ── T-20s: Calculate next window's slug and timestamp ──
-            # The NEXT window starts at the upcoming boundary
-            next_boundary = now.replace(second=0, microsecond=0)
-            next_min = ((now.minute // 15) + 1) * 15
-            if next_min >= 60:
-                next_boundary = next_boundary.replace(minute=0) + timedelta(hours=1)
-            else:
-                next_boundary = next_boundary.replace(minute=next_min)
-
-            window_ts = int(next_boundary.timestamp())
-
+            
             # ── T-15s: Fetch token IDs from Gamma API ──
             import requests as _req
             token_map = {}  # {asset: {"up_token": ..., "down_token": ..., "condition_id": ...}}
