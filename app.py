@@ -959,56 +959,6 @@ def _sniper_thread():
                 except Exception as _sv2e0:
                     print("SV2 no-target error: {}".format(_sv2e0))
 
-            # ── SV3 scores at same T-22s (pre-clear cache) ──
-            # T2.1 and T2.2: previous candle + price position logic
-            try:
-                # Use CURRENT boundary timestamp (round DOWN to nearest 15M)
-                # Same as window_ts that SV2 uses — the active market that just opened
-                _sv3_now = datetime.now(timezone.utc)
-                _sv3_cbm = (current_minute // 15) * 15  # current boundary minute
-                _sv3_cb = _sv3_now.replace(minute=_sv3_cbm, second=0, microsecond=0)
-                _sv3_window_ts = int(_sv3_cb.timestamp())
-                _sv3_now_str = datetime.now(timezone.utc).isoformat()
-                _sv3_cnt = 0
-                for _sv3_asset in SNIPER_ASSETS:
-                    try:
-                        import requests as _sv3_req, json as _sv3_json
-                        _sv3_slug = SNIPER_SLUGS[_sv3_asset].format(_sv3_window_ts)
-                        _sv3_r = _sv3_req.get(
-                            "{}/markets/slug/{}".format(GAMMA_API, _sv3_slug),
-                            timeout=5)
-                        if _sv3_r.status_code == 200:
-                            _sv3_md = _sv3_r.json()
-                            _sv3_toks = _sv3_md.get("clobTokenIds")
-                            if isinstance(_sv3_toks, str):
-                                try: _sv3_toks = _sv3_json.loads(_sv3_toks)
-                                except: _sv3_toks = None
-                            _sv3_oc = _sv3_md.get("outcomes")
-                            if isinstance(_sv3_oc, str):
-                                try: _sv3_oc = _sv3_json.loads(_sv3_oc)
-                                except: _sv3_oc = None
-                            if isinstance(_sv3_toks, list) and len(_sv3_toks) >= 2:
-                                _sv3_up = 0
-                                if isinstance(_sv3_oc, list) and len(_sv3_oc) >= 2:
-                                    if str(_sv3_oc[0]).lower().strip() in ("no","down","below"):
-                                        _sv3_up = 1
-                                _sv3_entry = {
-                                    "up_token":     _sv3_toks[_sv3_up],
-                                    "down_token":   _sv3_toks[1-_sv3_up],
-                                    "condition_id": _sv3_md.get("conditionId",""),
-                                    "slug":         _sv3_slug,
-                                    "title":        _sv3_md.get("question",""),
-                                }
-                                if _sv3_score_and_record(_sv3_asset, _sv3_entry, _sv3_window_ts, _sv3_now_str):
-                                    _sv3_cnt += 1
-                    except Exception as _sv3_inner_e:
-                        print("SV3 API fail {}: {}".format(_sv3_asset, _sv3_inner_e))
-                if _sv3_cnt:
-                    print("SV3: {} paper trades | pool=${:.2f}".format(
-                        _sv3_cnt, _sv3_state["balance"]))
-            except Exception as _sv3_err:
-                print("SV3 error: {}".format(_sv3_err))
-
             # ── T-30s: Force fresh indicators for all assets ──
             # MUST clear cache first — _calculate_indicators returns cached
             # data if age < TTL (600s). Without clearing, the "refresh" is a no-op.
@@ -1208,6 +1158,49 @@ def _sniper_thread():
                         _sv2_scored, _sv2_state["balance"]))
             except Exception as _sv2e:
                 print("SV2 error: {}".format(_sv2e))
+
+            # ── SV3 post-fire: scores using fresh cache + valid window_ts ──
+            try:
+                _sv3_now_str = datetime.now(timezone.utc).isoformat()
+                _sv3_cnt = 0
+                for _sv3_asset in SNIPER_ASSETS:
+                    try:
+                        import requests as _sv3_req, json as _sv3_json
+                        _sv3_slug = SNIPER_SLUGS[_sv3_asset].format(window_ts)
+                        _sv3_r = _sv3_req.get(
+                            "{}/markets/slug/{}".format(GAMMA_API, _sv3_slug),
+                            timeout=5)
+                        if _sv3_r.status_code == 200:
+                            _sv3_md = _sv3_r.json()
+                            _sv3_toks = _sv3_md.get("clobTokenIds")
+                            if isinstance(_sv3_toks, str):
+                                try: _sv3_toks = _sv3_json.loads(_sv3_toks)
+                                except: _sv3_toks = None
+                            _sv3_oc = _sv3_md.get("outcomes")
+                            if isinstance(_sv3_oc, str):
+                                try: _sv3_oc = _sv3_json.loads(_sv3_oc)
+                                except: _sv3_oc = None
+                            if isinstance(_sv3_toks, list) and len(_sv3_toks) >= 2:
+                                _sv3_up = 0
+                                if isinstance(_sv3_oc, list) and len(_sv3_oc) >= 2:
+                                    if str(_sv3_oc[0]).lower().strip() in ("no","down","below"):
+                                        _sv3_up = 1
+                                _sv3_entry = {
+                                    "up_token":     _sv3_toks[_sv3_up],
+                                    "down_token":   _sv3_toks[1-_sv3_up],
+                                    "condition_id": _sv3_md.get("conditionId",""),
+                                    "slug":         _sv3_slug,
+                                    "title":        _sv3_md.get("question",""),
+                                }
+                                if _sv3_score_and_record(_sv3_asset, _sv3_entry, window_ts, _sv3_now_str):
+                                    _sv3_cnt += 1
+                    except Exception as _sv3_ie:
+                        print("SV3 inner error {}: {}".format(_sv3_asset, _sv3_ie))
+                if _sv3_cnt:
+                    print("SV3: {} paper trades | pool=${:.2f}".format(
+                        _sv3_cnt, _sv3_state["balance"]))
+            except Exception as _sv3_err:
+                print("SV3 error: {}".format(_sv3_err))
 
             fired_results = []  # collect results for post-fire logging
             fire_time = datetime.now(timezone.utc)
