@@ -1498,13 +1498,14 @@ def _resolve_sv3_trades():
         conn = get_db()
         rows = conn.run("""
             SELECT id, asset, bet_side, tier, stake, fill_price,
-                   slug, fired_at
+                   slug, condition_id, fired_at
             FROM sniper_v3_paper_trades
             WHERE status='Pending'
             ORDER BY id DESC LIMIT 100
         """)
         rows = [{"id":r[0],"asset":r[1],"bet_side":r[2],"tier":r[3],
-                 "stake":r[4],"fill_price":r[5],"slug":r[6],"fired_at":r[7]}
+                 "stake":r[4],"fill_price":r[5],"slug":r[6],
+                 "condition_id":r[7],"fired_at":r[8]}
                 for r in rows]
         conn.close()
     except Exception as e:
@@ -1540,29 +1541,34 @@ def _resolve_sv3_trades():
 
             # Resolve using outcomePrices (same as SV2)
             won = None
-            if slug:
+            condition_id = p.get("condition_id", "")
+            for url in filter(None, [
+                "{}/markets/slug/{}".format(GAMMA_API, slug) if slug else None,
+                "{}/markets/{}".format(GAMMA_API, condition_id) if condition_id else None,
+            ]):
                 try:
-                    r = _rq.get("{}/markets/slug/{}".format(GAMMA_API, slug), timeout=5)
-                    if r.status_code == 200:
-                        md = r.json()
-                        ops = md.get("outcomePrices")
-                        if isinstance(ops, str):
-                            try: ops = _rj.loads(ops)
-                            except: ops = None
-                        if isinstance(ops, list) and len(ops) >= 2:
-                            p0, p1 = float(ops[0]), float(ops[1])
-                            oc = md.get("outcomes")
-                            if isinstance(oc, str):
-                                try: oc = _rj.loads(oc)
-                                except: oc = None
-                            up_idx = 0
-                            if isinstance(oc, list) and len(oc) >= 2:
-                                if str(oc[0]).lower().strip() in ("no","down","below"):
-                                    up_idx = 1
-                            ref_up = p0 if up_idx == 0 else p1
-                            ref_dn = p1 if up_idx == 0 else p0
-                            if ref_up >= 0.95:   won = (bet_side == "UP")
-                            elif ref_dn >= 0.95: won = (bet_side == "DOWN")
+                    r = _rq.get(url, timeout=5)
+                    if r.status_code != 200: continue
+                    md = r.json()
+                    ops = md.get("outcomePrices")
+                    if isinstance(ops, str):
+                        try: ops = _rj.loads(ops)
+                        except: ops = None
+                    if isinstance(ops, list) and len(ops) >= 2:
+                        p0, p1 = float(ops[0]), float(ops[1])
+                        oc = md.get("outcomes")
+                        if isinstance(oc, str):
+                            try: oc = _rj.loads(oc)
+                            except: oc = None
+                        up_idx = 0
+                        if isinstance(oc, list) and len(oc) >= 2:
+                            if str(oc[0]).lower().strip() in ("no","down","below"):
+                                up_idx = 1
+                        ref_up = p0 if up_idx == 0 else p1
+                        ref_dn = p1 if up_idx == 0 else p0
+                        if ref_up >= 0.95:   won = (bet_side == "UP")
+                        elif ref_dn >= 0.95: won = (bet_side == "DOWN")
+                    if won is not None: break
                 except: pass
 
             if won is None:
