@@ -426,6 +426,14 @@ def _poly_alpha3_load_recent():
     _sv2_load_balance()  # Load SV2 paper pool from DB
     _save_bot_balance("sv2_paper", _sv2_state)  # Ensure row exists in DB
     _save_bot_balance("sv3_paper", _sv3_state)  # Ensure SV3 row exists in DB
+    # Reset any RETURNED sv3 trades back to Pending so they re-resolve as WIN/LOSS
+    try:
+        _conn_sv3_fix = get_db()
+        _conn_sv3_fix.run("""UPDATE sniper_v3_paper_trades
+            SET status='Pending', outcome=NULL, sim_pnl=NULL, resolved_at=NULL
+            WHERE status='Resolved' AND outcome='RETURNED'""")
+        _conn_sv3_fix.close()
+    except: pass
 
     try:
         conn = get_db()
@@ -1235,12 +1243,10 @@ def _sniper_thread():
             try:
                 _sv3_now_str = datetime.now(timezone.utc).isoformat()
                 _sv3_cnt = 0
-                print("SV3 START: window_ts={} assets={}".format(window_ts, SNIPER_ASSETS))
                 for _sv3_asset in SNIPER_ASSETS:
                     try:
                         import requests as _sv3_req, json as _sv3_json
                         _sv3_slug = SNIPER_SLUGS[_sv3_asset].format(window_ts)
-                        print("SV3 FETCH {}: {}".format(_sv3_asset, _sv3_slug))
                         _sv3_r = _sv3_req.get(
                             "{}/markets/slug/{}".format(GAMMA_API, _sv3_slug),
                             timeout=5)
@@ -1461,114 +1467,114 @@ def _sv2_score_and_record(asset, token_map_entry, boundary_ts, now_str):
 
 
 def _resolve_sv3_trades():
-    """Resolve pending SV3 paper trades using Polymarket outcomes."""
+    """Resolve pending SV3 paper trades using outcomePrices — same method as SV2."""
     from datetime import datetime, timezone, timedelta
+    import requests as _rq, json as _rj
     now = datetime.now(timezone.utc)
     resolved = 0
     try:
         conn = get_db()
         rows = conn.run("""
-            SELECT id, asset, bet_side, tier, stake, payout, slug,
-                   prev_candle_tag, price_position, fired_at
+            SELECT id, asset, bet_side, tier, stake, fill_price,
+                   slug, fired_at
             FROM sniper_v3_paper_trades
             WHERE status='Pending'
             ORDER BY id DESC LIMIT 100
         """)
+        rows = [{"id":r[0],"asset":r[1],"bet_side":r[2],"tier":r[3],
+                 "stake":r[4],"fill_price":r[5],"slug":r[6],"fired_at":r[7]}
+                for r in rows]
         conn.close()
     except Exception as e:
         print("SV3 fetch error: {}".format(e))
         return 0
 
-    fee = 0.03
-    wp = (1/0.50)*(1-fee)
-
-    for row in rows:
+    for p in rows:
         try:
-            tid, asset, bet_side, tier, stake, payout, slug = (
-                row[0], row[1], row[2], row[3], row[4], row[5], row[6])
-            fired_str = row[9]
-            if not fired_str:
-                continue
+            tid      = p["id"]
+            bet_side = p["bet_side"]
+            stake    = p["stake"] or 2.50
+            slug     = p["slug"] or ""
+            fired_str = p["fired_at"] or ""
+            if not fired_str: continue
 
             fired_at = datetime.fromisoformat(fired_str.replace("Z","").split("+")[0])
             if fired_at.tzinfo is None:
                 fired_at = fired_at.replace(tzinfo=timezone.utc)
 
-            # Calculate expiry
-            fired_minute = fired_at.minute
-            next_bm = ((fired_minute // 15) + 1) * 15
+            # Expiry = next 15M boundary after fired_at + 15 mins
+            fm = fired_at.minute
+            next_bm = ((fm // 15) + 1) * 15
             if next_bm >= 60:
-                window_start = fired_at.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+                window_start = fired_at.replace(minute=0,second=0,microsecond=0) + timedelta(hours=1)
             else:
-                window_start = fired_at.replace(minute=next_bm, second=0, microsecond=0)
+                window_start = fired_at.replace(minute=next_bm,second=0,microsecond=0)
             expiry = window_start + timedelta(minutes=15)
 
             if now < expiry + timedelta(minutes=3):
                 continue
 
-            # Check outcome via Polymarket
-            outcome = None
+            # Resolve using outcomePrices (same as SV2)
+            won = None
             if slug:
                 try:
-                    import requests as _rq
                     r = _rq.get("{}/markets/slug/{}".format(GAMMA_API, slug), timeout=5)
                     if r.status_code == 200:
-                        mkt = r.json()
-                        winner = (mkt.get("winner") or "").upper()
-                        outcomes = mkt.get("outcomes")
-                        if isinstance(outcomes, str):
-                            import json
-                            try: outcomes = json.loads(outcomes)
-                            except: outcomes = None
-                        if winner and outcomes:
-                            if isinstance(outcomes, list) and len(outcomes) >= 2:
-                                if str(outcomes[0]).upper() in ("UP","YES","ABOVE"):
-                                    win_side = "UP" if winner == "YES" else "DOWN"
-                                else:
-                                    win_side = "DOWN" if winner == "YES" else "UP"
-                                outcome = "WIN" if win_side == bet_side else "LOSS"
+                        md = r.json()
+                        ops = md.get("outcomePrices")
+                        if isinstance(ops, str):
+                            try: ops = _rj.loads(ops)
+                            except: ops = None
+                        if isinstance(ops, list) and len(ops) >= 2:
+                            p0, p1 = float(ops[0]), float(ops[1])
+                            oc = md.get("outcomes")
+                            if isinstance(oc, str):
+                                try: oc = _rj.loads(oc)
+                                except: oc = None
+                            up_idx = 0
+                            if isinstance(oc, list) and len(oc) >= 2:
+                                if str(oc[0]).lower().strip() in ("no","down","below"):
+                                    up_idx = 1
+                            ref_up = p0 if up_idx == 0 else p1
+                            ref_dn = p1 if up_idx == 0 else p0
+                            if ref_up >= 0.95:   won = (bet_side == "UP")
+                            elif ref_dn >= 0.95: won = (bet_side == "DOWN")
                 except: pass
 
-            if not outcome:
+            if won is None:
                 if now > expiry + timedelta(hours=1):
-                    outcome = "RETURNED"
+                    won = False  # treat as loss after 1hr, not returned
                 else:
                     continue
 
-            # Update DB and balance
-            sim_pnl = 0.0
-            c_upd = get_db()
-            if outcome == "WIN":
-                sim_pnl = round(payout - stake, 2)
+            fee  = 0.03
+            fill = float(p.get("fill_price") or 0.50)
+            payout  = round(stake / fill * (1 - fee), 4) if won else 0
+            sim_pnl = round(payout - stake, 4) if won else round(-stake, 4)
+            status  = "Won" if won else "Lost"
+
+            if won:
                 _sv3_state["balance"] = round(_sv3_state["balance"] + payout, 2)
-                c_upd.run("""UPDATE sniper_v3_paper_trades
-                    SET status='Resolved', outcome='WIN', sim_pnl=:p,
-                        resolved_at=:t
-                    WHERE id=:i""",
-                    p=sim_pnl, t=now.isoformat(), i=tid)
-            elif outcome == "LOSS":
-                sim_pnl = -stake
-                c_upd.run("""UPDATE sniper_v3_paper_trades
-                    SET status='Resolved', outcome='LOSS', sim_pnl=:p,
-                        resolved_at=:t
-                    WHERE id=:i""",
-                    p=sim_pnl, t=now.isoformat(), i=tid)
-            else:  # RETURNED
-                _sv3_state["balance"] = round(_sv3_state["balance"] + stake, 2)
-                c_upd.run("""UPDATE sniper_v3_paper_trades
-                    SET status='Resolved', outcome='RETURNED', sim_pnl=0,
-                        resolved_at=:t
-                    WHERE id=:i""",
-                    t=now.isoformat(), i=tid)
-            c_upd.close()
+
+            if _sv3_state["balance"] > _sv3_state["peak_balance"]:
+                _sv3_state["peak_balance"] = _sv3_state["balance"]
+
+            c = get_db()
+            c.run("""UPDATE sniper_v3_paper_trades
+                SET status=:s, outcome=:o, payout=:pay,
+                    sim_pnl=:pnl, resolved_at=:r WHERE id=:i""",
+                s=status, o="WIN" if won else "LOSS",
+                pay=payout, pnl=sim_pnl,
+                r=now.isoformat(), i=tid)
+            c.close()
             resolved += 1
+            _save_bot_balance("sv3_paper", _sv3_state)
 
         except Exception as e:
-            print("SV3 resolve trade error: {}".format(e))
+            print("SV3 resolve error {}: {}".format(p.get("id"), e))
 
-    if resolved > 0:
-        _save_bot_balance("sv3_paper", _sv3_state)
     return resolved
+
 
 def _resolve_sv2_trades():
     """Resolve Sniper V2 paper trades using Polymarket Gamma API."""
