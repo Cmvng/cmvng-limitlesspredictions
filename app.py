@@ -678,7 +678,12 @@ def _sv3_score_and_record(asset, token_map_entry, boundary_ts, now_str):
     wp = (1 / 0.50) * (1 - fee)
 
     # ── Step 1: Get signal direction ──
-    direction, signals_agree, ind_str, confidence = _sniper_get_direction(asset, "15m")
+    # Use direction from snipe_targets if available (avoids stale cache issue)
+    forced = token_map_entry.get("forced_direction")
+    if forced:
+        direction, signals_agree, ind_str, confidence = forced, 3, "sniper_confirmed", "HIGH"
+    else:
+        direction, signals_agree, ind_str, confidence = _sniper_get_direction(asset, "15m")
     if not direction or signals_agree < 2:
         print("SV3 SKIP {}: no direction (dir={} agree={})".format(asset, direction, signals_agree))
         return False
@@ -981,6 +986,15 @@ def _sniper_thread():
 
             window_ts = int(next_boundary.timestamp())
 
+            # ── SV3: Capture directions NOW (fresh cache, before boundary wait) ──
+            _sv3_directions = {}
+            for _sv3_d_asset in SNIPER_ASSETS:
+                try:
+                    _sv3_d, _sv3_da, _, _ = _sniper_get_direction(_sv3_d_asset, "15m")
+                    if _sv3_d and _sv3_da >= 2:
+                        _sv3_directions[_sv3_d_asset] = _sv3_d
+                except: pass
+
             # ── T-15s: Fetch token IDs from Gamma API ──
             import requests as _req
             token_map = {}  # {asset: {"up_token": ..., "down_token": ..., "condition_id": ...}}
@@ -1244,6 +1258,8 @@ def _sniper_thread():
             try:
                 _sv3_now_str = datetime.now(timezone.utc).isoformat()
                 _sv3_cnt = 0
+                # Build direction map from snipe_targets (fresh, before cache can change)
+                _sv3_dir_map = {t["asset"]: t["direction"] for t in snipe_targets}
                 for _sv3_asset in SNIPER_ASSETS:
                     try:
                         import requests as _sv3_req, json as _sv3_json
@@ -1273,6 +1289,7 @@ def _sniper_thread():
                                     "slug":         _sv3_slug,
                                     "title":        _sv3_md.get("question",""),
                                 }
+                                _sv3_entry["forced_direction"] = _sv3_directions.get(_sv3_asset)
                                 if _sv3_score_and_record(_sv3_asset, _sv3_entry, window_ts, _sv3_now_str):
                                     _sv3_cnt += 1
                     except Exception as _sv3_ie:
