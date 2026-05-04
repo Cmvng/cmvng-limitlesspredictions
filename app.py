@@ -1086,6 +1086,43 @@ def _sniper_thread():
             else:
                 print("SNIPER: {} targets qualified: {}".format(len(snipe_targets), ", ".join(_sniper_debug)))
 
+            # ── A4 Dynamic Pricing: Lock directions at T+0 ──
+            # Instead of placing orders at fixed 50¢, lock the direction
+            # for each qualified asset. The scan loop will place orders
+            # at market odds when it confirms the signal 2-10 mins later.
+            _a4_lock_count = 0
+            for _lock_tgt in snipe_targets:
+                _lock_asset = _lock_tgt["asset"]
+                _lock_dir = _lock_tgt["direction"]
+                _lock_ind = _lock_tgt.get("indicators", "")
+                _lock_agree = _lock_tgt.get("signals_agree", 2)
+                
+                if window_ts not in _a4_direction_lock:
+                    _a4_direction_lock[window_ts] = {}
+                
+                _a4_direction_lock[window_ts][_lock_asset] = {
+                    "direction": _lock_dir,
+                    "indicators": _lock_ind,
+                    "signals_agree": _lock_agree,
+                    "locked_at": datetime.now(timezone.utc).isoformat(),
+                }
+                _a4_lock_count += 1
+            
+            # Clean old locks (keep only last 2 boundaries = 30 mins)
+            _old_boundaries = [k for k in _a4_direction_lock if k < window_ts - 1800]
+            for _ob in _old_boundaries:
+                _a4_direction_lock.pop(_ob, None)
+            
+            if _a4_lock_count > 0:
+                _lock_dirs = {t["asset"]: t["direction"] for t in snipe_targets}
+                print("A4 LOCK: {} directions at boundary {} | {}".format(
+                    _a4_lock_count, window_ts, 
+                    " ".join("{}={}".format(a,d) for a,d in _lock_dirs.items())))
+            else:
+                print("A4 LOCK: 0 directions at boundary {}".format(window_ts))
+
+
+
             # ── T-20s: Calculate next window's slug and timestamp ──
             # The NEXT window starts at the upcoming boundary
             next_boundary = now.replace(second=0, microsecond=0)
@@ -1227,42 +1264,7 @@ def _sniper_thread():
 
             # SV2 already scored at T-35s (before cache clear)
 
-            # ── A4 Dynamic Pricing: Lock directions at T+0 ──
-            # Instead of placing orders at fixed 50¢, lock the direction
-            # for each qualified asset. The scan loop will place orders
-            # at market odds when it confirms the signal 2-10 mins later.
-            _a4_lock_count = 0
-            for _lock_tgt in snipe_targets:
-                _lock_asset = _lock_tgt["asset"]
-                _lock_dir = _lock_tgt["direction"]
-                _lock_ind = _lock_tgt.get("indicators", "")
-                _lock_agree = _lock_tgt.get("signals_agree", 2)
-                
-                if window_ts not in _a4_direction_lock:
-                    _a4_direction_lock[window_ts] = {}
-                
-                _a4_direction_lock[window_ts][_lock_asset] = {
-                    "direction": _lock_dir,
-                    "indicators": _lock_ind,
-                    "signals_agree": _lock_agree,
-                    "locked_at": datetime.now(timezone.utc).isoformat(),
-                }
-                _a4_lock_count += 1
-            
-            # Clean old locks (keep only last 2 boundaries = 30 mins)
-            _old_boundaries = [k for k in _a4_direction_lock if k < window_ts - 1800]
-            for _ob in _old_boundaries:
-                _a4_direction_lock.pop(_ob, None)
-            
-            if _a4_lock_count > 0:
-                _lock_dirs = {t["asset"]: t["direction"] for t in snipe_targets}
-                print("A4 LOCK: {} directions at boundary {} | {}".format(
-                    _a4_lock_count, window_ts, 
-                    " ".join("{}={}".format(a,d) for a,d in _lock_dirs.items())))
-            else:
-                print("A4 LOCK: 0 directions at boundary {}".format(window_ts))
-
-            # ── SV3: Record paper trades at T+0 (same boundary entry as sniper) ──
+                        # ── SV3: Record paper trades at T+0 (same boundary entry as sniper) ──
             try:
                 _sv3_cnt = 0
                 for _sv3_asset, _sv3_entry in _sv3_token_map.items():
@@ -1847,7 +1849,7 @@ def _resolve_poly_alpha4_trades():
 
 
 # ═══════════════════════════════════════════════════════════
-# LIMITLESS SNIPER — P2.1 at Window Boundary + P2.3 Momentum Carry-Over
+# LIMITLESS SNIPER — Dynamic Pricing v2.0 · 3-Path Confirm + P2.3 Momentum Carry-Over
 # Two-tier staking: HIGH (P2.1 + momentum agree) vs BASE (P2.1 only)
 # Fires at exact :00/:15/:30/:45 on Limitless CLOB at 50¢
 # ═══════════════════════════════════════════════════════════
@@ -20561,6 +20563,92 @@ def poly_alpha4_page():
     if total_orders > 0:
         fill_rate = round(filled_count / len(trades) * 100, 1)
 
+    # ── Dynamic Pricing Stats ──
+    tier_stats = {}
+    confirm_stats = {}
+    odds_buckets = {"35-45": [0,0,0.0], "45-58": [0,0,0.0], "58-72": [0,0,0.0], "other": [0,0,0.0]}
+    
+    for t in trades:
+        ind = str(t.get("indicators", ""))
+        fp = float(t.get("fill_price") or 0.50)
+        odds_pct = round(fp * 100)
+        
+        # Extract tier from indicators (e.g. "T1_GOLD", "T2_SILVER", "T3_BRONZE")
+        _tier = "LEGACY"
+        for _tn in ["T1_GOLD", "T2_SILVER", "T3_BRONZE"]:
+            if _tn in ind:
+                _tier = _tn
+                break
+        if _tier not in tier_stats:
+            tier_stats[_tier] = {"w": 0, "l": 0, "pnl": 0.0, "trades": 0}
+        tier_stats[_tier]["trades"] += 1
+        if t.get("outcome") == "WIN":
+            tier_stats[_tier]["w"] += 1
+            tier_stats[_tier]["pnl"] += float(t.get("payout") or 0) - float(t.get("stake") or 0)
+        elif t.get("outcome") == "LOSS":
+            tier_stats[_tier]["l"] += 1
+            tier_stats[_tier]["pnl"] -= float(t.get("stake") or 0)
+        
+        # Extract confirmation path
+        _conf = "LEGACY"
+        for _cn in ["A4+BOT2", "A4+P21", "BOT2+P21"]:
+            if _cn in ind:
+                _conf = _cn
+                break
+        if _conf not in confirm_stats:
+            confirm_stats[_conf] = {"w": 0, "l": 0, "pnl": 0.0}
+        if t.get("outcome") == "WIN":
+            confirm_stats[_conf]["w"] += 1
+            confirm_stats[_conf]["pnl"] += float(t.get("payout") or 0) - float(t.get("stake") or 0)
+        elif t.get("outcome") == "LOSS":
+            confirm_stats[_conf]["l"] += 1
+            confirm_stats[_conf]["pnl"] -= float(t.get("stake") or 0)
+        
+        # Odds distribution
+        if t.get("outcome") in ("WIN", "LOSS"):
+            if 35 <= odds_pct < 45:
+                bk = "35-45"
+            elif 45 <= odds_pct < 58:
+                bk = "45-58"
+            elif 58 <= odds_pct <= 72:
+                bk = "58-72"
+            else:
+                bk = "other"
+            if t.get("outcome") == "WIN":
+                odds_buckets[bk][0] += 1
+            else:
+                odds_buckets[bk][1] += 1
+            pnl_val = float(t.get("payout") or 0) - float(t.get("stake") or 0) if t.get("outcome") == "WIN" else -float(t.get("stake") or 0)
+            odds_buckets[bk][2] += pnl_val
+
+    tier_html = ""
+    for tn in ["T1_GOLD", "T2_SILVER", "T3_BRONZE", "LEGACY"]:
+        d = tier_stats.get(tn)
+        if not d or d["trades"] == 0: continue
+        resolved_t = d["w"] + d["l"]
+        twr = round(d["w"] / resolved_t * 100, 1) if resolved_t > 0 else 0
+        tier_html += "<tr><td>{}</td><td>{}W/{}L</td><td>{}%</td><td>${:.2f}</td></tr>".format(
+            tn, d["w"], d["l"], twr, d["pnl"])
+
+    confirm_html = ""
+    for cn in ["A4+BOT2", "A4+P21", "BOT2+P21", "LEGACY"]:
+        d = confirm_stats.get(cn)
+        if not d: continue
+        resolved_c = d["w"] + d["l"]
+        if resolved_c == 0: continue
+        cwr = round(d["w"] / resolved_c * 100, 1)
+        confirm_html += "<tr><td>{}</td><td>{}W/{}L</td><td>{}%</td><td>${:.2f}</td></tr>".format(
+            cn, d["w"], d["l"], cwr, d["pnl"])
+
+    odds_html = ""
+    for bk in ["35-45", "45-58", "58-72", "other"]:
+        w, l, p = odds_buckets[bk]
+        if w + l == 0: continue
+        bwr = round(w / (w+l) * 100, 1)
+        label = {"35-45": "Bronze 35-45%", "45-58": "Silver 45-58%", "58-72": "Gold 58-72%", "other": "Other"}.get(bk, bk)
+        odds_html += "<tr><td>{}</td><td>{}W/{}L</td><td>{}%</td><td>${:.2f}</td></tr>".format(
+            label, w, l, bwr, p)
+
     return """<!DOCTYPE html><html><head><title>Sniper Alpha 4.0</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <style>body{{font-family:-apple-system,sans-serif;max-width:900px;margin:0 auto;padding:10px;background:#0a0a0a;color:#e0e0e0}}
@@ -20592,6 +20680,9 @@ a{{color:#00d4aa}}
 <div class="stat"><div class="val">${:.2f}</div><div class="lbl">Peak</div></div>
 <div class="stat"><div class="val">{}</div><div class="lbl">Today</div></div>
 </div>
+<h2>By Tier</h2><table><tr><th>Tier</th><th>Record</th><th>WR</th><th>P&L</th></tr>{}</table>
+<h2>By Confirmation Path</h2><table><tr><th>Path</th><th>Record</th><th>WR</th><th>P&L</th></tr>{}</table>
+<h2>By Entry Odds</h2><table><tr><th>Range</th><th>Record</th><th>WR</th><th>P&L</th></tr>{}</table>
 <h2>By Signal Strength</h2><table><tr><th>Score</th><th>Record</th><th>WR</th><th>P&L</th></tr>{}</table>
 <h2>By Asset</h2><table><tr><th>Asset</th><th>Record</th><th>WR</th><th>P&L</th></tr>{}</table>
 <h2>Trade History</h2><table><tr><th>#</th><th></th><th>Asset</th><th>Stake</th><th>Side</th><th>Fill</th><th>Time</th><th>P&L</th><th>Pool</th></tr>{}</table>
@@ -20601,6 +20692,7 @@ a{{color:#00d4aa}}
         _poly_alpha4_state["balance"], wr, total,
         pnlc, total_pnl, _poly_alpha4_state["peak_balance"],
         "{}T {}W {}L".format(_poly_alpha4_state["trades_today"], _poly_alpha4_state["wins_today"], _poly_alpha4_state["losses_today"]),
+        tier_html, confirm_html, odds_html,
         score_html, asset_html, trade_rows)
 
 
