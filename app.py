@@ -1171,29 +1171,14 @@ def _sniper_thread():
                                     token_map[_sv2_asset] = _sv2_entry
                         except Exception as _sv2_fe:
                             pass
-                    _sv2_forced = _sv2_directions.get(_sv2_asset)
                     if _sv2_entry and _sv2_score_and_record(
-                            _sv2_asset, _sv2_entry, window_ts, _sv2_now_str,
-                            forced_direction=_sv2_forced):
+                            _sv2_asset, _sv2_entry, window_ts, _sv2_now_str):
                         _sv2_scored += 1
                 if _sv2_scored:
                     print("SV2: {} paper trades recorded | pool=${:.2f}".format(
                         _sv2_scored, _sv2_state["balance"]))
             except Exception as _sv2e:
                 print("SV2 error: {}".format(_sv2e))
-
-            # ── Re-read directions at T+0 with fresh cache ──
-            # Sniper qualified targets at T-30s (stale cache)
-            # Now re-read with fresh Binance data for accuracy
-            _refreshed_targets = []
-            for _tgt in snipe_targets:
-                _fresh_dir, _fresh_agree, _fresh_ind, _fresh_conf = _sniper_get_direction(_tgt["asset"], "15m")
-                if _fresh_dir and _fresh_agree >= 2:
-                    _tgt["direction"]     = _fresh_dir
-                    _tgt["signals_agree"] = _fresh_agree
-                    _tgt["indicators"]    = _fresh_ind
-                    _refreshed_targets.append(_tgt)
-            snipe_targets = _refreshed_targets
 
             fired_results = []  # collect results for post-fire logging
             fire_time = datetime.now(timezone.utc)
