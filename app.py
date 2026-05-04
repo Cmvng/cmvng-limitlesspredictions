@@ -18445,21 +18445,24 @@ def run_poly_scan():
                                                                         (market_id,title,asset,timeframe,bet_side,stake,fill_price,
                                                                          pool_after,order_id,token_id,condition_id,slug,filled,
                                                                          status,outcome,indicators,signals_agree,fired_at)
-                                                                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
-                                                                        ["sniper_{}_15M_{}".format(asset, _a4d_boundary_ts),
-                                                                         parsed.get("title",""),
-                                                                         asset, "15M", _a4d_scan_dir,
-                                                                         _a4d_cost, _a4d_price,
-                                                                         _poly_alpha4_state["balance"],
-                                                                         _a4d_oid, _a4d_token, _a4d_cid, _a4d_slug,
-                                                                         _a4d_filled,
-                                                                         "Pending", "PENDING",
-                                                                         "{} | {}c {} | {}".format(
-                                                                             _a4d_ind_str,
-                                                                             int(_a4d_odds), _a4d_tier,
-                                                                             _a4d_confirm_src),
-                                                                         scored.get("score", scored.get("signals_agree", 2)),
-                                                                         datetime.now(timezone.utc).isoformat()])
+                                                                        VALUES (:mid,:ttl,:ast,:tf,:bs,:stk,:fp,
+                                                                         :pa,:oid,:tid,:cid,:slg,:fld,
+                                                                         :sts,:out,:ind,:sa,:fa)""",
+                                                                        mid="sniper_{}_15M_{}".format(asset, _a4d_boundary_ts),
+                                                                        ttl=parsed.get("title",""),
+                                                                        ast=asset, tf="15M", bs=_a4d_scan_dir,
+                                                                        stk=_a4d_cost, fp=_a4d_price,
+                                                                        pa=_poly_alpha4_state["balance"],
+                                                                        oid=str(_a4d_oid) if _a4d_oid else "",
+                                                                        tid=_a4d_token, cid=_a4d_cid, slg=_a4d_slug,
+                                                                        fld=_a4d_filled,
+                                                                        sts="Pending", out="PENDING",
+                                                                        ind="{} | {}c {} | {}".format(
+                                                                            _a4d_ind_str,
+                                                                            int(_a4d_odds), _a4d_tier,
+                                                                            _a4d_confirm_src),
+                                                                        sa=scored.get("score", scored.get("signals_agree", 2)),
+                                                                        fa=datetime.now(timezone.utc).isoformat())
                                                                     _a4d_db.close()
                                                                 except Exception as _a4d_dbe:
                                                                     print("A4 DYN DB error: {}".format(_a4d_dbe))
