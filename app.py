@@ -731,51 +731,55 @@ def _sv3_score_and_record(asset, token_map_entry, boundary_ts, now_str):
 
     tier = None
 
+    # ── Classify tier using candle direction + price position
+    # Following P2.9: never skip based on assumed support/resistance
+    # Price position within prev candle is context only — not proven S/R
+    # Only genuine skip: both prev AND current candle are doji (zero info)
+
+    if prev_was_doji and body_ratio < 0.15:
+        return False    # Both candles flat — genuinely zero directional info
+
     if direction == "UP":
         if near_low:
             if is_green:
-                tier = "T2.1"   # Uptrend confirmed + pullback to support = best setup
-            elif is_red:
-                tier = "T2.2"   # Mean reversion from support (candle dipped to low)
+                tier = "T2.1"   # Signal UP + green candle + price at low of prev range
+            else:
+                tier = "T2.2"   # Signal UP + red/doji candle + price at low of prev range
         elif near_high:
             if is_green:
-                return False    # Chasing momentum AT resistance — no edge
-            elif is_red:
-                tier = "T2.2"   # Signal UP + candle pulled back TO resistance level
-                                # Price at resistance but signal says break higher
-                                # Mean reversion / breakout attempt
-        elif in_middle:
-            if prev_was_doji or prev_closed_mid:
-                return False    # No structural context — genuine skip
-            elif prev_closed_high and (is_green or body_ratio < 0.3):
-                tier = "T2.3"   # Prev closed high, price retested middle = continuation
-            elif prev_closed_low and not is_red:
-                tier = "T2.4"   # Prev closed low, price breaking through middle = breakout
+                tier = "T2.1"   # Signal UP + green candle + price at high of prev range
             else:
-                return False
+                tier = "T2.2"   # Signal UP + red/doji candle + price at high of prev range
+        else:  # in_middle
+            if prev_closed_high:
+                tier = "T2.3"   # Signal UP + price in middle + prev closed high = retest
+            elif prev_closed_low:
+                tier = "T2.4"   # Signal UP + price in middle + prev closed low = breakout
+            elif is_green:
+                tier = "T2.3"   # Signal UP + green candle in middle = continuation
+            else:
+                tier = "T2.4"   # Signal UP + red candle in middle = mean reversion
 
     elif direction == "DOWN":
         if near_high:
             if is_red:
-                tier = "T2.1"   # Downtrend confirmed + bounce rejected at resistance = best setup
-            elif is_green:
-                tier = "T2.2"   # Mean reversion from resistance (candle bounced to high)
+                tier = "T2.1"   # Signal DOWN + red candle + price at high of prev range
+            else:
+                tier = "T2.2"   # Signal DOWN + green/doji candle + price at high
         elif near_low:
             if is_red:
-                tier = "T2.2"   # Signal DOWN + candle bounced TO support level
-                                # Price at support but signal says break lower
-                                # Mean reversion / breakdown attempt
-            elif is_green:
-                return False    # Chasing momentum AT support — no edge
-        elif in_middle:
-            if prev_was_doji or prev_closed_mid:
-                return False    # No structural context — genuine skip
-            elif prev_closed_low and (is_red or body_ratio < 0.3):
-                tier = "T2.3"   # Prev closed low, price retested middle = continuation
-            elif prev_closed_high and not is_green:
-                tier = "T2.4"   # Prev closed high, price breaking through middle = breakout
+                tier = "T2.1"   # Signal DOWN + red candle + price at low of prev range
             else:
-                return False
+                tier = "T2.2"   # Signal DOWN + green/doji candle + price at low
+        else:  # in_middle
+            if prev_closed_low:
+                tier = "T2.3"   # Signal DOWN + price in middle + prev closed low = retest
+            elif prev_closed_high:
+                tier = "T2.4"   # Signal DOWN + price in middle + prev closed high = breakout
+            elif is_red:
+                tier = "T2.3"   # Signal DOWN + red candle in middle = continuation
+            else:
+                tier = "T2.4"   # Signal DOWN + green candle in middle = mean reversion
 
     if not tier:
         return False
