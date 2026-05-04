@@ -1283,10 +1283,10 @@ def _sniper_thread():
                 if not _fa4_token:
                     continue
                 
-                # Fixed 50¢ entry, flat $1 stake
+                # Fixed 50¢ entry, flat $2.50 stake
                 _fa4_price = 0.50
-                _fa4_shares = 2.0  # $1 stake at 50¢ = 2 shares
-                _fa4_cost = 1.00
+                _fa4_shares = 5.0  # $2.50 stake at 50¢ = 5 shares
+                _fa4_cost = 2.50
                 
                 # Check pool balance
                 if _poly_alpha4_state["balance"] < _fa4_cost + 2:
