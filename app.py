@@ -18142,7 +18142,7 @@ def run_poly_scan():
             # 1H: score from 3 mins in up to 57 mins (wide window to catch new markets)
             if tf == "5M" and (mins_left < 1 or mins_left > 4):
                 continue
-            if tf == "15M" and (mins_left < 2 or mins_left > 10):
+            if tf == "15M" and (mins_left < 2 or mins_left > 13):
                 continue
             if tf == "1H" and (mins_left < 3 or mins_left > 57):
                 continue
