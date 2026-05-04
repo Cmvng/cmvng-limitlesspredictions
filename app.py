@@ -478,6 +478,56 @@ _poly_alpha4_state = {
 }
 _poly_alpha4_traded_markets = set()
 
+# ── A4 Dynamic Pricing: Direction lock from sniper thread ──
+# Sniper locks direction at T+0 for each asset+boundary.
+# Scan loop reads this to confirm and place orders at market odds.
+_a4_direction_lock = {}  # {boundary_ts: {asset: {"direction": "UP"/"DOWN", "indicators": str, "signals_agree": int}}}
+_a4_dynamic_traded = set()  # dedup: "{asset}_{boundary_ts}" keys
+
+
+# ── A4 Dynamic Pricing: Tier & Stake Calculator ──
+def _a4_dynamic_tier(odds_pct, pool):
+    """Determine tier and max stake based on odds and pool balance.
+    
+    Tiers (from P2.1 data, 2186 trades, 14 days zero losses):
+      Tier 1 (58-72%): 69.9-74.9% WR, ROI +41-64% → 4% pool
+      Tier 2 (45-58%): 61.1-61.7% WR, ROI +22-23% → 3% pool  
+      Tier 3 (35-45%): 55.3-57.5% WR, ROI +10-16% → 2% pool
+      Skip: <35% or >72% — no proven edge
+    
+    Returns: (tier_name, max_stake_dollars) or (None, 0) if skip.
+    Caller must convert to whole shares: floor(max_stake / price_per_share).
+    """
+    if odds_pct >= 58 and odds_pct <= 72:
+        # Tier 1 — High confidence: 4% of pool
+        max_stake = round(pool * 0.04, 2)
+        return ("T1_GOLD", max_stake)
+    elif odds_pct >= 45 and odds_pct < 58:
+        # Tier 2 — Solid: 3% of pool
+        max_stake = round(pool * 0.03, 2)
+        return ("T2_SILVER", max_stake)
+    elif odds_pct >= 35 and odds_pct < 45:
+        # Tier 3 — Speculative: 2% of pool
+        max_stake = round(pool * 0.02, 2)
+        return ("T3_BRONZE", max_stake)
+    else:
+        return (None, 0)
+
+
+def _a4_calc_shares(max_stake, price_per_share):
+    """Calculate whole shares that fit within max_stake.
+    Returns (num_shares, actual_cost).
+    Polymarket uses whole shares — never exceed max_stake.
+    """
+    if price_per_share <= 0 or max_stake <= 0:
+        return (0, 0)
+    num_shares = int(max_stake / price_per_share)  # floor division
+    if num_shares <= 0:
+        return (0, 0)
+    actual_cost = round(num_shares * price_per_share, 4)
+    return (num_shares, actual_cost)
+
+
 def _poly_alpha4_calc_stake(pool_balance, tier="T2"):
     """Variable stake by signal strength — one pool, three rates.
 
@@ -1177,74 +1227,40 @@ def _sniper_thread():
 
             # SV2 already scored at T-35s (before cache clear)
 
-            fired_results = []  # collect results for post-fire logging
-            fire_time = datetime.now(timezone.utc)
-
-            for target in snipe_targets:
-                asset = target["asset"]
-                if asset not in token_map:
-                    continue
-
-                market_key = "sniper_{}_{}_{}" .format(asset, "15M", window_ts)
-                if market_key in _poly_alpha4_traded_markets:
-                    continue
-
-                direction = target["direction"]
-                signals_agree = target.get("signals_agree", 2)
-                confidence = target.get("confidence", "MEDIUM")
-
-                # Determine tier from signal strength + candle direction
-                _ind_entry = _indicator_cache.get("{}_15m".format(asset.upper()))
-                _ind_data = _ind_entry.get("data") if _ind_entry else None
-                _candle_dir = None
-                if _ind_data:
-                    _c_open  = _ind_data.get("candle_open")
-                    _c_close = _ind_data.get("current")
-                    if _c_open and _c_close:
-                        _candle_raw = "UP" if _c_close > _c_open else "DOWN"
-                        _candle_dir = _candle_raw
-                _candle_confirms = (_candle_dir == direction) if _candle_dir else None
-                _candle_opposes  = (_candle_dir != direction) if _candle_dir else False
-
-                if signals_agree == 3 and _candle_confirms:
-                    _trade_tier = "T1"
-                elif signals_agree == 3:
-                    _trade_tier = "T2"
-                elif signals_agree >= 2 and not _candle_opposes:
-                    _trade_tier = "T2"
-                else:
-                    _trade_tier = "T3"
-
-                stake = _poly_alpha4_calc_stake(_poly_alpha4_state["balance"], _trade_tier)
-                if stake <= 0 or stake > _poly_alpha4_state["balance"]:
-                    continue
-
-                tdata = token_map[asset]
-                token_id = tdata["up_token"] if direction == "UP" else tdata["down_token"]
-
-                # Always 50c — no order book call (saves 100-200ms per asset)
-                # At boundary market always opens ~50/50, takers fill immediately
-                shares = max(5.0, round(stake / 0.50, 2))
-
-                try:
-                    oa = OrderArgs(token_id=str(token_id), price=0.50, size=shares, side=BUY)
-                    signed = client.create_order(oa)
-                    resp = client.post_order(signed, OrderType.GTC)
-                    order_id = resp.get("orderID") or resp.get("order_id") if resp else None
-                    filled = (resp.get("status") or "").upper() in ("MATCHED", "FILLED") if resp else False
-
-                    # Update pool immediately so next stake calc is correct
-                    _poly_alpha4_state["balance"] = round(_poly_alpha4_state["balance"] - stake, 2)
-                    _poly_alpha4_state["trades_today"] += 1
-                    _poly_alpha4_traded_markets.add(market_key)
-                    if _poly_alpha4_state["balance"] > _poly_alpha4_state["peak_balance"]:
-                        _poly_alpha4_state["peak_balance"] = _poly_alpha4_state["balance"]
-
-                    fired_results.append((asset, direction, stake,
-                                          order_id, filled, tdata, market_key, target))
-
-                except Exception as e:
-                    print("SNIPER order {} error: {}".format(asset, e))
+            # ── A4 Dynamic Pricing: Lock directions at T+0 ──
+            # Instead of placing orders at fixed 50¢, lock the direction
+            # for each qualified asset. The scan loop will place orders
+            # at market odds when it confirms the signal 2-10 mins later.
+            _a4_lock_count = 0
+            for _lock_tgt in snipe_targets:
+                _lock_asset = _lock_tgt["asset"]
+                _lock_dir = _lock_tgt["direction"]
+                _lock_ind = _lock_tgt.get("indicators", "")
+                _lock_agree = _lock_tgt.get("signals_agree", 2)
+                
+                if window_ts not in _a4_direction_lock:
+                    _a4_direction_lock[window_ts] = {}
+                
+                _a4_direction_lock[window_ts][_lock_asset] = {
+                    "direction": _lock_dir,
+                    "indicators": _lock_ind,
+                    "signals_agree": _lock_agree,
+                    "locked_at": datetime.now(timezone.utc).isoformat(),
+                }
+                _a4_lock_count += 1
+            
+            # Clean old locks (keep only last 2 boundaries = 30 mins)
+            _old_boundaries = [k for k in _a4_direction_lock if k < window_ts - 1800]
+            for _ob in _old_boundaries:
+                _a4_direction_lock.pop(_ob, None)
+            
+            if _a4_lock_count > 0:
+                _lock_dirs = {t["asset"]: t["direction"] for t in snipe_targets}
+                print("A4 LOCK: {} directions at boundary {} | {}".format(
+                    _a4_lock_count, window_ts, 
+                    " ".join("{}={}".format(a,d) for a,d in _lock_dirs.items())))
+            else:
+                print("A4 LOCK: 0 directions at boundary {}".format(window_ts))
 
             # ── SV3: Record paper trades at T+0 (same boundary entry as sniper) ──
             try:
@@ -1260,50 +1276,6 @@ def _sniper_thread():
                         _sv3_cnt, _sv3_state["balance"]))
             except Exception as _sv3_err:
                 print("SV3 T0 block error: {}".format(_sv3_err))
-
-            # ── Phase 2: DB + Telegram after all orders placed ──
-            fired_count = len(fired_results)
-            if fired_count > 0:
-                elapsed = (datetime.now(timezone.utc) - fire_time).total_seconds()
-                print("SNIPER: fired {} orders at boundary {} in {:.2f}s".format(
-                    fired_count, window_ts, elapsed))
-
-            for (asset, direction, stake,
-                 order_id, filled, tdata, market_key, target) in fired_results:
-                try:
-                    c4 = get_db()
-                    c4.run("""INSERT INTO poly_alpha4_trades
-                        (market_id,title,asset,timeframe,bet_side,stake,fill_price,
-                         pool_after,order_id,token_id,condition_id,slug,filled,status,
-                         indicators,signals_agree,fired_at)
-                        VALUES(:mid,:ttl,:ast,:tf,:bs,:stake,:fill,:pool,:oid,:tid,:cid,:slg,:filled,'Pending',
-                               :ind,:sa,:now)""",
-                        mid=market_key, ttl=tdata.get("title", ""),
-                        ast=asset, tf="15M", bs=direction, stake=stake,
-                        fill=0.5000, pool=_poly_alpha4_state["balance"],
-                        oid=order_id,
-                        tid=str(tdata.get("up_token" if direction=="UP" else "down_token",""))[:50],
-                        cid=tdata.get("condition_id", ""),
-                        slg=tdata.get("slug", ""),
-                        filled=filled,
-                        ind=target["indicators"],
-                        sa=target["signals_agree"],
-                        now=fire_time.isoformat())
-                    c4.close()
-                except Exception as e:
-                    print("SNIPER DB save error: {}".format(e))
-
-                fl_tag = "FILLED" if filled else "MAKER"
-                print("SNIPER A4: {} {} 15M ${:.2f} @50c [{}] {} | {} | pool=${:.2f}".format(
-                    direction, asset, stake, fl_tag,
-                    target["indicators"], _trade_tier, _poly_alpha4_state["balance"]))
-                send_telegram("🎯 <b>SNIPER A4</b>\n{} {} 15M ${:.2f} @50¢\n{}\nPool: ${:.2f}".format(
-                    direction, asset, stake,
-                    target["indicators"], _poly_alpha4_state["balance"]))
-
-            if fired_count > 0:
-                _save_bot_balance("poly_alpha4", _poly_alpha4_state)
-            _save_bot_balance("limitless_sniper", _limitless_sniper_state)
 
             # Sleep until next cycle (at least 60s to avoid double-firing)
             _time.sleep(60)
@@ -18352,6 +18324,146 @@ def run_poly_scan():
                         "sp": sim_payout, "now": now,
                         "slg": parsed.get("slug", ""), "cid": parsed.get("condition_id", "")
                     })
+
+                    # ── A4 DYNAMIC PRICING: 3-Path Confirmation ──
+                    # Path 1: A4 lock + Bot2 agree → fire
+                    # Path 2: A4 lock + P2.1 agree → fire
+                    # Path 3: Bot2 + P2.1 agree (no A4 needed) → fire
+                    # First two to agree on direction → confirmed
+                    if strat in ("p21", "bot2") and section == "all15m":
+                        try:
+                            # Find boundary timestamp for this market
+                            _a4d_exp_min = parsed.get("expiry_minute")
+                            _a4d_exp_hour = parsed.get("expiry_hour")
+                            if _a4d_exp_min is not None and _a4d_exp_hour is not None:
+                                from datetime import datetime as _a4d_dt, timezone as _a4d_tz
+                                _a4d_now = _a4d_dt.now(_a4d_tz.utc)
+                                _a4d_exp = _a4d_now.replace(hour=int(_a4d_exp_hour), minute=int(_a4d_exp_min), second=0, microsecond=0)
+                                _a4d_boundary_ts = int((_a4d_exp - timedelta(minutes=15)).timestamp())
+                                
+                                _a4d_scan_dir = poly_side  # "UP" or "DOWN"
+                                _a4d_dedup_key = "{}_{}_dyn".format(asset, _a4d_boundary_ts)
+                                
+                                if _a4d_dedup_key not in _a4_dynamic_traded:
+                                    # Check A4 direction lock
+                                    _a4d_locks = _a4_direction_lock.get(_a4d_boundary_ts, {})
+                                    _a4d_lock = _a4d_locks.get(asset)
+                                    _a4d_has_a4 = _a4d_lock and _a4d_lock["direction"] == _a4d_scan_dir
+                                    
+                                    # Track Bot2/P2.1 confirmations for this boundary+asset
+                                    _a4d_confirm_key = "{}_{}_confirm".format(asset, _a4d_boundary_ts)
+                                    if not hasattr(run_poly_scan, '_a4d_confirms'):
+                                        run_poly_scan._a4d_confirms = {}
+                                    
+                                    _a4d_prev = run_poly_scan._a4d_confirms.get(_a4d_confirm_key, {})
+                                    _a4d_prev[strat] = _a4d_scan_dir
+                                    run_poly_scan._a4d_confirms[_a4d_confirm_key] = _a4d_prev
+                                    
+                                    # Count agreements
+                                    _a4d_bot2_dir = _a4d_prev.get("bot2")
+                                    _a4d_p21_dir = _a4d_prev.get("p21")
+                                    
+                                    _a4d_confirmed = False
+                                    _a4d_confirm_src = ""
+                                    
+                                    # Path 1: A4 + current strat agree
+                                    if _a4d_has_a4:
+                                        _a4d_confirmed = True
+                                        _a4d_confirm_src = "A4+{}".format(strat.upper())
+                                    
+                                    # Path 3: Bot2 + P2.1 agree (both must have scored this boundary)
+                                    if not _a4d_confirmed and _a4d_bot2_dir and _a4d_p21_dir:
+                                        if _a4d_bot2_dir == _a4d_p21_dir == _a4d_scan_dir:
+                                            _a4d_confirmed = True
+                                            _a4d_confirm_src = "BOT2+P21"
+                                    
+                                    if _a4d_confirmed:
+                                        _a4d_odds = effective_odds
+                                        _a4d_tier, _a4d_max_stake = _a4_dynamic_tier(_a4d_odds, _poly_alpha4_state["balance"])
+                                        
+                                        if _a4d_tier:
+                                            _a4d_price = share_price
+                                            _a4d_shares, _a4d_cost = _a4_calc_shares(_a4d_max_stake, _a4d_price)
+                                            
+                                            if _a4d_shares > 0 and _a4d_cost <= _poly_alpha4_state["balance"] - 2:
+                                                _a4d_clob = parsed.get("clob_tokens", [])
+                                                _a4d_cid = parsed.get("condition_id", "")
+                                                _a4d_slug = parsed.get("slug", "")
+                                                _a4d_up_idx = parsed.get("up_token_index", 0)
+                                                _a4d_down_idx = parsed.get("down_token_index", 1)
+                                                
+                                                if isinstance(_a4d_clob, list) and len(_a4d_clob) >= 2:
+                                                    if _a4d_scan_dir == "UP":
+                                                        _a4d_token = _a4d_clob[_a4d_up_idx]
+                                                        _a4d_bet_side = "YES"
+                                                    else:
+                                                        _a4d_token = _a4d_clob[_a4d_down_idx]
+                                                        _a4d_bet_side = "NO"
+                                                    
+                                                    if _poly_has_creds():
+                                                        try:
+                                                            _a4d_oid, _a4d_filled = _place_gtc_order(
+                                                                _a4d_slug, _a4d_bet_side, _a4d_token,
+                                                                _a4d_cost, _a4d_price,
+                                                                _poly_creds["exchange"], _poly_creds["profile_id"],
+                                                                _poly_creds["fee_bps"])
+                                                            
+                                                            if _a4d_oid:
+                                                                _a4_dynamic_traded.add(_a4d_dedup_key)
+                                                                
+                                                                _poly_alpha4_state["balance"] = round(
+                                                                    _poly_alpha4_state["balance"] - _a4d_cost, 2)
+                                                                
+                                                                # Build indicators string
+                                                                _a4d_ind_str = ""
+                                                                if _a4d_lock:
+                                                                    _a4d_ind_str = _a4d_lock.get("indicators", "")
+                                                                else:
+                                                                    _a4d_ind_str = scored.get("indicators", "")
+                                                                
+                                                                try:
+                                                                    _a4d_db = get_db()
+                                                                    _a4d_db.run("""INSERT INTO poly_alpha4_trades
+                                                                        (market_id,title,asset,timeframe,bet_side,stake,fill_price,
+                                                                         pool_after,order_id,token_id,condition_id,slug,filled,
+                                                                         status,outcome,indicators,signals_agree,fired_at)
+                                                                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                                                                        ["sniper_{}_15M_{}".format(asset, _a4d_boundary_ts),
+                                                                         parsed.get("title",""),
+                                                                         asset, "15M", _a4d_scan_dir,
+                                                                         _a4d_cost, _a4d_price,
+                                                                         _poly_alpha4_state["balance"],
+                                                                         _a4d_oid, _a4d_token, _a4d_cid, _a4d_slug,
+                                                                         _a4d_filled,
+                                                                         "Pending", "PENDING",
+                                                                         "{} | {}c {} | {}".format(
+                                                                             _a4d_ind_str,
+                                                                             int(_a4d_odds), _a4d_tier,
+                                                                             _a4d_confirm_src),
+                                                                         scored.get("score", scored.get("signals_agree", 2)),
+                                                                         datetime.now(timezone.utc).isoformat()])
+                                                                    _a4d_db.close()
+                                                                except Exception as _a4d_dbe:
+                                                                    print("A4 DYN DB error: {}".format(_a4d_dbe))
+                                                                
+                                                                _save_bot_balance("poly_alpha4", _poly_alpha4_state)
+                                                                
+                                                                print("A4 DYN: {} {} @{}c ${:.2f} ({} shares) {} [{}] | pool=${:.2f}".format(
+                                                                    _a4d_scan_dir, asset, int(_a4d_odds),
+                                                                    _a4d_cost, _a4d_shares, _a4d_tier,
+                                                                    _a4d_confirm_src,
+                                                                    _poly_alpha4_state["balance"]))
+                                                        except Exception as _a4d_oe:
+                                                            print("A4 DYN order error {}: {}".format(asset, _a4d_oe))
+                                    
+                                    # Clean old confirms (keep last 30 mins)
+                                    _a4d_old_confirms = [k for k in run_poly_scan._a4d_confirms 
+                                                         if int(k.split("_")[1]) < _a4d_boundary_ts - 1800]
+                                    for _oc in _a4d_old_confirms:
+                                        run_poly_scan._a4d_confirms.pop(_oc, None)
+                                        
+                        except Exception as _a4d_e:
+                            pass  # Silent fail — don't break scan loop
                     existing_keys.add(key)
                     poly_counts[section] = poly_counts.get(section, 0) + 1
 
