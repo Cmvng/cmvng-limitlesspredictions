@@ -671,11 +671,13 @@ def _sv3_score_and_record(asset, token_map_entry, boundary_ts, now_str):
     # ── Step 1: Get signal direction ──
     direction, signals_agree, ind_str, confidence = _sniper_get_direction(asset, "15m")
     if not direction or signals_agree < 2:
+        print("SV3 SKIP {}: no direction (dir={} agree={})".format(asset, direction, signals_agree))
         return False
 
     # ── Step 2: Get previous candle via P2.9 logic ──
     candle = _p28_read_prev_candle(asset, "15m")
     if not candle:
+        print("SV3 SKIP {}: no prev candle".format(asset))
         return False
 
     prev_high  = candle.get("high", 0)
@@ -693,6 +695,7 @@ def _sv3_score_and_record(asset, token_map_entry, boundary_ts, now_str):
     # ── Step 3: Get current price (Chainlink RTDS estimate of price to beat) ──
     rtds_price = _rtds_prices.get(asset.upper())
     if not rtds_price:
+        print("SV3 SKIP {}: no RTDS price".format(asset))
         return False
 
     price_to_beat = rtds_price
@@ -700,6 +703,7 @@ def _sv3_score_and_record(asset, token_map_entry, boundary_ts, now_str):
     # ── Step 4: Calculate price position within previous candle range ──
     prev_range = prev_high - prev_low
     if prev_range <= 0:
+        print("SV3 SKIP {}: zero range h={} l={}".format(asset, prev_high, prev_low))
         return False
 
     price_position = (price_to_beat - prev_low) / prev_range
@@ -737,6 +741,7 @@ def _sv3_score_and_record(asset, token_map_entry, boundary_ts, now_str):
     # Only genuine skip: both prev AND current candle are doji (zero info)
 
     if prev_was_doji and body_ratio < 0.15:
+        print("SV3 SKIP {}: double doji".format(asset))
         return False    # Both candles flat — genuinely zero directional info
 
     if direction == "UP":
@@ -998,7 +1003,8 @@ def _sniper_thread():
                                 }
                                 if _sv3_score_and_record(_sv3_asset, _sv3_entry, _sv3_window_ts, _sv3_now_str):
                                     _sv3_cnt += 1
-                    except: pass
+                    except Exception as _sv3_inner_e:
+                        print("SV3 API fail {}: {}".format(_sv3_asset, _sv3_inner_e))
                 if _sv3_cnt:
                     print("SV3: {} paper trades | pool=${:.2f}".format(
                         _sv3_cnt, _sv3_state["balance"]))
