@@ -933,7 +933,18 @@ def _sniper_thread():
                 _time.sleep(min(secs_to_boundary - 27, 60))
                 continue
 
-            # ── T-30s: Force fresh indicators for all assets ──
+            # ── T-30s: SV2 + SV3 read STALE cache (before fresh Binance pull) ──
+            _sv2_directions = {}
+            _sv3_directions = {}
+            for _pre_asset in SNIPER_ASSETS:
+                try:
+                    _pre_d, _pre_da, _pre_ind, _pre_conf = _sniper_get_direction(_pre_asset, "15m")
+                    if _pre_d and _pre_da >= 2:
+                        _sv2_directions[_pre_asset] = (_pre_d, _pre_da, _pre_ind, _pre_conf)
+                        _sv3_directions[_pre_asset] = _pre_d
+                except: pass
+
+            # ── T-27s: Force fresh indicators for all assets ──
             # MUST clear cache first — _calculate_indicators returns cached
             # data if age < TTL (600s). Without clearing, the "refresh" is a no-op.
             # Clear then recalculate guarantees fresh data at fire time.
@@ -986,19 +997,6 @@ def _sniper_thread():
                 next_boundary = next_boundary.replace(minute=next_min)
 
             window_ts = int(next_boundary.timestamp())
-
-            # ── SV2 + SV3: Capture directions at T-22s (stale pre-clear cache) ──
-            # SV2 uses stale cache (before fresh Binance pull) — mirrors old P2.1 behaviour
-            # SV3 also reads stale cache for candle/price-position logic
-            _sv2_directions = {}
-            _sv3_directions = {}
-            for _pre_asset in SNIPER_ASSETS:
-                try:
-                    _pre_d, _pre_da, _pre_ind, _pre_conf = _sniper_get_direction(_pre_asset, "15m")
-                    if _pre_d and _pre_da >= 2:
-                        _sv2_directions[_pre_asset] = (_pre_d, _pre_da, _pre_ind, _pre_conf)
-                        _sv3_directions[_pre_asset] = _pre_d
-                except: pass
 
             # ── T-15s: Fetch token IDs from Gamma API ──
             import requests as _req
@@ -1179,17 +1177,6 @@ def _sniper_thread():
                         _sv2_scored, _sv2_state["balance"]))
             except Exception as _sv2e:
                 print("SV2 error: {}".format(_sv2e))
-
-            # ── A4: Re-read direction at T+0 (same moment as SV2) ──
-            _refreshed = []
-            for _tgt in snipe_targets:
-                _t0_dir, _t0_agree, _t0_ind, _t0_conf = _sniper_get_direction(_tgt["asset"], "15m")
-                if _t0_dir and _t0_agree >= 2:
-                    _tgt["direction"]     = _t0_dir
-                    _tgt["signals_agree"] = _t0_agree
-                    _tgt["indicators"]    = _t0_ind
-                    _refreshed.append(_tgt)
-            snipe_targets = _refreshed
 
             fired_results = []  # collect results for post-fire logging
             fire_time = datetime.now(timezone.utc)
