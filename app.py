@@ -928,23 +928,72 @@ def _sniper_thread():
 
             secs_to_boundary = mins_to_next * 60 - current_second
 
-            # If more than 27 seconds away, sleep and retry
-            if secs_to_boundary > 27:
-                _time.sleep(min(secs_to_boundary - 27, 60))
+            # If more than 35 seconds away, sleep and retry
+            if secs_to_boundary > 35:
+                _time.sleep(min(secs_to_boundary - 35, 60))
                 continue
 
-            # ── T-30s: SV2 + SV3 read STALE cache (before fresh Binance pull) ──
-            _sv2_directions = {}
+            # ── T-35s: SV2 scores with STALE cache (before any cache clear) ──
+            _sv2_now_str = datetime.now(timezone.utc).isoformat()
+            for _sv2_t30_asset in SNIPER_ASSETS:
+                try:
+                    _sv2_t30_entry = None
+                    _sv2_t30_slug = SNIPER_SLUGS[_sv2_t30_asset].format(
+                        int((now.replace(second=0, microsecond=0) +
+                             timedelta(minutes=(15 - (now.minute % 15)) if (now.minute % 15) != 0 else 0)).timestamp()))
+                    import requests as _sv2_req
+                    _sv2_t30_r = _sv2_req.get("{}/markets/slug/{}".format(GAMMA_API, _sv2_t30_slug), timeout=5)
+                    if _sv2_t30_r.status_code == 200:
+                        _sv2_t30_md = _sv2_t30_r.json()
+                        _sv2_t30_toks = _sv2_t30_md.get("clobTokenIds")
+                        if isinstance(_sv2_t30_toks, str):
+                            try:
+                                import json as _sv2_j
+                                _sv2_t30_toks = _sv2_j.loads(_sv2_t30_toks)
+                            except: _sv2_t30_toks = None
+                        _sv2_t30_oc = _sv2_t30_md.get("outcomes")
+                        if isinstance(_sv2_t30_oc, str):
+                            try: _sv2_t30_oc = _sv2_j.loads(_sv2_t30_oc)
+                            except: _sv2_t30_oc = None
+                        if isinstance(_sv2_t30_toks, list) and len(_sv2_t30_toks) >= 2:
+                            _sv2_t30_up = 0
+                            if isinstance(_sv2_t30_oc, list) and len(_sv2_t30_oc) >= 2:
+                                if str(_sv2_t30_oc[0]).lower().strip() in ("no","down","below"):
+                                    _sv2_t30_up = 1
+                            _sv2_t30_entry = {
+                                "up_token": _sv2_t30_toks[_sv2_t30_up],
+                                "down_token": _sv2_t30_toks[1-_sv2_t30_up],
+                                "condition_id": _sv2_t30_md.get("conditionId",""),
+                                "slug": _sv2_t30_slug,
+                                "title": _sv2_t30_md.get("question",""),
+                            }
+                    if _sv2_t30_entry:
+                        _sv2_score_and_record(_sv2_t30_asset, _sv2_t30_entry,
+                            int((now.replace(second=0, microsecond=0) +
+                                 timedelta(minutes=(15 - (now.minute % 15)) if (now.minute % 15) != 0 else 0)).timestamp()),
+                            _sv2_now_str)
+                except Exception as _sv2_t30_e:
+                    pass
+            _sv2_count = sum(1 for a in SNIPER_ASSETS if _indicator_cache.get("{}_15m".format(a)))
+            print("SV2: {} paper trades recorded | pool=${:.2f}".format(
+                _sv2_count, _sv2_state.get("balance", 0)) if hasattr(_sv2_state, 'get') else "SV2: scored")
+
+            # ── SV3: Capture directions with STALE cache (before clear) ──
             _sv3_directions = {}
             for _pre_asset in SNIPER_ASSETS:
                 try:
-                    _pre_d, _pre_da, _pre_ind, _pre_conf = _sniper_get_direction(_pre_asset, "15m")
+                    _pre_d, _pre_da, _, _ = _sniper_get_direction(_pre_asset, "15m")
                     if _pre_d and _pre_da >= 2:
-                        _sv2_directions[_pre_asset] = (_pre_d, _pre_da, _pre_ind, _pre_conf)
                         _sv3_directions[_pre_asset] = _pre_d
                 except: pass
 
-            # ── T-27s: Force fresh indicators for all assets ──
+            # ── Wait until T-15s before clearing cache ──
+            _now_pre_wait = datetime.now(timezone.utc)
+            _secs_to_t15 = secs_to_boundary - 15
+            if _secs_to_t15 > 0:
+                _time.sleep(_secs_to_t15)
+
+            # ── T-15s: Force fresh indicators for all assets ──
             # MUST clear cache first — _calculate_indicators returns cached
             # data if age < TTL (600s). Without clearing, the "refresh" is a no-op.
             # Clear then recalculate guarantees fresh data at fire time.
@@ -1126,57 +1175,7 @@ def _sniper_thread():
             from py_clob_client_v2 import Side, OrderArgs, OrderType
             BUY = Side.BUY
 
-            # ── Paper Sniper V2: Score ALL assets independently at boundary ──
-            # Runs regardless of whether live sniper has targets
-            # Fetches token_map entries for assets not covered by live sniper
-            try:
-                _sv2_now_str = datetime.now(timezone.utc).isoformat()
-                _sv2_scored = 0
-                for _sv2_asset in SNIPER_ASSETS:
-                    if _sv2_state["balance"] <= 5.0:
-                        break
-                    # Get token_map entry — fetch if not already in map
-                    _sv2_entry = token_map.get(_sv2_asset)
-                    if not _sv2_entry:
-                        try:
-                            import requests as _sv2_req
-                            _sv2_slug = SNIPER_SLUGS[_sv2_asset].format(window_ts)
-                            _sv2_r = _sv2_req.get(
-                                "{}/markets/slug/{}".format(GAMMA_API, _sv2_slug), timeout=5)
-                            if _sv2_r.status_code == 200:
-                                _sv2_md = _sv2_r.json()
-                                _sv2_toks = _sv2_md.get("clobTokenIds")
-                                if isinstance(_sv2_toks, str):
-                                    import json as _sv2_json
-                                    try: _sv2_toks = _sv2_json.loads(_sv2_toks)
-                                    except: _sv2_toks = None
-                                _sv2_oc = _sv2_md.get("outcomes")
-                                if isinstance(_sv2_oc, str):
-                                    try: _sv2_oc = _sv2_json.loads(_sv2_oc)
-                                    except: _sv2_oc = None
-                                if isinstance(_sv2_toks, list) and len(_sv2_toks) >= 2:
-                                    _sv2_up_idx = 0
-                                    if isinstance(_sv2_oc, list) and len(_sv2_oc) >= 2:
-                                        if str(_sv2_oc[0]).lower().strip() in ("no","down","below"):
-                                            _sv2_up_idx = 1
-                                    _sv2_entry = {
-                                        "up_token": _sv2_toks[_sv2_up_idx],
-                                        "down_token": _sv2_toks[1-_sv2_up_idx],
-                                        "condition_id": _sv2_md.get("conditionId",""),
-                                        "slug": _sv2_slug,
-                                        "title": _sv2_md.get("question",""),
-                                    }
-                                    token_map[_sv2_asset] = _sv2_entry
-                        except Exception as _sv2_fe:
-                            pass
-                    if _sv2_entry and _sv2_score_and_record(
-                            _sv2_asset, _sv2_entry, window_ts, _sv2_now_str):
-                        _sv2_scored += 1
-                if _sv2_scored:
-                    print("SV2: {} paper trades recorded | pool=${:.2f}".format(
-                        _sv2_scored, _sv2_state["balance"]))
-            except Exception as _sv2e:
-                print("SV2 error: {}".format(_sv2e))
+            # SV2 already scored at T-35s (before cache clear)
 
             fired_results = []  # collect results for post-fire logging
             fire_time = datetime.now(timezone.utc)
