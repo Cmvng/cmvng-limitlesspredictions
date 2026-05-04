@@ -18408,8 +18408,8 @@ def run_poly_scan():
                                                             _a4d_oid, _a4d_filled = _place_gtc_order(
                                                                 _a4d_slug, _a4d_bet_side, _a4d_token,
                                                                 _a4d_cost, _a4d_price,
-                                                                _poly_creds["exchange"], _poly_creds["profile_id"],
-                                                                _poly_creds["fee_bps"])
+                                                                _cached_credentials["exchange_addr"], _cached_credentials["profile_id"],
+                                                                _cached_credentials.get("fee_bps", 300))
                                                             
                                                             if _a4d_oid:
                                                                 _a4_dynamic_traded.add(_a4d_dedup_key)
