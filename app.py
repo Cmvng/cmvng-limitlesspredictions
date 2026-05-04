@@ -962,14 +962,12 @@ def _sniper_thread():
             # ── SV3 scores at same T-22s (pre-clear cache) ──
             # T2.1 and T2.2: previous candle + price position logic
             try:
-                # Calculate boundary timestamp from available variables
+                # Use CURRENT boundary timestamp (round DOWN to nearest 15M)
+                # Same as window_ts that SV2 uses — the active market that just opened
                 _sv3_now = datetime.now(timezone.utc)
-                _sv3_nbm = ((current_minute // 15) + 1) * 15
-                if _sv3_nbm >= 60:
-                    _sv3_nb = _sv3_now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
-                else:
-                    _sv3_nb = _sv3_now.replace(minute=_sv3_nbm, second=0, microsecond=0)
-                _sv3_window_ts = int(_sv3_nb.timestamp())
+                _sv3_cbm = (current_minute // 15) * 15  # current boundary minute
+                _sv3_cb = _sv3_now.replace(minute=_sv3_cbm, second=0, microsecond=0)
+                _sv3_window_ts = int(_sv3_cb.timestamp())
                 _sv3_now_str = datetime.now(timezone.utc).isoformat()
                 _sv3_cnt = 0
                 for _sv3_asset in SNIPER_ASSETS:
