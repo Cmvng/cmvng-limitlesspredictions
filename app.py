@@ -987,13 +987,17 @@ def _sniper_thread():
 
             window_ts = int(next_boundary.timestamp())
 
-            # ── SV3: Capture directions NOW (fresh cache, before boundary wait) ──
+            # ── SV2 + SV3: Capture directions at T-22s (stale pre-clear cache) ──
+            # SV2 uses stale cache (before fresh Binance pull) — mirrors old P2.1 behaviour
+            # SV3 also reads stale cache for candle/price-position logic
+            _sv2_directions = {}
             _sv3_directions = {}
-            for _sv3_d_asset in SNIPER_ASSETS:
+            for _pre_asset in SNIPER_ASSETS:
                 try:
-                    _sv3_d, _sv3_da, _, _ = _sniper_get_direction(_sv3_d_asset, "15m")
-                    if _sv3_d and _sv3_da >= 2:
-                        _sv3_directions[_sv3_d_asset] = _sv3_d
+                    _pre_d, _pre_da, _pre_ind, _pre_conf = _sniper_get_direction(_pre_asset, "15m")
+                    if _pre_d and _pre_da >= 2:
+                        _sv2_directions[_pre_asset] = (_pre_d, _pre_da, _pre_ind, _pre_conf)
+                        _sv3_directions[_pre_asset] = _pre_d
                 except: pass
 
             # ── T-15s: Fetch token IDs from Gamma API ──
@@ -1167,14 +1171,29 @@ def _sniper_thread():
                                     token_map[_sv2_asset] = _sv2_entry
                         except Exception as _sv2_fe:
                             pass
+                    _sv2_forced = _sv2_directions.get(_sv2_asset)
                     if _sv2_entry and _sv2_score_and_record(
-                            _sv2_asset, _sv2_entry, window_ts, _sv2_now_str):
+                            _sv2_asset, _sv2_entry, window_ts, _sv2_now_str,
+                            forced_direction=_sv2_forced):
                         _sv2_scored += 1
                 if _sv2_scored:
                     print("SV2: {} paper trades recorded | pool=${:.2f}".format(
                         _sv2_scored, _sv2_state["balance"]))
             except Exception as _sv2e:
                 print("SV2 error: {}".format(_sv2e))
+
+            # ── Re-read directions at T+0 with fresh cache ──
+            # Sniper qualified targets at T-30s (stale cache)
+            # Now re-read with fresh Binance data for accuracy
+            _refreshed_targets = []
+            for _tgt in snipe_targets:
+                _fresh_dir, _fresh_agree, _fresh_ind, _fresh_conf = _sniper_get_direction(_tgt["asset"], "15m")
+                if _fresh_dir and _fresh_agree >= 2:
+                    _tgt["direction"]     = _fresh_dir
+                    _tgt["signals_agree"] = _fresh_agree
+                    _tgt["indicators"]    = _fresh_ind
+                    _refreshed_targets.append(_tgt)
+            snipe_targets = _refreshed_targets
 
             fired_results = []  # collect results for post-fire logging
             fire_time = datetime.now(timezone.utc)
@@ -1416,9 +1435,15 @@ def _sv2_get_tier(asset, direction, signals_agree, confidence, ind_data):
     return None
 
 
-def _sv2_score_and_record(asset, token_map_entry, boundary_ts, now_str):
-    """Score one asset for Sniper V2 paper trade. Returns True if trade recorded."""
-    direction, signals_agree, ind_str, confidence = _sniper_get_direction(asset, "15m")
+def _sv2_score_and_record(asset, token_map_entry, boundary_ts, now_str, forced_direction=None):
+    """Score one asset for Sniper V2 paper trade. Returns True if trade recorded.
+    forced_direction: pre-captured (direction, signals_agree, ind_str, confidence) tuple
+    from T-22s stale cache. If None, reads fresh cache (old behaviour).
+    """
+    if forced_direction:
+        direction, signals_agree, ind_str, confidence = forced_direction
+    else:
+        direction, signals_agree, ind_str, confidence = _sniper_get_direction(asset, "15m")
     if not direction or signals_agree < 2:
         return False
 
