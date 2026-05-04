@@ -18409,11 +18409,22 @@ def run_poly_scan():
                                                     
                                                     if _poly_has_creds():
                                                         try:
-                                                            _a4d_oid, _a4d_filled = _place_gtc_order(
-                                                                _a4d_slug, _a4d_bet_side, _a4d_token,
-                                                                _a4d_cost, _a4d_price,
-                                                                _cached_credentials["exchange_addr"], _cached_credentials["profile_id"],
-                                                                _cached_credentials.get("fee_bps", 300))
+                                                            _a4d_client = _get_poly_client()
+                                                            _a4d_oid = None
+                                                            _a4d_filled = False
+                                                            if _a4d_client:
+                                                                from py_clob_client_v2 import OrderArgs, OrderType, Side as _A4Side
+                                                                _a4d_order_args = OrderArgs(
+                                                                    token_id=str(_a4d_token),
+                                                                    price=round(_a4d_price, 2),
+                                                                    size=float(_a4d_shares),
+                                                                    side=_A4Side.BUY,
+                                                                )
+                                                                _a4d_signed = _a4d_client.create_order(_a4d_order_args)
+                                                                _a4d_resp = _a4d_client.post_order(_a4d_signed, OrderType.GTC)
+                                                                if _a4d_resp:
+                                                                    _a4d_oid = _a4d_resp.get("orderID") or _a4d_resp.get("id") or "placed"
+                                                                    _a4d_filled = bool(_a4d_resp.get("status") == "matched")
                                                             
                                                             if _a4d_oid:
                                                                 _a4_dynamic_traded.add(_a4d_dedup_key)
