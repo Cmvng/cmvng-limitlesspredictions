@@ -422,6 +422,8 @@ def _poly_alpha3_load_recent():
     _saved_pa41 = _saved_balances.get("poly_alpha41", {})
     if _saved_pa41 and _saved_pa41.get("balance", 0) > 0:
         _poly_alpha41_state["balance"] = _saved_pa41["balance"]
+    else:
+        _poly_alpha41_state["balance"] = 200.00  # Fresh $200 pool
     _poly_alpha4_state["floor_balance"] = 5.0
     _poly_alpha4_state["enabled"] = True
     print("SNIPER A4: ${:.2f} pool (restored from DB) | P2.1 at boundary | 15M | 50¢ fills".format(
@@ -468,7 +470,7 @@ def _poly_alpha3_calc_stake(pool_balance):
 # Independent thread, no scanner dependency
 # ═══════════════════════════════════════════════════════════
 
-_poly_alpha41_state = {"balance": 100.00}
+_poly_alpha41_state = {"balance": 200.00}
 _sv21_paper_state = {"balance": 100.00}
 _poly_alpha4_state = {
     "enabled": True,
@@ -18857,7 +18859,7 @@ def run_poly_scan():
                                     _h41_now = datetime.now(timezone.utc)
                                     _h41_exp = _h41_now.replace(hour=int(_h41_exp_hour), minute=int(_h41_exp_min), second=0, microsecond=0)
                                     _h41_bnd_ts = int((_h41_exp - timedelta(minutes=15)).timestamp())
-                                    _h41_dedup = "a41_{}_{}_{}".format(asset, _h41_bnd_ts, strat)
+                                    _h41_dedup = "a41_{}_{}_{}".format(asset, _h41_bnd_ts, strat)  # Both strategies fire independently
                                     
                                     if not hasattr(run_poly_scan, '_a41_traded'):
                                         run_poly_scan._a41_traded = set()
@@ -18959,6 +18961,7 @@ def run_poly_scan():
                                                                 _poly_alpha41_state["balance"]))
                                                             
                                                             try:
+                                                                print("A41 sending telegram...")
                                                                 send_telegram("A41: {} {} {} @{}c ${:.2f} {} [{}] pool=${:.2f}".format(
                                                                     _h41_type, _h41_dir, asset, _h41_gtc_pct,
                                                                     _h41_cost, _h41_tier,
