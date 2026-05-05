@@ -1330,7 +1330,7 @@ def _sniper_thread():
                     print("A4 post-fire error: {}".format(_fr_e))
             
             if fired_results:
-                _save_bot_balance("poly_alpha4", _poly_alpha4_state["balance"])
+                _save_bot_balance("poly_alpha4", _poly_alpha4_state)
                 print("A4: fired {} orders at T+0 | pool=${:.2f}".format(
                     len(fired_results), _poly_alpha4_state["balance"]))
 
@@ -2247,7 +2247,7 @@ def _sniper_a41_thread():
                     print("A41 post-fire error: {}".format(_fr_e))
             
             if fired:
-                _save_bot_balance("poly_alpha41", _poly_alpha41_state["balance"])
+                _save_bot_balance("poly_alpha41", _poly_alpha41_state)
                 print("A41: fired {} orders | pool=${:.2f}".format(len(fired), _poly_alpha41_state["balance"]))
             
             _time.sleep(60)
@@ -20035,7 +20035,7 @@ def _poly_scan_loop():
                         out=_a41r_out, pay=_a41r_pay, ra=datetime.now(timezone.utc).isoformat(), id=_a41r_item["id"])
                     if _a41r_won:
                         _poly_alpha41_state["balance"] = round(_poly_alpha41_state["balance"] + _a41r_pay, 2)
-                    _save_bot_balance("poly_alpha41", _poly_alpha41_state["balance"])
+                    _save_bot_balance("poly_alpha41", _poly_alpha41_state)
                     print("A41 resolved: {} {} {} ${:.2f} pool=${:.2f}".format(
                         _a41r_item.get("asset","?"), _a41r_side, _a41r_out, _a41r_stk, _poly_alpha41_state["balance"]))
                 except:
@@ -21012,6 +21012,7 @@ def poly_alpha4_page():
     
     nav_links = [
         ("/app/poly-alpha4", "🎯 Sniper A4"),
+        ("/app/poly-alpha41", "🎯 A41 P31"),
         ("/app/limitless-sniper", "🎯 LMTS"),
         ("/app/sniper-v2", "📊 Sniper V2 Paper"),
         ("/app/paper21", "Paper 2.1"),
