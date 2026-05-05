@@ -2046,14 +2046,25 @@ def _sniper_a41_thread():
                 _a41_next_min = ((_a41_now.minute // 15) + 1) * 15
                 _a41_expiry_min = _a41_next_min if _a41_next_min < 60 else 0
                 
+                # Debug: check what data A41 is reading
+                if not _a41_ind_data or not _a41_ind_data.get("sma_trend"):
+                    print("A41 DEBUG {}: ind_data empty or no sma_trend | keys={}".format(
+                        asset, list(_a41_ind_data.keys())[:5] if _a41_ind_data else "EMPTY"))
+                
                 try:
                     _a41_result = _score_paper31_trade(
                         _a41_market, _a41_price, _a41_ind_data,
                         ind_macro=_a41_macro_data,
                         expiry_minute=_a41_expiry_min
                     )
+                    if not _a41_result:
+                        print("A41 DEBUG {}: P31 returned None | price={} baseline={} ind_keys={}".format(
+                            asset, _a41_price, _a41_market["baseline"], 
+                            list(_a41_ind_data.keys())[:5] if _a41_ind_data else "EMPTY"))
                 except Exception as _a41_err:
                     print("A41 P31 score error {}: {}".format(asset, _a41_err))
+                    import traceback
+                    traceback.print_exc()
                     _a41_result = None
                 
                 if _a41_result and _a41_result.get("bet_side"):
@@ -20961,137 +20972,42 @@ h2{{font-size:16px;font-weight:700;color:#1a3d2e;margin-bottom:12px}}
 
 @app.route("/app/poly-alpha4")
 def poly_alpha4_page():
-    """Sniper A4 dashboard — per-asset filter model, T+0 at 50¢."""
+    """Sniper A4 dashboard — Original TV+SMA+BTC model."""
     try:
         db = get_db()
         trades = db.run("SELECT * FROM poly_alpha4_trades ORDER BY fired_at DESC LIMIT 200")
         cols = [c['name'] for c in db.columns] if trades else []
         trades = [dict(zip(cols, row)) for row in trades] if trades else []
-    except Exception as e:
-        print("A4 dashboard DB error: {}".format(e))
+    except:
         trades = []
-    
-    resolved = [t for t in trades if t.get("outcome") in ("WIN", "LOSS")]
-    pending = [t for t in trades if t.get("outcome") == "PENDING" or t.get("status") == "Pending"]
+    resolved = [t for t in trades if t.get("outcome") in ("WIN","LOSS")]
+    pending = [t for t in trades if t.get("outcome") == "PENDING"]
     wins = sum(1 for t in resolved if t["outcome"] == "WIN")
-    losses = len(resolved) - wins
-    wr = round(wins / len(resolved) * 100, 1) if resolved else 0
-    pnl = round(sum(
-        (float(t.get("payout") or 0) - float(t.get("stake") or 0)) if t["outcome"] == "WIN"
-        else -float(t.get("stake") or 0)
-        for t in resolved
-    ), 2)
-    
-    # Per-asset stats
-    asset_stats = {}
-    for asset in ["BTC", "ETH", "SOL", "XRP"]:
-        at = [t for t in resolved if t.get("asset") == asset]
-        if at:
-            aw = sum(1 for t in at if t["outcome"] == "WIN")
-            asset_stats[asset] = {"trades": len(at), "wins": aw, "wr": round(aw/len(at)*100, 1)}
-    
-    asset_rows = ""
-    filter_rules = {
-        "BTC": "TV+SMA disagree · no FLIP",
-        "ETH": "TV+SMA disagree · no FLIP",
-        "SOL": "TV+SMA disagree · no FLIP",
-        "XRP": "WEAK period · no FLIP",
-    }
-    for asset in ["BTC", "ETH", "SOL", "XRP"]:
-        st = asset_stats.get(asset, {"trades": 0, "wins": 0, "wr": 0})
-        wr_c = "#4ade80" if st["wr"] >= 52 else "#f87171" if st["wr"] < 48 else "#fbbf24"
-        asset_rows += "<tr><td>{}</td><td>{}</td><td style=\"color:{}\">{}%</td><td>{}W/{}L</td></tr>\n".format(
-            asset, filter_rules.get(asset, ""), wr_c, st["wr"], st["wins"], st["trades"] - st["wins"])
-    
-    # Recent trades
-    trade_rows = ""
-    for t in trades[:50]:
-        outcome = t.get("outcome", "PENDING")
-        icon = "✅" if outcome == "WIN" else "❌" if outcome == "LOSS" else "⏳"
-        side = t.get("bet_side", "?")
-        asset = t.get("asset", "?")
-        stake = float(t.get("stake") or 0)
-        fired = (t.get("fired_at") or "")[:16]
-        payout = float(t.get("payout") or 0)
-        tpnl = round(payout - stake, 2) if outcome == "WIN" else round(-stake, 2) if outcome == "LOSS" else "—"
-        tpnl_c = "#4ade80" if outcome == "WIN" else "#f87171" if outcome == "LOSS" else "#888"
-        trade_rows += "<tr><td>{}</td><td>{}</td><td>{}</td><td>${:.2f}</td><td>{}</td><td style=\"color:{}\">{}</td></tr>\n".format(
-            icon, asset, side, stake, fired, tpnl_c, tpnl)
-    
+    wr = round(wins/len(resolved)*100, 1) if resolved else 0
+    pnl = round(sum((float(t.get("payout") or 0) - float(t.get("stake") or 0)) if t["outcome"]=="WIN" else -float(t.get("stake") or 0) for t in resolved), 2)
     bal = _poly_alpha4_state["balance"]
-    pnl_c = "#4ade80" if pnl >= 0 else "#f87171"
-    wr_c = "#4ade80" if wr >= 52 else "#f87171" if wr < 48 else "#fbbf24"
-    
-    nav_links = [
-        ("/app/poly-alpha4", "🎯 Sniper A4"),
-        ("/app/poly-alpha41", "🎯 A41 P31"),
-        ("/app/limitless-sniper", "🎯 LMTS"),
-        ("/app/sniper-v2", "📊 Sniper V2 Paper"),
-        ("/app/paper21", "Paper 2.1"),
-        ("/app/sniper-v3", "📊 Sniper V3"),
-    ]
-    nav = '<nav style="background:#161b22;padding:8px 16px;display:flex;gap:8px;flex-wrap:wrap;border-bottom:1px solid #30363d">'
-    for href, label in nav_links:
-        nav += '<a href="{}" style="color:#58a6ff;text-decoration:none;padding:4px 10px;border-radius:6px;font-size:13px">{}</a>'.format(href, label)
-    nav += "</nav>"
-    
-    HTML = """<!DOCTYPE html>
-<html><head><title>Sniper Alpha 4.0</title>
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<style>
-body {{ background: #0d1117; color: #e6edf3; font-family: -apple-system, sans-serif; margin: 0; padding: 16px; }}
-.card {{ background: #161b22; border: 1px solid #30363d; border-radius: 12px; padding: 20px; margin-bottom: 16px; }}
-.stat {{ display: inline-block; min-width: 120px; margin: 8px 16px 8px 0; }}
-.stat .val {{ font-size: 28px; font-weight: 700; }}
-.stat .lbl {{ font-size: 12px; color: #8b949e; }}
-table {{ width: 100%; border-collapse: collapse; font-size: 14px; }}
-th {{ text-align: left; color: #8b949e; padding: 8px; border-bottom: 1px solid #30363d; }}
-td {{ padding: 8px; border-bottom: 1px solid #21262d; }}
-h2 {{ color: #58a6ff; margin: 0 0 12px 0; font-size: 18px; }}
-.filter {{ background: #1c2333; border-radius: 8px; padding: 12px; margin: 4px 0; font-size: 13px; }}
-.filter .asset {{ font-weight: 700; color: #58a6ff; }}
-.filter .rule {{ color: #8b949e; }}
-</style></head><body>
-{nav}
-<h1>Sniper A4 — P31 Strategy (7 Indicators)</h1>
-<p style="color:#8b949e">T+0 · 50¢ Entry · P31 Score-Based Stake · Polymarket 15M</p>
-
-<div class="card">
-<div class="stat"><div class="val">${bal:.2f}</div><div class="lbl">Pool</div></div>
-<div class="stat"><div class="val" style="color:{wr_c}">{wr}%</div><div class="lbl">Win Rate</div></div>
-<div class="stat"><div class="val">{tot}</div><div class="lbl">Trades</div></div>
-<div class="stat"><div class="val" style="color:{pnl_c}">${pnl:+.2f}</div><div class="lbl">P&L</div></div>
-<div class="stat"><div class="val">{pending}</div><div class="lbl">Pending</div></div>
-</div>
-
-<div class="card">
-<h2>P31 Strategy (7 Indicators)</h2>
-<div class="filter"><span class="asset">Pair signals:</span> <span class="rule">TV + SMA + UT + EMA4 + PIV → majority vote for direction</span></div>
-<div class="filter"><span class="asset">BTC role:</span> <span class="rule">Confirms pair direction (not a voter)</span></div>
-<div class="filter"><span class="asset">SQZ:</span> <span class="rule">Momentum context · Pullback detection</span></div>
-<div class="filter"><span class="asset">Staking:</span> <span class="rule">Score 3-4 = $3.00 (strong edge) · Score 5-6 = $2.50 (minimum)</span></div>
-<p style="color:#8b949e;font-size:12px;margin-top:8px">Based on 1,206 P31 trades at 50¢: 55.7% WR · Zero losing days in 15 days</p>
-</div>
-
-<div class="card">
-<h2>By Asset</h2>
-<table><tr><th>Asset</th><th>Filter Rule</th><th>Win Rate</th><th>Record</th></tr>
-{asset_rows}
-</table></div>
-
-<div class="card">
-<h2>Recent Trades</h2>
-<table><tr><th></th><th>Asset</th><th>Side</th><th>Stake</th><th>Time</th><th>P&L</th></tr>
-{trade_rows}
-</table></div>
-
-<script>setTimeout(()=>location.reload(), 60000)</script>
-</body></html>"""
-    
-    return HTML.format(
-        nav=nav, bal=bal, wr_c=wr_c, wr=wr, tot=len(resolved),
-        pnl_c=pnl_c, pnl=pnl, pending=len(pending),
-        asset_rows=asset_rows, trade_rows=trade_rows)
+    rows = ""
+    for t in trades[:50]:
+        o = t.get("outcome","PENDING")
+        ic = "W" if o=="WIN" else "L" if o=="LOSS" else "P"
+        tp = round(float(t.get("payout") or 0)-float(t.get("stake") or 0),2) if o=="WIN" else round(-float(t.get("stake") or 0),2) if o=="LOSS" else "-"
+        tc = "#4ade80" if o=="WIN" else "#f87171" if o=="LOSS" else "#888"
+        rows += "<tr><td>%s</td><td>%s</td><td>%s</td><td>$%.2f</td><td>%s</td><td style=\"color:%s\">%s</td></tr>" % (ic,t.get("asset","?"),t.get("bet_side","?"),float(t.get("stake") or 0),str(t.get("fired_at",""))[:16],tc,tp)
+    wc = "#4ade80" if wr>=52 else "#f87171" if wr<48 else "#fbbf24"
+    pc = "#4ade80" if pnl>=0 else "#f87171"
+    html = "<!DOCTYPE html><html><head><title>Sniper A4</title><meta name=viewport content=\"width=device-width,initial-scale=1\"><style>body{background:#0d1117;color:#e6edf3;font-family:sans-serif;margin:0;padding:16px}.c{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:20px;margin-bottom:16px}.s{display:inline-block;min-width:100px;margin:8px 12px 8px 0}.s .v{font-size:24px;font-weight:700}.s .l{font-size:11px;color:#8b949e}table{width:100%%;border-collapse:collapse;font-size:13px}th{text-align:left;color:#8b949e;padding:6px;border-bottom:1px solid #30363d}td{padding:6px;border-bottom:1px solid #21262d}</style></head><body>"
+    html += "<nav style=\"background:#161b22;padding:8px 16px;display:flex;gap:8px;border-bottom:1px solid #30363d\"><a href=/app/poly-alpha4 style=\"color:#58a6ff;text-decoration:none;padding:4px 10px;font-size:13px;font-weight:bold\">A4</a><a href=/app/poly-alpha41 style=\"color:#58a6ff;text-decoration:none;padding:4px 10px;font-size:13px\">A41 P31</a><a href=/app/sv21 style=\"color:#58a6ff;text-decoration:none;padding:4px 10px;font-size:13px\">SV2.1</a><a href=/app/limitless-sniper style=\"color:#58a6ff;text-decoration:none;padding:4px 10px;font-size:13px\">LMTS</a><a href=/app/sniper-v2 style=\"color:#58a6ff;text-decoration:none;padding:4px 10px;font-size:13px\">SV2</a></nav>"
+    html += "<h1>Sniper A4 — Original Model</h1>"
+    html += "<p style=\"color:#8b949e\">TV+SMA+BTC 2/3 agree | T+0 at 50c | $2.50 flat stake</p>"
+    html += "<div class=c><div class=s><div class=v>$%.2f</div><div class=l>Pool</div></div>" % bal
+    html += "<div class=s><div class=v style=\"color:%s\">%.1f%%</div><div class=l>Win Rate</div></div>" % (wc, wr)
+    html += "<div class=s><div class=v>%d</div><div class=l>Trades</div></div>" % len(resolved)
+    html += "<div class=s><div class=v style=\"color:%s\">$%+.2f</div><div class=l>P&L</div></div>" % (pc, pnl)
+    html += "<div class=s><div class=v>%d</div><div class=l>Pending</div></div></div>" % len(pending)
+    html += "<div class=c><p style=\"color:#8b949e;font-size:13px\">Original A4: TradingView + SMA(1H) + BTC trend, 2 of 3 must agree.<br>Fresh Binance indicators at T-15s. GTC at 50c, $2.50 flat.</p></div>"
+    html += "<div class=c><table><tr><th></th><th>Asset</th><th>Side</th><th>Stake</th><th>Time</th><th>P&L</th></tr>%s</table></div>" % rows
+    html += "<script>setTimeout(function(){location.reload()},60000)</script></body></html>"
+    return html
 
 @app.route("/app/poly-alpha")
 def poly_alpha_page():
@@ -21799,6 +21715,43 @@ def export_p34():
         return out.getvalue(), 200, {"Content-Type":"text/csv","Content-Disposition":"attachment; filename=paper34_trades.csv"}
     except Exception as e:
         return "Error: {}".format(e), 500
+@app.route("/app/sv21")
+def sv21_page():
+    try:
+        db = get_db()
+        trades = db.run("SELECT * FROM sv21_paper_trades ORDER BY fired_at DESC LIMIT 200")
+        cols = [c['name'] for c in db.columns] if trades else []
+        trades = [dict(zip(cols, row)) for row in trades] if trades else []
+    except:
+        trades = []
+    resolved = [t for t in trades if t.get("outcome") in ("WIN","LOSS")]
+    pending = [t for t in trades if t.get("outcome") == "PENDING"]
+    wins = sum(1 for t in resolved if t["outcome"] == "WIN")
+    wr = round(wins/len(resolved)*100, 1) if resolved else 0
+    pnl = round(sum((float(t.get("sim_pnl") or 0)) for t in resolved), 2)
+    bal = _sv21_paper_state["balance"]
+    rows = ""
+    for t in trades[:50]:
+        o = t.get("outcome","PENDING")
+        ic = "W" if o=="WIN" else "L" if o=="LOSS" else "P"
+        tp = t.get("sim_pnl", "-")
+        tc = "#4ade80" if o=="WIN" else "#f87171" if o=="LOSS" else "#888"
+        rows += "<tr><td>%s</td><td>%s</td><td>%s</td><td>$%.2f</td><td>s%s</td><td>%s</td><td style=\"color:%s\">%s</td></tr>" % (ic,t.get("asset","?"),t.get("bet_side","?"),float(t.get("stake") or 0),t.get("score","?"),str(t.get("fired_at",""))[:16],tc,tp)
+    wc = "#4ade80" if wr>=52 else "#f87171" if wr<48 else "#fbbf24"
+    pc = "#4ade80" if pnl>=0 else "#f87171"
+    html = "<!DOCTYPE html><html><head><title>SV2.1 Paper</title><meta name=viewport content=\"width=device-width,initial-scale=1\"><style>body{background:#0d1117;color:#e6edf3;font-family:sans-serif;margin:0;padding:16px}.c{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:20px;margin-bottom:16px}.s{display:inline-block;min-width:100px;margin:8px 12px 8px 0}.s .v{font-size:24px;font-weight:700}.s .l{font-size:11px;color:#8b949e}table{width:100%%;border-collapse:collapse;font-size:13px}th{text-align:left;color:#8b949e;padding:6px;border-bottom:1px solid #30363d}td{padding:6px;border-bottom:1px solid #21262d}</style></head><body>"
+    html += "<nav style=\"background:#161b22;padding:8px 16px;display:flex;gap:8px;border-bottom:1px solid #30363d\"><a href=/app/poly-alpha4 style=\"color:#58a6ff;text-decoration:none;padding:4px 10px;font-size:13px\">A4</a><a href=/app/poly-alpha41 style=\"color:#58a6ff;text-decoration:none;padding:4px 10px;font-size:13px\">A41 P31</a><a href=/app/sv21 style=\"color:#58a6ff;text-decoration:none;padding:4px 10px;font-size:13px;font-weight:bold\">SV2.1</a><a href=/app/sniper-v2 style=\"color:#58a6ff;text-decoration:none;padding:4px 10px;font-size:13px\">SV2</a></nav>"
+    html += "<h1>SV2.1 Paper — P31 Strategy</h1>"
+    html += "<p style=\"color:#8b949e\">Paper trades using P31 7-indicator strategy | Mirrors A41</p>"
+    html += "<div class=c><div class=s><div class=v>$%.2f</div><div class=l>Pool</div></div>" % bal
+    html += "<div class=s><div class=v style=\"color:%s\">%.1f%%</div><div class=l>Win Rate</div></div>" % (wc, wr)
+    html += "<div class=s><div class=v>%d</div><div class=l>Trades</div></div>" % len(resolved)
+    html += "<div class=s><div class=v style=\"color:%s\">$%+.2f</div><div class=l>P&L</div></div>" % (pc, pnl)
+    html += "<div class=s><div class=v>%d</div><div class=l>Pending</div></div></div>" % len(pending)
+    html += "<div class=c><table><tr><th></th><th>Asset</th><th>Side</th><th>Stake</th><th>Score</th><th>Time</th><th>P&L</th></tr>%s</table></div>" % rows
+    html += "<script>setTimeout(function(){location.reload()},60000)</script></body></html>"
+    return html
+
 @app.route("/export/a41")
 def export_a41():
     import io, csv as _csv
