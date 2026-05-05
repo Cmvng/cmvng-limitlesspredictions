@@ -936,6 +936,18 @@ def _sv3_score_and_record(asset, token_map_entry, boundary_ts, now_str):
         _sv3_state["balance"] = pool_before
         return False
 
+
+
+# ── Sniper shared config (used by A4 and A41 threads) ──
+SNIPER_ASSETS = ["BTC", "ETH", "SOL", "XRP"]
+SNIPER_SLUGS = {
+    "BTC": "btc-updown-15m-{}",
+    "ETH": "eth-updown-15m-{}",
+    "SOL": "sol-updown-15m-{}",
+    "XRP": "xrp-updown-15m-{}",
+}
+GAMMA_API = "https://gamma-api.polymarket.com"
+
 def _sniper_thread():
     """Dedicated sniper thread — fires at exact 15M window boundaries.
     Runs independently from the main scanner.
