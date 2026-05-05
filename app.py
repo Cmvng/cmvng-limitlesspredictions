@@ -420,10 +420,8 @@ def _poly_alpha3_load_recent():
         _poly_alpha4_state["balance"] = _saved_pa4["balance"]
         _poly_alpha4_state["peak_balance"] = _saved_pa4.get("peak_balance", _saved_pa4["balance"])
     _saved_pa41 = _saved_balances.get("poly_alpha41", {})
-    # Force reset to $130 — clear inflated balance from resolver double-counting
-    _poly_alpha41_state["balance"] = 130.00
-    _save_bot_balance("poly_alpha41", _poly_alpha41_state)
-    print("A41 pool RESET to $130.00")
+    if _saved_pa41 and _saved_pa41.get("balance", 0) > 0:
+        _poly_alpha41_state["balance"] = _saved_pa41["balance"]
     _poly_alpha4_state["floor_balance"] = 5.0
     _poly_alpha4_state["enabled"] = True
     print("SNIPER A4: ${:.2f} pool (restored from DB) | P2.1 at boundary | 15M | 50¢ fills".format(
@@ -19007,6 +19005,8 @@ def run_poly_scan():
                             else:
                                 _h41_exp_min = parsed.get("expiry_minute")
                                 _h41_exp_hour = parsed.get("expiry_hour")
+                                if _h41_exp_min is None or _h41_exp_hour is None:
+                                    print("A41 SKIP {}: no expiry (min={} hr={})".format(asset, _h41_exp_min, _h41_exp_hour))
                                 if _h41_exp_min is not None and _h41_exp_hour is not None:
                                     _h41_now = datetime.now(timezone.utc)
                                     _h41_exp = _h41_now.replace(hour=int(_h41_exp_hour), minute=int(_h41_exp_min), second=0, microsecond=0)
