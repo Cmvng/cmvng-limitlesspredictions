@@ -1328,7 +1328,7 @@ def _sniper_thread():
                     
                     # DB insert
                     try:
-                        _fa4_db = _get_db()
+                        _fa4_db = get_db()
                         _fa4_db.run("""INSERT INTO poly_alpha4_trades
                             (market_id,title,asset,timeframe,bet_side,stake,fill_price,
                              pool_after,order_id,token_id,condition_id,slug,filled,
@@ -20631,7 +20631,7 @@ h2{{font-size:16px;font-weight:700;color:#1a3d2e;margin-bottom:12px}}
 def poly_alpha4_page():
     """Sniper A4 dashboard — per-asset filter model, T+0 at 50¢."""
     try:
-        db = _get_db()
+        db = get_db()
         trades = db.run("SELECT * FROM poly_alpha4_trades ORDER BY fired_at DESC LIMIT 200")
         cols = [d[0] for d in db._conn.description] if trades else []
         trades = [dict(zip(cols, row)) for row in trades] if trades else []
