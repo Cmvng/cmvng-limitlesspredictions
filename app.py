@@ -18836,10 +18836,9 @@ def run_poly_scan():
                     existing_keys.add(key)
 
                     # ── A41 HYBRID: P2.1 + P31 Independent Dynamic Entry ──
-                    # P2.1 signal → enter at market odds ≤ 65¢
-                    # P31 signal → enter at market odds ≤ 60¢
-                    # Each fires independently — no cross-confirmation needed
                     if strat in ("p21", "p31") and section == "all15m" and scored:
+                        print("A41 EVAL: {} {} dir={} odds={} conf={}".format(
+                            asset, strat, scored.get("bet_side"), scored.get("bet_odds"), scored.get("confidence")))
                         try:
                             _h41_odds = scored.get("bet_odds", 50)
                             _h41_side = scored.get("bet_side")  # YES or NO
@@ -21627,13 +21626,13 @@ def poly_alpha41_page():
     html = "<!DOCTYPE html><html><head><title>A41</title><meta name=viewport content=\"width=device-width,initial-scale=1\"><style>body{background:#0d1117;color:#e6edf3;font-family:sans-serif;margin:0;padding:16px}.c{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:20px;margin-bottom:16px}.s{display:inline-block;min-width:100px;margin:8px 12px 8px 0}.s .v{font-size:24px;font-weight:700}.s .l{font-size:11px;color:#8b949e}table{width:100%%;border-collapse:collapse;font-size:13px}th{text-align:left;color:#8b949e;padding:6px;border-bottom:1px solid #30363d}td{padding:6px;border-bottom:1px solid #21262d}</style></head><body>"
     html += "<nav style=\"background:#161b22;padding:8px 16px;display:flex;gap:8px;border-bottom:1px solid #30363d\"><a href=/app/poly-alpha4 style=\"color:#58a6ff;text-decoration:none;padding:4px 10px;font-size:13px\">A4</a><a href=/app/poly-alpha41 style=\"color:#58a6ff;text-decoration:none;padding:4px 10px;font-size:13px;font-weight:bold\">A41 P31</a><a href=/app/limitless-sniper style=\"color:#58a6ff;text-decoration:none;padding:4px 10px;font-size:13px\">LMTS</a><a href=/app/sniper-v2 style=\"color:#58a6ff;text-decoration:none;padding:4px 10px;font-size:13px\">SV2</a></nav>"
     html += "<h1>Sniper A41 — P31 Strategy</h1>"
-    html += "<p style=\"color:#8b949e\">T+0 50c | 7 indicators | Pair leads BTC confirms | Score staking</p>"
+    html += "<p style=\"color:#8b949e\">HYBRID: P2.1 (cap 65c) + P31 (cap 60c) | Variable odds | Tiered staking</p>"
     html += "<div class=c><div class=s><div class=v>$%.2f</div><div class=l>Pool</div></div>" % bal
     html += "<div class=s><div class=v style=\"color:%s\">%.1f%%</div><div class=l>Win Rate</div></div>" % (wc, wr)
     html += "<div class=s><div class=v>%d</div><div class=l>Trades</div></div>" % len(resolved)
     html += "<div class=s><div class=v style=\"color:%s\">$%+.2f</div><div class=l>P&L</div></div>" % (pc, pnl)
     html += "<div class=s><div class=v>%d</div><div class=l>Pending</div></div></div>" % len(pending)
-    html += "<div class=c><p style=\"color:#8b949e;font-size:13px\">5 pair signals (TV SMA UT EMA4 PIV) majority. BTC confirms. SQZ momentum.<br>Score 3-4=$3 | Score 5-6=$2.50 | P31: 55.7%% WR, 1206 trades, 0 losing days</p></div>"
+    html += "<div class=c><p style=\"color:#8b949e;font-size:13px\">P2.1 signals (cap 65c, 68.5%% WR) + P31 signals (cap 60c, 59.3%% WR)<br>Tiered: T1(58-72c)=4%% pool, T2(45-58c)=3%%, T3(35-45c)=2%% | FOK at market price<br>15/15 winning days in backtest | $100 to $1224 simulated</p></div>"
     html += "<div class=c><table><tr><th></th><th>Asset</th><th>Side</th><th>Stake</th><th>Score</th><th>Time</th><th>P&L</th></tr>%s</table></div>" % rows
     html += "<script>setTimeout(function(){location.reload()},60000)</script></body></html>"
     return html
