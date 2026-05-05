@@ -20633,7 +20633,7 @@ def poly_alpha4_page():
     try:
         db = get_db()
         trades = db.run("SELECT * FROM poly_alpha4_trades ORDER BY fired_at DESC LIMIT 200")
-        cols = [d[0] for d in db._conn.description] if trades else []
+        cols = [c['name'] for c in db.columns] if trades else []
         trades = [dict(zip(cols, row)) for row in trades] if trades else []
     except Exception as e:
         print("A4 dashboard DB error: {}".format(e))
