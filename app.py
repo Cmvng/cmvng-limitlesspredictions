@@ -499,21 +499,19 @@ def _a4_dynamic_tier(odds_pct, pool):
       Tier 2 (45-58%): 61.1-61.7% WR, ROI +22-23% → 3% pool  
       Tier 3 (35-45%): 55.3-57.5% WR, ROI +10-16% → 2% pool
       Skip: <35% or >72% — no proven edge
+      Minimum stake: $2.50 (Polymarket floor)
     
     Returns: (tier_name, max_stake_dollars) or (None, 0) if skip.
     Caller must convert to whole shares: floor(max_stake / price_per_share).
     """
     if odds_pct >= 58 and odds_pct <= 72:
-        # Tier 1 — High confidence: 4% of pool
-        max_stake = round(pool * 0.04, 2)
+        max_stake = max(round(pool * 0.04, 2), 2.50)
         return ("T1_GOLD", max_stake)
     elif odds_pct >= 45 and odds_pct < 58:
-        # Tier 2 — Solid: 3% of pool
-        max_stake = round(pool * 0.03, 2)
+        max_stake = max(round(pool * 0.03, 2), 2.50)
         return ("T2_SILVER", max_stake)
     elif odds_pct >= 35 and odds_pct < 45:
-        # Tier 3 — Speculative: 2% of pool
-        max_stake = round(pool * 0.02, 2)
+        max_stake = max(round(pool * 0.02, 2), 2.50)
         return ("T3_BRONZE", max_stake)
     else:
         return (None, 0)
@@ -18872,7 +18870,7 @@ def run_poly_scan():
                                         # Determine direction
                                         _h41_dir = "UP" if _h41_side == "YES" else "DOWN"
                                         
-                                        # Get tier and stake from pool
+                                        # Tiered staking based on odds and pool
                                         _h41_tier, _h41_max_stake = _a4_dynamic_tier(int(_h41_odds), _poly_alpha41_state["balance"])
                                         
                                         if _h41_tier and _h41_max_stake >= 2.50:
