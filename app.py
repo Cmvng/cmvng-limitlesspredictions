@@ -1076,62 +1076,16 @@ def _sniper_thread():
                         "indicators": ind_str,
                     })
 
-            # ── Disagreement filter (54.8% WR model) ──
-            # At T+0 at 50¢, consensus trades LOSE (market priced in)
-            # Edge = TV≠SMA, BTC breaks tie. Skip FLIP always.
-            _a4_pre = len(snipe_targets)
-            _a4_kept = []
-            for _tgt in snipe_targets:
-                _ta = _tgt["asset"]
-                _ti = _tgt["indicators"]
-                _tv_d = "BUY" if "TV=BUY" in _ti else "SELL" if "TV=SELL" in _ti else None
-                _sm_d = "BUY" if "SMA=BUY" in _ti else "SELL" if "SMA=SELL" in _ti else None
-                _is_flip = "FLIP" in _ti
-                _is_weak = "WEAK" in _ti
-                _tv_sma_dis = _tv_d and _sm_d and _tv_d != _sm_d
-                
-                if _is_flip:
-                    _sniper_reject.append("{}=SKIP(flip)".format(_ta))
-                elif _ta == "XRP":
-                    if _is_weak:
-                        _a4_kept.append(_tgt)
-                    else:
-                        _sniper_reject.append("{}=SKIP(strong)".format(_ta))
-                elif _tv_sma_dis:
-                    _a4_kept.append(_tgt)
-                elif not _tv_d and _sm_d:
-                    _a4_kept.append(_tgt)
-                else:
-                    _sniper_reject.append("{}=SKIP(consensus)".format(_ta))
-            
-            snipe_targets = _a4_kept
-            
+            # ── Original A4: fire all qualified targets (no filter) ──
             if not snipe_targets:
-                if _a4_pre > 0:
-                    print("SNIPER: 0 after filter ({} pre) | skipped: {}".format(
-                        _a4_pre, ", ".join(_sniper_reject)))
-                else:
-                    print("SNIPER: 0 targets at boundary | cache: {}".format(
-                        {a: bool(_indicator_cache.get("{}_15m".format(a))) for a in SNIPER_ASSETS}))
-
+                print("SNIPER: 0 targets at boundary | cache: {}".format(
+                    {a: bool(_indicator_cache.get("{}_15m".format(a))) for a in SNIPER_ASSETS}))
                 _time.sleep(60)
                 continue
 
-            else:
-                _fm = " (kept {}/{})".format(len(snipe_targets), _a4_pre) if _a4_pre != len(snipe_targets) else ""
-                print("SNIPER: {} targets{}: {}{}".format(
-                    len(snipe_targets), _fm,
-                    ", ".join("{}={}".format(t["asset"], t["direction"]) for t in snipe_targets),
-                    " | skipped: {}".format(", ".join(_sniper_reject)) if _sniper_reject else ""))
-
-            # ── T-20s: Calculate next window's slug and timestamp ──
-            # The NEXT window starts at the upcoming boundary
-            next_boundary = now.replace(second=0, microsecond=0)
-            next_min = ((now.minute // 15) + 1) * 15
-            if next_min >= 60:
-                next_boundary = next_boundary.replace(minute=0) + timedelta(hours=1)
-            else:
-                next_boundary = next_boundary.replace(minute=next_min)
+            print("SNIPER: {} targets qualified: {}".format(
+                len(snipe_targets),
+                ", ".join("{}={}".format(t["asset"], t["direction"]) for t in snipe_targets)))
 
             window_ts = int(next_boundary.timestamp())
 
