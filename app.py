@@ -507,13 +507,13 @@ def _a4_dynamic_tier(odds_pct, pool):
     Caller must convert to whole shares: floor(max_stake / price_per_share).
     """
     if odds_pct >= 58 and odds_pct <= 72:
-        max_stake = max(round(pool * 0.04, 2), 2.50)
+        max_stake = max(round(pool * 0.03, 2), 2.50)
         return ("T1_GOLD", max_stake)
     elif odds_pct >= 45 and odds_pct < 58:
-        max_stake = max(round(pool * 0.03, 2), 2.50)
+        max_stake = max(round(pool * 0.02, 2), 2.50)
         return ("T2_SILVER", max_stake)
     elif odds_pct >= 35 and odds_pct < 45:
-        max_stake = max(round(pool * 0.02, 2), 2.50)
+        max_stake = max(round(pool * 0.015, 2), 2.50)
         return ("T3_BRONZE", max_stake)
     else:
         return (None, 0)
