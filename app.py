@@ -18961,7 +18961,6 @@ def run_poly_scan():
                                                                 _poly_alpha41_state["balance"]))
                                                             
                                                             try:
-                                                                print("A41 sending telegram...")
                                                                 send_telegram("A41: {} {} {} @{}c ${:.2f} {} [{}] pool=${:.2f}".format(
                                                                     _h41_type, _h41_dir, asset, _h41_gtc_pct,
                                                                     _h41_cost, _h41_tier,
@@ -20082,6 +20081,8 @@ def _poly_scan_loop():
             _a41r_rows = _a41r_conn.run("SELECT * FROM poly_alpha41_trades WHERE status='Pending' ORDER BY id")
             _a41r_cols = [c['name'] for c in _a41r_conn.columns]
             _a41r_items = [dict(zip(_a41r_cols, r)) for r in _a41r_rows]
+            if _a41r_items:
+                print("A41 resolver: {} pending trades".format(len(_a41r_items)))
             for _a41r_item in _a41r_items:
                 try:
                     import requests as _a41rq
@@ -20099,9 +20100,11 @@ def _poly_scan_loop():
                     _a41r_dn = float(_a41r_op[1]) if len(_a41r_op) > 1 else 0
                     _a41r_side = _a41r_item.get("bet_side", "")
                     _a41r_stk = float(_a41r_item.get("stake", 0))
+                    _a41r_fp = float(_a41r_item.get("fill_price", 0.50) or 0.50)
                     _a41r_won = (_a41r_up > 0.5) if _a41r_side == "UP" else (_a41r_dn > 0.5)
                     _a41r_out = "WIN" if _a41r_won else "LOSS"
-                    _a41r_pay = round(_a41r_stk / 0.50, 2) if _a41r_won else 0
+                    _a41r_shares = int(_a41r_stk / _a41r_fp) if _a41r_fp > 0 else 0
+                    _a41r_pay = round(_a41r_shares * 1.0, 2) if _a41r_won else 0
                     _a41r_c2 = get_db()
                     _a41r_c2.run("UPDATE poly_alpha41_trades SET status='Resolved', outcome=:out, payout=:pay, resolved_at=:ra WHERE id=:id",
                         out=_a41r_out, pay=_a41r_pay, ra=datetime.now(timezone.utc).isoformat(), id=_a41r_item["id"])
