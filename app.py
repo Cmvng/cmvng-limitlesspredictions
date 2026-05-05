@@ -20690,7 +20690,17 @@ def poly_alpha4_page():
     pnl_c = "#4ade80" if pnl >= 0 else "#f87171"
     wr_c = "#4ade80" if wr >= 52 else "#f87171" if wr < 48 else "#fbbf24"
     
-    nav = _get_nav_html()
+    nav_links = [
+        ("/app/poly-alpha4", "🎯 Sniper A4"),
+        ("/app/limitless-sniper", "🎯 LMTS"),
+        ("/app/sniper-v2", "📊 Sniper V2 Paper"),
+        ("/app/paper21", "Paper 2.1"),
+        ("/app/sniper-v3", "📊 Sniper V3"),
+    ]
+    nav = '<nav style="background:#161b22;padding:8px 16px;display:flex;gap:8px;flex-wrap:wrap;border-bottom:1px solid #30363d">'
+    for href, label in nav_links:
+        nav += '<a href="{}" style="color:#58a6ff;text-decoration:none;padding:4px 10px;border-radius:6px;font-size:13px">{}</a>'.format(href, label)
+    nav += "</nav>"
     
     HTML = """<!DOCTYPE html>
 <html><head><title>Sniper Alpha 4.0</title>
