@@ -20183,6 +20183,7 @@ def _poly_scan_loop():
                 print("A41 resolver: {} trades resolved".format(_a41r_count))
         except Exception as e:
             print("A41 resolve error: {}".format(e))
+
         try:
             _lmts_resolved = _resolve_limitless_sniper_trades()
             if _lmts_resolved:
