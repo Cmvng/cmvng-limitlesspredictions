@@ -423,7 +423,7 @@ def _poly_alpha3_load_recent():
     if _saved_pa41 and _saved_pa41.get("balance", 0) > 0:
         _poly_alpha41_state["balance"] = _saved_pa41["balance"]
     else:
-        _poly_alpha41_state["balance"] = 200.00  # Fresh $200 pool
+        _poly_alpha41_state["balance"] = 130.00  # Reset pool
     _poly_alpha4_state["floor_balance"] = 5.0
     _poly_alpha4_state["enabled"] = True
     print("SNIPER A4: ${:.2f} pool (restored from DB) | P2.1 at boundary | 15M | 50¢ fills".format(
@@ -470,7 +470,7 @@ def _poly_alpha3_calc_stake(pool_balance):
 # Independent thread, no scanner dependency
 # ═══════════════════════════════════════════════════════════
 
-_poly_alpha41_state = {"balance": 200.00}
+_poly_alpha41_state = {"balance": 130.00}
 _sv21_paper_state = {"balance": 100.00}
 _poly_alpha4_state = {
     "enabled": True,
