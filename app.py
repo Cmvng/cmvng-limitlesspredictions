@@ -419,6 +419,9 @@ def _poly_alpha3_load_recent():
     if _saved_pa4 and _saved_pa4.get("balance", 0) > 0:
         _poly_alpha4_state["balance"] = _saved_pa4["balance"]
         _poly_alpha4_state["peak_balance"] = _saved_pa4.get("peak_balance", _saved_pa4["balance"])
+    _saved_pa41 = _saved_balances.get("poly_alpha41", {})
+    if _saved_pa41 and _saved_pa41.get("balance", 0) > 0:
+        _poly_alpha41_state["balance"] = _saved_pa41["balance"]
     _poly_alpha4_state["floor_balance"] = 5.0
     _poly_alpha4_state["enabled"] = True
     print("SNIPER A4: ${:.2f} pool (restored from DB) | P2.1 at boundary | 15M | 50¢ fills".format(
@@ -1969,6 +1972,291 @@ def _limitless_update_momentum(asset, direction, p23_confirmed):
         "confirmed": p23_confirmed,
     }
 
+
+def _sniper_a41_thread():
+    """Sniper A41 — P31 strategy (7 indicators), T+0 at 50¢."""
+    import time as _time
+    from datetime import datetime, timezone, timedelta
+    
+    _time.sleep(5)  # Let main thread initialize
+    print("SNIPER A41 THREAD STARTED — P31 strategy, waiting for first boundary...")
+    
+    while True:
+        try:
+            now = datetime.now(timezone.utc)
+            
+            # Calculate next 15M boundary
+            next_min = ((now.minute // 15) + 1) * 15
+            if next_min >= 60:
+                next_boundary = now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+            else:
+                next_boundary = now.replace(minute=next_min, second=0, microsecond=0)
+            
+            secs_to_boundary = (next_boundary - now).total_seconds()
+            
+            # Wake at T-15s to score with fresh indicators (A4 already refreshed cache)
+            wake_at = secs_to_boundary - 15
+            if wake_at > 0:
+                _time.sleep(wake_at)
+            
+            now2 = datetime.now(timezone.utc)
+            
+            # Wait for A4 to finish refreshing indicators (it does this at T-15s)
+            _time.sleep(5)  # Give A4 5 seconds to finish indicator refresh
+            
+            # Score each asset using P31 strategy
+            a41_targets = []
+            a41_debug = []
+            
+            for asset in SNIPER_ASSETS:
+                _a41_ind = _indicator_cache.get("{}_15m".format(asset.upper()))
+                _a41_ind_data = _a41_ind.get("data") if _a41_ind else {}
+                if not _a41_ind_data:
+                    _a41_ind_data = {}
+                
+                _a41_macro = _indicator_cache.get("{}_1h".format(asset.upper()))
+                _a41_macro_data = _a41_macro.get("data") if _a41_macro else None
+                
+                _a41_price = _a41_ind_data.get("current") or 0
+                
+                _a41_market = {
+                    "asset": asset.upper(),
+                    "yes_odds": 50,
+                    "direction": "above",
+                    "baseline": _a41_price,
+                    "is_15m_market": True,
+                    "is_hourly_market": False,
+                }
+                
+                _a41_now = datetime.now(timezone.utc)
+                _a41_next_min = ((_a41_now.minute // 15) + 1) * 15
+                _a41_expiry_min = _a41_next_min if _a41_next_min < 60 else 0
+                
+                try:
+                    _a41_result = _score_paper31_trade(
+                        _a41_market, _a41_price, _a41_ind_data,
+                        ind_macro=_a41_macro_data,
+                        expiry_minute=_a41_expiry_min
+                    )
+                except Exception as _a41_err:
+                    print("A41 P31 score error {}: {}".format(asset, _a41_err))
+                    _a41_result = None
+                
+                if _a41_result and _a41_result.get("bet_side"):
+                    _a41_side = _a41_result["bet_side"]
+                    _a41_score = _a41_result.get("score", 3)
+                    _a41_conf = _a41_result.get("confidence", "LOW")
+                    _a41_indicators = _a41_result.get("indicators", "")
+                    
+                    direction = "UP" if _a41_side == "YES" else "DOWN"
+                    
+                    if _a41_score <= 4:
+                        _a41_stake = 3.00
+                    else:
+                        _a41_stake = 2.50
+                    
+                    a41_debug.append("{}={}(s{})".format(asset, direction, _a41_score))
+                    a41_targets.append({
+                        "asset": asset,
+                        "direction": direction,
+                        "signals_agree": _a41_score,
+                        "indicators": "[{}] {} | score={}/{}".format(
+                            _a41_conf, _a41_indicators, _a41_score,
+                            _a41_result.get("total_signals", 5)),
+                        "stake": _a41_stake,
+                        "score": _a41_score,
+                        "confidence": _a41_conf,
+                    })
+            
+            if not a41_targets:
+                print("A41: 0 targets at boundary")
+                _time.sleep(60)
+                continue
+            
+            print("A41: {} targets: {}".format(len(a41_targets), ", ".join(a41_debug)))
+            
+            # Calculate boundary timestamp
+            window_ts = int(next_boundary.timestamp())
+            
+            # SV2.1 paper trades
+            for _sv21_tgt in a41_targets:
+                try:
+                    _sv21_asset = _sv21_tgt["asset"]
+                    _sv21_stake = _sv21_tgt["stake"]
+                    _sv21_score = _sv21_tgt.get("score", 3)
+                    _sv21_conf = _sv21_tgt.get("confidence", "LOW")
+                    
+                    _sv21_paper_state["balance"] = round(_sv21_paper_state["balance"] - _sv21_stake, 2)
+                    
+                    db = get_db()
+                    db.run("""INSERT INTO sv21_paper_trades
+                        (market_id, asset, timeframe, bet_side, stake, fill_price,
+                         pool_after, tier, indicators, signals_agree, score, confidence,
+                         status, outcome, fired_at)
+                        VALUES (:mid, :ast, :tf, :bs, :stk, :fp,
+                         :pa, :tier, :ind, :sa, :sc, :conf,
+                         :sts, :out, :fa)""",
+                        mid="sv21_{}_15M_{}".format(_sv21_asset, window_ts),
+                        ast=_sv21_asset, tf="15M", bs=_sv21_tgt["direction"],
+                        stk=_sv21_stake, fp=0.50,
+                        pa=_sv21_paper_state["balance"],
+                        tier="T1" if _sv21_score <= 4 else "T2",
+                        ind=_sv21_tgt["indicators"],
+                        sa=_sv21_tgt["signals_agree"],
+                        sc=_sv21_score, conf=_sv21_conf,
+                        sts="Pending", out="PENDING",
+                        fa=datetime.now(timezone.utc).isoformat())
+                except Exception as _sv21_e:
+                    print("SV2.1 paper error: {}".format(_sv21_e))
+            
+            print("SV2.1: {} paper trades | pool=${:.2f}".format(len(a41_targets), _sv21_paper_state["balance"]))
+            
+            # Wait until T+3s (3 seconds after boundary, avoid clashing with A4)
+            now3 = datetime.now(timezone.utc)
+            wait_secs = (next_boundary - now3).total_seconds() + 3
+            if wait_secs > 0:
+                _time.sleep(wait_secs)
+            
+            # Fetch token map
+            import requests as _a41_req
+            token_map = {}
+            for _a41_asset in set(t["asset"] for t in a41_targets):
+                _a41_slugs = SNIPER_SLUGS.get(_a41_asset, [])
+                for _a41_slug_tmpl in _a41_slugs:
+                    try:
+                        _a41_slug = _a41_slug_tmpl.format(ts=window_ts)
+                        _a41_r = _a41_req.get("{}/markets/slug/{}".format(GAMMA_API, _a41_slug), timeout=5)
+                        if _a41_r.status_code == 200:
+                            _a41_mkt = _a41_r.json()
+                            _a41_tokens = _a41_mkt.get("clobTokenIds") or _a41_mkt.get("clob_token_ids") or []
+                            if len(_a41_tokens) >= 2:
+                                token_map[_a41_asset] = {
+                                    "up_token": _a41_tokens[0],
+                                    "down_token": _a41_tokens[1],
+                                    "condition_id": _a41_mkt.get("conditionId") or _a41_mkt.get("condition_id") or "",
+                                    "slug": _a41_slug,
+                                }
+                                break
+                    except:
+                        pass
+            
+            if not token_map:
+                print("A41: no markets found for boundary {} — tokens not deployed yet".format(window_ts))
+                _time.sleep(60)
+                continue
+            
+            # Place orders
+            try:
+                client = _get_poly_client()
+                from py_clob_client_v2 import Side, OrderArgs, OrderType
+                BUY = Side.BUY
+            except Exception as _a41_client_err:
+                print("A41 client error: {}".format(_a41_client_err))
+                _time.sleep(60)
+                continue
+            
+            fired = []
+            for target in a41_targets:
+                _a41_a = target["asset"]
+                _a41_d = target["direction"]
+                _a41_entry = token_map.get(_a41_a)
+                if not _a41_entry:
+                    continue
+                
+                _a41_token = _a41_entry.get("up_token") if _a41_d == "UP" else _a41_entry.get("down_token")
+                if not _a41_token:
+                    continue
+                
+                _a41_price = 0.50
+                _a41_stake = target.get("stake", 2.50)
+                _a41_shares = round(_a41_stake / 0.50, 1)
+                
+                if _poly_alpha41_state["balance"] < _a41_stake + 2:
+                    continue
+                
+                try:
+                    _a41_args = OrderArgs(
+                        token_id=str(_a41_token),
+                        price=_a41_price,
+                        size=_a41_shares,
+                        side=BUY,
+                    )
+                    _a41_signed = client.create_order(_a41_args)
+                    _a41_resp = client.post_order(_a41_signed, OrderType.GTC)
+                    _a41_oid = _a41_resp.get("orderID") or _a41_resp.get("id") or "placed" if _a41_resp else None
+                    
+                    fired.append({
+                        "asset": _a41_a, "direction": _a41_d,
+                        "indicators": target["indicators"],
+                        "signals_agree": target["signals_agree"],
+                        "score": target.get("score", 3),
+                        "confidence": target.get("confidence", ""),
+                        "order_id": _a41_oid, "cost": _a41_stake,
+                        "price": _a41_price, "shares": _a41_shares,
+                        "token_id": _a41_token,
+                        "slug": _a41_entry.get("slug", ""),
+                        "condition_id": _a41_entry.get("condition_id", ""),
+                    })
+                except Exception as _a41_oe:
+                    print("A41 order error {}: {}".format(_a41_a, _a41_oe))
+            
+            for _fr in fired:
+                try:
+                    _poly_alpha41_state["balance"] = round(_poly_alpha41_state["balance"] - _fr["cost"], 2)
+                    print("A41: {} {} @50c ${:.2f} [s{}] | pool=${:.2f}".format(
+                        _fr["direction"], _fr["asset"], _fr["cost"],
+                        _fr.get("score", "?"), _poly_alpha41_state["balance"]))
+                    
+                    try:
+                        _a41_db = get_db()
+                        _a41_db.run("""INSERT INTO poly_alpha41_trades
+                            (market_id,title,asset,timeframe,bet_side,stake,fill_price,
+                             pool_after,order_id,token_id,condition_id,slug,filled,
+                             status,outcome,indicators,signals_agree,score,confidence,fired_at)
+                            VALUES (:mid,:ttl,:ast,:tf,:bs,:stk,:fp,
+                             :pa,:oid,:tid,:cid,:slg,:fld,
+                             :sts,:out,:ind,:sa,:sc,:conf,:fa)""",
+                            mid="a41_{}_15M_{}".format(_fr["asset"], window_ts),
+                            ttl="A41 {} {} 15M".format(_fr["asset"], _fr["direction"]),
+                            ast=_fr["asset"], tf="15M", bs=_fr["direction"],
+                            stk=_fr["cost"], fp=_fr["price"],
+                            pa=_poly_alpha41_state["balance"],
+                            oid=str(_fr["order_id"]) if _fr["order_id"] else "",
+                            tid=_fr["token_id"],
+                            cid=_fr["condition_id"], slg=_fr["slug"],
+                            fld=bool(_fr["order_id"]),
+                            sts="Pending", out="PENDING",
+                            ind=_fr["indicators"],
+                            sa=_fr["signals_agree"],
+                            sc=_fr.get("score", 3),
+                            conf=_fr.get("confidence", ""),
+                            fa=datetime.now(timezone.utc).isoformat())
+                    except Exception as _a41_dbe:
+                        print("A41 DB error: {}".format(_a41_dbe))
+                    
+                    try:
+                        send_telegram("A41 P31: {} {} @50c ${:.2f} [s{}|{}] pool=${:.2f}".format(
+                            _fr["direction"], _fr["asset"], _fr["cost"],
+                            _fr.get("score", "?"), _fr.get("confidence", ""),
+                            _poly_alpha41_state["balance"]))
+                    except: pass
+                    
+                except Exception as _fr_e:
+                    print("A41 post-fire error: {}".format(_fr_e))
+            
+            if fired:
+                _save_bot_balance("poly_alpha41", _poly_alpha41_state["balance"])
+                print("A41: fired {} orders | pool=${:.2f}".format(len(fired), _poly_alpha41_state["balance"]))
+            
+            _time.sleep(60)
+            
+        except Exception as _a41_main_err:
+            print("A41 thread error: {}".format(_a41_main_err))
+            import traceback
+            traceback.print_exc()
+            _time.sleep(60)
+
+
 def _limitless_sniper_thread():
     """Limitless 1H Sniper — fires at hourly boundaries using proven _place_gtc_order.
     1H markets have better liquidity for 50c fills on Limitless.
@@ -3174,6 +3462,33 @@ def init_db():
             status TEXT DEFAULT 'Pending', outcome TEXT,
             indicators TEXT, signals_agree INTEGER,
             fired_at TEXT, resolved_at TEXT
+        )
+    """)
+    conn.run("""
+        CREATE TABLE IF NOT EXISTS poly_alpha41_trades (
+            id SERIAL PRIMARY KEY,
+            market_id TEXT, title TEXT, asset TEXT, timeframe TEXT,
+            bet_side TEXT, stake REAL, fill_price REAL,
+            pool_after REAL, order_id TEXT, token_id TEXT,
+            condition_id TEXT, slug TEXT, filled BOOLEAN,
+            status TEXT DEFAULT 'Pending', outcome TEXT DEFAULT 'PENDING',
+            payout REAL DEFAULT 0, indicators TEXT, signals_agree INTEGER,
+            score INTEGER, confidence TEXT,
+            fired_at TIMESTAMP DEFAULT NOW(),
+            resolved_at TIMESTAMP, created_at TIMESTAMP DEFAULT NOW()
+        )
+    """)
+    conn.run("""
+        CREATE TABLE IF NOT EXISTS sv21_paper_trades (
+            id SERIAL PRIMARY KEY,
+            market_id TEXT, title TEXT, asset TEXT, timeframe TEXT,
+            bet_side TEXT, stake REAL, fill_price REAL,
+            pool_after REAL, tier TEXT, indicators TEXT,
+            signals_agree INTEGER, score INTEGER, confidence TEXT,
+            status TEXT DEFAULT 'Pending', outcome TEXT DEFAULT 'PENDING',
+            sim_pnl REAL DEFAULT 0,
+            fired_at TIMESTAMP DEFAULT NOW(),
+            resolved_at TIMESTAMP, created_at TIMESTAMP DEFAULT NOW()
         )
     """)
     conn.run("""
@@ -15181,6 +15496,8 @@ def admin_set_balance():
 
     valid_bots = {
         "poly_alpha4": _poly_alpha4_state,
+        "poly_alpha41": ("poly_alpha41", _poly_alpha41_state),
+        "sv21_paper": ("sv21_paper", _sv21_paper_state),
         "limitless_sniper": _limitless_sniper_state,
     }
 
@@ -17548,6 +17865,8 @@ if SIGNALS_DB_URL:
     threading.Thread(target=_signals_poll_loop, daemon=True).start()
     threading.Thread(target=_sniper_thread, daemon=True).start()
     print("SNIPER A4 thread launched")
+    _threading.Thread(target=_sniper_a41_thread, daemon=True).start()
+    print("SNIPER A41 (P31): ${:.2f} pool | launched".format(_poly_alpha41_state["balance"]))
 
     # ── LIMITLESS SNIPER init ──
     _saved_lmts = _saved_balances.get("limitless_sniper", {})
@@ -19685,6 +20004,43 @@ def _poly_scan_loop():
         except Exception as e:
             print("Sniper Alpha4 resolve error: {}".format(e))
         try:
+            _a41r_conn = get_db()
+            _a41r_rows = _a41r_conn.run("SELECT * FROM poly_alpha41_trades WHERE status='Pending' ORDER BY id")
+            _a41r_cols = [c['name'] for c in _a41r_conn.columns]
+            _a41r_items = [dict(zip(_a41r_cols, r)) for r in _a41r_rows]
+            for _a41r_item in _a41r_items:
+                try:
+                    import requests as _a41rq
+                    _a41r_slug = _a41r_item.get("slug", "")
+                    if not _a41r_slug:
+                        continue
+                    _a41r_mkt = _a41rq.get("{}/markets/slug/{}".format(GAMMA_API, _a41r_slug), timeout=5).json()
+                    _a41r_resolved = _a41r_mkt.get("resolved", False) or _a41r_mkt.get("closed", False)
+                    if not _a41r_resolved:
+                        continue
+                    _a41r_op = _a41r_mkt.get("outcomePrices") or _a41r_mkt.get("outcome_prices")
+                    if not _a41r_op:
+                        continue
+                    _a41r_up = float(_a41r_op[0]) if len(_a41r_op) > 0 else 0
+                    _a41r_dn = float(_a41r_op[1]) if len(_a41r_op) > 1 else 0
+                    _a41r_side = _a41r_item.get("bet_side", "")
+                    _a41r_stk = float(_a41r_item.get("stake", 0))
+                    _a41r_won = (_a41r_up > 0.5) if _a41r_side == "UP" else (_a41r_dn > 0.5)
+                    _a41r_out = "WIN" if _a41r_won else "LOSS"
+                    _a41r_pay = round(_a41r_stk / 0.50, 2) if _a41r_won else 0
+                    _a41r_c2 = get_db()
+                    _a41r_c2.run("UPDATE poly_alpha41_trades SET status='Resolved', outcome=:out, payout=:pay, resolved_at=:ra WHERE id=:id",
+                        out=_a41r_out, pay=_a41r_pay, ra=datetime.now(timezone.utc).isoformat(), id=_a41r_item["id"])
+                    if _a41r_won:
+                        _poly_alpha41_state["balance"] = round(_poly_alpha41_state["balance"] + _a41r_pay, 2)
+                    _save_bot_balance("poly_alpha41", _poly_alpha41_state["balance"])
+                    print("A41 resolved: {} {} {} ${:.2f} pool=${:.2f}".format(
+                        _a41r_item.get("asset","?"), _a41r_side, _a41r_out, _a41r_stk, _poly_alpha41_state["balance"]))
+                except:
+                    pass
+        except Exception as e:
+            print("A41 resolve error: {}".format(e))
+        try:
             _lmts_resolved = _resolve_limitless_sniper_trades()
             if _lmts_resolved:
                 print("LMTS Sniper resolved: {}".format(_lmts_resolved))
@@ -20682,8 +21038,8 @@ h2 {{ color: #58a6ff; margin: 0 0 12px 0; font-size: 18px; }}
 .filter .rule {{ color: #8b949e; }}
 </style></head><body>
 {nav}
-<h1>Sniper A4 — Per-Asset Filter Model</h1>
-<p style="color:#8b949e">T+0 · 50¢ Entry · $1 Flat Stake · Polymarket 15M</p>
+<h1>Sniper A4 — P31 Strategy (7 Indicators)</h1>
+<p style="color:#8b949e">T+0 · 50¢ Entry · P31 Score-Based Stake · Polymarket 15M</p>
 
 <div class="card">
 <div class="stat"><div class="val">${bal:.2f}</div><div class="lbl">Pool</div></div>
@@ -20694,12 +21050,12 @@ h2 {{ color: #58a6ff; margin: 0 0 12px 0; font-size: 18px; }}
 </div>
 
 <div class="card">
-<h2>Per-Asset Filters</h2>
-<div class="filter"><span class="asset">BTC:</span> <span class="rule">TV+SMA disagree (BTC tiebreaker) · No FLIP</span></div>
-<div class="filter"><span class="asset">ETH:</span> <span class="rule">TV+SMA disagree (BTC tiebreaker) · No FLIP</span></div>
-<div class="filter"><span class="asset">SOL:</span> <span class="rule">TV+SMA disagree (BTC tiebreaker) · No FLIP</span></div>
-<div class="filter"><span class="asset">XRP:</span> <span class="rule">WEAK period only · No FLIP</span></div>
-<p style="color:#8b949e;font-size:12px;margin-top:8px">Based on 1,237 T+0 trades: disagreement filter gives 54.8% WR vs 48% baseline</p>
+<h2>P31 Strategy (7 Indicators)</h2>
+<div class="filter"><span class="asset">Pair signals:</span> <span class="rule">TV + SMA + UT + EMA4 + PIV → majority vote for direction</span></div>
+<div class="filter"><span class="asset">BTC role:</span> <span class="rule">Confirms pair direction (not a voter)</span></div>
+<div class="filter"><span class="asset">SQZ:</span> <span class="rule">Momentum context · Pullback detection</span></div>
+<div class="filter"><span class="asset">Staking:</span> <span class="rule">Score 3-4 = $3.00 (strong edge) · Score 5-6 = $2.50 (minimum)</span></div>
+<p style="color:#8b949e;font-size:12px;margin-top:8px">Based on 1,206 P31 trades at 50¢: 55.7% WR · Zero losing days in 15 days</p>
 </div>
 
 <div class="card">
@@ -21230,6 +21586,44 @@ print("Limitless Bot v4 — {} threads running (Polymarket + Chainlink RTDS{})".
 # CSV EXPORT ROUTES — Data analysis
 # ═══════════════════════════════════════════════════════════
 
+@app.route("/app/poly-alpha41")
+def poly_alpha41_page():
+    try:
+        db = get_db()
+        trades = db.run("SELECT * FROM poly_alpha41_trades ORDER BY fired_at DESC LIMIT 200")
+        cols = [c['name'] for c in db.columns] if trades else []
+        trades = [dict(zip(cols, row)) for row in trades] if trades else []
+    except:
+        trades = []
+    resolved = [t for t in trades if t.get("outcome") in ("WIN","LOSS")]
+    pending = [t for t in trades if t.get("outcome") == "PENDING"]
+    wins = sum(1 for t in resolved if t["outcome"] == "WIN")
+    wr = round(wins/len(resolved)*100, 1) if resolved else 0
+    pnl = round(sum((float(t.get("payout") or 0) - float(t.get("stake") or 0)) if t["outcome"]=="WIN" else -float(t.get("stake") or 0) for t in resolved), 2)
+    bal = _poly_alpha41_state["balance"]
+    rows = ""
+    for t in trades[:50]:
+        o = t.get("outcome","PENDING")
+        ic = "W" if o=="WIN" else "L" if o=="LOSS" else "P"
+        tp = round(float(t.get("payout") or 0)-float(t.get("stake") or 0),2) if o=="WIN" else round(-float(t.get("stake") or 0),2) if o=="LOSS" else "-"
+        tc = "#4ade80" if o=="WIN" else "#f87171" if o=="LOSS" else "#888"
+        rows += "<tr><td>%s</td><td>%s</td><td>%s</td><td>$%.2f</td><td>s%s</td><td>%s</td><td style=\"color:%s\">%s</td></tr>" % (ic,t.get("asset","?"),t.get("bet_side","?"),float(t.get("stake") or 0),t.get("score","?"),str(t.get("fired_at",""))[:16],tc,tp)
+    wc = "#4ade80" if wr>=52 else "#f87171" if wr<48 else "#fbbf24"
+    pc = "#4ade80" if pnl>=0 else "#f87171"
+    html = "<!DOCTYPE html><html><head><title>A41</title><meta name=viewport content=\"width=device-width,initial-scale=1\"><style>body{background:#0d1117;color:#e6edf3;font-family:sans-serif;margin:0;padding:16px}.c{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:20px;margin-bottom:16px}.s{display:inline-block;min-width:100px;margin:8px 12px 8px 0}.s .v{font-size:24px;font-weight:700}.s .l{font-size:11px;color:#8b949e}table{width:100%%;border-collapse:collapse;font-size:13px}th{text-align:left;color:#8b949e;padding:6px;border-bottom:1px solid #30363d}td{padding:6px;border-bottom:1px solid #21262d}</style></head><body>"
+    html += "<nav style=\"background:#161b22;padding:8px 16px;display:flex;gap:8px;border-bottom:1px solid #30363d\"><a href=/app/poly-alpha4 style=\"color:#58a6ff;text-decoration:none;padding:4px 10px;font-size:13px\">A4</a><a href=/app/poly-alpha41 style=\"color:#58a6ff;text-decoration:none;padding:4px 10px;font-size:13px;font-weight:bold\">A41 P31</a><a href=/app/limitless-sniper style=\"color:#58a6ff;text-decoration:none;padding:4px 10px;font-size:13px\">LMTS</a><a href=/app/sniper-v2 style=\"color:#58a6ff;text-decoration:none;padding:4px 10px;font-size:13px\">SV2</a></nav>"
+    html += "<h1>Sniper A41 — P31 Strategy</h1>"
+    html += "<p style=\"color:#8b949e\">T+0 50c | 7 indicators | Pair leads BTC confirms | Score staking</p>"
+    html += "<div class=c><div class=s><div class=v>$%.2f</div><div class=l>Pool</div></div>" % bal
+    html += "<div class=s><div class=v style=\"color:%s\">%.1f%%</div><div class=l>Win Rate</div></div>" % (wc, wr)
+    html += "<div class=s><div class=v>%d</div><div class=l>Trades</div></div>" % len(resolved)
+    html += "<div class=s><div class=v style=\"color:%s\">$%+.2f</div><div class=l>P&L</div></div>" % (pc, pnl)
+    html += "<div class=s><div class=v>%d</div><div class=l>Pending</div></div></div>" % len(pending)
+    html += "<div class=c><p style=\"color:#8b949e;font-size:13px\">5 pair signals (TV SMA UT EMA4 PIV) majority. BTC confirms. SQZ momentum.<br>Score 3-4=$3 | Score 5-6=$2.50 | P31: 55.7%% WR, 1206 trades, 0 losing days</p></div>"
+    html += "<div class=c><table><tr><th></th><th>Asset</th><th>Side</th><th>Stake</th><th>Score</th><th>Time</th><th>P&L</th></tr>%s</table></div>" % rows
+    html += "<script>setTimeout(function(){location.reload()},60000)</script></body></html>"
+    return html
+
 @app.route("/export/bot2")
 def export_bot2_csv():
     try:
@@ -21390,6 +21784,30 @@ def export_p34():
         return out.getvalue(), 200, {"Content-Type":"text/csv","Content-Disposition":"attachment; filename=paper34_trades.csv"}
     except Exception as e:
         return "Error: {}".format(e), 500
+@app.route("/export/a41")
+def export_a41():
+    import io, csv as _csv
+    c = get_db()
+    rows = c.run("SELECT * FROM poly_alpha41_trades ORDER BY id")
+    cols = [col['name'] for col in c.columns]
+    out = io.StringIO()
+    w = _csv.writer(out)
+    w.writerow(cols)
+    w.writerows(rows)
+    return out.getvalue(), 200, {"Content-Type":"text/csv","Content-Disposition":"attachment; filename=a41_trades.csv"}
+
+@app.route("/export/sv21")
+def export_sv21():
+    import io, csv as _csv
+    c = get_db()
+    rows = c.run("SELECT * FROM sv21_paper_trades ORDER BY id")
+    cols = [col['name'] for col in c.columns]
+    out = io.StringIO()
+    w = _csv.writer(out)
+    w.writerow(cols)
+    w.writerows(rows)
+    return out.getvalue(), 200, {"Content-Type":"text/csv","Content-Disposition":"attachment; filename=sv21_trades.csv"}
+
 @app.route("/export/sv3")
 def export_sv3_csv():
     try:
