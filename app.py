@@ -1064,7 +1064,6 @@ def _sniper_thread():
 
             snipe_targets = []
             _sniper_debug = []
-            _sniper_reject = []
             for asset in SNIPER_ASSETS:
                 direction, signals_agree, ind_str, _confidence = _sniper_get_direction(asset, "15m")
                 if direction and signals_agree >= 2:
@@ -1086,6 +1085,15 @@ def _sniper_thread():
             print("SNIPER: {} targets qualified: {}".format(
                 len(snipe_targets),
                 ", ".join("{}={}".format(t["asset"], t["direction"]) for t in snipe_targets)))
+
+            # Calculate next 15M boundary
+            now = datetime.now(timezone.utc)
+            next_boundary = now.replace(second=0, microsecond=0)
+            next_min = ((now.minute // 15) + 1) * 15
+            if next_min >= 60:
+                next_boundary = next_boundary.replace(minute=0) + timedelta(hours=1)
+            else:
+                next_boundary = next_boundary.replace(minute=next_min)
 
             window_ts = int(next_boundary.timestamp())
 
