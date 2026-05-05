@@ -2101,13 +2101,15 @@ def _sniper_a41_thread():
                 if not live_price:
                     continue
                 
-                # Indicators from cache
-                ind_entry = _indicator_cache.get("{}_15m".format(_asset.upper()))
-                ind_data = ind_entry.get("data") if ind_entry else {}
-                if not ind_data:
+                # Calculate FRESH indicators at T+90s (not stale cache)
+                try:
+                    ind_data = _calculate_indicators(_asset, "15m") or {}
+                except:
                     ind_data = {}
-                macro_entry = _indicator_cache.get("{}_1h".format(_asset.upper()))
-                macro_data = macro_entry.get("data") if macro_entry else None
+                try:
+                    macro_data = _calculate_indicators(_asset, "1h")
+                except:
+                    macro_data = None
                 
                 # Build market object with REAL data
                 market = {
