@@ -420,10 +420,10 @@ def _poly_alpha3_load_recent():
         _poly_alpha4_state["balance"] = _saved_pa4["balance"]
         _poly_alpha4_state["peak_balance"] = _saved_pa4.get("peak_balance", _saved_pa4["balance"])
     _saved_pa41 = _saved_balances.get("poly_alpha41", {})
-    if _saved_pa41 and _saved_pa41.get("balance", 0) > 0:
-        _poly_alpha41_state["balance"] = _saved_pa41["balance"]
-    else:
-        _poly_alpha41_state["balance"] = 130.00  # Reset pool
+    # Force reset to $130 — clear inflated balance from resolver double-counting
+    _poly_alpha41_state["balance"] = 130.00
+    _save_bot_balance("poly_alpha41", _poly_alpha41_state)
+    print("A41 pool RESET to $130.00")
     _poly_alpha4_state["floor_balance"] = 5.0
     _poly_alpha4_state["enabled"] = True
     print("SNIPER A4: ${:.2f} pool (restored from DB) | P2.1 at boundary | 15M | 50¢ fills".format(
@@ -2100,23 +2100,6 @@ def _resolve_poly_alpha41_trades():
 
 # ═══════════════════════════════════════════════════════════
 # LIMITLESS SNIPER — Dynamic Pricing v2.0 · 3-Path Confirm + P2.3 Momentum Carry-Over
-# Two-tier staking: HIGH (P2.1 + momentum agree) vs BASE (P2.1 only)
-# Fires at exact :00/:15/:30/:45 on Limitless CLOB at 50¢
-# ═══════════════════════════════════════════════════════════
-
-_limitless_sniper_state = {
-    "enabled": True,
-    "balance": 30.0,
-    "peak_balance": 30.0,
-    "starting_balance": 30.0,
-    "floor_balance": 5.0,
-    "trades_today": 0,
-    "wins_today": 0,
-    "losses_today": 0,
-    "profit_today": 0.0,
-}
-_limitless_sniper_traded = set()
-_limitless_prev_momentum = {}  # {asset: {"direction": "BUY"/"SELL", "confirmed": True/False}}
 
 
 def _limitless_sniper_stake(pool, tier):
