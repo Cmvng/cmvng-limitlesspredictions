@@ -17865,7 +17865,7 @@ if SIGNALS_DB_URL:
     threading.Thread(target=_signals_poll_loop, daemon=True).start()
     threading.Thread(target=_sniper_thread, daemon=True).start()
     print("SNIPER A4 thread launched")
-    _threading.Thread(target=_sniper_a41_thread, daemon=True).start()
+    threading.Thread(target=_sniper_a41_thread, daemon=True).start()
     print("SNIPER A41 (P31): ${:.2f} pool | launched".format(_poly_alpha41_state["balance"]))
 
     # ── LIMITLESS SNIPER init ──
