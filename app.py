@@ -1988,264 +1988,12 @@ def _limitless_update_momentum(asset, direction, p23_confirmed):
 
 
 def _sniper_a41_thread():
-    """Sniper A41 — P31 strategy, T+90s entry with real PTB."""
+    """A41 sniper thread — DISABLED. Hybrid runs in scan loop."""
     import time as _time
-    import requests as _a41_req
-    import json as _a41_json
-    import re as _a41_re
-    from datetime import datetime, timezone, timedelta
-    
-    _time.sleep(8)
-    print("SNIPER A41 THREAD STARTED — P31 strategy, T+90s entry")
-    
+    _time.sleep(5)
+    print("A41: hybrid mode — trades via scan loop, thread idle")
     while True:
-        try:
-            now = datetime.now(timezone.utc)
-            next_min = ((now.minute // 15) + 1) * 15
-            if next_min >= 60:
-                next_boundary = now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
-            else:
-                next_boundary = now.replace(minute=next_min, second=0, microsecond=0)
-            
-            # Wait until T+90s
-            fire_time = next_boundary + timedelta(seconds=90)
-            wait_secs = (fire_time - now).total_seconds()
-            if wait_secs > 0:
-                _time.sleep(wait_secs)
-            
-            window_ts = int(next_boundary.timestamp())
-            
-            # ── Step 1: Fetch markets (SAME logic as A4) ──
-            token_map = {}
-            for _asset in SNIPER_ASSETS:
-                slug = SNIPER_SLUGS.get(_asset, "").format(window_ts)
-                if not slug:
-                    continue
-                try:
-                    r = _a41_req.get("{}/markets/slug/{}".format(GAMMA_API, slug), timeout=8)
-                    md = None
-                    if r.status_code == 200:
-                        md = r.json()
-                    else:
-                        r2 = _a41_req.get("{}/markets?slug={}".format(GAMMA_API, slug), timeout=8)
-                        if r2.status_code == 200:
-                            results = r2.json()
-                            if isinstance(results, list) and results:
-                                md = results[0]
-                    
-                    if not md:
-                        continue
-                    
-                    tokens = md.get("clobTokenIds")
-                    if isinstance(tokens, str):
-                        try: tokens = _a41_json.loads(tokens)
-                        except: tokens = None
-                    outcomes = md.get("outcomes")
-                    if isinstance(outcomes, str):
-                        try: outcomes = _a41_json.loads(outcomes)
-                        except: outcomes = None
-                    
-                    if not tokens or not isinstance(tokens, list) or len(tokens) < 2:
-                        continue
-                    
-                    up_idx = 0
-                    if isinstance(outcomes, list) and len(outcomes) >= 2:
-                        if str(outcomes[0]).lower().strip() in ("no", "down", "below"):
-                            up_idx = 1
-                    down_idx = 1 - up_idx
-                    
-                    # Extract PTB from question
-                    question = md.get("question", "") or md.get("title", "")
-                    ptb = None
-                    ptb_match = _a41_re.search(r'\$([0-9,]+\.?\d*)', question)
-                    if ptb_match:
-                        ptb = float(ptb_match.group(1).replace(",", ""))
-                    
-                    # Get current odds
-                    yes_odds = 50
-                    op = md.get("outcomePrices") or md.get("outcome_prices")
-                    if op and len(op) >= 2:
-                        try: yes_odds = round(float(op[0]) * 100)
-                        except: pass
-                    
-                    token_map[_asset] = {
-                        "up_token": tokens[up_idx],
-                        "down_token": tokens[down_idx],
-                        "condition_id": md.get("conditionId", ""),
-                        "slug": slug,
-                        "ptb": ptb,
-                        "yes_odds": yes_odds,
-                        "title": question,
-                    }
-                except:
-                    pass
-            
-            if not token_map:
-                print("A41: no markets at T+90s for boundary {}".format(window_ts))
-                _time.sleep(30)
-                continue
-            
-            # ── Step 2: Score with P31 using real PTB + live price ──
-            a41_targets = []
-            for _asset, _md in token_map.items():
-                ptb = _md.get("ptb")
-                if not ptb:
-                    continue
-                
-                # Live Chainlink price
-                rtds = _rtds_prices.get(_asset.upper(), {})
-                live_price = rtds.get("price") if rtds else None
-                if not live_price:
-                    ci = _indicator_cache.get("{}_15m".format(_asset.upper()))
-                    live_price = ci.get("data", {}).get("current") if ci else None
-                if not live_price:
-                    continue
-                
-                # Calculate FRESH indicators at T+90s (not stale cache)
-                try:
-                    ind_data = _calculate_indicators(_asset, "15m") or {}
-                except:
-                    ind_data = {}
-                try:
-                    macro_data = _calculate_indicators(_asset, "1h")
-                except:
-                    macro_data = None
-                
-                # Build market object with REAL data
-                market = {
-                    "asset": _asset.upper(),
-                    "yes_odds": _md["yes_odds"],
-                    "direction": "above",
-                    "baseline": ptb,
-                    "is_15m_market": True,
-                    "is_hourly_market": False,
-                }
-                
-                exp_min = next_boundary.minute + 15
-                if exp_min >= 60:
-                    exp_min -= 60
-                
-                try:
-                    result = _score_paper31_trade(market, live_price, ind_data,
-                        ind_macro=macro_data, expiry_minute=exp_min)
-                except Exception as e:
-                    print("A41 P31 error {}: {}".format(_asset, e))
-                    result = None
-                
-                if result and result.get("bet_side"):
-                    side = result["bet_side"]
-                    score = result.get("score", 3)
-                    conf = result.get("confidence", "LOW")
-                    inds = result.get("indicators", "")
-                    direction = "UP" if side == "YES" else "DOWN"
-                    stake = 3.00 if score <= 4 else 2.50
-                    
-                    a41_targets.append({
-                        "asset": _asset, "direction": direction,
-                        "signals_agree": score, "stake": stake,
-                        "score": score, "confidence": conf,
-                        "indicators": "[{}] {} | s{} | ptb={} p={:.2f}".format(
-                            conf, inds, score, ptb, live_price),
-                        "token_data": _md,
-                    })
-            
-            if not a41_targets:
-                print("A41: 0 targets at T+90s | markets={}".format(list(token_map.keys())))
-                _time.sleep(30)
-                continue
-            
-            print("A41: {} targets at T+90s: {}".format(len(a41_targets),
-                ", ".join("{}={}(s{})".format(t["asset"], t["direction"], t["score"]) for t in a41_targets)))
-            
-            # ── Step 3: SV2.1 paper trades ──
-            for sv in a41_targets:
-                try:
-                    stk = sv["stake"]
-                    _sv21_paper_state["balance"] = round(_sv21_paper_state["balance"] - stk, 2)
-                    db = get_db()
-                    db.run("INSERT INTO sv21_paper_trades (market_id,asset,timeframe,bet_side,stake,fill_price,pool_after,tier,indicators,signals_agree,score,confidence,status,outcome,fired_at) VALUES (:mid,:ast,:tf,:bs,:stk,:fp,:pa,:tier,:ind,:sa,:sc,:conf,:sts,:out,:fa)",
-                        mid="sv21_{}_15M_{}".format(sv["asset"], window_ts),
-                        ast=sv["asset"], tf="15M", bs=sv["direction"],
-                        stk=stk, fp=0.50, pa=_sv21_paper_state["balance"],
-                        tier="T1" if sv.get("score",5)<=4 else "T2",
-                        ind=sv["indicators"], sa=sv["signals_agree"],
-                        sc=sv.get("score",3), conf=sv.get("confidence",""),
-                        sts="Pending", out="PENDING",
-                        fa=datetime.now(timezone.utc).isoformat())
-                except Exception as e:
-                    print("SV2.1 error: {}".format(e))
-            print("SV2.1: {} paper | pool=${:.2f}".format(len(a41_targets), _sv21_paper_state["balance"]))
-            
-            # ── Step 4: Place real orders at 50c ──
-            try:
-                client = _get_poly_client()
-                from py_clob_client_v2 import Side, OrderArgs, OrderType
-                BUY = Side.BUY
-            except Exception as ce:
-                print("A41 client error: {}".format(ce))
-                _time.sleep(30)
-                continue
-            
-            fired = []
-            for target in a41_targets:
-                td = target["token_data"]
-                tok = td.get("up_token") if target["direction"]=="UP" else td.get("down_token")
-                if not tok:
-                    continue
-                stk = target.get("stake", 2.50)
-                if _poly_alpha41_state["balance"] < stk + 2:
-                    continue
-                try:
-                    args = OrderArgs(token_id=str(tok), price=0.50, size=round(stk/0.50,1), side=BUY)
-                    signed = client.create_order(args)
-                    resp = client.post_order(signed, OrderType.GTC)
-                    oid = resp.get("orderID") or resp.get("id") or "placed" if resp else None
-                    fired.append({"asset": target["asset"], "direction": target["direction"],
-                        "indicators": target["indicators"], "signals_agree": target["signals_agree"],
-                        "score": target.get("score",3), "confidence": target.get("confidence",""),
-                        "order_id": oid, "cost": stk, "token_id": tok,
-                        "slug": td.get("slug",""), "condition_id": td.get("condition_id","")})
-                except Exception as oe:
-                    print("A41 order error {}: {}".format(target["asset"], oe))
-            
-            # ── Step 5: Log ──
-            for fr in fired:
-                _poly_alpha41_state["balance"] = round(_poly_alpha41_state["balance"] - fr["cost"], 2)
-                print("A41: {} {} @50c ${:.2f} [s{}|{}] pool=${:.2f}".format(
-                    fr["direction"], fr["asset"], fr["cost"],
-                    fr.get("score","?"), fr.get("confidence",""), _poly_alpha41_state["balance"]))
-                try:
-                    dbc = get_db()
-                    dbc.run("INSERT INTO poly_alpha41_trades (market_id,title,asset,timeframe,bet_side,stake,fill_price,pool_after,order_id,token_id,condition_id,slug,filled,status,outcome,indicators,signals_agree,score,confidence,fired_at) VALUES (:mid,:ttl,:ast,:tf,:bs,:stk,:fp,:pa,:oid,:tid,:cid,:slg,:fld,:sts,:out,:ind,:sa,:sc,:conf,:fa)",
-                        mid="a41_{}_15M_{}".format(fr["asset"], window_ts),
-                        ttl="A41 {} {} 15M".format(fr["asset"], fr["direction"]),
-                        ast=fr["asset"], tf="15M", bs=fr["direction"],
-                        stk=fr["cost"], fp=0.50, pa=_poly_alpha41_state["balance"],
-                        oid=str(fr["order_id"]) if fr["order_id"] else "",
-                        tid=fr["token_id"], cid=fr["condition_id"], slg=fr["slug"],
-                        fld=bool(fr["order_id"]), sts="Pending", out="PENDING",
-                        ind=fr["indicators"], sa=fr["signals_agree"],
-                        sc=fr.get("score",3), conf=fr.get("confidence",""),
-                        fa=datetime.now(timezone.utc).isoformat())
-                except Exception as dbe:
-                    print("A41 DB error: {}".format(dbe))
-                try:
-                    send_telegram("A41: {} {} @50c ${:.2f} [s{}] pool=${:.2f}".format(
-                        fr["direction"], fr["asset"], fr["cost"],
-                        fr.get("score","?"), _poly_alpha41_state["balance"]))
-                except:
-                    pass
-            
-            if fired:
-                _save_bot_balance("poly_alpha41", _poly_alpha41_state)
-                print("A41: fired {} at T+90s | pool=${:.2f}".format(len(fired), _poly_alpha41_state["balance"]))
-            
-            _time.sleep(30)
-        except Exception as main_err:
-            print("A41 thread error: {}".format(main_err))
-            import traceback
-            traceback.print_exc()
-            _time.sleep(60)
+        _time.sleep(86400)
 
 
 def _limitless_sniper_thread():
@@ -8638,6 +8386,203 @@ def _score_paper5_trade(p, price, indicators, ind_macro=None, expiry_minute=None
 # ═══════════════════════════════════════════════════════════
 # PAPER 3.1: BTC Tiebreaker + Dual Timeframe + UT Gatekeeper
 # ═══════════════════════════════════════════════════════════
+
+def _score_paper31_t0(p, price, indicators, ind_macro=None, expiry_minute=None, expiry_hour=None):
+    """Paper 3.1: Same indicators as Paper 3 but with:
+    1. BTC as tiebreaker (pair leads, BTC confirms/ignored)
+    2. Dual-timeframe pullback with UT Bot gatekeeper
+    3. 4H macro for 1H markets
+    """
+    if not indicators or price is None:
+        return None
+
+    asset = p["asset"]
+    yes_odds = p["yes_odds"]
+    no_odds = 100 - yes_odds
+
+    if not (30 <= yes_odds <= 70 or 30 <= no_odds <= 70):
+        return None
+
+    if p["direction"] == "above":
+        price_above = price > p["baseline"]
+    else:
+        price_above = price < p["baseline"]
+
+    # ── Pair's own signals (without BTC) ──
+    tv = _tv_trends.get(asset.upper())
+    tv_dir = tv["dir"] if tv else None
+    # SMA from _pair_sma_cache (1H) — same source as P2.1 for consistency.
+    # indicators.get("sma_trend") gives 15M SMA on Polymarket which is wrong.
+    sma_trend = _pair_sma_cache.get(asset.upper(), {}).get("trend") or indicators.get("sma_trend")
+    btc_trend = _btc_trend_cache.get("trend")
+    ut_trend = indicators.get("ut_trend")
+    ema_stack = indicators.get("ema_stack")
+    pivot_signal = indicators.get("pivot_signal")
+    sqz_val = indicators.get("squeeze_val")
+    sqz_prev = indicators.get("squeeze_prev_val")
+    sqz_dir = None
+    if sqz_val is not None and sqz_prev is not None:
+        sqz_dir = "BUY" if sqz_val > 0 else "SELL" if sqz_val < 0 else None
+
+    pair_signals = [tv_dir, sma_trend, ut_trend, ema_stack, pivot_signal]
+    pair_buy = sum(1 for s in pair_signals if s in ("BUY", "STRONG_BUY"))
+    pair_sell = sum(1 for s in pair_signals if s in ("SELL", "STRONG_SELL"))
+    pair_dir = "BUY" if pair_buy > pair_sell else "SELL" if pair_sell > pair_buy else None
+
+    # ── BTC role ──
+    btc_agrees = (btc_trend == pair_dir) if pair_dir and btc_trend else False
+    if pair_dir and btc_agrees:
+        btc_role = "CONFIRM"
+        eff_buy = pair_buy + (1 if pair_dir == "BUY" else 0)
+        eff_sell = pair_sell + (1 if pair_dir == "SELL" else 0)
+    elif pair_dir and not btc_agrees and btc_trend:
+        btc_role = "IGNORED"
+        eff_buy = pair_buy
+        eff_sell = pair_sell
+    elif pair_dir:
+        btc_role = "NONE"
+        eff_buy = pair_buy
+        eff_sell = pair_sell
+    else:
+        btc_role = "TIEBREAK"
+        eff_buy = pair_buy + (1 if btc_trend == "BUY" else 0)
+        eff_sell = pair_sell + (1 if btc_trend == "SELL" else 0)
+        pair_dir = btc_trend
+
+    total_buy = eff_buy
+    total_sell = eff_sell
+    eff_dir = pair_dir
+
+    # ── Macro direction ──
+    macro_dir = None
+    if ind_macro:
+        m_sma = ind_macro.get("sma_trend")
+        m_ut = ind_macro.get("ut_trend")
+        m_ema = ind_macro.get("ema_stack")
+        m_signals = [s for s in [m_sma, m_ut, m_ema, btc_trend] if s is not None]
+        m_buy = sum(1 for s in m_signals if s in ("BUY", "STRONG_BUY"))
+        m_sell = sum(1 for s in m_signals if s in ("SELL", "STRONG_SELL"))
+        m_total = len(m_signals)
+        # Need majority: 2/3 or 3/4 or 2/2
+        if m_total >= 2 and m_buy > m_sell and m_buy >= 2: macro_dir = "BUY"
+        elif m_total >= 2 and m_sell > m_buy and m_sell >= 2: macro_dir = "SELL"
+
+    # ── Timing ──
+    mtype = "15M" if p.get("is_15m_market") else "1H" if p.get("is_hourly_market") else "Daily"
+    is_weak_period = False
+    if mtype == "15M" and expiry_minute is not None:
+        is_weak_period = expiry_minute in (0, 30)
+    elif mtype == "1H" and expiry_hour is not None:
+        hour_in_4h = expiry_hour % 4
+        is_weak_period = hour_in_4h in (2, 3)
+
+    # ── Decision ──
+    bet_side = None
+    confidence = "LOW"
+    reason = ""
+
+    if is_weak_period and macro_dir:
+        # ═══ WEAK: UT Bot gatekeeper ═══
+        ut_opposes = (ut_trend == "SELL" and macro_dir == "BUY") or (ut_trend == "BUY" and macro_dir == "SELL")
+        sqz_opposes = (sqz_dir == "SELL" and macro_dir == "BUY") or (sqz_dir == "BUY" and macro_dir == "SELL")
+
+        if ut_opposes and sqz_opposes:
+            if macro_dir == "BUY":
+                bet_side = "NO" if p["direction"] == "above" else "YES"
+                confidence = "HIGH"; reason = "PULLBACK_S4_BEAR"
+            else:
+                bet_side = "YES" if p["direction"] == "above" else "NO"
+                confidence = "HIGH"; reason = "PULLBACK_S4_BULL"
+        elif ut_opposes and not sqz_opposes:
+            if macro_dir == "BUY":
+                bet_side = "NO" if p["direction"] == "above" else "YES"
+                confidence = "MEDIUM"; reason = "PULLBACK_S3_BEAR"
+            else:
+                bet_side = "YES" if p["direction"] == "above" else "NO"
+                confidence = "MEDIUM"; reason = "PULLBACK_S3_BULL"
+        elif not ut_opposes and sqz_opposes:
+            return None
+        else:
+            if eff_dir == "BUY" and total_buy >= 3:
+                bet_side = "YES" if p["direction"] == "above" else "NO"
+                confidence = "MEDIUM" if total_buy >= 4 else "LOW"
+                reason = "WEAK_TREND_HOLDS"
+            elif eff_dir == "SELL" and total_sell >= 3:
+                bet_side = "NO" if p["direction"] == "above" else "YES"
+                confidence = "MEDIUM" if total_sell >= 4 else "LOW"
+                reason = "WEAK_TREND_HOLDS_BEAR"
+            else:
+                return None
+    else:
+        # ═══ STRONG: pair-led ═══
+        if eff_dir == "BUY" and total_buy >= 4:
+            bet_side = "YES" if p["direction"] == "above" else "NO"
+            confidence = "HIGH" if total_buy >= 5 else "MEDIUM"
+            reason = "FULL_BULL"
+        elif eff_dir == "SELL" and total_sell >= 4:
+            bet_side = "NO" if p["direction"] == "above" else "YES"
+            confidence = "HIGH" if total_sell >= 5 else "MEDIUM"
+            reason = "FULL_BEAR"
+        elif eff_dir == "BUY" and total_buy >= 3:
+            bet_side = "YES" if p["direction"] == "above" else "NO"
+            confidence = "MEDIUM" if btc_agrees else "LOW"
+            reason = "CONFIRMED_BULL"
+        elif eff_dir == "SELL" and total_sell >= 3:
+            bet_side = "NO" if p["direction"] == "above" else "YES"
+            confidence = "MEDIUM" if btc_agrees else "LOW"
+            reason = "CONFIRMED_BEAR"
+
+    if bet_side is None:
+        return None
+
+    effective_odds = yes_odds if bet_side == "YES" else no_odds
+    if effective_odds < 30 or effective_odds > 70:
+        return None
+
+    if asset in ("ETH", "XRP") and mtype == "1H" and confidence == "LOW":
+        return None
+    if mtype == "1H" and confidence == "LOW" and total_buy < 4 and total_sell < 4:
+        return None
+    if mtype == "Daily" and confidence != "HIGH":
+        return None
+
+    # ── Output ──
+    indicator_details = []
+    for name, signal in [("TV", tv_dir), ("SMA", sma_trend), ("BTC", btc_trend),
+                          ("UT", ut_trend), ("EMA4", ema_stack), ("PIV", pivot_signal)]:
+        if signal in ("BUY", "STRONG_BUY"):
+            indicator_details.append("{}=BUY".format(name))
+        elif signal in ("SELL", "STRONG_SELL"):
+            indicator_details.append("{}=SELL".format(name))
+        else:
+            indicator_details.append("{}=\u2014".format(name))
+
+    if sqz_dir: indicator_details.append("SQZ={}".format(sqz_dir))
+    indicator_details.append("BTC:{}".format(btc_role))
+    if is_weak_period and macro_dir:
+        indicator_details.append("MACRO={}".format(macro_dir))
+    if "PULLBACK" in reason:
+        indicator_details.append("FLIP")
+
+    pair_total = pair_buy + pair_sell
+    score = max(total_buy, total_sell)
+
+    share_price = effective_odds / 100.0
+    if bet_side == "NO": share_price = 1.0 - (yes_odds / 100.0)
+    sim_payout = round(1.0 / share_price, 4) if share_price > 0 else 0
+
+    return {
+        "bet_side": bet_side, "bet_odds": effective_odds,
+        "score": max(int(score), 3), "total_signals": max(int(pair_total), 3),
+        "confidence": confidence, "indicators": " | ".join(indicator_details),
+        "rsi": indicators.get("rsi"), "bb_pos": indicators.get("bb_position"),
+        "market_type": mtype, "sim_payout": sim_payout,
+    }
+
+# ═══════════════════════════════════════════════════════════
+# PAPER 2.1: Bot 2 strategy + BTC Tiebreaker + 15M Pullback
+# ═══════════════════════════════════════════════════════════
+
 
 def _score_paper31_trade(p, price, indicators, ind_macro=None, expiry_minute=None, expiry_hour=None):
     """Paper 3.1: Same indicators as Paper 3 but with:
@@ -18891,6 +18836,180 @@ def run_poly_scan():
                         except Exception as _a4d_e:
                             print("A4 DYN debug error: {} {} {}".format(asset, strat, _a4d_e))
                     existing_keys.add(key)
+
+                    # ── A41 HYBRID: P2.1 + P31 Independent Dynamic Entry ──
+                    # P2.1 signal → enter at market odds ≤ 65¢
+                    # P31 signal → enter at market odds ≤ 60¢
+                    # Each fires independently — no cross-confirmation needed
+                    if strat in ("p21", "p31") and section == "all15m" and scored:
+                        try:
+                            _h41_odds = scored.get("bet_odds", 50)
+                            _h41_side = scored.get("bet_side")  # YES or NO
+                            _h41_conf = scored.get("confidence", "LOW")
+                            _h41_score = scored.get("score", 3)
+                            
+                            # Apply per-strategy caps
+                            _h41_cap = 65 if strat == "p21" else 60
+                            
+                            if _h41_odds > _h41_cap or _h41_odds < 35:
+                                pass  # Skip — outside profitable range
+                            elif not _h41_side:
+                                pass  # No signal
+                            else:
+                                # Dedup: one trade per asset per boundary per strategy
+                                _h41_exp_min = parsed.get("expiry_minute")
+                                _h41_exp_hour = parsed.get("expiry_hour")
+                                if _h41_exp_min is not None and _h41_exp_hour is not None:
+                                    _h41_now = datetime.now(timezone.utc)
+                                    _h41_exp = _h41_now.replace(hour=int(_h41_exp_hour), minute=int(_h41_exp_min), second=0, microsecond=0)
+                                    _h41_bnd_ts = int((_h41_exp - timedelta(minutes=15)).timestamp())
+                                    _h41_dedup = "a41_{}_{}_{}".format(asset, _h41_bnd_ts, strat)
+                                    
+                                    if not hasattr(run_poly_scan, '_a41_traded'):
+                                        run_poly_scan._a41_traded = set()
+                                    
+                                    if _h41_dedup not in run_poly_scan._a41_traded:
+                                        # Determine direction
+                                        _h41_dir = "UP" if _h41_side == "YES" else "DOWN"
+                                        
+                                        # Get tier and stake from pool
+                                        _h41_tier, _h41_max_stake = _a4_dynamic_tier(int(_h41_odds), _poly_alpha41_state["balance"])
+                                        
+                                        if _h41_tier and _h41_max_stake >= 2.50:
+                                            _h41_price = _h41_odds / 100.0
+                                            _h41_shares = int(_h41_max_stake / _h41_price)
+                                            _h41_cost = round(_h41_shares * _h41_price, 2)
+                                            
+                                            if _h41_shares >= 5 and _h41_cost <= _poly_alpha41_state["balance"] - 5:
+                                                # Find token from poly slug data
+                                                _h41_slug_data = None
+                                                _h41_slug_key = "{}_15M".format(asset)
+                                                if hasattr(run_poly_scan, '_poly_slug_cache'):
+                                                    _h41_slug_data = run_poly_scan._poly_slug_cache.get(_h41_slug_key)
+                                                
+                                                if not _h41_slug_data:
+                                                    # Try to get from the poly slug lookup
+                                                    for _h41_mk in getattr(run_poly_scan, '_poly_markets', []):
+                                                        if _h41_mk.get("asset") == asset and _h41_mk.get("tf") == "15M":
+                                                            _h41_slug_data = _h41_mk
+                                                            break
+                                                
+                                                _h41_token = None
+                                                _h41_slug = ""
+                                                _h41_cid = ""
+                                                
+                                                if _h41_slug_data:
+                                                    if _h41_dir == "UP":
+                                                        _h41_token = _h41_slug_data.get("up_token")
+                                                    else:
+                                                        _h41_token = _h41_slug_data.get("down_token")
+                                                    _h41_slug = _h41_slug_data.get("slug", "")
+                                                    _h41_cid = _h41_slug_data.get("condition_id", "")
+                                                
+                                                if not _h41_token:
+                                                    # Fallback: get from SNIPER_SLUGS
+                                                    import requests as _h41_req
+                                                    import json as _h41_json
+                                                    _h41_s_slug = SNIPER_SLUGS.get(asset, "").format(_h41_bnd_ts)
+                                                    try:
+                                                        _h41_r = _h41_req.get("{}/markets/slug/{}".format(GAMMA_API, _h41_s_slug), timeout=5)
+                                                        if _h41_r.status_code == 200:
+                                                            _h41_md = _h41_r.json()
+                                                            _h41_toks = _h41_md.get("clobTokenIds")
+                                                            if isinstance(_h41_toks, str):
+                                                                _h41_toks = _h41_json.loads(_h41_toks)
+                                                            _h41_outs = _h41_md.get("outcomes")
+                                                            if isinstance(_h41_outs, str):
+                                                                _h41_outs = _h41_json.loads(_h41_outs)
+                                                            if _h41_toks and len(_h41_toks) >= 2:
+                                                                _h41_up_idx = 0
+                                                                if isinstance(_h41_outs, list) and len(_h41_outs) >= 2:
+                                                                    if str(_h41_outs[0]).lower().strip() in ("no","down","below"):
+                                                                        _h41_up_idx = 1
+                                                                _h41_token = _h41_toks[_h41_up_idx] if _h41_dir == "UP" else _h41_toks[1-_h41_up_idx]
+                                                                _h41_slug = _h41_s_slug
+                                                                _h41_cid = _h41_md.get("conditionId", "")
+                                                    except:
+                                                        pass
+                                                
+                                                if _h41_token:
+                                                    # Check live orderbook for actual fill price
+                                                    _h41_live_price = None
+                                                    try:
+                                                        _h41_book = _h41_req.get(
+                                                            "https://clob.polymarket.com/book?token_id={}".format(_h41_token),
+                                                            timeout=5).json()
+                                                        _h41_asks = _h41_book.get("asks", [])
+                                                        if _h41_asks:
+                                                            _h41_live_price = float(_h41_asks[0].get("price", 0))
+                                                    except:
+                                                        pass
+                                                    
+                                                    if _h41_live_price and 0.35 <= _h41_live_price <= (_h41_cap / 100.0):
+                                                        # Recalculate shares at live price
+                                                        _h41_tier2, _h41_ms2 = _a4_dynamic_tier(int(_h41_live_price * 100), _poly_alpha41_state["balance"])
+                                                        if _h41_tier2 and _h41_ms2 >= 2.50:
+                                                            _h41_shares2 = int(_h41_ms2 / _h41_live_price)
+                                                            _h41_cost2 = round(_h41_shares2 * _h41_live_price, 2)
+                                                            
+                                                            if _h41_shares2 >= 5 and _h41_cost2 <= _poly_alpha41_state["balance"] - 5:
+                                                                try:
+                                                                    _h41_client = _get_poly_client()
+                                                                    from py_clob_client_v2 import Side as _H41Side, OrderArgs as _H41Args, OrderType as _H41OT
+                                                                    _h41_order = _h41_client.create_order(_H41Args(
+                                                                        token_id=str(_h41_token),
+                                                                        price=_h41_live_price,
+                                                                        size=float(_h41_shares2),
+                                                                        side=_H41Side.BUY,
+                                                                    ))
+                                                                    _h41_resp = _h41_client.post_order(_h41_order, _H41OT.FOK)
+                                                                    if _h41_resp:
+                                                                        _h41_oid = _h41_resp.get("orderID") or _h41_resp.get("id") or "placed"
+                                                                        run_poly_scan._a41_traded.add(_h41_dedup)
+                                                                        _poly_alpha41_state["balance"] = round(_poly_alpha41_state["balance"] - _h41_cost2, 2)
+                                                                        
+                                                                        # DB insert
+                                                                        try:
+                                                                            _h41_db = get_db()
+                                                                            _h41_db.run("INSERT INTO poly_alpha41_trades (market_id,title,asset,timeframe,bet_side,stake,fill_price,pool_after,order_id,token_id,condition_id,slug,filled,status,outcome,indicators,signals_agree,score,confidence,fired_at) VALUES (:mid,:ttl,:ast,:tf,:bs,:stk,:fp,:pa,:oid,:tid,:cid,:slg,:fld,:sts,:out,:ind,:sa,:sc,:conf,:fa)",
+                                                                                mid="a41_{}_15M_{}".format(asset, _h41_bnd_ts),
+                                                                                ttl="A41 {} {} 15M {}".format(asset, _h41_dir, strat.upper()),
+                                                                                ast=asset, tf="15M", bs=_h41_dir,
+                                                                                stk=_h41_cost2, fp=_h41_live_price,
+                                                                                pa=_poly_alpha41_state["balance"],
+                                                                                oid=str(_h41_oid),
+                                                                                tid=str(_h41_token), cid=_h41_cid, slg=_h41_slug,
+                                                                                fld=True, sts="Pending", out="PENDING",
+                                                                                ind=scored.get("indicators", ""),
+                                                                                sa=scored.get("total_signals", 0),
+                                                                                sc=_h41_score, conf=_h41_conf,
+                                                                                fa=datetime.now(timezone.utc).isoformat())
+                                                                        except Exception as _h41_dbe:
+                                                                            print("A41 DB error: {}".format(_h41_dbe))
+                                                                        
+                                                                        _save_bot_balance("poly_alpha41", _poly_alpha41_state)
+                                                                        
+                                                                        print("A41: {} {} @{}c ${:.2f} ({} shares) {} [{}|s{}] | pool=${:.2f}".format(
+                                                                            _h41_dir, asset, int(_h41_live_price*100),
+                                                                            _h41_cost2, _h41_shares2, _h41_tier2,
+                                                                            strat.upper(), _h41_score,
+                                                                            _poly_alpha41_state["balance"]))
+                                                                        
+                                                                        try:
+                                                                            send_telegram("A41: {} {} @{}c ${:.2f} {} [{}|s{}] pool=${:.2f}".format(
+                                                                                _h41_dir, asset, int(_h41_live_price*100),
+                                                                                _h41_cost2, _h41_tier2,
+                                                                                strat.upper(), _h41_score,
+                                                                                _poly_alpha41_state["balance"]))
+                                                                        except:
+                                                                            pass
+                                                                except Exception as _h41_oe:
+                                                                    print("A41 order error {}: {}".format(asset, _h41_oe))
+                                                    elif _h41_live_price:
+                                                        print("A41 SKIP: {} {} live={}c outside cap {}c".format(
+                                                            asset, _h41_dir, int(_h41_live_price*100), _h41_cap))
+                        except Exception as _h41_e:
+                            print("A41 hybrid error: {} {} {}".format(asset, strat, _h41_e))
                     poly_counts[section] = poly_counts.get(section, 0) + 1
 
                     # Log P2.3 paper trade scoring for diagnostics
