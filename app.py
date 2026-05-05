@@ -21310,6 +21310,86 @@ def export_a4_csv():
     except Exception as e:
         return "Error: {}".format(e), 500
 
+
+@app.route("/export/p3")
+def export_p3():
+    import io, csv as _csv
+    try:
+        c = get_db()
+        rows = c.run("SELECT * FROM paper3_trades ORDER BY id")
+        cols = [col['name'] for col in c.columns]
+        c.close()
+        out = io.StringIO()
+        w = _csv.writer(out)
+        w.writerow(cols)
+        w.writerows(rows)
+        return out.getvalue(), 200, {"Content-Type":"text/csv","Content-Disposition":"attachment; filename=paper3_trades.csv"}
+    except Exception as e:
+        return "Error: {}".format(e), 500
+
+@app.route("/export/p31")
+def export_p31():
+    import io, csv as _csv
+    try:
+        c = get_db()
+        rows = c.run("SELECT * FROM paper31_trades ORDER BY id")
+        cols = [col['name'] for col in c.columns]
+        c.close()
+        out = io.StringIO()
+        w = _csv.writer(out)
+        w.writerow(cols)
+        w.writerows(rows)
+        return out.getvalue(), 200, {"Content-Type":"text/csv","Content-Disposition":"attachment; filename=paper31_trades.csv"}
+    except Exception as e:
+        return "Error: {}".format(e), 500
+
+@app.route("/export/p32")
+def export_p32():
+    import io, csv as _csv
+    try:
+        c = get_db()
+        rows = c.run("SELECT * FROM paper32_trades ORDER BY id")
+        cols = [col['name'] for col in c.columns]
+        c.close()
+        out = io.StringIO()
+        w = _csv.writer(out)
+        w.writerow(cols)
+        w.writerows(rows)
+        return out.getvalue(), 200, {"Content-Type":"text/csv","Content-Disposition":"attachment; filename=paper32_trades.csv"}
+    except Exception as e:
+        return "Error: {}".format(e), 500
+
+@app.route("/export/p33")
+def export_p33():
+    import io, csv as _csv
+    try:
+        c = get_db()
+        rows = c.run("SELECT * FROM paper33_trades ORDER BY id")
+        cols = [col['name'] for col in c.columns]
+        c.close()
+        out = io.StringIO()
+        w = _csv.writer(out)
+        w.writerow(cols)
+        w.writerows(rows)
+        return out.getvalue(), 200, {"Content-Type":"text/csv","Content-Disposition":"attachment; filename=paper33_trades.csv"}
+    except Exception as e:
+        return "Error: {}".format(e), 500
+
+@app.route("/export/p34")
+def export_p34():
+    import io, csv as _csv
+    try:
+        c = get_db()
+        rows = c.run("SELECT * FROM paper34_trades ORDER BY id")
+        cols = [col['name'] for col in c.columns]
+        c.close()
+        out = io.StringIO()
+        w = _csv.writer(out)
+        w.writerow(cols)
+        w.writerows(rows)
+        return out.getvalue(), 200, {"Content-Type":"text/csv","Content-Disposition":"attachment; filename=paper34_trades.csv"}
+    except Exception as e:
+        return "Error: {}".format(e), 500
 @app.route("/export/sv3")
 def export_sv3_csv():
     try:
