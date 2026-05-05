@@ -1693,7 +1693,7 @@ def _resolve_sv2_trades():
         for p in items:
             try:
                 if not p.get("fired_at"): continue
-                fired = datetime.fromisoformat(p["fired_at"])
+                fired = datetime.fromisoformat(str(p["fired_at"]).replace("+00:00","").replace("Z","")[:26]) if p.get("fired_at") else datetime.now(timezone.utc)
                 if fired.tzinfo is None:
                     fired = fired.replace(tzinfo=timezone.utc)
                 # Correct expiry: sniper fires ~30s before boundary → round UP
@@ -1796,7 +1796,7 @@ def _resolve_poly_alpha4_trades():
         for p in items:
             try:
                 if not p.get("fired_at"): continue
-                fired = datetime.fromisoformat(p["fired_at"])
+                fired = datetime.fromisoformat(str(p["fired_at"]).replace("+00:00","").replace("Z","")[:26]) if p.get("fired_at") else datetime.now(timezone.utc)
                 if fired.tzinfo is None: fired = fired.replace(tzinfo=timezone.utc)
                 # ── Correct expiry calculation ──
                 # Sniper fires ~30s BEFORE the boundary (e.g. fires at 10:14:30
@@ -1964,7 +1964,7 @@ def _resolve_poly_alpha41_trades():
         for p in items:
             try:
                 if not p.get("fired_at"): continue
-                fired = datetime.fromisoformat(p["fired_at"])
+                fired = datetime.fromisoformat(str(p["fired_at"]).replace("+00:00","").replace("Z","")[:26]) if p.get("fired_at") else datetime.now(timezone.utc)
                 if fired.tzinfo is None: fired = fired.replace(tzinfo=timezone.utc)
                 # ── Correct expiry calculation ──
                 # Sniper fires ~30s BEFORE the boundary (e.g. fires at 10:14:30
@@ -2452,7 +2452,7 @@ def _resolve_limitless_sniper_trades():
         for p in items:
             try:
                 if not p.get("fired_at"): continue
-                fired = datetime.fromisoformat(p["fired_at"])
+                fired = datetime.fromisoformat(str(p["fired_at"]).replace("+00:00","").replace("Z","")[:26]) if p.get("fired_at") else datetime.now(timezone.utc)
                 if fired.tzinfo is None: fired = fired.replace(tzinfo=timezone.utc)
                 window_start = fired.replace(minute=0, second=0, microsecond=0)
                 expiry = window_start + timedelta(hours=1)
@@ -12237,7 +12237,7 @@ def _resolve_paper_table(table_name):
                 if not p.get("fired_at") or not p.get("asset") or p.get("baseline") is None:
                     continue
 
-                fired = datetime.fromisoformat(p["fired_at"])
+                fired = datetime.fromisoformat(str(p["fired_at"]).replace("+00:00","").replace("Z","")[:26]) if p.get("fired_at") else datetime.now(timezone.utc)
                 if fired.tzinfo is None:
                     fired = fired.replace(tzinfo=timezone.utc)
                 hours_left = float(p.get("hours_left") or 0)
@@ -12542,7 +12542,7 @@ def _resolve_alpha_trades():
                     print("ALPHA RESOLVE SKIP #{}: missing fired_at or asset".format(p.get("id")))
                     continue
 
-                fired = datetime.fromisoformat(p["fired_at"])
+                fired = datetime.fromisoformat(str(p["fired_at"]).replace("+00:00","").replace("Z","")[:26]) if p.get("fired_at") else datetime.now(timezone.utc)
                 if fired.tzinfo is None:
                     fired = fired.replace(tzinfo=timezone.utc)
 
@@ -13057,7 +13057,7 @@ def resolve_paper_trades():
                 if not p.get("fired_at") or not p.get("asset") or p.get("baseline") is None:
                     continue
 
-                fired = datetime.fromisoformat(p["fired_at"])
+                fired = datetime.fromisoformat(str(p["fired_at"]).replace("+00:00","").replace("Z","")[:26]) if p.get("fired_at") else datetime.now(timezone.utc)
                 if fired.tzinfo is None:
                     fired = fired.replace(tzinfo=timezone.utc)
                 hours_left = float(p.get("hours_left") or 0)
@@ -13679,7 +13679,7 @@ def outcome_loop():
                             p.get("id"), p.get("asset"), p.get("baseline")))
                         continue
 
-                    fired = datetime.fromisoformat(p["fired_at"])
+                    fired = datetime.fromisoformat(str(p["fired_at"]).replace("+00:00","").replace("Z","")[:26]) if p.get("fired_at") else datetime.now(timezone.utc)
                     if fired.tzinfo is None:
                         fired = fired.replace(tzinfo=timezone.utc)
                     hours_left = float(p.get("hours_left") or 0)
@@ -19602,7 +19602,7 @@ def _resolve_poly_trades():
                 if not p.get("fired_at") or not p.get("asset") or p.get("baseline") is None:
                     continue
 
-                fired = datetime.fromisoformat(p["fired_at"])
+                fired = datetime.fromisoformat(str(p["fired_at"]).replace("+00:00","").replace("Z","")[:26]) if p.get("fired_at") else datetime.now(timezone.utc)
                 if fired.tzinfo is None:
                     fired = fired.replace(tzinfo=timezone.utc)
                 hours_left = float(p.get("hours_left") or 0)
@@ -19836,7 +19836,7 @@ def _resolve_poly_alpha_trades():
             try:
                 if not p.get("fired_at"):
                     continue
-                fired = datetime.fromisoformat(p["fired_at"])
+                fired = datetime.fromisoformat(str(p["fired_at"]).replace("+00:00","").replace("Z","")[:26]) if p.get("fired_at") else datetime.now(timezone.utc)
                 if fired.tzinfo is None:
                     fired = fired.replace(tzinfo=timezone.utc)
                 tf = p.get("timeframe", "15M")
@@ -20003,7 +20003,7 @@ def _resolve_poly_alpha2_trades():
             try:
                 if not p.get("fired_at"):
                     continue
-                fired = datetime.fromisoformat(p["fired_at"])
+                fired = datetime.fromisoformat(str(p["fired_at"]).replace("+00:00","").replace("Z","")[:26]) if p.get("fired_at") else datetime.now(timezone.utc)
                 if fired.tzinfo is None:
                     fired = fired.replace(tzinfo=timezone.utc)
                 tf = p.get("timeframe", "15M")
@@ -20126,7 +20126,7 @@ def _resolve_poly_alpha3_trades():
         for p in items:
             try:
                 if not p.get("fired_at"): continue
-                fired = datetime.fromisoformat(p["fired_at"])
+                fired = datetime.fromisoformat(str(p["fired_at"]).replace("+00:00","").replace("Z","")[:26]) if p.get("fired_at") else datetime.now(timezone.utc)
                 if fired.tzinfo is None: fired = fired.replace(tzinfo=timezone.utc)
                 tf = p.get("timeframe", "15M")
                 if tf == "1H":
