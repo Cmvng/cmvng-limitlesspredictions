@@ -468,10 +468,9 @@ def _poly_alpha3_calc_stake(pool_balance):
 # Independent thread, no scanner dependency
 # ═══════════════════════════════════════════════════════════
 
-_
 _poly_alpha41_state = {"balance": 100.00}
 _sv21_paper_state = {"balance": 100.00}
-poly_alpha4_state = {
+_poly_alpha4_state = {
     "enabled": True,
     "balance": 60.0,
     "peak_balance": 60.0,
