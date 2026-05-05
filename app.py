@@ -1991,6 +1991,7 @@ def _sniper_a41_thread():
     """Sniper A41 — P31 strategy, T+90s entry with real PTB."""
     import time as _time
     import requests as _a41_req
+    import json as _a41_json
     import re as _a41_re
     from datetime import datetime, timezone, timedelta
     
@@ -2006,6 +2007,7 @@ def _sniper_a41_thread():
             else:
                 next_boundary = now.replace(minute=next_min, second=0, microsecond=0)
             
+            # Wait until T+90s
             fire_time = next_boundary + timedelta(seconds=90)
             wait_secs = (fire_time - now).total_seconds()
             if wait_secs > 0:
@@ -2013,182 +2015,222 @@ def _sniper_a41_thread():
             
             window_ts = int(next_boundary.timestamp())
             
-            # Step 1: Fetch real market data
+            # ── Step 1: Fetch markets (SAME logic as A4) ──
             token_map = {}
-            for _a41_asset in SNIPER_ASSETS:
-                _a41_slug = SNIPER_SLUGS.get(_a41_asset, "").format(window_ts)
-                if not _a41_slug:
+            for _asset in SNIPER_ASSETS:
+                slug = SNIPER_SLUGS.get(_asset, "").format(window_ts)
+                if not slug:
                     continue
                 try:
-                    _a41_r = _a41_req.get("{}/markets/slug/{}".format(GAMMA_API, _a41_slug), timeout=5)
-                    if _a41_r.status_code == 200:
-                        _a41_mkt = _a41_r.json()
-                        _a41_tokens = _a41_mkt.get("clobTokenIds") or _a41_mkt.get("clob_token_ids") or []
-                        _a41_prices = _a41_mkt.get("outcomePrices") or _a41_mkt.get("outcome_prices")
-                        _a41_question = _a41_mkt.get("question", "") or _a41_mkt.get("title", "")
-                        _a41_ptb = None
-                        _a41_ptb_match = _a41_re.search(r'\$([\d,]+\.?\d*)', _a41_question)
-                        if _a41_ptb_match:
-                            _a41_ptb = float(_a41_ptb_match.group(1).replace(",", ""))
-                        _a41_yes_price = 50
-                        if _a41_prices and len(_a41_prices) >= 2:
-                            try:
-                                _a41_yes_price = round(float(_a41_prices[0]) * 100)
-                            except:
-                                pass
-                        if len(_a41_tokens) >= 2 and _a41_ptb:
-                            token_map[_a41_asset] = {
-                                "up_token": _a41_tokens[0], "down_token": _a41_tokens[1],
-                                "condition_id": _a41_mkt.get("conditionId") or _a41_mkt.get("condition_id") or "",
-                                "slug": _a41_slug, "ptb": _a41_ptb, "yes_odds": _a41_yes_price,
-                            }
+                    r = _a41_req.get("{}/markets/slug/{}".format(GAMMA_API, slug), timeout=8)
+                    md = None
+                    if r.status_code == 200:
+                        md = r.json()
+                    else:
+                        r2 = _a41_req.get("{}/markets?slug={}".format(GAMMA_API, slug), timeout=8)
+                        if r2.status_code == 200:
+                            results = r2.json()
+                            if isinstance(results, list) and results:
+                                md = results[0]
+                    
+                    if not md:
+                        continue
+                    
+                    tokens = md.get("clobTokenIds")
+                    if isinstance(tokens, str):
+                        try: tokens = _a41_json.loads(tokens)
+                        except: tokens = None
+                    outcomes = md.get("outcomes")
+                    if isinstance(outcomes, str):
+                        try: outcomes = _a41_json.loads(outcomes)
+                        except: outcomes = None
+                    
+                    if not tokens or not isinstance(tokens, list) or len(tokens) < 2:
+                        continue
+                    
+                    up_idx = 0
+                    if isinstance(outcomes, list) and len(outcomes) >= 2:
+                        if str(outcomes[0]).lower().strip() in ("no", "down", "below"):
+                            up_idx = 1
+                    down_idx = 1 - up_idx
+                    
+                    # Extract PTB from question
+                    question = md.get("question", "") or md.get("title", "")
+                    ptb = None
+                    ptb_match = _a41_re.search(r'\$([0-9,]+\.?\d*)', question)
+                    if ptb_match:
+                        ptb = float(ptb_match.group(1).replace(",", ""))
+                    
+                    # Get current odds
+                    yes_odds = 50
+                    op = md.get("outcomePrices") or md.get("outcome_prices")
+                    if op and len(op) >= 2:
+                        try: yes_odds = round(float(op[0]) * 100)
+                        except: pass
+                    
+                    token_map[_asset] = {
+                        "up_token": tokens[up_idx],
+                        "down_token": tokens[down_idx],
+                        "condition_id": md.get("conditionId", ""),
+                        "slug": slug,
+                        "ptb": ptb,
+                        "yes_odds": yes_odds,
+                        "title": question,
+                    }
                 except:
                     pass
             
             if not token_map:
-                print("A41: no markets at boundary {}".format(window_ts))
+                print("A41: no markets at T+90s for boundary {}".format(window_ts))
                 _time.sleep(30)
                 continue
             
-            # Step 2: Score with P31 using REAL PTB and live price
+            # ── Step 2: Score with P31 using real PTB + live price ──
             a41_targets = []
-            for _a41_asset, _a41_md in token_map.items():
-                _a41_ptb = _a41_md["ptb"]
-                _a41_rtds = _rtds_prices.get(_a41_asset.upper(), {})
-                _a41_live = _a41_rtds.get("price") if _a41_rtds else None
-                if not _a41_live:
-                    _a41_ci = _indicator_cache.get("{}_15m".format(_a41_asset.upper()))
-                    _a41_live = _a41_ci.get("data", {}).get("current") if _a41_ci else None
-                if not _a41_live:
+            for _asset, _md in token_map.items():
+                ptb = _md.get("ptb")
+                if not ptb:
                     continue
                 
-                _a41_ind = _indicator_cache.get("{}_15m".format(_a41_asset.upper()))
-                _a41_ind_data = _a41_ind.get("data") if _a41_ind else {}
-                if not _a41_ind_data:
-                    _a41_ind_data = {}
-                _a41_macro = _indicator_cache.get("{}_1h".format(_a41_asset.upper()))
-                _a41_macro_data = _a41_macro.get("data") if _a41_macro else None
+                # Live Chainlink price
+                rtds = _rtds_prices.get(_asset.upper(), {})
+                live_price = rtds.get("price") if rtds else None
+                if not live_price:
+                    ci = _indicator_cache.get("{}_15m".format(_asset.upper()))
+                    live_price = ci.get("data", {}).get("current") if ci else None
+                if not live_price:
+                    continue
                 
-                _a41_market = {
-                    "asset": _a41_asset.upper(), "yes_odds": _a41_md["yes_odds"],
-                    "direction": "above", "baseline": _a41_ptb,
-                    "is_15m_market": True, "is_hourly_market": False,
+                # Indicators from cache
+                ind_entry = _indicator_cache.get("{}_15m".format(_asset.upper()))
+                ind_data = ind_entry.get("data") if ind_entry else {}
+                if not ind_data:
+                    ind_data = {}
+                macro_entry = _indicator_cache.get("{}_1h".format(_asset.upper()))
+                macro_data = macro_entry.get("data") if macro_entry else None
+                
+                # Build market object with REAL data
+                market = {
+                    "asset": _asset.upper(),
+                    "yes_odds": _md["yes_odds"],
+                    "direction": "above",
+                    "baseline": ptb,
+                    "is_15m_market": True,
+                    "is_hourly_market": False,
                 }
-                _a41_exp = next_boundary.minute + 15
-                if _a41_exp >= 60:
-                    _a41_exp -= 60
+                
+                exp_min = next_boundary.minute + 15
+                if exp_min >= 60:
+                    exp_min -= 60
                 
                 try:
-                    _a41_result = _score_paper31_trade(_a41_market, _a41_live, _a41_ind_data,
-                        ind_macro=_a41_macro_data, expiry_minute=_a41_exp)
-                except Exception as _a41_err:
-                    print("A41 P31 error {}: {}".format(_a41_asset, _a41_err))
-                    _a41_result = None
+                    result = _score_paper31_trade(market, live_price, ind_data,
+                        ind_macro=macro_data, expiry_minute=exp_min)
+                except Exception as e:
+                    print("A41 P31 error {}: {}".format(_asset, e))
+                    result = None
                 
-                if _a41_result and _a41_result.get("bet_side"):
-                    _a41_side = _a41_result["bet_side"]
-                    _a41_score = _a41_result.get("score", 3)
-                    _a41_conf = _a41_result.get("confidence", "LOW")
-                    _a41_inds = _a41_result.get("indicators", "")
-                    direction = "UP" if _a41_side == "YES" else "DOWN"
-                    _a41_stake = 3.00 if _a41_score <= 4 else 2.50
+                if result and result.get("bet_side"):
+                    side = result["bet_side"]
+                    score = result.get("score", 3)
+                    conf = result.get("confidence", "LOW")
+                    inds = result.get("indicators", "")
+                    direction = "UP" if side == "YES" else "DOWN"
+                    stake = 3.00 if score <= 4 else 2.50
                     
                     a41_targets.append({
-                        "asset": _a41_asset, "direction": direction,
-                        "signals_agree": _a41_score,
-                        "indicators": "[{}] {} | s{} | ptb={} live={:.2f}".format(
-                            _a41_conf, _a41_inds, _a41_score, _a41_ptb, _a41_live),
-                        "stake": _a41_stake, "score": _a41_score,
-                        "confidence": _a41_conf, "token_data": _a41_md,
+                        "asset": _asset, "direction": direction,
+                        "signals_agree": score, "stake": stake,
+                        "score": score, "confidence": conf,
+                        "indicators": "[{}] {} | s{} | ptb={} p={:.2f}".format(
+                            conf, inds, score, ptb, live_price),
+                        "token_data": _md,
                     })
-                else:
-                    print("A41 skip {}: price={:.2f} ptb={} odds={}".format(
-                        _a41_asset, _a41_live, _a41_ptb, _a41_md["yes_odds"]))
             
             if not a41_targets:
-                print("A41: 0 targets at T+90s")
+                print("A41: 0 targets at T+90s | markets={}".format(list(token_map.keys())))
                 _time.sleep(30)
                 continue
             
             print("A41: {} targets at T+90s: {}".format(len(a41_targets),
                 ", ".join("{}={}(s{})".format(t["asset"], t["direction"], t["score"]) for t in a41_targets)))
             
-            # Step 3: SV2.1 paper trades
-            for _sv21 in a41_targets:
+            # ── Step 3: SV2.1 paper trades ──
+            for sv in a41_targets:
                 try:
-                    _sv21s = _sv21["stake"]
-                    _sv21_paper_state["balance"] = round(_sv21_paper_state["balance"] - _sv21s, 2)
+                    stk = sv["stake"]
+                    _sv21_paper_state["balance"] = round(_sv21_paper_state["balance"] - stk, 2)
                     db = get_db()
                     db.run("INSERT INTO sv21_paper_trades (market_id,asset,timeframe,bet_side,stake,fill_price,pool_after,tier,indicators,signals_agree,score,confidence,status,outcome,fired_at) VALUES (:mid,:ast,:tf,:bs,:stk,:fp,:pa,:tier,:ind,:sa,:sc,:conf,:sts,:out,:fa)",
-                        mid="sv21_{}_15M_{}".format(_sv21["asset"], window_ts),
-                        ast=_sv21["asset"], tf="15M", bs=_sv21["direction"],
-                        stk=_sv21s, fp=0.50, pa=_sv21_paper_state["balance"],
-                        tier="T1" if _sv21.get("score",5)<=4 else "T2",
-                        ind=_sv21["indicators"], sa=_sv21["signals_agree"],
-                        sc=_sv21.get("score",3), conf=_sv21.get("confidence",""),
+                        mid="sv21_{}_15M_{}".format(sv["asset"], window_ts),
+                        ast=sv["asset"], tf="15M", bs=sv["direction"],
+                        stk=stk, fp=0.50, pa=_sv21_paper_state["balance"],
+                        tier="T1" if sv.get("score",5)<=4 else "T2",
+                        ind=sv["indicators"], sa=sv["signals_agree"],
+                        sc=sv.get("score",3), conf=sv.get("confidence",""),
                         sts="Pending", out="PENDING",
                         fa=datetime.now(timezone.utc).isoformat())
-                except Exception as _sv21e:
-                    print("SV2.1 error: {}".format(_sv21e))
+                except Exception as e:
+                    print("SV2.1 error: {}".format(e))
             print("SV2.1: {} paper | pool=${:.2f}".format(len(a41_targets), _sv21_paper_state["balance"]))
             
-            # Step 4: Place real orders at 50c
+            # ── Step 4: Place real orders at 50c ──
             try:
                 client = _get_poly_client()
                 from py_clob_client_v2 import Side, OrderArgs, OrderType
                 BUY = Side.BUY
-            except Exception as _a41_ce:
-                print("A41 client error: {}".format(_a41_ce))
+            except Exception as ce:
+                print("A41 client error: {}".format(ce))
                 _time.sleep(30)
                 continue
             
             fired = []
             for target in a41_targets:
-                _td = target["token_data"]
-                _tok = _td.get("up_token") if target["direction"]=="UP" else _td.get("down_token")
-                if not _tok:
+                td = target["token_data"]
+                tok = td.get("up_token") if target["direction"]=="UP" else td.get("down_token")
+                if not tok:
                     continue
-                _stk = target.get("stake", 2.50)
-                if _poly_alpha41_state["balance"] < _stk + 2:
+                stk = target.get("stake", 2.50)
+                if _poly_alpha41_state["balance"] < stk + 2:
                     continue
                 try:
-                    _args = OrderArgs(token_id=str(_tok), price=0.50, size=round(_stk/0.50,1), side=BUY)
-                    _signed = client.create_order(_args)
-                    _resp = client.post_order(_signed, OrderType.GTC)
-                    _oid = _resp.get("orderID") or _resp.get("id") or "placed" if _resp else None
+                    args = OrderArgs(token_id=str(tok), price=0.50, size=round(stk/0.50,1), side=BUY)
+                    signed = client.create_order(args)
+                    resp = client.post_order(signed, OrderType.GTC)
+                    oid = resp.get("orderID") or resp.get("id") or "placed" if resp else None
                     fired.append({"asset": target["asset"], "direction": target["direction"],
                         "indicators": target["indicators"], "signals_agree": target["signals_agree"],
                         "score": target.get("score",3), "confidence": target.get("confidence",""),
-                        "order_id": _oid, "cost": _stk, "token_id": _tok,
-                        "slug": _td.get("slug",""), "condition_id": _td.get("condition_id","")})
-                except Exception as _oe:
-                    print("A41 order error {}: {}".format(target["asset"], _oe))
+                        "order_id": oid, "cost": stk, "token_id": tok,
+                        "slug": td.get("slug",""), "condition_id": td.get("condition_id","")})
+                except Exception as oe:
+                    print("A41 order error {}: {}".format(target["asset"], oe))
             
-            # Step 5: Log
-            for _fr in fired:
-                _poly_alpha41_state["balance"] = round(_poly_alpha41_state["balance"] - _fr["cost"], 2)
+            # ── Step 5: Log ──
+            for fr in fired:
+                _poly_alpha41_state["balance"] = round(_poly_alpha41_state["balance"] - fr["cost"], 2)
                 print("A41: {} {} @50c ${:.2f} [s{}|{}] pool=${:.2f}".format(
-                    _fr["direction"], _fr["asset"], _fr["cost"],
-                    _fr.get("score","?"), _fr.get("confidence",""), _poly_alpha41_state["balance"]))
+                    fr["direction"], fr["asset"], fr["cost"],
+                    fr.get("score","?"), fr.get("confidence",""), _poly_alpha41_state["balance"]))
                 try:
-                    _db = get_db()
-                    _db.run("INSERT INTO poly_alpha41_trades (market_id,title,asset,timeframe,bet_side,stake,fill_price,pool_after,order_id,token_id,condition_id,slug,filled,status,outcome,indicators,signals_agree,score,confidence,fired_at) VALUES (:mid,:ttl,:ast,:tf,:bs,:stk,:fp,:pa,:oid,:tid,:cid,:slg,:fld,:sts,:out,:ind,:sa,:sc,:conf,:fa)",
-                        mid="a41_{}_15M_{}".format(_fr["asset"], window_ts),
-                        ttl="A41 {} {} 15M".format(_fr["asset"], _fr["direction"]),
-                        ast=_fr["asset"], tf="15M", bs=_fr["direction"],
-                        stk=_fr["cost"], fp=0.50, pa=_poly_alpha41_state["balance"],
-                        oid=str(_fr["order_id"]) if _fr["order_id"] else "",
-                        tid=_fr["token_id"], cid=_fr["condition_id"], slg=_fr["slug"],
-                        fld=bool(_fr["order_id"]), sts="Pending", out="PENDING",
-                        ind=_fr["indicators"], sa=_fr["signals_agree"],
-                        sc=_fr.get("score",3), conf=_fr.get("confidence",""),
+                    dbc = get_db()
+                    dbc.run("INSERT INTO poly_alpha41_trades (market_id,title,asset,timeframe,bet_side,stake,fill_price,pool_after,order_id,token_id,condition_id,slug,filled,status,outcome,indicators,signals_agree,score,confidence,fired_at) VALUES (:mid,:ttl,:ast,:tf,:bs,:stk,:fp,:pa,:oid,:tid,:cid,:slg,:fld,:sts,:out,:ind,:sa,:sc,:conf,:fa)",
+                        mid="a41_{}_15M_{}".format(fr["asset"], window_ts),
+                        ttl="A41 {} {} 15M".format(fr["asset"], fr["direction"]),
+                        ast=fr["asset"], tf="15M", bs=fr["direction"],
+                        stk=fr["cost"], fp=0.50, pa=_poly_alpha41_state["balance"],
+                        oid=str(fr["order_id"]) if fr["order_id"] else "",
+                        tid=fr["token_id"], cid=fr["condition_id"], slg=fr["slug"],
+                        fld=bool(fr["order_id"]), sts="Pending", out="PENDING",
+                        ind=fr["indicators"], sa=fr["signals_agree"],
+                        sc=fr.get("score",3), conf=fr.get("confidence",""),
                         fa=datetime.now(timezone.utc).isoformat())
-                except Exception as _dbe:
-                    print("A41 DB error: {}".format(_dbe))
+                except Exception as dbe:
+                    print("A41 DB error: {}".format(dbe))
                 try:
                     send_telegram("A41: {} {} @50c ${:.2f} [s{}] pool=${:.2f}".format(
-                        _fr["direction"], _fr["asset"], _fr["cost"],
-                        _fr.get("score","?"), _poly_alpha41_state["balance"]))
+                        fr["direction"], fr["asset"], fr["cost"],
+                        fr.get("score","?"), _poly_alpha41_state["balance"]))
                 except:
                     pass
             
@@ -2197,8 +2239,8 @@ def _sniper_a41_thread():
                 print("A41: fired {} at T+90s | pool=${:.2f}".format(len(fired), _poly_alpha41_state["balance"]))
             
             _time.sleep(30)
-        except Exception as _main_err:
-            print("A41 thread error: {}".format(_main_err))
+        except Exception as main_err:
+            print("A41 thread error: {}".format(main_err))
             import traceback
             traceback.print_exc()
             _time.sleep(60)
