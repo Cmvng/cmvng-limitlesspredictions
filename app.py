@@ -1950,6 +1950,175 @@ _limitless_sniper_state = {
 _limitless_sniper_traded = set()
 _limitless_prev_momentum = {}  # {asset: {"direction": "BUY"/"SELL", "confirmed": True/False}}
 
+def _resolve_poly_alpha41_trades():
+    """Resolve Alpha 4.1 hybrid trades."""
+    try:
+        conn = get_db()
+        rows = conn.run("SELECT * FROM poly_alpha41_trades WHERE status='Pending' ORDER BY id")
+        cols = [c['name'] for c in conn.columns]
+        items = [dict(zip(cols, r)) for r in rows]
+        conn.close()
+        if not items: return 0
+        now = datetime.now(timezone.utc)
+        resolved = 0
+        for p in items:
+            try:
+                if not p.get("fired_at"): continue
+                fired = datetime.fromisoformat(p["fired_at"])
+                if fired.tzinfo is None: fired = fired.replace(tzinfo=timezone.utc)
+                # ── Correct expiry calculation ──
+                # Sniper fires ~30s BEFORE the boundary (e.g. fires at 10:14:30
+                # for the 10:15 boundary). So fired_at minute=14 falls in the
+                # PREVIOUS 15M window. We must use the NEXT boundary after fired_at.
+                # Round UP to next 15M boundary, not down to current window.
+                fired_minute = fired.minute
+                fired_second = fired.second
+                # Next 15M boundary after fired_at
+                next_boundary_minute = ((fired_minute // 15) + 1) * 15
+                if next_boundary_minute >= 60:
+                    window_start = fired.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+                else:
+                    window_start = fired.replace(minute=next_boundary_minute, second=0, microsecond=0)
+                expiry = window_start + timedelta(minutes=15)
+                if now < expiry + timedelta(minutes=3): continue
+
+                stake = float(p.get("stake") or 2.50)
+                order_id = p.get("order_id")
+
+                # ── Check actual fill status from Polymarket API ──
+                # GTC maker orders are placed at 50¢ and filled LATER by takers.
+                # The saved `filled` column only reflects the immediate placement
+                # response, not the eventual fill. We must check the order status.
+                actual_filled = p.get("filled", False)
+                if not actual_filled and order_id:
+                    try:
+                        import requests as req
+                        r_ord = req.get(
+                            "https://clob.polymarket.com/order/{}".format(order_id),
+                            timeout=5)
+                        if r_ord.status_code == 200:
+                            ord_data = r_ord.json()
+                            ord_status = (ord_data.get("status") or "").upper()
+                            size_matched = float(ord_data.get("size_matched") or 0)
+                            if ord_status in ("MATCHED", "FILLED") or size_matched > 0:
+                                actual_filled = True
+                                # Update the DB so future checks don't re-query
+                                c_upd = get_db()
+                                c_upd.run("UPDATE poly_alpha41_trades SET filled=TRUE WHERE id=:i",
+                                          i=p["id"])
+                                c_upd.close()
+                    except:
+                        pass  # Can't reach API — fall back to saved value
+
+                # Unfilled → return stake
+                if not actual_filled and now > expiry:
+                    _poly_alpha41_state["balance"] = round(_poly_alpha41_state["balance"] + stake, 2)
+                    c4 = get_db()
+                    c4.run("UPDATE poly_alpha41_trades SET status='Returned',outcome='RETURNED',resolved_at=:r WHERE id=:i",
+                           r=now.isoformat(), i=p["id"])
+                    c4.close()
+                    resolved += 1; continue
+
+                # Check resolution via Gamma API
+                won = None
+                slug = p.get("slug", "")
+                bs = p.get("bet_side", "UP")
+                try:
+                    import requests as req
+                    if slug:
+                        r = req.get("{}/markets/slug/{}".format(POLY_GAMMA_API, slug), timeout=8)
+                        if r.status_code == 200:
+                            md = r.json()
+                            ops = md.get("outcomePrices")
+                            if isinstance(ops, str):
+                                try: ops = json.loads(ops)
+                                except: ops = None
+                            if isinstance(ops, list) and len(ops) >= 2:
+                                p0 = float(ops[0]); p1 = float(ops[1])
+                                _oc = md.get("outcomes")
+                                if isinstance(_oc, str):
+                                    try: _oc = json.loads(_oc)
+                                    except: _oc = None
+                                _up_idx = 0
+                                if isinstance(_oc, list) and len(_oc) >= 2:
+                                    o0 = str(_oc[0]).lower().strip()
+                                    if o0 in ("no", "down", "below"): _up_idx = 1
+                                if _up_idx == 0:
+                                    if p0 >= 0.95: won = (bs == "UP")
+                                    elif p1 >= 0.95: won = (bs == "DOWN")
+                                else:
+                                    if p1 >= 0.95: won = (bs == "UP")
+                                    elif p0 >= 0.95: won = (bs == "DOWN")
+                except: pass
+
+                if won is None:
+                    if now > expiry + timedelta(hours=1): won = False
+                    else: continue
+
+                fill = float(p.get("fill_price") or 0.50)
+                payout = round(stake / fill, 4) if won else 0
+                status = "Won" if won else "Lost"
+
+                c4 = get_db()
+                c4.run("UPDATE poly_alpha41_trades SET status=:s,outcome=:o,resolved_at=:r,payout=:p,filled=TRUE WHERE id=:i",
+                       s=status, o="WIN" if won else "LOSS", r=now.isoformat(), p=payout, i=p["id"])
+                c4.close()
+                resolved += 1
+
+                if won:
+                    _poly_alpha41_state["balance"] = round(_poly_alpha41_state["balance"] + payout, 2)
+                    _poly_alpha41_state["wins_today"] += 1
+                    _poly_alpha41_state["profit_today"] = round(_poly_alpha41_state["profit_today"] + (payout - stake), 2)
+                else:
+                    _poly_alpha41_state["losses_today"] += 1
+                    _poly_alpha41_state["profit_today"] = round(_poly_alpha41_state["profit_today"] - stake, 2)
+
+                if _poly_alpha41_state["balance"] > _poly_alpha41_state["peak_balance"]:
+                    _poly_alpha41_state["peak_balance"] = _poly_alpha41_state["balance"]
+                if _poly_alpha41_state["balance"] <= _poly_alpha41_state["floor_balance"]:
+                    _poly_alpha41_state["enabled"] = False
+                    send_telegram("🚨 SNIPER A4 STOPPED — Floor ${:.2f}".format(_poly_alpha41_state["balance"]))
+
+                _pnl = "+${:.2f}".format(payout - stake) if won else "-${:.2f}".format(stake)
+                print("SNIPER A4 #{} {}: ${:.2f} → {} | pool=${:.2f}".format(
+                    p["id"], "WIN" if won else "LOSS", stake, _pnl, _poly_alpha41_state["balance"]))
+                _emoji = "\u2705" if won else "\u274c"
+                send_telegram("{} <b>SNIPER A4</b> {} {}\n${:.2f} → {}\nPool: ${:.2f}".format(
+                    _emoji, p.get("asset","?"), "WIN" if won else "LOSS",
+                    stake, _pnl, _poly_alpha41_state["balance"]))
+                # Save balance to DB immediately after each resolution
+                _save_bot_balance("poly_alpha41", _poly_alpha41_state)
+
+            except Exception as e:
+                print("SNIPER A4 resolve error #{}: {}".format(p.get("id"), e))
+        return resolved
+    except Exception as e:
+        print("SNIPER A4 resolve error: {}".format(e))
+        return 0
+
+
+
+# ═══════════════════════════════════════════════════════════
+# LIMITLESS SNIPER — Dynamic Pricing v2.0 · 3-Path Confirm + P2.3 Momentum Carry-Over
+# Two-tier staking: HIGH (P2.1 + momentum agree) vs BASE (P2.1 only)
+# Fires at exact :00/:15/:30/:45 on Limitless CLOB at 50¢
+# ═══════════════════════════════════════════════════════════
+
+_limitless_sniper_state = {
+    "enabled": True,
+    "balance": 30.0,
+    "peak_balance": 30.0,
+    "starting_balance": 30.0,
+    "floor_balance": 5.0,
+    "trades_today": 0,
+    "wins_today": 0,
+    "losses_today": 0,
+    "profit_today": 0.0,
+}
+_limitless_sniper_traded = set()
+_limitless_prev_momentum = {}  # {asset: {"direction": "BUY"/"SELL", "confirmed": True/False}}
+
+
 def _limitless_sniper_stake(pool, tier):
     """Variable stake by signal strength — same formula as Poly A4.
 
@@ -20077,110 +20246,9 @@ def _poly_scan_loop():
         except Exception as e:
             print("Sniper Alpha4 resolve error: {}".format(e))
         try:
-            _a41r_conn = get_db()
-            _a41r_rows = _a41r_conn.run("SELECT * FROM poly_alpha41_trades WHERE status='Pending' ORDER BY id")
-            _a41r_cols = [c['name'] for c in _a41r_conn.columns]
-            _a41r_items = [dict(zip(_a41r_cols, r)) for r in _a41r_rows]
-            _a41r_count = 0
-            for _a41r_item in _a41r_items:
-                try:
-                    import requests as _a41rq
-                    _a41r_slug = _a41r_item.get("slug", "")
-                    _a41r_oid = _a41r_item.get("order_id", "")
-                    _a41r_id = _a41r_item["id"]
-                    _a41r_side = _a41r_item.get("bet_side", "")
-                    _a41r_stk = float(_a41r_item.get("stake", 0))
-                    _a41r_fp = float(_a41r_item.get("fill_price", 0.50) or 0.50)
-                    
-                    if not _a41r_slug:
-                        continue
-                    
-                    # Step 1: Check if market is resolved
-                    _a41r_resp = _a41rq.get("{}/markets/slug/{}".format(GAMMA_API, _a41r_slug), timeout=5)
-                    if _a41r_resp.status_code != 200:
-                        continue
-                    _a41r_mkt = _a41r_resp.json()
-                    _a41r_resolved = _a41r_mkt.get("resolved", False) or _a41r_mkt.get("closed", False)
-                    
-                    if not _a41r_resolved:
-                        # Market not resolved yet — check if it's expired (>20 min old)
-                        # If expired and not resolved, Polymarket may take time
-                        continue
-                    
-                    # Step 2: Check order fill status via CLOB API
-                    _a41r_filled = _a41r_item.get("filled", False)
-                    if _a41r_oid and not _a41r_filled:
-                        try:
-                            _a41r_order_resp = _a41rq.get(
-                                "https://clob.polymarket.com/order/{}".format(_a41r_oid), timeout=5)
-                            if _a41r_order_resp.status_code == 200:
-                                _a41r_order_data = _a41r_order_resp.json()
-                                _a41r_size_matched = float(_a41r_order_data.get("size_matched", 0) or 0)
-                                _a41r_original_size = float(_a41r_order_data.get("original_size", 0) or 0)
-                                _a41r_order_status = _a41r_order_data.get("status", "")
-                                
-                                if _a41r_size_matched > 0:
-                                    _a41r_filled = True
-                                    # Update fill price from actual matched data
-                                    _a41r_actual_shares = _a41r_size_matched
-                                elif _a41r_order_status in ("CANCELLED", "EXPIRED", "DEAD"):
-                                    # Order never filled — return stake to pool
-                                    _a41r_c2 = get_db()
-                                    _a41r_c2.run("UPDATE poly_alpha41_trades SET status='Cancelled', outcome='CANCELLED', resolved_at=:ra WHERE id=:id",
-                                        ra=datetime.now(timezone.utc).isoformat(), id=_a41r_id)
-                                    _poly_alpha41_state["balance"] = round(_poly_alpha41_state["balance"] + _a41r_stk, 2)
-                                    _save_bot_balance("poly_alpha41", _poly_alpha41_state)
-                                    print("A41 cancelled: {} {} unfilled | +${:.2f} returned | pool=${:.2f}".format(
-                                        _a41r_item.get("asset"), _a41r_side, _a41r_stk, _poly_alpha41_state["balance"]))
-                                    _a41r_count += 1
-                                    continue
-                                else:
-                                    # Still open, not filled yet
-                                    continue
-                        except:
-                            # Can't check order — assume filled if market resolved
-                            _a41r_filled = True
-                    else:
-                        _a41r_filled = True
-                    
-                    if not _a41r_filled:
-                        continue
-                    
-                    # Step 3: Determine outcome
-                    _a41r_op = _a41r_mkt.get("outcomePrices") or _a41r_mkt.get("outcome_prices")
-                    if not _a41r_op:
-                        continue
-                    
-                    _a41r_up_price = float(_a41r_op[0]) if len(_a41r_op) > 0 else 0
-                    _a41r_dn_price = float(_a41r_op[1]) if len(_a41r_op) > 1 else 0
-                    _a41r_won = (_a41r_up_price > 0.5) if _a41r_side == "UP" else (_a41r_dn_price > 0.5)
-                    _a41r_out = "WIN" if _a41r_won else "LOSS"
-                    
-                    # Calculate payout: shares * $1 on win
-                    _a41r_shares = _a41r_stk / _a41r_fp if _a41r_fp > 0 else 0
-                    _a41r_pay = round(_a41r_shares * 1.0, 2) if _a41r_won else 0
-                    
-                    _a41r_c3 = get_db()
-                    _a41r_c3.run("UPDATE poly_alpha41_trades SET status='Resolved', outcome=:out, payout=:pay, filled=TRUE, resolved_at=:ra WHERE id=:id",
-                        out=_a41r_out, pay=_a41r_pay, ra=datetime.now(timezone.utc).isoformat(), id=_a41r_id)
-                    
-                    if _a41r_won:
-                        _poly_alpha41_state["balance"] = round(_poly_alpha41_state["balance"] + _a41r_pay, 2)
-                    _save_bot_balance("poly_alpha41", _poly_alpha41_state)
-                    _a41r_count += 1
-                    
-                    print("A41 resolved: {} {} {} ${:.2f} payout=${:.2f} pool=${:.2f}".format(
-                        _a41r_item.get("asset"), _a41r_side, _a41r_out, _a41r_stk, _a41r_pay, _poly_alpha41_state["balance"]))
-                    
-                    try:
-                        send_telegram("A41 {}: {} {} ${:.2f} → ${:.2f} pool=${:.2f}".format(
-                            _a41r_out, _a41r_item.get("asset"), _a41r_side, _a41r_stk, _a41r_pay, _poly_alpha41_state["balance"]))
-                    except:
-                        pass
-                except:
-                    pass
-            if _a41r_count > 0:
-                print("A41 resolver: {} trades resolved".format(_a41r_count))
+            _a41r_resolved = _resolve_poly_alpha41_trades()
+            if _a41r_resolved:
+                print("A41 resolved: {}".format(_a41r_resolved))
         except Exception as e:
             print("A41 resolve error: {}".format(e))
 
