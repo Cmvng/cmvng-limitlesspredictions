@@ -1188,12 +1188,8 @@ def _sv3_score_and_record(asset, token_map_entry, boundary_ts, now_str):
     fee = 0.03
     wp = (1 / 0.50) * (1 - fee)
 
-    # ── Step 1: Get signal direction ──
-    forced = token_map_entry.get("forced_direction")
-    if forced:
-        direction, signals_agree, ind_str, confidence = forced, 3, "sniper_confirmed", "HIGH"
-    else:
-        direction, signals_agree, ind_str, confidence = _sniper_get_direction(asset, "15m")
+    # ── Step 1: Get signal direction (always fresh at T+0) ──
+    direction, signals_agree, ind_str, confidence = _sniper_get_direction(asset, "15m")
     if not direction or signals_agree < 2:
         print("SV3 SKIP {}: no direction (dir={} agree={})".format(asset, direction, signals_agree))
         return False
@@ -1596,13 +1592,8 @@ def _sniper_thread():
             # ── SV3: Phase 1 — Fetch MTF candles at T-22s (before cache clear) ──
             # Fetch 1H + 30M + 15M candles from Binance for each asset
             # Results cached in _sv3_structure_cache, scored at T+0 in Phase 2
-            _sv3_directions = {}
+            # Direction is read FRESH at T+0 (not captured here — avoids stale signal bug)
             for _pre_asset in SNIPER_ASSETS:
-                try:
-                    _pre_d, _pre_da, _, _ = _sniper_get_direction(_pre_asset, "15m")
-                    if _pre_d and _pre_da >= 2:
-                        _sv3_directions[_pre_asset] = _pre_d
-                except: pass
                 try:
                     _sv3_mtf = _sv3_fetch_mtf_candles(_pre_asset)
                     if _sv3_mtf:
@@ -1710,7 +1701,6 @@ def _sniper_thread():
                                 "condition_id": _sv3_pf_md.get("conditionId",""),
                                 "slug":         _sv3_pf_slug,
                                 "title":        _sv3_pf_md.get("question",""),
-                                "forced_direction": _sv3_directions.get(_sv3_pf_asset),
                             }
                 except: pass
 
