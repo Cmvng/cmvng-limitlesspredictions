@@ -903,6 +903,31 @@ def _sv3_score_timeframe(candles, signal_direction):
     elif sig_bull and last_green and strong_close: reasons.append("strong green")
     elif sig_bear and last_red and strong_close: reasons.append("strong red")
     
+    # Retracement risk: is the last candle overextended?
+    # If the last candle made a big move in the signal direction,
+    # the PTB (= its close) is at the extreme — next candle likely pulls back.
+    # Compare last candle body to average body of previous 5 candles.
+    if len(candles) >= 6:
+        prev5_bodies = [abs(c["close"] - c["open"]) for c in candles[-6:-1]]
+        avg_body = sum(prev5_bodies) / len(prev5_bodies) if prev5_bodies else 0
+        
+        if avg_body > 0:
+            extension_ratio = last_body / avg_body
+            
+            # Last candle is 2x+ bigger than average AND in signal direction
+            # → PTB at the extreme of an overextended move → retracement likely
+            overextended_bull = sig_bull and last_green and extension_ratio >= 2.0
+            overextended_bear = sig_bear and last_red and extension_ratio >= 2.0
+            
+            if overextended_bull or overextended_bear:
+                score -= 1
+                reasons.append("overextended {:.1f}x avg".format(extension_ratio))
+            
+            # Last candle is tiny (< 0.3x average) → indecision at PTB
+            # Not a strong penalty, just noted
+            elif extension_ratio < 0.3 and not is_doji:
+                reasons.append("tiny candle {:.1f}x avg".format(extension_ratio))
+    
     # BOS/CHoCH
     if bullish_bos and sig_bull and not choch_bull: score += 1; reasons.append("bull BOS")
     elif bearish_bos and sig_bear and not choch_bear: score += 1; reasons.append("bear BOS")
