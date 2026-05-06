@@ -22152,6 +22152,15 @@ h2{{font-size:16px;font-weight:700;color:#1a3d2e;margin-bottom:12px}}
 
 
 
+@app.route("/app/a4-reset")
+def a4_reset():
+    """Reset A4 pool to $100. Hit once, then it preserves balance across deploys."""
+    _poly_alpha4_state["balance"] = 100.0
+    _poly_alpha4_state["peak_balance"] = 100.0
+    _save_bot_balance("poly_alpha4", _poly_alpha4_state)
+    return '<html><head><meta http-equiv="refresh" content="2;url=/app/poly-alpha4"></head><body style="background:#0d1117;color:#4ade80;padding:20px;font-family:sans-serif">A4 pool reset to $100.00. Redirecting...</body></html>'
+
+
 @app.route("/app/poly-alpha4")
 def poly_alpha4_page():
     """Sniper A4 dashboard — Binance SMA + SV3 Tiered Stakes."""
