@@ -532,6 +532,11 @@ _poly_alpha4_traded_markets = set()
 _a4_direction_lock = {}  # {boundary_ts: {asset: {"direction": "UP"/"DOWN", "indicators": str, "signals_agree": int}}}
 _a4_dynamic_traded = set()  # dedup: "{asset}_{boundary_ts}" keys
 
+# ── A4 + SV3 Gatekeeper: WAIT queue for low-MTF-score trades ──
+# Trades where SV3 score < +4 go here instead of firing instantly.
+# Processed 2 minutes later — if price confirmed signal direction, fire.
+_a4_sv3_wait_queue = {}  # {key: {asset, direction, token_id, entry details, queued_at, ...}}
+
 
 # ── A4 Dynamic Pricing: Tier & Stake Calculator ──
 def _a4_dynamic_tier(odds_pct, pool):
@@ -1787,7 +1792,7 @@ def _sniper_thread():
 
             # SV2 already scored at T-35s (before cache clear)
 
-            # ── T+0: FIRE A4 ORDERS at 50¢ ──
+            # ── T+0: FIRE A4 ORDERS at 50¢ (with SV3 gatekeeper) ──
             fired_results = []
             for target in snipe_targets:
                 _fa4_asset = target["asset"]
@@ -1813,6 +1818,50 @@ def _sniper_thread():
                 if _poly_alpha4_state["balance"] < _fa4_cost + 2:
                     continue
                 
+                # ── SV3 GATEKEEPER: Check candle structure score ──
+                _fa4_sv3_score = None
+                _fa4_sv3_tag = ""
+                try:
+                    _fa4_mtf = _sv3_structure_cache.get(_fa4_asset.upper())
+                    if _fa4_mtf and _fa4_mtf.get("15m"):
+                        _fa4_s1h, _fa4_r1h = _sv3_score_timeframe(_fa4_mtf.get("1h"), _fa4_dir)
+                        _fa4_s30, _fa4_r30 = _sv3_score_timeframe(_fa4_mtf.get("30m"), _fa4_dir)
+                        _fa4_s15, _fa4_r15 = _sv3_score_timeframe(_fa4_mtf.get("15m"), _fa4_dir)
+                        _fa4_sv3_score = _fa4_s1h + _fa4_s30 + _fa4_s15
+                        _fa4_sv3_tag = "MTF{} 1H={} 30M={} 15M={}".format(
+                            _fa4_sv3_score, _fa4_s1h, _fa4_s30, _fa4_s15)
+                except Exception as _fa4_sv3_e:
+                    print("A4 SV3 gate error {}: {}".format(_fa4_asset, _fa4_sv3_e))
+                
+                # Decision: score >= +4 → fire now, score < +4 → wait queue
+                if _fa4_sv3_score is not None and _fa4_sv3_score < 4:
+                    # ── WAIT: candle structure doesn't strongly confirm ──
+                    _fa4_wk = "a4_wait_{}_{}".format(_fa4_asset, window_ts)
+                    _a4_sv3_wait_queue[_fa4_wk] = {
+                        "asset": _fa4_asset,
+                        "direction": _fa4_dir,
+                        "indicators": _fa4_ind,
+                        "agree": _fa4_agree,
+                        "token_id": _fa4_token,
+                        "price": _fa4_price,
+                        "shares": _fa4_shares,
+                        "cost": _fa4_cost,
+                        "slug": _fa4_entry.get("slug", ""),
+                        "condition_id": _fa4_entry.get("condition_id", ""),
+                        "sv3_score": _fa4_sv3_score,
+                        "sv3_tag": _fa4_sv3_tag,
+                        "boundary_ts": window_ts,
+                        "queued_at": datetime.now(timezone.utc),
+                    }
+                    print("A4 SV3 WAIT: {} {} score={} — needs confirmation | {}".format(
+                        _fa4_dir, _fa4_asset, _fa4_sv3_score, _fa4_sv3_tag))
+                    continue
+                
+                # ── FIRE: score >= +4 or no candle data (fallback to old behavior) ──
+                if _fa4_sv3_score is not None:
+                    print("A4 SV3 PASS: {} {} score={} — firing | {}".format(
+                        _fa4_dir, _fa4_asset, _fa4_sv3_score, _fa4_sv3_tag))
+                
                 try:
                     _fa4_args = OrderArgs(
                         token_id=str(_fa4_token),
@@ -1834,6 +1883,8 @@ def _sniper_thread():
                         "token_id": _fa4_token,
                         "slug": _fa4_entry.get("slug", ""),
                         "condition_id": _fa4_entry.get("condition_id", ""),
+                        "sv3_score": _fa4_sv3_score,
+                        "sv3_tag": _fa4_sv3_tag,
                     })
                 except Exception as _fa4_e:
                     print("A4 order error {}: {}".format(_fa4_asset, _fa4_e))
@@ -1917,6 +1968,185 @@ def _sniper_thread():
                         _save_bot_balance("sv3_paper", _sv3_state)
                 except Exception as _sv3_we:
                     print("SV3 WAIT error: {}".format(_sv3_we))
+
+            # ── A4 SV3 WAIT QUEUE: Process after 2 minutes ──
+            # For each queued A4 trade: check if price confirmed the direction.
+            # If yes → place the real order. If no → skip.
+            if _a4_sv3_wait_queue:
+                _a4w_keys_done = []
+                _a4w_now = datetime.now(timezone.utc)
+                for _a4w_key, _a4w in list(_a4_sv3_wait_queue.items()):
+                    _a4w_age = (_a4w_now - _a4w["queued_at"]).total_seconds()
+                    if _a4w_age < 90:
+                        continue  # Not ready yet (wait at least 90s)
+                    if _a4w_age > 300:
+                        # Expired — 5 minutes is too long
+                        print("A4 WAIT expired: {} {} ({}s)".format(
+                            _a4w["direction"], _a4w["asset"], int(_a4w_age)))
+                        try:
+                            _a4w_exp_db = get_db()
+                            _a4w_exp_db.run("""INSERT INTO poly_alpha4_trades
+                                (market_id,title,asset,timeframe,bet_side,stake,fill_price,
+                                 pool_after,order_id,token_id,condition_id,slug,filled,
+                                 status,outcome,indicators,signals_agree,fired_at)
+                                VALUES (:mid,:ttl,:ast,:tf,:bs,0,0,
+                                 :pa,'','','','',FALSE,
+                                 'Skipped','SV3_WAIT_EXPIRED',:ind,:sa,:fa)""",
+                                mid="sniper_{}_15M_{}_expired".format(_a4w["asset"], _a4w["boundary_ts"]),
+                                ttl="A4 {} {} 15M SV3 WAIT→EXPIRED".format(_a4w["asset"], _a4w["direction"]),
+                                ast=_a4w["asset"], tf="15M", bs=_a4w["direction"],
+                                pa=_poly_alpha4_state["balance"],
+                                ind=_a4w.get("sv3_tag", "")[:200],
+                                sa=_a4w.get("agree", 0),
+                                fa=datetime.now(timezone.utc).isoformat())
+                            _a4w_exp_db.close()
+                        except: pass
+                        _a4w_keys_done.append(_a4w_key)
+                        continue
+
+                    _a4w_asset = _a4w["asset"]
+                    _a4w_dir = _a4w["direction"]
+
+                    # Get PTB and current price from Chainlink stream
+                    _a4w_ptb_key = "{}_15M".format(_a4w_asset.upper())
+                    _a4w_ptb_entry = _chainlink_ptb.get(_a4w_ptb_key)
+                    _a4w_ptb = _a4w_ptb_entry[1] if _a4w_ptb_entry else _chainlink_prices.get(_a4w_asset.upper())
+                    _a4w_current = _chainlink_prices.get(_a4w_asset.upper())
+
+                    if not _a4w_current or not _a4w_ptb:
+                        _a4w_keys_done.append(_a4w_key)
+                        continue
+
+                    # Confirmation: price moved past PTB + 0.02% in signal direction
+                    _a4w_threshold = _a4w_ptb * 0.0002
+                    if _a4w_dir == "UP":
+                        _a4w_confirmed = _a4w_current > _a4w_ptb + _a4w_threshold
+                    else:
+                        _a4w_confirmed = _a4w_current < _a4w_ptb - _a4w_threshold
+
+                    if not _a4w_confirmed:
+                        print("A4 WAIT not confirmed: {} {} price={:.2f} vs PTB={:.2f} (score={})".format(
+                            _a4w_dir, _a4w_asset, _a4w_current, _a4w_ptb, _a4w["sv3_score"]))
+                        # Record the skip in DB so dashboard shows what was blocked
+                        try:
+                            _a4w_skip_db = get_db()
+                            _a4w_skip_db.run("""INSERT INTO poly_alpha4_trades
+                                (market_id,title,asset,timeframe,bet_side,stake,fill_price,
+                                 pool_after,order_id,token_id,condition_id,slug,filled,
+                                 status,outcome,indicators,signals_agree,fired_at)
+                                VALUES (:mid,:ttl,:ast,:tf,:bs,0,0,
+                                 :pa,'','','','',FALSE,
+                                 'Skipped','SV3_WAIT_UNCONFIRMED',:ind,:sa,:fa)""",
+                                mid="sniper_{}_15M_{}_wait".format(_a4w_asset, _a4w["boundary_ts"]),
+                                ttl="A4 {} {} 15M SV3 WAIT→SKIP".format(_a4w_asset, _a4w_dir),
+                                ast=_a4w_asset, tf="15M", bs=_a4w_dir,
+                                pa=_poly_alpha4_state["balance"],
+                                ind="{} | price={:.2f} vs PTB={:.2f}".format(_a4w["sv3_tag"], _a4w_current, _a4w_ptb)[:200],
+                                sa=_a4w["agree"],
+                                fa=datetime.now(timezone.utc).isoformat())
+                            _a4w_skip_db.close()
+                        except: pass
+                        _a4w_keys_done.append(_a4w_key)
+                        continue
+
+                    # ── CONFIRMED: Place the real A4 order at best book price ≤ 58¢ ──
+                    if _poly_alpha4_state["balance"] < _a4w["cost"] + 2:
+                        _a4w_keys_done.append(_a4w_key)
+                        continue
+
+                    try:
+                        _a4w_client = _get_poly_client()
+                        if _a4w_client:
+                            from py_clob_client_v2 import Side as _A4WSide, OrderArgs as _A4WArgs, OrderType as _A4WOT
+
+                            # Fetch live order book to find best ask ≤ 58¢
+                            _a4w_max_price = 0.58  # Cap: never pay more than 58¢
+                            _a4w_fill_price = None
+                            try:
+                                _a4w_book = _a4w_client.get_order_book(str(_a4w["token_id"]))
+                                if _a4w_book and _a4w_book.get("asks") and len(_a4w_book["asks"]) > 0:
+                                    _a4w_best_ask = round(float(_a4w_book["asks"][0]["price"]), 2)
+                                    if _a4w_best_ask <= _a4w_max_price:
+                                        _a4w_fill_price = _a4w_best_ask
+                                    else:
+                                        print("A4 WAIT SKIP: {} {} best ask={}c > 58c cap".format(
+                                            _a4w_dir, _a4w_asset, int(_a4w_best_ask * 100)))
+                                else:
+                                    # No asks in book — place GTC at 50¢ (might fill later)
+                                    _a4w_fill_price = 0.50
+                            except Exception as _a4w_bke:
+                                # Book fetch failed — use 50¢ fallback
+                                _a4w_fill_price = 0.50
+                                print("A4 WAIT book error {}: {} — using 50c".format(_a4w_asset, _a4w_bke))
+
+                            if _a4w_fill_price:
+                                # Calculate shares at this price
+                                _a4w_shares = int(2.50 / _a4w_fill_price)  # $2.50 stake
+                                _a4w_actual_cost = round(_a4w_shares * _a4w_fill_price, 2)
+
+                                if _a4w_shares >= 1 and _a4w_actual_cost <= _poly_alpha4_state["balance"] - 2:
+                                    _a4w_args = _A4WArgs(
+                                        token_id=str(_a4w["token_id"]),
+                                        price=_a4w_fill_price,
+                                        size=float(_a4w_shares),
+                                        side=_A4WSide.BUY,
+                                    )
+                                    _a4w_signed = _a4w_client.create_order(_a4w_args)
+                                    _a4w_resp = _a4w_client.post_order(_a4w_signed, _A4WOT.GTC)
+                                    _a4w_oid = None
+                                    if _a4w_resp:
+                                        _a4w_oid = _a4w_resp.get("orderID") or _a4w_resp.get("id") or "placed"
+
+                                    _poly_alpha4_state["balance"] = round(_poly_alpha4_state["balance"] - _a4w_actual_cost, 2)
+
+                                    print("A4 WAIT→FIRE: {} {} @{}c ${:.2f} ({}shares) confirmed after {}s | score={} | pool=${:.2f}".format(
+                                        _a4w_dir, _a4w_asset, int(_a4w_fill_price * 100),
+                                        _a4w_actual_cost, _a4w_shares, int(_a4w_age),
+                                        _a4w["sv3_score"], _poly_alpha4_state["balance"]))
+
+                                    # DB insert
+                                    try:
+                                        _a4w_db = get_db()
+                                        _a4w_db.run("""INSERT INTO poly_alpha4_trades
+                                            (market_id,title,asset,timeframe,bet_side,stake,fill_price,
+                                             pool_after,order_id,token_id,condition_id,slug,filled,
+                                             status,outcome,indicators,signals_agree,fired_at)
+                                            VALUES (:mid,:ttl,:ast,:tf,:bs,:stk,:fp,
+                                             :pa,:oid,:tid,:cid,:slg,:fld,
+                                             :sts,:out,:ind,:sa,:fa)""",
+                                            mid="sniper_{}_15M_{}".format(_a4w_asset, _a4w["boundary_ts"]),
+                                            ttl="A4 {} {} 15M WAIT→CONFIRMED @{}c".format(_a4w_asset, _a4w_dir, int(_a4w_fill_price*100)),
+                                            ast=_a4w_asset, tf="15M", bs=_a4w_dir,
+                                            stk=_a4w_actual_cost, fp=_a4w_fill_price,
+                                            pa=_poly_alpha4_state["balance"],
+                                            oid=str(_a4w_oid) if _a4w_oid else "",
+                                            tid=str(_a4w["token_id"]),
+                                            cid=_a4w["condition_id"], slg=_a4w["slug"],
+                                            fld=bool(_a4w_oid),
+                                            sts="Pending", out="PENDING",
+                                            ind="{} | {}".format(_a4w["sv3_tag"], _a4w["indicators"])[:200],
+                                            sa=_a4w["agree"],
+                                            fa=datetime.now(timezone.utc).isoformat())
+                                        _a4w_db.close()
+                                    except Exception as _a4w_dbe:
+                                        print("A4 WAIT DB error: {}".format(_a4w_dbe))
+
+                                    # Telegram
+                                    try:
+                                        send_telegram("A4 WAIT→FIRE: {} {} @{}c ${:.2f} | confirmed {}s | {} | pool=${:.2f}".format(
+                                            _a4w_dir, _a4w_asset, int(_a4w_fill_price * 100),
+                                            _a4w_actual_cost, int(_a4w_age),
+                                            _a4w["sv3_tag"], _poly_alpha4_state["balance"]))
+                                    except: pass
+
+                                    _save_bot_balance("poly_alpha4", _poly_alpha4_state)
+                    except Exception as _a4w_err:
+                        print("A4 WAIT order error {}: {}".format(_a4w_asset, _a4w_err))
+
+                    _a4w_keys_done.append(_a4w_key)
+
+                for _a4w_k in _a4w_keys_done:
+                    _a4_sv3_wait_queue.pop(_a4w_k, None)
 
         except Exception as e:
             print("SNIPER thread error: {}".format(e))
