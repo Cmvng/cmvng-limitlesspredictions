@@ -1188,8 +1188,19 @@ def _sv3_score_and_record(asset, token_map_entry, boundary_ts, now_str):
     fee = 0.03
     wp = (1 / 0.50) * (1 - fee)
 
-    # ── Step 1: Get signal direction (always fresh at T+0) ──
-    direction, signals_agree, ind_str, confidence = _sniper_get_direction(asset, "15m")
+    # ── Step 1: Get signal direction ──
+    # Use A4's direction if injected (guarantees A4 and SV3 always match)
+    _a4_forced = token_map_entry.get("forced_direction_a4")
+    if _a4_forced:
+        direction = _a4_forced
+        # Still need signals_agree for scoring — read fresh but only use direction from A4
+        _, signals_agree, ind_str, confidence = _sniper_get_direction(asset, "15m")
+        if not signals_agree or signals_agree < 1:
+            signals_agree = 2  # A4 already confirmed 2/3 agree
+            ind_str = "a4_confirmed"
+            confidence = "MEDIUM"
+    else:
+        direction, signals_agree, ind_str, confidence = _sniper_get_direction(asset, "15m")
     if not direction or signals_agree < 2:
         print("SV3 SKIP {}: no direction (dir={} agree={})".format(asset, direction, signals_agree))
         return False
@@ -1944,6 +1955,12 @@ def _sniper_thread():
                     len(fired_results), _poly_alpha4_state["balance"]))
 
                         # ── SV3: Record paper trades at T+0 (same boundary entry as sniper) ──
+            # Inject A4's direction into SV3 token_map so they ALWAYS match
+            _sv3_dir_from_a4 = {t["asset"]: t["direction"] for t in snipe_targets}
+            for _sv3_inject_asset, _sv3_inject_dir in _sv3_dir_from_a4.items():
+                if _sv3_inject_asset in _sv3_token_map:
+                    _sv3_token_map[_sv3_inject_asset]["forced_direction_a4"] = _sv3_inject_dir
+
             try:
                 _sv3_cnt = 0
                 for _sv3_asset, _sv3_entry in _sv3_token_map.items():
@@ -22011,7 +22028,7 @@ h2{{font-size:16px;font-weight:700;color:#1a3d2e;margin-bottom:12px}}
 
 @app.route("/app/poly-alpha4")
 def poly_alpha4_page():
-    """Sniper A4 dashboard — Original TV+SMA+BTC model."""
+    """Sniper A4 dashboard — with SV3 Smart PA gatekeeper."""
     try:
         db = get_db()
         trades = db.run("SELECT * FROM poly_alpha4_trades ORDER BY fired_at DESC LIMIT 200")
@@ -22019,32 +22036,42 @@ def poly_alpha4_page():
         trades = [dict(zip(cols, row)) for row in trades] if trades else []
     except:
         trades = []
-    resolved = [t for t in trades if t.get("outcome") in ("WIN","LOSS")]
-    pending = [t for t in trades if t.get("outcome") == "PENDING"]
+    # Only count trades from TODAY for P&L (fresh $50 start)
+    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    today_trades = [t for t in trades if str(t.get("fired_at",""))[:10] >= today_str]
+    resolved = [t for t in today_trades if t.get("outcome") in ("WIN","LOSS")]
+    pending = [t for t in today_trades if t.get("outcome") == "PENDING"]
+    skipped = [t for t in today_trades if t.get("status") == "Skipped"]
     wins = sum(1 for t in resolved if t["outcome"] == "WIN")
     wr = round(wins/len(resolved)*100, 1) if resolved else 0
     pnl = round(sum((float(t.get("payout") or 0) - float(t.get("stake") or 0)) if t["outcome"]=="WIN" else -float(t.get("stake") or 0) for t in resolved), 2)
     bal = _poly_alpha4_state["balance"]
     rows = ""
-    for t in trades[:50]:
+    for t in today_trades[:50]:
         o = t.get("outcome","PENDING")
-        ic = "W" if o=="WIN" else "L" if o=="LOSS" else "P"
+        s_status = t.get("status","")
+        ic = "W" if o=="WIN" else "L" if o=="LOSS" else "S" if s_status=="Skipped" else "P"
         tp = round(float(t.get("payout") or 0)-float(t.get("stake") or 0),2) if o=="WIN" else round(-float(t.get("stake") or 0),2) if o=="LOSS" else "-"
-        tc = "#4ade80" if o=="WIN" else "#f87171" if o=="LOSS" else "#888"
-        rows += "<tr><td>%s</td><td>%s</td><td>%s</td><td>$%.2f</td><td>%s</td><td style=\"color:%s\">%s</td></tr>" % (ic,t.get("asset","?"),t.get("bet_side","?"),float(t.get("stake") or 0),str(t.get("fired_at",""))[:16],tc,tp)
+        tc = "#4ade80" if o=="WIN" else "#f87171" if o=="LOSS" else "#58a6ff" if s_status=="Skipped" else "#888"
+        sv3_tag = ""
+        ind = str(t.get("indicators",""))
+        if "MTF" in ind:
+            sv3_tag = ind.split("|")[0].strip()[:15]
+        rows += "<tr><td>%s</td><td>%s</td><td>%s</td><td>$%.2f</td><td>%s</td><td style=\"font-size:11px;color:#8b949e\">%s</td><td style=\"color:%s\">%s</td></tr>" % (ic,t.get("asset","?"),t.get("bet_side","?"),float(t.get("stake") or 0),str(t.get("fired_at",""))[:16],sv3_tag,tc,tp)
     wc = "#4ade80" if wr>=52 else "#f87171" if wr<48 else "#fbbf24"
     pc = "#4ade80" if pnl>=0 else "#f87171"
     html = "<!DOCTYPE html><html><head><title>Sniper A4</title><meta name=viewport content=\"width=device-width,initial-scale=1\"><style>body{background:#0d1117;color:#e6edf3;font-family:sans-serif;margin:0;padding:16px}.c{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:20px;margin-bottom:16px}.s{display:inline-block;min-width:100px;margin:8px 12px 8px 0}.s .v{font-size:24px;font-weight:700}.s .l{font-size:11px;color:#8b949e}table{width:100%%;border-collapse:collapse;font-size:13px}th{text-align:left;color:#8b949e;padding:6px;border-bottom:1px solid #30363d}td{padding:6px;border-bottom:1px solid #21262d}</style></head><body>"
     html += "<nav style=\"background:#161b22;padding:8px 16px;display:flex;gap:8px;border-bottom:1px solid #30363d\"><a href=/app/poly-alpha4 style=\"color:#58a6ff;text-decoration:none;padding:4px 10px;font-size:13px;font-weight:bold\">A4</a><a href=/app/poly-alpha41 style=\"color:#58a6ff;text-decoration:none;padding:4px 10px;font-size:13px\">A41 P31</a><a href=/app/sv21 style=\"color:#58a6ff;text-decoration:none;padding:4px 10px;font-size:13px\">SV2.1</a><a href=/app/limitless-sniper style=\"color:#58a6ff;text-decoration:none;padding:4px 10px;font-size:13px\">LMTS</a><a href=/app/sniper-v2 style=\"color:#58a6ff;text-decoration:none;padding:4px 10px;font-size:13px\">SV2</a></nav>"
-    html += "<h1>Sniper A4 — Original Model</h1>"
-    html += "<p style=\"color:#8b949e\">TV+SMA+BTC 2/3 agree | T+0 at 50c | $2.50 flat stake</p>"
+    html += "<h1>Sniper A4 + SV3 Gate</h1>"
+    html += "<p style=\"color:#8b949e\">TV+SMA+BTC 2/3 agree | SV3 score≥+4=instant, &lt;+4=WAIT 2min confirm | 50c GTC</p>"
     html += "<div class=c><div class=s><div class=v>$%.2f</div><div class=l>Pool</div></div>" % bal
     html += "<div class=s><div class=v style=\"color:%s\">%.1f%%</div><div class=l>Win Rate</div></div>" % (wc, wr)
-    html += "<div class=s><div class=v>%d</div><div class=l>Trades</div></div>" % len(resolved)
-    html += "<div class=s><div class=v style=\"color:%s\">$%+.2f</div><div class=l>P&L</div></div>" % (pc, pnl)
-    html += "<div class=s><div class=v>%d</div><div class=l>Pending</div></div></div>" % len(pending)
-    html += "<div class=c><p style=\"color:#8b949e;font-size:13px\">Original A4: TradingView + SMA(1H) + BTC trend, 2 of 3 must agree.<br>Fresh Binance indicators at T-15s. GTC at 50c, $2.50 flat.</p></div>"
-    html += "<div class=c><table><tr><th></th><th>Asset</th><th>Side</th><th>Stake</th><th>Time</th><th>P&L</th></tr>%s</table></div>" % rows
+    html += "<div class=s><div class=v>%d</div><div class=l>Resolved</div></div>" % len(resolved)
+    html += "<div class=s><div class=v style=\"color:%s\">$%+.2f</div><div class=l>P&L (today)</div></div>" % (pc, pnl)
+    html += "<div class=s><div class=v>%d</div><div class=l>Pending</div></div>" % len(pending)
+    html += "<div class=s><div class=v style=\"color:#58a6ff\">%d</div><div class=l>Skipped</div></div></div>" % len(skipped)
+    html += "<div class=c><p style=\"color:#8b949e;font-size:13px\">SV3 gatekeeper: 8 price action concepts × 3 TFs (1H+30M+15M).<br>Score ≥+4 → fire instant at 50c. Score &lt;+4 → WAIT 2min → price confirms → fire or skip.<br>Skipped = SV3 blocked (saved money). Today only.</p></div>"
+    html += "<div class=c><table><tr><th></th><th>Asset</th><th>Side</th><th>Stake</th><th>Time</th><th>SV3</th><th>P&L</th></tr>%s</table></div>" % rows
     html += "<script>setTimeout(function(){location.reload()},60000)</script></body></html>"
     return html
 
