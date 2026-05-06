@@ -22974,6 +22974,7 @@ def backtest_menu():
     
     html = """<!DOCTYPE html><html><head><title>Backtest Workbench</title>
 <meta name=viewport content="width=device-width,initial-scale=1">
+{refresh}
 <style>
 body{{background:#0d1117;color:#e6edf3;font-family:sans-serif;margin:0;padding:12px}}
 h1{{font-size:20px;margin:8px 0}}
@@ -23024,22 +23025,47 @@ Real Polymarket outcomes (Gamma API) × Real Binance candles × SV3 scoring.
 </p>
 </body></html>""".format(
         sc=status_color, status=status.upper(), tested=tested,
-        days=days, assets=assets, strat_btns=strat_btns, fetched=fetched)
+        days=days, assets=assets, strat_btns=strat_btns, fetched=fetched,
+        refresh='<meta http-equiv="refresh" content="5">' if status == "fetching" else "")
     
     return html
 
 
 @app.route("/app/backtest/fetch")
 def backtest_fetch():
-    """Step 1: Fetch Polymarket outcomes + Binance candles and cache them."""
+    """Step 1: Start background fetch of Polymarket outcomes + Binance candles."""
+    import threading
+    
+    days = int(request.args.get("days", 3))
+    asset_filter = request.args.get("asset", "BTC").upper()
+    source = request.args.get("source", "gamma")
+    
+    # Don't start a new fetch if one is already running
+    if _backtest_cache["status"] == "fetching":
+        return '<html><head><meta http-equiv="refresh" content="3;url=/app/backtest"></head><body style="background:#0d1117;color:#fbbf24;padding:20px;font-family:sans-serif">Already fetching... {} cached so far. <a href="/app/backtest" style="color:#58a6ff">Check progress</a></body></html>'.format(_backtest_cache["tested"])
+    
+    # Reset cache and start background thread
+    _backtest_cache["status"] = "fetching"
+    _backtest_cache["data"] = []
+    _backtest_cache["tested"] = 0
+    _backtest_cache["skipped"] = 0
+    _backtest_cache["errors"] = 0
+    _backtest_cache["days"] = days
+    _backtest_cache["assets"] = [asset_filter] if asset_filter != "ALL" else ["BTC", "ETH", "SOL", "XRP"]
+    _backtest_cache["fetched_at"] = "In progress..."
+    
+    t = threading.Thread(target=_backtest_fetch_worker, args=(days, asset_filter, source), daemon=True)
+    t.start()
+    
+    return '<html><head><meta http-equiv="refresh" content="5;url=/app/backtest"></head><body style="background:#0d1117;color:#4ade80;padding:20px;font-family:sans-serif">Fetching started! {}d {} via {}. <a href="/app/backtest" style="color:#58a6ff">Back to workbench</a> (auto-refreshes in 5s)</body></html>'.format(days, asset_filter, source.upper())
+
+
+def _backtest_fetch_worker(days, asset_filter, source):
+    """Background worker: fetch Polymarket outcomes + Binance candles."""
     import requests as _bt_req
     import json as _bt_json
     import time as _bt_time
     from datetime import datetime, timezone, timedelta
-    
-    days = int(request.args.get("days", 3))
-    asset_filter = request.args.get("asset", "BTC").upper()
-    source = request.args.get("source", "gamma")  # "gamma" or "pbt"
     
     PBT_KEY = os.environ.get("POLYBACKTEST_API_KEY", "")
     GAMMA = "https://gamma-api.polymarket.com"
@@ -23052,10 +23078,7 @@ def backtest_fetch():
     now = datetime.now(timezone.utc)
     start = now - timedelta(days=days)
     
-    _backtest_cache["status"] = "fetching"
-    _backtest_cache["data"] = []
-    
-    # Generate all 15M boundary timestamps
+    # Generate boundaries
     boundaries = []
     t = start.replace(minute=(start.minute // 15) * 15, second=0, microsecond=0)
     while t < now - timedelta(minutes=20):
@@ -23066,93 +23089,255 @@ def backtest_fetch():
     tested = 0
     skipped = 0
     api_errors = 0
-    total = len(boundaries) * len(ASSETS)
     
-    # ── PolyBackTest.com source — bulk fetch resolved markets ──
-    if source == "pbt" and PBT_KEY:
-        pbt_coin_map = {"BTC": "btc", "ETH": "eth", "SOL": "sol"}
-        
-        for asset in ASSETS:
-            pbt_coin = pbt_coin_map.get(asset)
-            if not pbt_coin:
-                continue
+    try:
+        # ── PolyBackTest.com source ──
+        if source == "pbt" and PBT_KEY:
+            pbt_coin_map = {"BTC": "btc", "ETH": "eth", "SOL": "sol"}
             
-            # Fetch all resolved 15M markets from PBT API
-            pbt_markets = []
-            cursor = None
-            for _page in range(50):  # Max 50 pages
-                try:
-                    params = {
-                        "type": "15m",
-                        "resolved": "true",
-                        "start_time": start.isoformat(),
-                        "end_time": now.isoformat(),
-                        "limit": 100,
-                    }
-                    if cursor:
-                        params["cursor"] = cursor
-                    
-                    r = _bt_req.get("{}/v3/{}/markets".format(PBT_API, pbt_coin),
-                        headers={"X-API-Key": PBT_KEY}, params=params, timeout=15)
-                    
-                    if r.status_code == 429:
-                        _bt_time.sleep(3)
+            for asset in ASSETS:
+                pbt_coin = pbt_coin_map.get(asset)
+                if not pbt_coin:
+                    continue
+                
+                print("BT: Fetching {} 15M markets from PolyBackTest...".format(asset))
+                
+                pbt_markets = []
+                cursor = None
+                for _page in range(50):
+                    try:
+                        params = {
+                            "type": "15m",
+                            "resolved": "true",
+                            "start_time": start.isoformat(),
+                            "end_time": now.isoformat(),
+                            "limit": 100,
+                        }
+                        if cursor:
+                            params["cursor"] = cursor
+                        
                         r = _bt_req.get("{}/v3/{}/markets".format(PBT_API, pbt_coin),
                             headers={"X-API-Key": PBT_KEY}, params=params, timeout=15)
-                    
-                    if r.status_code != 200:
+                        
+                        if r.status_code == 429:
+                            _bt_time.sleep(3)
+                            r = _bt_req.get("{}/v3/{}/markets".format(PBT_API, pbt_coin),
+                                headers={"X-API-Key": PBT_KEY}, params=params, timeout=15)
+                        
+                        if r.status_code != 200:
+                            print("BT: PBT error {} — {}".format(r.status_code, r.text[:100]))
+                            api_errors += 1
+                            break
+                        
+                        resp = r.json()
+                        data = resp.get("data", [])
+                        pbt_markets.extend(data)
+                        print("BT: PBT page {} — {} markets (total {})".format(_page + 1, len(data), len(pbt_markets)))
+                        
+                        pag = resp.get("pagination", {})
+                        if not pag.get("has_more"):
+                            break
+                        cursor = pag.get("next_cursor")
+                        if not cursor:
+                            break
+                        
+                        _bt_time.sleep(0.5)
+                    except Exception as e:
+                        print("BT: PBT page error: {}".format(e))
                         api_errors += 1
                         break
-                    
-                    resp = r.json()
-                    data = resp.get("data", [])
-                    pbt_markets.extend(data)
-                    
-                    pag = resp.get("pagination", {})
-                    if not pag.get("has_more"):
-                        break
-                    cursor = pag.get("next_cursor")
-                    if not cursor:
-                        break
-                    
-                    _bt_time.sleep(0.5)
-                except Exception as e:
-                    api_errors += 1
-                    break
-            
-            # Process each resolved market
-            for mkt in pbt_markets:
-                try:
-                    winner = mkt.get("winner")
-                    if not winner:
-                        skipped += 1
-                        continue
-                    
-                    actual = winner.upper()  # "up" → "UP", "down" → "DOWN"
-                    
-                    # Parse boundary timestamp from start_time
-                    st = mkt.get("start_time", "")
+                
+                print("BT: Got {} resolved {} markets. Fetching candles...".format(len(pbt_markets), asset))
+                
+                for mkt_idx, mkt in enumerate(pbt_markets):
                     try:
-                        if "T" in str(st):
-                            bnd_dt = datetime.fromisoformat(str(st).replace("Z", "+00:00"))
+                        winner = mkt.get("winner")
+                        if not winner:
+                            skipped += 1
+                            continue
+                        
+                        actual = winner.upper()
+                        
+                        st = mkt.get("start_time", "")
+                        try:
+                            if "T" in str(st):
+                                bnd_dt = datetime.fromisoformat(str(st).replace("Z", "+00:00"))
+                            else:
+                                bnd_dt = datetime.fromtimestamp(int(st) / 1000 if int(st) > 1e12 else int(st), tz=timezone.utc)
+                        except:
+                            skipped += 1
+                            continue
+                        
+                        bnd_ts = int(bnd_dt.timestamp())
+                        
+                        if mkt_idx > 0 and mkt_idx % 10 == 0:
+                            _bt_time.sleep(1)
+                            _backtest_cache["tested"] = tested  # Update progress
+                        
+                        candle_data = {}
+                        for tf in ["1h", "30m", "15m"]:
+                            try:
+                                cr = _bt_req.get("https://api.binance.com/api/v3/klines", params={
+                                    "symbol": BINANCE_MAP.get(asset, "BTCUSDT"),
+                                    "interval": tf,
+                                    "endTime": bnd_ts * 1000,
+                                    "limit": 25,
+                                }, timeout=8)
+                                if cr.status_code == 429:
+                                    _bt_time.sleep(5)
+                                    cr = _bt_req.get("https://api.binance.com/api/v3/klines", params={
+                                        "symbol": BINANCE_MAP.get(asset, "BTCUSDT"),
+                                        "interval": tf,
+                                        "endTime": bnd_ts * 1000,
+                                        "limit": 25,
+                                    }, timeout=8)
+                                if cr.status_code == 200:
+                                    klines = cr.json()
+                                    candles = [{"ts": int(k[0]), "open": float(k[1]), "high": float(k[2]),
+                                                "low": float(k[3]), "close": float(k[4]), "volume": float(k[5])}
+                                               for k in klines]
+                                    if len(candles) >= 5:
+                                        candle_data[tf] = candles[-20:]
+                            except:
+                                api_errors += 1
+                        
+                        if not candle_data.get("15m"):
+                            skipped += 1
+                            continue
+                        
+                        up_1h, _ = _sv3_score_timeframe(candle_data.get("1h"), "UP") if candle_data.get("1h") else (0, {})
+                        up_30, _ = _sv3_score_timeframe(candle_data.get("30m"), "UP") if candle_data.get("30m") else (0, {})
+                        up_15, _ = _sv3_score_timeframe(candle_data.get("15m"), "UP")
+                        up_total = up_1h + up_30 + up_15
+                        
+                        dn_1h, _ = _sv3_score_timeframe(candle_data.get("1h"), "DOWN") if candle_data.get("1h") else (0, {})
+                        dn_30, _ = _sv3_score_timeframe(candle_data.get("30m"), "DOWN") if candle_data.get("30m") else (0, {})
+                        dn_15, _ = _sv3_score_timeframe(candle_data.get("15m"), "DOWN")
+                        dn_total = dn_1h + dn_30 + dn_15
+                        
+                        if up_total > dn_total:
+                            candle_dir = "UP"
+                            candle_score = up_total
+                        elif dn_total > up_total:
+                            candle_dir = "DOWN"
+                            candle_score = dn_total
                         else:
-                            bnd_dt = datetime.fromtimestamp(int(st) / 1000 if int(st) > 1e12 else int(st), tz=timezone.utc)
-                    except:
+                            candle_dir = None
+                            candle_score = 0
+                        
+                        ind_dir = None
+                        if candle_data.get("1h") and len(candle_data["1h"]) >= 10:
+                            closes = [c["close"] for c in candle_data["1h"]]
+                            sma10 = sum(closes[-10:]) / 10
+                            ind_dir = "UP" if closes[-1] > sma10 else "DOWN"
+                        
+                        price_pos = None
+                        if len(candle_data["15m"]) >= 2:
+                            price_pos = "UP" if candle_data["15m"][-1]["close"] > candle_data["15m"][-2]["close"] else "DOWN"
+                        
+                        results.append({
+                            "asset": asset,
+                            "boundary": bnd_dt.strftime("%m-%d %H:%M"),
+                            "actual": actual,
+                            "candle_dir": candle_dir,
+                            "candle_score": candle_score,
+                            "up_total": up_total,
+                            "dn_total": dn_total,
+                            "up_detail": "{}/{}/{}".format(up_1h, up_30, up_15),
+                            "dn_detail": "{}/{}/{}".format(dn_1h, dn_30, dn_15),
+                            "ind_dir": ind_dir,
+                            "price_pos": price_pos,
+                        })
+                        tested += 1
+                        
+                    except Exception as e:
+                        api_errors += 1
+            
+            _backtest_cache["data"] = results
+            _backtest_cache["tested"] = tested
+            _backtest_cache["skipped"] = skipped
+            _backtest_cache["errors"] = api_errors
+            _backtest_cache["fetched_at"] = "{} (PolyBackTest.com)".format(now.strftime("%Y-%m-%d %H:%M UTC"))
+            _backtest_cache["status"] = "ready" if tested > 0 else "error"
+            print("BT: PBT fetch complete — {} tested, {} skipped, {} errors".format(tested, skipped, api_errors))
+            return
+        
+        # ── Gamma API source ──
+        print("BT: Starting Gamma API fetch — {} days, {} assets, {} boundaries".format(days, len(ASSETS), len(boundaries)))
+        
+        for asset in ASSETS:
+            slug_tmpl = SLUG_MAP.get(asset)
+            if not slug_tmpl:
+                continue
+            
+            print("BT: Fetching {} via Gamma...".format(asset))
+            
+            for bnd_idx, bnd_ts in enumerate(boundaries):
+                try:
+                    if bnd_idx > 0 and bnd_idx % 10 == 0:
+                        _bt_time.sleep(1)
+                        _backtest_cache["tested"] = tested  # Update progress
+                    
+                    if bnd_idx > 0 and bnd_idx % 50 == 0:
+                        print("BT: {} — {}/{} boundaries, {} cached".format(asset, bnd_idx, len(boundaries), tested))
+                    
+                    md = None
+                    slug = ""
+                    for try_ts in [bnd_ts + 900, bnd_ts]:
+                        try:
+                            _try_slug = slug_tmpl.format(try_ts)
+                            r = _bt_req.get("{}/markets/slug/{}".format(GAMMA, _try_slug), timeout=8)
+                            if r.status_code == 200:
+                                md = r.json()
+                                slug = _try_slug
+                                break
+                            elif r.status_code == 429:
+                                _bt_time.sleep(3)
+                                r = _bt_req.get("{}/markets/slug/{}".format(GAMMA, _try_slug), timeout=8)
+                                if r.status_code == 200:
+                                    md = r.json()
+                                    slug = _try_slug
+                                    break
+                        except:
+                            api_errors += 1
+                    
+                    if not md or not md.get("closed"):
                         skipped += 1
                         continue
                     
-                    bnd_ts = int(bnd_dt.timestamp())
+                    ops = md.get("outcomePrices", "")
+                    if isinstance(ops, str):
+                        try: ops = _bt_json.loads(ops)
+                        except: continue
+                    if not isinstance(ops, list) or len(ops) < 2:
+                        continue
                     
-                    # Rate limit Binance calls
-                    if tested > 0 and tested % 10 == 0:
-                        _bt_time.sleep(1)
+                    outcomes = md.get("outcomes", "")
+                    if isinstance(outcomes, str):
+                        try: outcomes = _bt_json.loads(outcomes)
+                        except: outcomes = ["Up", "Down"]
                     
-                    # Fetch Binance candles at this boundary
+                    up_idx = 0
+                    if isinstance(outcomes, list) and len(outcomes) >= 2:
+                        if str(outcomes[0]).lower().strip() in ("no", "down", "below"):
+                            up_idx = 1
+                    
+                    up_price = float(ops[up_idx])
+                    down_price = float(ops[1 - up_idx])
+                    
+                    if up_price > 0.9:
+                        actual = "UP"
+                    elif down_price > 0.9:
+                        actual = "DOWN"
+                    else:
+                        skipped += 1
+                        continue
+                    
                     candle_data = {}
                     for tf in ["1h", "30m", "15m"]:
                         try:
                             cr = _bt_req.get("https://api.binance.com/api/v3/klines", params={
-                                "symbol": BINANCE_MAP.get(asset, "BTCUSDT"),
+                                "symbol": BINANCE_MAP[asset],
                                 "interval": tf,
                                 "endTime": bnd_ts * 1000,
                                 "limit": 25,
@@ -23160,7 +23345,7 @@ def backtest_fetch():
                             if cr.status_code == 429:
                                 _bt_time.sleep(5)
                                 cr = _bt_req.get("https://api.binance.com/api/v3/klines", params={
-                                    "symbol": BINANCE_MAP.get(asset, "BTCUSDT"),
+                                    "symbol": BINANCE_MAP[asset],
                                     "interval": tf,
                                     "endTime": bnd_ts * 1000,
                                     "limit": 25,
@@ -23179,7 +23364,6 @@ def backtest_fetch():
                         skipped += 1
                         continue
                     
-                    # Score SV3 both directions
                     up_1h, _ = _sv3_score_timeframe(candle_data.get("1h"), "UP") if candle_data.get("1h") else (0, {})
                     up_30, _ = _sv3_score_timeframe(candle_data.get("30m"), "UP") if candle_data.get("30m") else (0, {})
                     up_15, _ = _sv3_score_timeframe(candle_data.get("15m"), "UP")
@@ -23200,17 +23384,17 @@ def backtest_fetch():
                         candle_dir = None
                         candle_score = 0
                     
-                    # Indicator direction from SMA
                     ind_dir = None
                     if candle_data.get("1h") and len(candle_data["1h"]) >= 10:
                         closes = [c["close"] for c in candle_data["1h"]]
                         sma10 = sum(closes[-10:]) / 10
                         ind_dir = "UP" if closes[-1] > sma10 else "DOWN"
                     
-                    # Price position
                     price_pos = None
-                    if len(candle_data["15m"]) >= 2:
+                    if candle_data.get("15m") and len(candle_data["15m"]) >= 2:
                         price_pos = "UP" if candle_data["15m"][-1]["close"] > candle_data["15m"][-2]["close"] else "DOWN"
+                    
+                    bnd_dt = datetime.fromtimestamp(bnd_ts, tz=timezone.utc)
                     
                     results.append({
                         "asset": asset,
@@ -23230,186 +23414,19 @@ def backtest_fetch():
                 except Exception as e:
                     api_errors += 1
         
-        # Save and redirect
         _backtest_cache["data"] = results
         _backtest_cache["tested"] = tested
         _backtest_cache["skipped"] = skipped
         _backtest_cache["errors"] = api_errors
-        _backtest_cache["days"] = days
-        _backtest_cache["assets"] = ASSETS
-        _backtest_cache["fetched_at"] = "{} (PolyBackTest.com)".format(now.strftime("%Y-%m-%d %H:%M UTC"))
+        _backtest_cache["fetched_at"] = now.strftime("%Y-%m-%d %H:%M UTC")
         _backtest_cache["status"] = "ready" if tested > 0 else "error"
-        
-        return '<html><head><meta http-equiv="refresh" content="0;url=/app/backtest"></head><body>PBT: Cached {} boundaries. <a href="/app/backtest">Back</a></body></html>'.format(tested)
+        print("BT: Gamma fetch complete — {} tested, {} skipped, {} errors".format(tested, skipped, api_errors))
     
-    # ── Gamma API source (original path) ──
+    except Exception as e:
+        _backtest_cache["status"] = "error"
+        _backtest_cache["fetched_at"] = "Error: {}".format(str(e)[:100])
+        print("BT: Fatal error: {}".format(e))
     
-    for asset in ASSETS:
-        slug_tmpl = SLUG_MAP.get(asset)
-        if not slug_tmpl:
-            continue
-        
-        for bnd_idx, bnd_ts in enumerate(boundaries):
-            try:
-                # Rate limit
-                if bnd_idx > 0 and bnd_idx % 10 == 0:
-                    _bt_time.sleep(1)
-                
-                # Try both slug formats
-                md = None
-                slug = ""
-                for try_ts in [bnd_ts + 900, bnd_ts]:
-                    try:
-                        _try_slug = slug_tmpl.format(try_ts)
-                        r = _bt_req.get("{}/markets/slug/{}".format(GAMMA, _try_slug), timeout=8)
-                        if r.status_code == 200:
-                            md = r.json()
-                            slug = _try_slug
-                            break
-                        elif r.status_code == 429:
-                            _bt_time.sleep(3)
-                            r = _bt_req.get("{}/markets/slug/{}".format(GAMMA, _try_slug), timeout=8)
-                            if r.status_code == 200:
-                                md = r.json()
-                                slug = _try_slug
-                                break
-                    except:
-                        api_errors += 1
-                
-                if not md or not md.get("closed"):
-                    skipped += 1
-                    continue
-                
-                # Parse outcome
-                ops = md.get("outcomePrices", "")
-                if isinstance(ops, str):
-                    try: ops = _bt_json.loads(ops)
-                    except: continue
-                if not isinstance(ops, list) or len(ops) < 2:
-                    continue
-                
-                # Determine outcome index mapping
-                outcomes = md.get("outcomes", "")
-                if isinstance(outcomes, str):
-                    try: outcomes = _bt_json.loads(outcomes)
-                    except: outcomes = ["Up", "Down"]
-                
-                up_idx = 0
-                if isinstance(outcomes, list) and len(outcomes) >= 2:
-                    if str(outcomes[0]).lower().strip() in ("no", "down", "below"):
-                        up_idx = 1
-                
-                up_price = float(ops[up_idx])
-                down_price = float(ops[1 - up_idx])
-                
-                if up_price > 0.9:
-                    actual = "UP"
-                elif down_price > 0.9:
-                    actual = "DOWN"
-                else:
-                    skipped += 1
-                    continue
-                
-                # Fetch Binance candles
-                candle_data = {}
-                for tf in ["1h", "30m", "15m"]:
-                    try:
-                        cr = _bt_req.get("https://api.binance.com/api/v3/klines", params={
-                            "symbol": BINANCE_MAP[asset],
-                            "interval": tf,
-                            "endTime": bnd_ts * 1000,
-                            "limit": 25,
-                        }, timeout=8)
-                        if cr.status_code == 429:
-                            _bt_time.sleep(5)
-                            cr = _bt_req.get("https://api.binance.com/api/v3/klines", params={
-                                "symbol": BINANCE_MAP[asset],
-                                "interval": tf,
-                                "endTime": bnd_ts * 1000,
-                                "limit": 25,
-                            }, timeout=8)
-                        if cr.status_code == 200:
-                            klines = cr.json()
-                            candles = [{"ts": int(k[0]), "open": float(k[1]), "high": float(k[2]),
-                                        "low": float(k[3]), "close": float(k[4]), "volume": float(k[5])}
-                                       for k in klines]
-                            if len(candles) >= 5:
-                                candle_data[tf] = candles[-20:]
-                    except:
-                        api_errors += 1
-                
-                if not candle_data.get("15m"):
-                    skipped += 1
-                    continue
-                
-                # Score SV3 for BOTH directions
-                up_1h, _ = _sv3_score_timeframe(candle_data.get("1h"), "UP") if candle_data.get("1h") else (0, {})
-                up_30, _ = _sv3_score_timeframe(candle_data.get("30m"), "UP") if candle_data.get("30m") else (0, {})
-                up_15, _ = _sv3_score_timeframe(candle_data.get("15m"), "UP")
-                up_total = up_1h + up_30 + up_15
-                
-                dn_1h, _ = _sv3_score_timeframe(candle_data.get("1h"), "DOWN") if candle_data.get("1h") else (0, {})
-                dn_30, _ = _sv3_score_timeframe(candle_data.get("30m"), "DOWN") if candle_data.get("30m") else (0, {})
-                dn_15, _ = _sv3_score_timeframe(candle_data.get("15m"), "DOWN")
-                dn_total = dn_1h + dn_30 + dn_15
-                
-                # Candle direction
-                if up_total > dn_total:
-                    candle_dir = "UP"
-                    candle_score = up_total
-                elif dn_total > up_total:
-                    candle_dir = "DOWN"
-                    candle_score = dn_total
-                else:
-                    candle_dir = None
-                    candle_score = 0
-                
-                # Indicator direction (SMA from 1H candles)
-                ind_dir = None
-                if candle_data.get("1h") and len(candle_data["1h"]) >= 10:
-                    closes = [c["close"] for c in candle_data["1h"]]
-                    sma10 = sum(closes[-10:]) / 10
-                    ind_dir = "UP" if closes[-1] > sma10 else "DOWN"
-                
-                # Price position
-                price_pos = None
-                if candle_data.get("15m") and len(candle_data["15m"]) >= 2:
-                    prev_close = candle_data["15m"][-2]["close"]
-                    last_close = candle_data["15m"][-1]["close"]
-                    price_pos = "UP" if last_close > prev_close else "DOWN"
-                
-                bnd_dt = datetime.fromtimestamp(bnd_ts, tz=timezone.utc)
-                
-                results.append({
-                    "asset": asset,
-                    "boundary": bnd_dt.strftime("%m-%d %H:%M"),
-                    "actual": actual,
-                    "candle_dir": candle_dir,
-                    "candle_score": candle_score,
-                    "up_total": up_total,
-                    "dn_total": dn_total,
-                    "up_detail": "{}/{}/{}".format(up_1h, up_30, up_15),
-                    "dn_detail": "{}/{}/{}".format(dn_1h, dn_30, dn_15),
-                    "ind_dir": ind_dir,
-                    "price_pos": price_pos,
-                })
-                tested += 1
-                
-            except Exception as e:
-                api_errors += 1
-    
-    # Save to cache
-    _backtest_cache["data"] = results
-    _backtest_cache["tested"] = tested
-    _backtest_cache["skipped"] = skipped
-    _backtest_cache["errors"] = api_errors
-    _backtest_cache["days"] = days
-    _backtest_cache["assets"] = ASSETS
-    _backtest_cache["fetched_at"] = now.strftime("%Y-%m-%d %H:%M UTC")
-    _backtest_cache["status"] = "ready" if tested > 0 else "error"
-    
-    # Redirect back to menu
-    return '<html><head><meta http-equiv="refresh" content="0;url=/app/backtest"></head><body>Cached {} boundaries. <a href="/app/backtest">Back to menu</a></body></html>'.format(tested)
 
 
 @app.route("/app/backtest/run")
