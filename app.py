@@ -22917,6 +22917,284 @@ def export_sv3_csv():
         return "Error: {}".format(e), 500
 
 # ═══════════════════════════════════════════════════════════════════
+# BACKTEST INDICATOR HELPERS — Calculate UT Bot, Squeeze, candle
+# patterns, and full P2.1 logic from Binance OHLC candle data.
+# These are standalone functions that don't depend on any live cache.
+# ═══════════════════════════════════════════════════════════════════
+
+def _bt_calc_atr(candles, period=1):
+    """Calculate Average True Range from candle data."""
+    if not candles or len(candles) < period + 1:
+        return None
+    trs = []
+    for i in range(1, len(candles)):
+        h = candles[i]["high"]
+        l = candles[i]["low"]
+        pc = candles[i-1]["close"]
+        tr = max(h - l, abs(h - pc), abs(l - pc))
+        trs.append(tr)
+    if len(trs) < period:
+        return None
+    # Simple average of last N true ranges
+    return sum(trs[-period:]) / period
+
+
+def _bt_calc_ut_bot(candles, atr_period=1, atr_mult=2.0):
+    """Calculate UT Bot Alert direction from candle OHLC.
+    
+    UT Bot = ATR-based trailing stop.
+    When close > trailing stop → BUY
+    When close < trailing stop → SELL
+    
+    Uses Wilder's smoothing for ATR, then trailing stop logic.
+    """
+    if not candles or len(candles) < atr_period + 5:
+        return None
+    
+    # Calculate ATR series
+    trs = []
+    for i in range(1, len(candles)):
+        h, l, pc = candles[i]["high"], candles[i]["low"], candles[i-1]["close"]
+        trs.append(max(h - l, abs(h - pc), abs(l - pc)))
+    
+    if len(trs) < 2:
+        return None
+    
+    # Wilder smoothing for ATR (or simple for period=1)
+    if atr_period == 1:
+        atr_vals = trs
+    else:
+        atr_vals = [sum(trs[:atr_period]) / atr_period]
+        for i in range(atr_period, len(trs)):
+            atr_vals.append((atr_vals[-1] * (atr_period - 1) + trs[i]) / atr_period)
+    
+    # Trailing stop calculation
+    # Start from candle index atr_period (first candle with ATR)
+    start = atr_period
+    trail = candles[start]["close"]
+    direction = "BUY"
+    
+    for i in range(start, len(candles)):
+        atr_idx = i - 1  # ATR index offset by 1 since trs starts at candle 1
+        if atr_idx >= len(atr_vals):
+            break
+        nloss = atr_vals[atr_idx] * atr_mult
+        close = candles[i]["close"]
+        prev_close = candles[i-1]["close"]
+        
+        # Trail logic
+        if close > trail:
+            new_trail = max(trail, close - nloss)
+        else:
+            new_trail = min(trail, close + nloss)
+        
+        # Direction flip
+        if prev_close <= trail and close > trail:
+            direction = "BUY"
+        elif prev_close >= trail and close < trail:
+            direction = "SELL"
+        
+        trail = new_trail
+    
+    return direction
+
+
+def _bt_calc_squeeze(candles, bb_period=20, bb_mult=2.0, kc_period=20, kc_mult=1.5, mom_period=12):
+    """Calculate Squeeze Momentum direction from candle OHLC.
+    
+    Squeeze = Bollinger Bands inside Keltner Channels.
+    Momentum = linear regression of (close - midline).
+    Returns: direction ("BUY"/"SELL") and squeeze_val (momentum value).
+    """
+    if not candles or len(candles) < max(bb_period, kc_period, mom_period) + 5:
+        return None, None
+    
+    closes = [c["close"] for c in candles]
+    highs = [c["high"] for c in candles]
+    lows = [c["low"] for c in candles]
+    n = len(closes)
+    
+    # Bollinger Bands
+    bb_sma = sum(closes[-bb_period:]) / bb_period
+    bb_std = (sum((c - bb_sma)**2 for c in closes[-bb_period:]) / bb_period) ** 0.5
+    
+    # Keltner Channels (using ATR)
+    kc_sma = sum(closes[-kc_period:]) / kc_period
+    trs = []
+    for i in range(1, len(candles)):
+        h, l, pc = highs[i], lows[i], closes[i-1]
+        trs.append(max(h - l, abs(h - pc), abs(l - pc)))
+    kc_atr = sum(trs[-kc_period:]) / kc_period if len(trs) >= kc_period else 0
+    
+    # Momentum: close - midline(high+low average over period)
+    midline_vals = []
+    for i in range(n - mom_period, n):
+        hl_avg = (max(highs[max(0,i-kc_period):i+1]) + min(lows[max(0,i-kc_period):i+1])) / 2
+        sma_val = sum(closes[max(0,i-kc_period):i+1]) / min(kc_period, i+1)
+        midline_vals.append(closes[i] - (hl_avg + sma_val) / 2)
+    
+    if not midline_vals:
+        return None, None
+    
+    # Simple momentum direction from last few values
+    squeeze_val = midline_vals[-1] if midline_vals else 0
+    sqz_dir = "BUY" if squeeze_val > 0 else "SELL" if squeeze_val < 0 else None
+    
+    return sqz_dir, squeeze_val
+
+
+def _bt_read_candle_pattern(candles):
+    """Read the last completed candle pattern from candle data.
+    Same logic as _p28_read_prev_candle but works with pre-fetched candles.
+    Returns the pattern dict or None.
+    """
+    if not candles or len(candles) < 2:
+        return None
+    
+    prev = candles[-2]  # Last COMPLETED candle (current one is still forming)
+    o, h, l, c = prev["open"], prev["high"], prev["low"], prev["close"]
+    
+    body = abs(c - o)
+    total_range = h - l
+    
+    if total_range == 0:
+        return {"pattern": "doji", "body_ratio": 0, "is_green": False, "is_red": False,
+                "upper_wick_ratio": 0, "lower_wick_ratio": 0}
+    
+    upper_wick = h - max(o, c)
+    lower_wick = min(o, c) - l
+    body_ratio = body / total_range
+    upper_wick_ratio = upper_wick / total_range
+    lower_wick_ratio = lower_wick / total_range
+    is_green = c > o
+    is_red = c < o
+    
+    pattern = "unclear"
+    if body_ratio < 0.1:
+        pattern = "doji"
+    elif lower_wick_ratio > 0.6 and body_ratio < 0.35:
+        pattern = "hammer"
+    elif upper_wick_ratio > 0.6 and body_ratio < 0.35:
+        pattern = "shooting_star"
+    elif is_green and upper_wick > body * 2 and upper_wick_ratio > 0.45:
+        pattern = "bull_trap"
+    elif is_red and lower_wick > body * 2 and lower_wick_ratio > 0.45:
+        pattern = "bear_trap"
+    elif is_red and body_ratio > 0.7:
+        pattern = "red_no_lower_wick" if lower_wick_ratio < 0.05 else "strong_red"
+    elif is_green and body_ratio > 0.7:
+        pattern = "green_no_upper_wick" if upper_wick_ratio < 0.05 else "strong_green"
+    elif is_red and body_ratio > 0.4:
+        pattern = "moderate_red"
+    elif is_green and body_ratio > 0.4:
+        pattern = "moderate_green"
+    
+    return {"pattern": pattern, "body_ratio": round(body_ratio, 2),
+            "is_green": is_green, "is_red": is_red,
+            "upper_wick_ratio": round(upper_wick_ratio, 2),
+            "lower_wick_ratio": round(lower_wick_ratio, 2)}
+
+
+def _bt_calc_full_direction(asset, candle_data, boundary_ts):
+    """Calculate full P2.1-style direction from candle data.
+    
+    Reconstructs the P2.1 majority vote using:
+    - SMA(10) from 1H candles (replaces yfinance SMA)
+    - BTC SMA(10) from BTC 1H candles (replaces _btc_trend_cache)
+    - UT Bot from 15M candles (replaces yfinance UT Bot)
+    - Squeeze Momentum from 15M candles (replaces yfinance Squeeze)
+    - Weak/Strong period from boundary time
+    
+    TV direction is the only missing signal — replaced with None.
+    Without TV, we need SMA + BTC to agree (Path 5 in the original).
+    
+    Returns dict with direction, confidence, all signals, and whether it would trade.
+    """
+    from datetime import datetime, timezone
+    
+    # ── SMA direction from 1H candles ──
+    sma_dir = None
+    h1_candles = candle_data.get("1h", [])
+    if h1_candles and len(h1_candles) >= 10:
+        closes = [c["close"] for c in h1_candles]
+        sma10 = sum(closes[-10:]) / 10
+        sma_dir = "BUY" if closes[-1] > sma10 else "SELL"
+    
+    if not sma_dir:
+        return None  # SMA always required
+    
+    # ── BTC trend (SMA from BTC 1H candles) ──
+    # For BTC asset, btc_trend = sma_dir. For others, we'd need BTC candles.
+    # In the backtest, btc_candles are fetched separately and stored.
+    btc_trend = candle_data.get("_btc_sma_dir")  # Set during fetch for non-BTC assets
+    if asset.upper() == "BTC":
+        btc_trend = sma_dir  # BTC trend = its own SMA
+    
+    # ── TV direction = None (can't reconstruct) ──
+    tv_dir = None
+    
+    # ── Majority vote (need 2/3, TV is None so need SMA+BTC to agree) ──
+    active_signals = [sig for sig in [tv_dir, sma_dir, btc_trend] if sig is not None]
+    if len(active_signals) < 2:
+        return None
+    
+    buy_votes = sum(1 for s in active_signals if s == "BUY")
+    sell_votes = sum(1 for s in active_signals if s == "SELL")
+    
+    if buy_votes > sell_votes and buy_votes >= 2:
+        pair_dir = "BUY"
+    elif sell_votes > buy_votes and sell_votes >= 2:
+        pair_dir = "SELL"
+    else:
+        return None  # Tied or insufficient
+    
+    signals_agree = max(buy_votes, sell_votes)
+    confidence = "HIGH" if signals_agree == 3 else "MEDIUM"
+    
+    # ── UT Bot + Squeeze from 15M candles ──
+    candles_15m = candle_data.get("15m", [])
+    ut_trend = _bt_calc_ut_bot(candles_15m) if candles_15m and len(candles_15m) >= 5 else None
+    sqz_dir, sqz_val = _bt_calc_squeeze(candles_15m) if candles_15m and len(candles_15m) >= 25 else (None, None)
+    
+    # ── Weak/Strong period from boundary time ──
+    bnd_dt = datetime.fromtimestamp(boundary_ts, tz=timezone.utc)
+    next_15 = ((bnd_dt.minute // 15) + 1) * 15
+    expiry_min = 0 if next_15 >= 60 else next_15
+    is_weak = expiry_min in (0, 30)
+    
+    # ── Apply UT Bot flip on weak periods ──
+    direction = pair_dir
+    flipped = False
+    
+    if is_weak:
+        ut_opp = bool(ut_trend and ((ut_trend == "SELL" and direction == "BUY") or
+                                     (ut_trend == "BUY" and direction == "SELL")))
+        sqz_opp = bool(sqz_dir and ((sqz_dir == "SELL" and direction == "BUY") or
+                                     (sqz_dir == "BUY" and direction == "SELL")))
+        if ut_opp:
+            direction = "SELL" if direction == "BUY" else "BUY"
+            confidence = "HIGH" if sqz_opp else "MEDIUM"
+            flipped = True
+        elif sqz_opp:
+            return None  # SQZ-only oppose → SKIP
+    
+    bet_direction = "UP" if direction == "BUY" else "DOWN"
+    
+    return {
+        "direction": bet_direction,
+        "confidence": confidence,
+        "sma_dir": sma_dir,
+        "btc_trend": btc_trend,
+        "tv_dir": tv_dir,
+        "ut_trend": ut_trend,
+        "sqz_dir": sqz_dir,
+        "is_weak": is_weak,
+        "flipped": flipped,
+        "signals_agree": signals_agree,
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════
 # BACKTESTER WORKBENCH — 2-step: cache data, then score strategies
 # Step 1: /app/backtest/fetch?days=3&asset=BTC — fetches & caches data
 # Step 2: /app/backtest/run?strategy=candle3 — scores cached data
@@ -22961,6 +23239,11 @@ def backtest_menu():
         ("flip5", "Candle+Indicator Flip |score| ≥ 5", "+5 agree=fire, -5 oppose=flip direction"),
         ("price_pos", "Pure Price Position", "Price above PTB=UP, below=DOWN"),
         ("extremes", "Extremes Only (+6 or flip ≤-3)", "Only highest conviction trades"),
+        ("p21_full", "P2.1 Full (no TV)", "SMA+BTC+UT Bot+Squeeze+Weak period logic"),
+        ("p21_gate4", "P2.1 Full + SV3 Gate ≥+4", "Full P2.1 direction, candles must agree +4"),
+        ("p21_gate4_no5", "P2.1 Full + Gate ≥+4 (skip 5)", "Same but skip score 5"),
+        ("p28", "P2.8 Candle-First", "Single candle pattern decides direction"),
+        ("p29", "P2.9 BlackRock (P2.1+candle)", "P2.1 direction + candle confidence adjustment"),
     ]
     
     strat_btns = ""
@@ -23235,9 +23518,18 @@ def _backtest_fetch_worker(days, asset_filter, source):
                         if len(candle_data["15m"]) >= 2:
                             price_pos = "UP" if candle_data["15m"][-1]["close"] > candle_data["15m"][-2]["close"] else "DOWN"
                         
+                        # Full P2.1 direction with UT Bot + Squeeze + weak period
+                        full_p21 = _bt_calc_full_direction(asset, candle_data, bnd_ts)
+                        p21_dir = full_p21["direction"] if full_p21 else None
+                        p21_info = full_p21 if full_p21 else {}
+                        
+                        # Candle pattern (P2.8 style)
+                        candle_pattern = _bt_read_candle_pattern(candle_data.get("15m", []))
+                        
                         results.append({
                             "asset": asset,
                             "boundary": bnd_dt.strftime("%m-%d %H:%M"),
+                            "boundary_ts": bnd_ts,
                             "actual": actual,
                             "candle_dir": candle_dir,
                             "candle_score": candle_score,
@@ -23247,6 +23539,10 @@ def _backtest_fetch_worker(days, asset_filter, source):
                             "dn_detail": "{}/{}/{}".format(dn_1h, dn_30, dn_15),
                             "ind_dir": ind_dir,
                             "price_pos": price_pos,
+                            "p21_dir": p21_dir,
+                            "p21_info": p21_info,
+                            "candle_pattern": candle_pattern,
+                            "candle_data": candle_data,  # Raw candles for P2.9 scoring
                         })
                         tested += 1
                         
@@ -23394,11 +23690,20 @@ def _backtest_fetch_worker(days, asset_filter, source):
                     if candle_data.get("15m") and len(candle_data["15m"]) >= 2:
                         price_pos = "UP" if candle_data["15m"][-1]["close"] > candle_data["15m"][-2]["close"] else "DOWN"
                     
+                    # Full P2.1 direction with UT Bot + Squeeze + weak period
+                    full_p21 = _bt_calc_full_direction(asset, candle_data, bnd_ts)
+                    p21_dir = full_p21["direction"] if full_p21 else None
+                    p21_info = full_p21 if full_p21 else {}
+                    
+                    # Candle pattern (P2.8 style)
+                    candle_pattern = _bt_read_candle_pattern(candle_data.get("15m", []))
+                    
                     bnd_dt = datetime.fromtimestamp(bnd_ts, tz=timezone.utc)
                     
                     results.append({
                         "asset": asset,
                         "boundary": bnd_dt.strftime("%m-%d %H:%M"),
+                        "boundary_ts": bnd_ts,
                         "actual": actual,
                         "candle_dir": candle_dir,
                         "candle_score": candle_score,
@@ -23408,6 +23713,10 @@ def _backtest_fetch_worker(days, asset_filter, source):
                         "dn_detail": "{}/{}/{}".format(dn_1h, dn_30, dn_15),
                         "ind_dir": ind_dir,
                         "price_pos": price_pos,
+                        "p21_dir": p21_dir,
+                        "p21_info": p21_info,
+                        "candle_pattern": candle_pattern,
+                        "candle_data": candle_data,
                     })
                     tested += 1
                     
@@ -23561,6 +23870,117 @@ def backtest_run():
                     bet_dir = "DOWN" if ind_dir == "UP" else "UP"
                     tag = "flip -{}".format(score_against)
         
+        elif strategy == "p21_full":
+            # Full P2.1 reconstruction (SMA + BTC + UT Bot + Squeeze + weak period)
+            p21_d = r.get("p21_dir")
+            if p21_d:
+                bet_dir = p21_d
+                info = r.get("p21_info", {})
+                weak = "W" if info.get("is_weak") else "S"
+                flip = "F" if info.get("flipped") else ""
+                ut = info.get("ut_trend", "?")[:1]
+                sqz = (info.get("sqz_dir") or "?")[:1]
+                tag = "{}{}|ut={}|sq={}".format(weak, flip, ut, sqz)
+        
+        elif strategy == "p21_gate4":
+            # Full P2.1 direction + SV3 gate ≥ +4
+            p21_d = r.get("p21_dir")
+            if p21_d:
+                score_for = up_t if p21_d == "UP" else dn_t
+                if score_for >= 4:
+                    bet_dir = p21_d
+                    tag = "gate={}".format(score_for)
+        
+        elif strategy == "p21_gate4_no5":
+            # Full P2.1 direction + SV3 gate ≥ +4, skip score 5
+            p21_d = r.get("p21_dir")
+            if p21_d:
+                score_for = up_t if p21_d == "UP" else dn_t
+                if score_for >= 4 and score_for != 5:
+                    bet_dir = p21_d
+                    tag = "gate={}".format(score_for)
+        
+        elif strategy == "p28":
+            # P2.8 Candle-First: single candle pattern decides direction
+            cp = r.get("candle_pattern")
+            if cp and cp.get("pattern") not in ("doji", "unclear", None):
+                pattern = cp["pattern"]
+                if pattern in ("strong_red", "red_no_lower_wick", "shooting_star", "bull_trap"):
+                    bet_dir = "DOWN"
+                    tag = pattern
+                elif pattern in ("strong_green", "green_no_upper_wick", "hammer", "bear_trap"):
+                    bet_dir = "UP"
+                    tag = pattern
+                elif pattern == "moderate_red":
+                    # Moderate needs price confirmation
+                    if r.get("price_pos") == "DOWN":
+                        bet_dir = "DOWN"
+                        tag = "mod_red+price"
+                elif pattern == "moderate_green":
+                    if r.get("price_pos") == "UP":
+                        bet_dir = "UP"
+                        tag = "mod_green+price"
+        
+        elif strategy == "p29":
+            # P2.9 BlackRock: P2.1 direction + candle confidence
+            p21_d = r.get("p21_dir")
+            cp = r.get("candle_pattern")
+            if p21_d and cp:
+                pattern = cp.get("pattern", "")
+                is_green = cp.get("is_green", False)
+                is_red = cp.get("is_red", False)
+                body_ratio = cp.get("body_ratio", 0)
+                
+                # Check if candle confirms, opposes, or is neutral
+                candle_confirms = False
+                candle_opposes_strong = False
+                skip_reversal = False
+                
+                if p21_d == "UP":
+                    if pattern == "shooting_star":
+                        # Check trend for reversal
+                        cd = r.get("candle_data", {})
+                        c15 = cd.get("15m", [])
+                        if len(c15) >= 5:
+                            recent_greens = sum(1 for c in c15[-5:-1] if c["close"] > c["open"])
+                            if recent_greens >= 3:
+                                skip_reversal = True
+                    if is_green and body_ratio > 0.5:
+                        candle_confirms = True
+                    elif is_green:
+                        candle_confirms = True
+                    elif is_red and body_ratio >= 0.5:
+                        candle_opposes_strong = True
+                elif p21_d == "DOWN":
+                    if pattern == "hammer":
+                        cd = r.get("candle_data", {})
+                        c15 = cd.get("15m", [])
+                        if len(c15) >= 5:
+                            recent_reds = sum(1 for c in c15[-5:-1] if c["close"] < c["open"])
+                            if recent_reds >= 3:
+                                skip_reversal = True
+                    if is_red and body_ratio > 0.5:
+                        candle_confirms = True
+                    elif is_red:
+                        candle_confirms = True
+                    elif is_green and body_ratio >= 0.5:
+                        candle_opposes_strong = True
+                
+                if skip_reversal:
+                    pass  # Skip this trade — reversal pattern
+                elif candle_confirms:
+                    bet_dir = p21_d
+                    tag = "P21+candle"
+                elif candle_opposes_strong:
+                    pass  # Skip — strong candle opposes
+                elif pattern == "doji" or pattern == "unclear":
+                    bet_dir = p21_d
+                    tag = "P21_only"
+                else:
+                    # Moderate/weak candle — P2.1 decides
+                    bet_dir = p21_d
+                    tag = "P21+weak_candle"
+        
         if bet_dir is None:
             continue
         
@@ -23650,6 +24070,11 @@ def backtest_run():
         "flip5": "Candle+Indicator Flip |score| ≥ 5",
         "price_pos": "Pure Price Position",
         "extremes": "Extremes Only (+6 or flip ≤-3)",
+        "p21_full": "P2.1 Full (no TV)",
+        "p21_gate4": "P2.1 Full + SV3 Gate ≥+4",
+        "p21_gate4_no5": "P2.1 Full + Gate ≥+4 (skip 5)",
+        "p28": "P2.8 Candle-First",
+        "p29": "P2.9 BlackRock (P2.1+candle)",
     }
     strat_name = strat_names.get(strategy, strategy)
     
