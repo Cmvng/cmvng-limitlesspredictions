@@ -422,6 +422,21 @@ def _poly_alpha3_load_recent():
     _poly_alpha4_state["floor_balance"] = 5.0
     _poly_alpha4_state["enabled"] = True
     _save_bot_balance("poly_alpha4", _poly_alpha4_state)
+    
+    # Cancel all old pending A4 trades so resolver doesn't add their payouts
+    # to the fresh $50 pool. These were from before the SV3 gate.
+    try:
+        _a4_cleanup = get_db()
+        _a4_old_count = _a4_cleanup.run(
+            "UPDATE poly_alpha4_trades SET status='Cancelled', outcome='OLD_PRE_GATE' "
+            "WHERE status='Pending' AND (indicators IS NULL OR indicators NOT LIKE '%MTF%') "
+            "RETURNING id")
+        _a4_cleanup.close()
+        if _a4_old_count:
+            print("A4: cancelled {} old pre-gate pending trades".format(len(_a4_old_count)))
+    except Exception as _a4c_e:
+        print("A4 cleanup error: {}".format(_a4c_e))
+    
     print("SNIPER A4: $50.00 pool (fresh + SV3 gatekeeper) | P2.1 at boundary | 15M")
     
     # ── A41 PAUSED — not trading on Polymarket until further notice ──
@@ -22036,18 +22051,17 @@ def poly_alpha4_page():
         trades = [dict(zip(cols, row)) for row in trades] if trades else []
     except:
         trades = []
-    # Only count trades from TODAY for P&L (fresh $50 start)
-    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    today_trades = [t for t in trades if str(t.get("fired_at",""))[:10] >= today_str]
-    resolved = [t for t in today_trades if t.get("outcome") in ("WIN","LOSS")]
-    pending = [t for t in today_trades if t.get("outcome") == "PENDING"]
-    skipped = [t for t in today_trades if t.get("status") == "Skipped"]
+    # Only count trades with SV3 gate tags (MTF in indicators) for stats
+    gate_trades = [t for t in trades if "MTF" in str(t.get("indicators","")) or t.get("status") == "Skipped"]
+    resolved = [t for t in gate_trades if t.get("outcome") in ("WIN","LOSS")]
+    pending = [t for t in gate_trades if t.get("outcome") == "PENDING"]
+    skipped = [t for t in gate_trades if t.get("status") == "Skipped"]
     wins = sum(1 for t in resolved if t["outcome"] == "WIN")
     wr = round(wins/len(resolved)*100, 1) if resolved else 0
     pnl = round(sum((float(t.get("payout") or 0) - float(t.get("stake") or 0)) if t["outcome"]=="WIN" else -float(t.get("stake") or 0) for t in resolved), 2)
     bal = _poly_alpha4_state["balance"]
     rows = ""
-    for t in today_trades[:50]:
+    for t in gate_trades[:50]:
         o = t.get("outcome","PENDING")
         s_status = t.get("status","")
         ic = "W" if o=="WIN" else "L" if o=="LOSS" else "S" if s_status=="Skipped" else "P"
