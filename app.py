@@ -2080,8 +2080,15 @@ def _sniper_thread():
                         if _a4w_client:
                             from py_clob_client_v2 import Side as _A4WSide, OrderArgs as _A4WArgs, OrderType as _A4WOT
 
-                            # ── Fetch live order book for best price ≤ 58¢ ──
-                            # Same approach as A41 — read asks[0] for the token
+                            # ── Fetch live order book for best entry price ──
+                            # On Polymarket, to BUY a token we either:
+                            #   a) Hit an existing ASK (taker, instant fill, but expensive)
+                            #   b) Place a BID (maker, wait for fill, but better price)
+                            #
+                            # Strategy: check best ask. If ≤ 58¢ → take it.
+                            # If ask > 58¢ → check bids. Place our bid at best_bid + 1¢
+                            # to get priority, capped at 58¢. This sits in the book
+                            # and fills when price comes to us.
                             _a4w_max_price = 0.58
                             _a4w_fill_price = None
                             try:
@@ -2089,27 +2096,39 @@ def _sniper_thread():
                                 _a4w_n_asks = len(_a4w_book.get("asks", [])) if _a4w_book else 0
                                 _a4w_n_bids = len(_a4w_book.get("bids", [])) if _a4w_book else 0
                                 
+                                _a4w_best_ask = None
+                                _a4w_best_bid = None
                                 if _a4w_n_asks > 0:
                                     _a4w_best_ask = round(float(_a4w_book["asks"][0]["price"]), 2)
-                                    print("A4 WAIT BOOK {}: {} asks, {} bids | best_ask={}c | token={}...".format(
-                                        _a4w_asset, _a4w_n_asks, _a4w_n_bids,
-                                        int(_a4w_best_ask * 100), str(_a4w["token_id"])[:12]))
-                                    
-                                    if _a4w_best_ask <= _a4w_max_price:
-                                        _a4w_fill_price = _a4w_best_ask
-                                    elif _a4w_best_ask >= 0.90:
-                                        # 90¢+ means we're probably reading the wrong side
-                                        # Fall back to 50¢ GTC — let the market come to us
-                                        print("A4 WAIT BOOK {}: ask={}c looks like wrong side — using 50c GTC".format(
-                                            _a4w_asset, int(_a4w_best_ask * 100)))
-                                        _a4w_fill_price = 0.50
-                                    else:
-                                        print("A4 WAIT SKIP: {} {} best ask={}c > 58c cap".format(
-                                            _a4w_dir, _a4w_asset, int(_a4w_best_ask * 100)))
-                                else:
-                                    print("A4 WAIT BOOK {}: empty book ({} asks, {} bids) — using 50c GTC".format(
-                                        _a4w_asset, _a4w_n_asks, _a4w_n_bids))
+                                if _a4w_n_bids > 0:
+                                    _a4w_best_bid = round(float(_a4w_book["bids"][0]["price"]), 2)
+                                
+                                print("A4 WAIT BOOK {}: {} asks, {} bids | ask={}c bid={}c | token={}...".format(
+                                    _a4w_asset, _a4w_n_asks, _a4w_n_bids,
+                                    int(_a4w_best_ask * 100) if _a4w_best_ask else "—",
+                                    int(_a4w_best_bid * 100) if _a4w_best_bid else "—",
+                                    str(_a4w["token_id"])[:12]))
+                                
+                                if _a4w_best_ask and _a4w_best_ask <= _a4w_max_price:
+                                    # Best ask is cheap enough — take it
+                                    _a4w_fill_price = _a4w_best_ask
+                                elif _a4w_best_bid and _a4w_best_bid < _a4w_max_price:
+                                    # Ask is too expensive but there are bids
+                                    # Place our bid at best_bid + 1¢ for priority, capped at 58¢
+                                    _a4w_fill_price = min(round(_a4w_best_bid + 0.01, 2), _a4w_max_price)
+                                    print("A4 WAIT BID: {} {} placing bid at {}c (best_bid={}c, ask={}c)".format(
+                                        _a4w_dir, _a4w_asset, int(_a4w_fill_price * 100),
+                                        int(_a4w_best_bid * 100),
+                                        int(_a4w_best_ask * 100) if _a4w_best_ask else "—"))
+                                elif not _a4w_best_ask and not _a4w_best_bid:
+                                    # Empty book — use 50¢
                                     _a4w_fill_price = 0.50
+                                else:
+                                    # Ask > 58¢ and no bids below 58¢ — skip
+                                    print("A4 WAIT SKIP: {} {} ask={}c bid={}c — no entry below 58c".format(
+                                        _a4w_dir, _a4w_asset,
+                                        int(_a4w_best_ask * 100) if _a4w_best_ask else "—",
+                                        int(_a4w_best_bid * 100) if _a4w_best_bid else "—"))
                             except Exception as _a4w_bke:
                                 _a4w_fill_price = 0.50
                                 print("A4 WAIT book error {}: {} — using 50c".format(_a4w_asset, _a4w_bke))
