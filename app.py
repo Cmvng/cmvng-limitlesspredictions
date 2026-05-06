@@ -22916,6 +22916,600 @@ def export_sv3_csv():
     except Exception as e:
         return "Error: {}".format(e), 500
 
+# ═══════════════════════════════════════════════════════════════════
+# BACKTESTER WORKBENCH — 2-step: cache data, then score strategies
+# Step 1: /app/backtest/fetch?days=3&asset=BTC — fetches & caches data
+# Step 2: /app/backtest/run?strategy=candle3 — scores cached data
+# ═══════════════════════════════════════════════════════════════════
+
+_backtest_cache = {
+    "data": [],       # List of {boundary, asset, actual, candles, up/down scores, ind_dir}
+    "fetched_at": None,
+    "days": 0,
+    "assets": [],
+    "tested": 0,
+    "skipped": 0,
+    "errors": 0,
+    "status": "idle",  # idle, fetching, ready, error
+}
+
+
+@app.route("/app/backtest")
+def backtest_menu():
+    """Backtest workbench — main menu."""
+    c = _backtest_cache
+    status = c["status"]
+    tested = c["tested"]
+    days = c["days"]
+    assets = ", ".join(c["assets"]) if c["assets"] else "—"
+    fetched = c["fetched_at"] or "Never"
+    
+    # Strategy buttons (only enabled if cache is ready)
+    strats = [
+        ("candle1", "SV3 Candle-Led |score| ≥ 1", "Candle direction, any conviction"),
+        ("candle2", "SV3 Candle-Led |score| ≥ 2", "Candle direction, weak+ conviction"),
+        ("candle3", "SV3 Candle-Led |score| ≥ 3", "Candle direction, moderate conviction"),
+        ("candle4", "SV3 Candle-Led |score| ≥ 4", "Candle direction, strong conviction"),
+        ("candle5", "SV3 Candle-Led |score| ≥ 5", "Candle direction, very strong"),
+        ("candle6", "SV3 Candle-Led |score| ≥ 6", "Candle direction, max conviction"),
+        ("indicator", "P2.1 Indicator Direction", "TV+SMA+BTC majority vote"),
+        ("ind_gate3", "Indicator + SV3 Gate ≥ +3", "P2.1 direction, candles must agree +3"),
+        ("ind_gate4", "Indicator + SV3 Gate ≥ +4", "P2.1 direction, candles must agree +4"),
+        ("ind_gate6", "Indicator + SV3 Gate ≥ +6", "P2.1 direction, candles must agree +6"),
+        ("flip3", "Candle+Indicator Flip |score| ≥ 3", "+3 agree=fire, -3 oppose=flip direction"),
+        ("flip4", "Candle+Indicator Flip |score| ≥ 4", "+4 agree=fire, -4 oppose=flip direction"),
+        ("flip5", "Candle+Indicator Flip |score| ≥ 5", "+5 agree=fire, -5 oppose=flip direction"),
+        ("price_pos", "Pure Price Position", "Price above PTB=UP, below=DOWN"),
+        ("extremes", "Extremes Only (+6 or flip ≤-3)", "Only highest conviction trades"),
+    ]
+    
+    strat_btns = ""
+    for sid, name, desc in strats:
+        if status == "ready":
+            strat_btns += '<a href="/app/backtest/run?strategy={}" style="display:block;background:#21262d;border:1px solid #30363d;border-radius:8px;padding:10px 14px;margin:6px 0;text-decoration:none;color:#e6edf3"><b style="color:#58a6ff">{}</b><br><span style="font-size:11px;color:#8b949e">{}</span></a>'.format(sid, name, desc)
+        else:
+            strat_btns += '<div style="display:block;background:#161b22;border:1px solid #21262d;border-radius:8px;padding:10px 14px;margin:6px 0;color:#484f58"><b>{}</b><br><span style="font-size:11px">{}</span></div>'.format(name, desc)
+    
+    status_color = {"idle": "#8b949e", "fetching": "#fbbf24", "ready": "#4ade80", "error": "#f87171"}.get(status, "#8b949e")
+    
+    html = """<!DOCTYPE html><html><head><title>Backtest Workbench</title>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<style>
+body{{background:#0d1117;color:#e6edf3;font-family:sans-serif;margin:0;padding:12px}}
+h1{{font-size:20px;margin:8px 0}}
+h2{{font-size:15px;color:#58a6ff;margin:14px 0 6px}}
+.c{{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:14px;margin-bottom:12px}}
+.s{{display:inline-block;min-width:70px;margin:4px 8px 4px 0}}
+.s .v{{font-size:18px;font-weight:700}}
+.s .l{{font-size:10px;color:#8b949e}}
+.nav{{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px}}
+.nav a{{background:#21262d;padding:6px 12px;border-radius:6px;font-size:12px;color:#58a6ff;text-decoration:none}}
+.nav a.active{{background:#58a6ff;color:#0d1117}}
+</style></head><body>
+<h1>📊 Backtest Workbench</h1>
+
+<h2>Step 1: Fetch & Cache Data</h2>
+<div class=c>
+<div class=s><div class=v style="color:{sc}">{status}</div><div class=l>Status</div></div>
+<div class=s><div class=v>{tested}</div><div class=l>Cached</div></div>
+<div class=s><div class=v>{days}d</div><div class=l>Period</div></div>
+<div class=s><div class=v>{assets}</div><div class=l>Assets</div></div>
+</div>
+
+<p style="font-size:12px;color:#8b949e">Select period and asset, then tap Fetch. Data is cached — fetch once, test many strategies.</p>
+
+<div class=nav>
+<a href="/app/backtest/fetch?days=1&asset=BTC">1d BTC</a>
+<a href="/app/backtest/fetch?days=1&asset=ALL">1d ALL</a>
+<a href="/app/backtest/fetch?days=3&asset=BTC">3d BTC</a>
+<a href="/app/backtest/fetch?days=3&asset=ALL">3d ALL</a>
+<a href="/app/backtest/fetch?days=7&asset=BTC">7d BTC</a>
+<a href="/app/backtest/fetch?days=7&asset=ALL">7d ALL</a>
+</div>
+
+<h2>Step 2: Select Strategy to Test</h2>
+{strat_btns}
+
+<p style="color:#8b949e;font-size:11px;margin-top:16px">
+Fetched: {fetched}<br>
+Real Polymarket outcomes (Gamma API) × Real Binance candles × SV3 scoring.
+</p>
+</body></html>""".format(
+        sc=status_color, status=status.upper(), tested=tested,
+        days=days, assets=assets, strat_btns=strat_btns, fetched=fetched)
+    
+    return html
+
+
+@app.route("/app/backtest/fetch")
+def backtest_fetch():
+    """Step 1: Fetch Polymarket outcomes + Binance candles and cache them."""
+    import requests as _bt_req
+    import json as _bt_json
+    import time as _bt_time
+    from datetime import datetime, timezone, timedelta
+    
+    days = int(request.args.get("days", 3))
+    asset_filter = request.args.get("asset", "BTC").upper()
+    
+    GAMMA = "https://gamma-api.polymarket.com"
+    ASSETS = [asset_filter] if asset_filter != "ALL" else ["BTC", "ETH", "SOL", "XRP"]
+    SLUG_MAP = {"BTC": "btc-updown-15m-{}", "ETH": "eth-updown-15m-{}",
+                "SOL": "sol-updown-15m-{}", "XRP": "xrp-updown-15m-{}"}
+    BINANCE_MAP = {"BTC": "BTCUSDT", "ETH": "ETHUSDT", "SOL": "SOLUSDT", "XRP": "XRPUSDT"}
+    
+    now = datetime.now(timezone.utc)
+    start = now - timedelta(days=days)
+    
+    _backtest_cache["status"] = "fetching"
+    _backtest_cache["data"] = []
+    
+    # Generate all 15M boundary timestamps
+    boundaries = []
+    t = start.replace(minute=(start.minute // 15) * 15, second=0, microsecond=0)
+    while t < now - timedelta(minutes=20):
+        boundaries.append(int(t.timestamp()))
+        t += timedelta(minutes=15)
+    
+    results = []
+    tested = 0
+    skipped = 0
+    api_errors = 0
+    total = len(boundaries) * len(ASSETS)
+    
+    for asset in ASSETS:
+        slug_tmpl = SLUG_MAP.get(asset)
+        if not slug_tmpl:
+            continue
+        
+        for bnd_idx, bnd_ts in enumerate(boundaries):
+            try:
+                # Rate limit
+                if bnd_idx > 0 and bnd_idx % 10 == 0:
+                    _bt_time.sleep(1)
+                
+                # Try both slug formats
+                md = None
+                slug = ""
+                for try_ts in [bnd_ts + 900, bnd_ts]:
+                    try:
+                        _try_slug = slug_tmpl.format(try_ts)
+                        r = _bt_req.get("{}/markets/slug/{}".format(GAMMA, _try_slug), timeout=8)
+                        if r.status_code == 200:
+                            md = r.json()
+                            slug = _try_slug
+                            break
+                        elif r.status_code == 429:
+                            _bt_time.sleep(3)
+                            r = _bt_req.get("{}/markets/slug/{}".format(GAMMA, _try_slug), timeout=8)
+                            if r.status_code == 200:
+                                md = r.json()
+                                slug = _try_slug
+                                break
+                    except:
+                        api_errors += 1
+                
+                if not md or not md.get("closed"):
+                    skipped += 1
+                    continue
+                
+                # Parse outcome
+                ops = md.get("outcomePrices", "")
+                if isinstance(ops, str):
+                    try: ops = _bt_json.loads(ops)
+                    except: continue
+                if not isinstance(ops, list) or len(ops) < 2:
+                    continue
+                
+                # Determine outcome index mapping
+                outcomes = md.get("outcomes", "")
+                if isinstance(outcomes, str):
+                    try: outcomes = _bt_json.loads(outcomes)
+                    except: outcomes = ["Up", "Down"]
+                
+                up_idx = 0
+                if isinstance(outcomes, list) and len(outcomes) >= 2:
+                    if str(outcomes[0]).lower().strip() in ("no", "down", "below"):
+                        up_idx = 1
+                
+                up_price = float(ops[up_idx])
+                down_price = float(ops[1 - up_idx])
+                
+                if up_price > 0.9:
+                    actual = "UP"
+                elif down_price > 0.9:
+                    actual = "DOWN"
+                else:
+                    skipped += 1
+                    continue
+                
+                # Fetch Binance candles
+                candle_data = {}
+                for tf in ["1h", "30m", "15m"]:
+                    try:
+                        cr = _bt_req.get("https://api.binance.com/api/v3/klines", params={
+                            "symbol": BINANCE_MAP[asset],
+                            "interval": tf,
+                            "endTime": bnd_ts * 1000,
+                            "limit": 25,
+                        }, timeout=8)
+                        if cr.status_code == 429:
+                            _bt_time.sleep(5)
+                            cr = _bt_req.get("https://api.binance.com/api/v3/klines", params={
+                                "symbol": BINANCE_MAP[asset],
+                                "interval": tf,
+                                "endTime": bnd_ts * 1000,
+                                "limit": 25,
+                            }, timeout=8)
+                        if cr.status_code == 200:
+                            klines = cr.json()
+                            candles = [{"ts": int(k[0]), "open": float(k[1]), "high": float(k[2]),
+                                        "low": float(k[3]), "close": float(k[4]), "volume": float(k[5])}
+                                       for k in klines]
+                            if len(candles) >= 5:
+                                candle_data[tf] = candles[-20:]
+                    except:
+                        api_errors += 1
+                
+                if not candle_data.get("15m"):
+                    skipped += 1
+                    continue
+                
+                # Score SV3 for BOTH directions
+                up_1h, _ = _sv3_score_timeframe(candle_data.get("1h"), "UP") if candle_data.get("1h") else (0, {})
+                up_30, _ = _sv3_score_timeframe(candle_data.get("30m"), "UP") if candle_data.get("30m") else (0, {})
+                up_15, _ = _sv3_score_timeframe(candle_data.get("15m"), "UP")
+                up_total = up_1h + up_30 + up_15
+                
+                dn_1h, _ = _sv3_score_timeframe(candle_data.get("1h"), "DOWN") if candle_data.get("1h") else (0, {})
+                dn_30, _ = _sv3_score_timeframe(candle_data.get("30m"), "DOWN") if candle_data.get("30m") else (0, {})
+                dn_15, _ = _sv3_score_timeframe(candle_data.get("15m"), "DOWN")
+                dn_total = dn_1h + dn_30 + dn_15
+                
+                # Candle direction
+                if up_total > dn_total:
+                    candle_dir = "UP"
+                    candle_score = up_total
+                elif dn_total > up_total:
+                    candle_dir = "DOWN"
+                    candle_score = dn_total
+                else:
+                    candle_dir = None
+                    candle_score = 0
+                
+                # Indicator direction (SMA from 1H candles)
+                ind_dir = None
+                if candle_data.get("1h") and len(candle_data["1h"]) >= 10:
+                    closes = [c["close"] for c in candle_data["1h"]]
+                    sma10 = sum(closes[-10:]) / 10
+                    ind_dir = "UP" if closes[-1] > sma10 else "DOWN"
+                
+                # Price position
+                price_pos = None
+                if candle_data.get("15m") and len(candle_data["15m"]) >= 2:
+                    prev_close = candle_data["15m"][-2]["close"]
+                    last_close = candle_data["15m"][-1]["close"]
+                    price_pos = "UP" if last_close > prev_close else "DOWN"
+                
+                bnd_dt = datetime.fromtimestamp(bnd_ts, tz=timezone.utc)
+                
+                results.append({
+                    "asset": asset,
+                    "boundary": bnd_dt.strftime("%m-%d %H:%M"),
+                    "actual": actual,
+                    "candle_dir": candle_dir,
+                    "candle_score": candle_score,
+                    "up_total": up_total,
+                    "dn_total": dn_total,
+                    "up_detail": "{}/{}/{}".format(up_1h, up_30, up_15),
+                    "dn_detail": "{}/{}/{}".format(dn_1h, dn_30, dn_15),
+                    "ind_dir": ind_dir,
+                    "price_pos": price_pos,
+                })
+                tested += 1
+                
+            except Exception as e:
+                api_errors += 1
+    
+    # Save to cache
+    _backtest_cache["data"] = results
+    _backtest_cache["tested"] = tested
+    _backtest_cache["skipped"] = skipped
+    _backtest_cache["errors"] = api_errors
+    _backtest_cache["days"] = days
+    _backtest_cache["assets"] = ASSETS
+    _backtest_cache["fetched_at"] = now.strftime("%Y-%m-%d %H:%M UTC")
+    _backtest_cache["status"] = "ready" if tested > 0 else "error"
+    
+    # Redirect back to menu
+    return '<html><head><meta http-equiv="refresh" content="0;url=/app/backtest"></head><body>Cached {} boundaries. <a href="/app/backtest">Back to menu</a></body></html>'.format(tested)
+
+
+@app.route("/app/backtest/run")
+def backtest_run():
+    """Step 2: Score a single strategy against cached data."""
+    strategy = request.args.get("strategy", "candle3")
+    data = _backtest_cache.get("data", [])
+    
+    if not data:
+        return '<html><body style="background:#0d1117;color:#e6edf3;padding:20px">No cached data. <a href="/app/backtest" style="color:#58a6ff">Go fetch data first</a></body></html>'
+    
+    # ── Apply strategy logic ──
+    wins = 0
+    losses = 0
+    trades = []
+    
+    for r in data:
+        actual = r["actual"]
+        candle_dir = r["candle_dir"]
+        candle_score = r["candle_score"]
+        ind_dir = r["ind_dir"]
+        up_t = r["up_total"]
+        dn_t = r["dn_total"]
+        price_pos = r.get("price_pos")
+        
+        bet_dir = None
+        tag = ""
+        
+        if strategy == "candle1":
+            if candle_dir and candle_score >= 1:
+                bet_dir = candle_dir
+                tag = "score={}".format(candle_score)
+        
+        elif strategy == "candle2":
+            if candle_dir and candle_score >= 2:
+                bet_dir = candle_dir
+                tag = "score={}".format(candle_score)
+        
+        elif strategy == "candle3":
+            if candle_dir and candle_score >= 3:
+                bet_dir = candle_dir
+                tag = "score={}".format(candle_score)
+        
+        elif strategy == "candle4":
+            if candle_dir and candle_score >= 4:
+                bet_dir = candle_dir
+                tag = "score={}".format(candle_score)
+        
+        elif strategy == "candle5":
+            if candle_dir and candle_score >= 5:
+                bet_dir = candle_dir
+                tag = "score={}".format(candle_score)
+        
+        elif strategy == "candle6":
+            if candle_dir and candle_score >= 6:
+                bet_dir = candle_dir
+                tag = "score={}".format(candle_score)
+        
+        elif strategy == "indicator":
+            if ind_dir:
+                bet_dir = ind_dir
+                tag = "SMA"
+        
+        elif strategy == "ind_gate3":
+            if ind_dir:
+                score_for_dir = up_t if ind_dir == "UP" else dn_t
+                if score_for_dir >= 3:
+                    bet_dir = ind_dir
+                    tag = "gate={}".format(score_for_dir)
+        
+        elif strategy == "ind_gate4":
+            if ind_dir:
+                score_for_dir = up_t if ind_dir == "UP" else dn_t
+                if score_for_dir >= 4:
+                    bet_dir = ind_dir
+                    tag = "gate={}".format(score_for_dir)
+        
+        elif strategy == "ind_gate6":
+            if ind_dir:
+                score_for_dir = up_t if ind_dir == "UP" else dn_t
+                if score_for_dir >= 6:
+                    bet_dir = ind_dir
+                    tag = "gate={}".format(score_for_dir)
+        
+        elif strategy == "flip3":
+            if ind_dir:
+                score_for_dir = up_t if ind_dir == "UP" else dn_t
+                score_against = dn_t if ind_dir == "UP" else up_t
+                if score_for_dir >= 3:
+                    bet_dir = ind_dir
+                    tag = "agree +{}".format(score_for_dir)
+                elif score_against >= 3:
+                    bet_dir = "DOWN" if ind_dir == "UP" else "UP"
+                    tag = "flip -{}".format(score_against)
+        
+        elif strategy == "flip4":
+            if ind_dir:
+                score_for_dir = up_t if ind_dir == "UP" else dn_t
+                score_against = dn_t if ind_dir == "UP" else up_t
+                if score_for_dir >= 4:
+                    bet_dir = ind_dir
+                    tag = "agree +{}".format(score_for_dir)
+                elif score_against >= 4:
+                    bet_dir = "DOWN" if ind_dir == "UP" else "UP"
+                    tag = "flip -{}".format(score_against)
+        
+        elif strategy == "flip5":
+            if ind_dir:
+                score_for_dir = up_t if ind_dir == "UP" else dn_t
+                score_against = dn_t if ind_dir == "UP" else up_t
+                if score_for_dir >= 5:
+                    bet_dir = ind_dir
+                    tag = "agree +{}".format(score_for_dir)
+                elif score_against >= 5:
+                    bet_dir = "DOWN" if ind_dir == "UP" else "UP"
+                    tag = "flip -{}".format(score_against)
+        
+        elif strategy == "price_pos":
+            if price_pos:
+                bet_dir = price_pos
+                tag = "price"
+        
+        elif strategy == "extremes":
+            # +6 agree OR flip when ≤-3
+            if ind_dir:
+                score_for_dir = up_t if ind_dir == "UP" else dn_t
+                score_against = dn_t if ind_dir == "UP" else up_t
+                if score_for_dir >= 6:
+                    bet_dir = ind_dir
+                    tag = "agree +{}".format(score_for_dir)
+                elif score_against >= 3:
+                    bet_dir = "DOWN" if ind_dir == "UP" else "UP"
+                    tag = "flip -{}".format(score_against)
+        
+        if bet_dir is None:
+            continue
+        
+        won = bet_dir == actual
+        if won:
+            wins += 1
+        else:
+            losses += 1
+        
+        trades.append({
+            "boundary": r["boundary"],
+            "asset": r["asset"],
+            "bet": bet_dir,
+            "actual": actual,
+            "won": won,
+            "tag": tag,
+            "up_t": up_t,
+            "dn_t": dn_t,
+        })
+    
+    total = wins + losses
+    wr = round(wins / total * 100, 1) if total > 0 else 0
+    pnl = round(wins * 2.35 - losses * 2.50, 2)
+    
+    # Score distribution
+    from collections import defaultdict
+    score_bins = defaultdict(lambda: {"w": 0, "l": 0})
+    for t in trades:
+        sc = max(t["up_t"], t["dn_t"])
+        if t["won"]:
+            score_bins[sc]["w"] += 1
+        else:
+            score_bins[sc]["l"] += 1
+    
+    dist_rows = ""
+    for sc in sorted(score_bins.keys(), reverse=True):
+        d = score_bins[sc]
+        tt = d["w"] + d["l"]
+        swr = round(d["w"] / tt * 100, 1) if tt > 0 else 0
+        spnl = round(d["w"] * 2.35 - d["l"] * 2.50, 2)
+        wrc = "#4ade80" if swr >= 55 else "#f87171" if swr < 50 else "#fbbf24"
+        pc = "#4ade80" if spnl > 0 else "#f87171"
+        dist_rows += "<tr><td>Score {}</td><td>{}</td><td>{}W/{}L</td><td style='color:{}'>{:.1f}%</td><td style='color:{}'>${:+.2f}</td></tr>".format(
+            sc, tt, d["w"], d["l"], wrc, swr, pc, spnl)
+    
+    # Asset breakdown
+    asset_stats = defaultdict(lambda: {"w": 0, "l": 0})
+    for t in trades:
+        if t["won"]:
+            asset_stats[t["asset"]]["w"] += 1
+        else:
+            asset_stats[t["asset"]]["l"] += 1
+    
+    asset_rows = ""
+    for a in sorted(asset_stats.keys()):
+        d = asset_stats[a]
+        tt = d["w"] + d["l"]
+        awr = round(d["w"] / tt * 100, 1) if tt > 0 else 0
+        apnl = round(d["w"] * 2.35 - d["l"] * 2.50, 2)
+        wrc = "#4ade80" if awr >= 55 else "#f87171" if awr < 50 else "#fbbf24"
+        pc = "#4ade80" if apnl > 0 else "#f87171"
+        asset_rows += "<tr><td>{}</td><td>{}</td><td>{}W/{}L</td><td style='color:{}'>{:.1f}%</td><td style='color:{}'>${:+.2f}</td></tr>".format(
+            a, tt, d["w"], d["l"], wrc, awr, pc, apnl)
+    
+    # Trade detail (last 60)
+    detail_rows = ""
+    for t in trades[-60:]:
+        tc = "#4ade80" if t["won"] else "#f87171"
+        icon = "✅" if t["won"] else "❌"
+        detail_rows += "<tr><td>{}</td><td>{}</td><td>{}</td><td style='color:{}'>{} {}</td><td>{}</td><td>↑{} ↓{}</td></tr>".format(
+            t["boundary"], t["asset"], t["actual"], tc, icon, t["bet"], t["tag"], t["up_t"], t["dn_t"])
+    
+    # Strategy name lookup
+    strat_names = {
+        "candle1": "SV3 Candle-Led |score| ≥ 1",
+        "candle2": "SV3 Candle-Led |score| ≥ 2",
+        "candle3": "SV3 Candle-Led |score| ≥ 3",
+        "candle4": "SV3 Candle-Led |score| ≥ 4",
+        "candle5": "SV3 Candle-Led |score| ≥ 5",
+        "candle6": "SV3 Candle-Led |score| ≥ 6",
+        "indicator": "P2.1 Indicator Direction",
+        "ind_gate3": "Indicator + SV3 Gate ≥ +3",
+        "ind_gate4": "Indicator + SV3 Gate ≥ +4",
+        "ind_gate6": "Indicator + SV3 Gate ≥ +6",
+        "flip3": "Candle+Indicator Flip |score| ≥ 3",
+        "flip4": "Candle+Indicator Flip |score| ≥ 4",
+        "flip5": "Candle+Indicator Flip |score| ≥ 5",
+        "price_pos": "Pure Price Position",
+        "extremes": "Extremes Only (+6 or flip ≤-3)",
+    }
+    strat_name = strat_names.get(strategy, strategy)
+    
+    wrc = "#4ade80" if wr >= 55 else "#f87171" if wr < 50 else "#fbbf24"
+    pnlc = "#4ade80" if pnl > 0 else "#f87171"
+    
+    html = """<!DOCTYPE html><html><head><title>Backtest: {name}</title>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<style>
+body{{background:#0d1117;color:#e6edf3;font-family:sans-serif;margin:0;padding:12px}}
+h1{{font-size:18px;margin:8px 0}}
+h2{{font-size:14px;color:#58a6ff;margin:14px 0 6px}}
+.c{{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:14px;margin-bottom:12px}}
+.s{{display:inline-block;min-width:70px;margin:4px 8px 4px 0}}
+.s .v{{font-size:22px;font-weight:700}}
+.s .l{{font-size:10px;color:#8b949e}}
+table{{width:100%;border-collapse:collapse;font-size:12px}}
+th{{text-align:left;color:#8b949e;padding:5px;border-bottom:1px solid #30363d;font-size:11px}}
+td{{padding:5px;border-bottom:1px solid #21262d}}
+a{{color:#58a6ff;text-decoration:none}}
+</style></head><body>
+<a href="/app/backtest">← Back to Workbench</a>
+<h1>📊 {name}</h1>
+
+<div class=c>
+<div class=s><div class=v>{total}</div><div class=l>Trades</div></div>
+<div class=s><div class=v>{wins}W/{losses}L</div><div class=l>Record</div></div>
+<div class=s><div class=v style="color:{wrc}">{wr:.1f}%</div><div class=l>Win Rate</div></div>
+<div class=s><div class=v style="color:{pnlc}">${pnl:+.2f}</div><div class=l>Est P&L</div></div>
+</div>
+
+<h2>By Score Level</h2>
+<div class=c><table>
+<tr><th>Score</th><th>Trades</th><th>Record</th><th>Win Rate</th><th>P&L</th></tr>
+{dist_rows}
+</table></div>
+
+<h2>By Asset</h2>
+<div class=c><table>
+<tr><th>Asset</th><th>Trades</th><th>Record</th><th>Win Rate</th><th>P&L</th></tr>
+{asset_rows}
+</table></div>
+
+<h2>Trade Detail (last 60)</h2>
+<div class=c><table>
+<tr><th>Time</th><th>Asset</th><th>Actual</th><th>Bet</th><th>Tag</th><th>Scores</th></tr>
+{detail_rows}
+</table></div>
+
+<p style="color:#8b949e;font-size:11px">
+Data: {cached} boundaries | {period}d | {assets}<br>
+T+0 at 50¢. Win=$2.35, Loss=$2.50 (3% fee).
+</p>
+</body></html>""".format(
+        name=strat_name, total=total, wins=wins, losses=losses,
+        wrc=wrc, wr=wr, pnlc=pnlc, pnl=pnl,
+        dist_rows=dist_rows, asset_rows=asset_rows, detail_rows=detail_rows,
+        cached=_backtest_cache["tested"],
+        period=_backtest_cache["days"],
+        assets=", ".join(_backtest_cache["assets"]))
+    
+    return html
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
