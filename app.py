@@ -783,28 +783,44 @@ def _sv3_fetch_mtf_candles(asset, num_candles=20):
 
 
 def _sv3_score_timeframe(candles, signal_direction):
-    """Score a single timeframe's support for the signal direction.
-    Returns (score, reasons) where score is -2 to +2.
+    """SV3 Smart Price Action Scoring v2.
+
+    Reads candle structure on a single timeframe and scores support
+    for the signal direction relative to the PTB.
+
+    Concepts scored (8 total):
+    1. Trend (first-third vs last-third + last 5 candle direction)
+    2. Momentum (last 3 candles, body shrinking detection)
+    3. Candle patterns (engulfing, shooting star, hammer, doji)
+    4. BOS / CHoCH (did recent candles break first-half extremes?)
+    5. Equal Highs / Equal Lows (liquidity pools — clustered pivot levels)
+    6. Fakeouts (wick beyond key level + close back inside)
+    7. Extension from SMA (overextended = revert risk)
+    8. Fib Exhaustion (price at 0.618+ retracement of recent swing)
+
+    Returns (score, reasons) where score is clamped -3 to +3.
     """
     if not candles or len(candles) < 5:
         return 0, ["insufficient candles"]
-    
+
     reasons = []
     score = 0
     sig_bull = signal_direction == "UP"
     sig_bear = signal_direction == "DOWN"
     n = len(candles)
-    
-    # ── TREND: compare first third vs last third ──
+
+    # ══════════════════════════════════════════════════════════
+    # 1. TREND: compare first third vs last third
+    # ══════════════════════════════════════════════════════════
     third = max(3, n // 3)
     avg_start = sum(c["close"] for c in candles[:third]) / third
     avg_end = sum(c["close"] for c in candles[-third:]) / third
     move_pct = (avg_end - avg_start) / avg_start * 100 if avg_start > 0 else 0
-    
+
     last5 = candles[-5:]
     greens_5 = sum(1 for c in last5 if c["close"] > c["open"])
     reds_5 = sum(1 for c in last5 if c["close"] < c["open"])
-    
+
     if move_pct > 0.1 and greens_5 >= 3:
         trend = "UP"
     elif move_pct < -0.1 and reds_5 >= 3:
@@ -817,25 +833,29 @@ def _sv3_score_timeframe(candles, signal_direction):
         trend = "DOWN"
     else:
         trend = "RANGE"
-    
-    # ── MOMENTUM: last 3 candles ──
+
+    # ══════════════════════════════════════════════════════════
+    # 2. MOMENTUM: last 3 candles
+    # ══════════════════════════════════════════════════════════
     last3 = candles[-3:]
     greens = sum(1 for c in last3 if c["close"] > c["open"])
     reds = sum(1 for c in last3 if c["close"] < c["open"])
     bodies = [abs(c["close"] - c["open"]) for c in last3]
     body_shrinking = bodies[-1] < bodies[0] * 0.5 if bodies[0] > 0 else False
-    
-    # ── LAST CANDLE PATTERN ──
+
+    # ══════════════════════════════════════════════════════════
+    # 3. LAST CANDLE PATTERN
+    # ══════════════════════════════════════════════════════════
     last = candles[-1]
     prev = candles[-2]
     last_range = last["high"] - last["low"]
     last_body = abs(last["close"] - last["open"])
     last_green = last["close"] > last["open"]
     last_red = last["close"] < last["open"]
-    
+
     strong_close = (last_body / last_range > 0.6) if last_range > 0 else False
     is_doji = (last_body / last_range < 0.15) if last_range > 0 else True
-    
+
     upper_wick = last["high"] - max(last["open"], last["close"])
     lower_wick = min(last["open"], last["close"]) - last["low"]
     shooting_star = False
@@ -845,12 +865,14 @@ def _sv3_score_timeframe(candles, signal_direction):
             shooting_star = True
         if lower_wick / last_range > 0.55 and last_body / last_range < 0.3:
             hammer = True
-    
+
     prev_body = abs(prev["close"] - prev["open"])
     bull_engulf = last_green and prev["close"] < prev["open"] and last_body > prev_body * 1.2
     bear_engulf = last_red and prev["close"] > prev["open"] and last_body > prev_body * 1.2
-    
-    # ── RANGE POSITION (only used when trend=RANGE) ──
+
+    # ══════════════════════════════════════════════════════════
+    # 4. RANGE POSITION
+    # ══════════════════════════════════════════════════════════
     range_top = max(c["high"] for c in candles)
     range_bot = min(c["low"] for c in candles)
     full_range = range_top - range_bot
@@ -858,8 +880,10 @@ def _sv3_score_timeframe(candles, signal_direction):
     position = (last_close - range_bot) / full_range if full_range > 0 else 0.5
     near_top = position >= 0.75
     near_bottom = position <= 0.25
-    
-    # ── BOS (simplified: did recent candles break first-half extremes?) ──
+
+    # ══════════════════════════════════════════════════════════
+    # 5. BOS / CHoCH
+    # ══════════════════════════════════════════════════════════
     half = max(3, n // 2)
     first_half_high = max(c["high"] for c in candles[:half])
     first_half_low = min(c["low"] for c in candles[:half])
@@ -867,34 +891,176 @@ def _sv3_score_timeframe(candles, signal_direction):
     bearish_bos = any(c["close"] < first_half_low for c in candles[-3:])
     choch_bull = trend == "DOWN" and bullish_bos
     choch_bear = trend == "UP" and bearish_bos
-    
-    # ═══ SCORING ═══
-    
-    # Trend alignment
+
+    # ══════════════════════════════════════════════════════════
+    # 6. EQUAL HIGHS / EQUAL LOWS (Liquidity Pools)
+    #    Find pivot highs/lows. Two pivots within 10% of ATR
+    #    → equal highs/lows = liquidity pool smart money targets.
+    # ══════════════════════════════════════════════════════════
+    pivot_len = 3
+    pivot_highs = []
+    pivot_lows = []
+
+    for i in range(pivot_len, n - pivot_len):
+        is_ph = all(candles[i]["high"] >= candles[i-j]["high"] and
+                     candles[i]["high"] >= candles[i+j]["high"]
+                     for j in range(1, pivot_len + 1))
+        if is_ph:
+            pivot_highs.append(candles[i]["high"])
+
+        is_pl = all(candles[i]["low"] <= candles[i-j]["low"] and
+                     candles[i]["low"] <= candles[i+j]["low"]
+                     for j in range(1, pivot_len + 1))
+        if is_pl:
+            pivot_lows.append(candles[i]["low"])
+
+    atr_approx = sum(c["high"] - c["low"] for c in candles[-10:]) / min(10, n) if n > 0 else 1
+    eq_threshold = atr_approx * 0.1
+
+    eqh_detected = False
+    eqh_level = None
+    for i in range(len(pivot_highs)):
+        for j in range(i + 1, len(pivot_highs)):
+            if abs(pivot_highs[i] - pivot_highs[j]) < eq_threshold:
+                eqh_detected = True
+                eqh_level = (pivot_highs[i] + pivot_highs[j]) / 2
+                break
+        if eqh_detected:
+            break
+
+    eql_detected = False
+    eql_level = None
+    for i in range(len(pivot_lows)):
+        for j in range(i + 1, len(pivot_lows)):
+            if abs(pivot_lows[i] - pivot_lows[j]) < eq_threshold:
+                eql_detected = True
+                eql_level = (pivot_lows[i] + pivot_lows[j]) / 2
+                break
+        if eql_detected:
+            break
+
+    # ══════════════════════════════════════════════════════════
+    # 7. FAKEOUT DETECTION
+    #    Wick beyond key level + close back inside = liquidity
+    #    grab = reversal signal.
+    #    GUARD: range must be significant (> 0.5 ATR) and the
+    #    wick must extend meaningfully beyond the level (> 20% ATR).
+    #    Without these guards, tight ranges produce false fakeouts.
+    # ══════════════════════════════════════════════════════════
+    fakeout_bull = False
+    fakeout_bear = False
+    min_range_for_fakeout = atr_approx * 0.5  # Range must be at least half ATR
+    min_wick_extension = atr_approx * 0.2     # Wick must extend 20%+ ATR beyond level
+
+    # Fakeout above range top (wick above, close red below)
+    if (full_range > min_range_for_fakeout and
+            last["high"] > range_top and
+            (last["high"] - range_top) > min_wick_extension and
+            last_red and last["close"] < range_top):
+        fakeout_bear = True
+        reasons.append("fakeout above range top")
+
+    # Fakeout below range bottom (wick below, close green above)
+    if (full_range > min_range_for_fakeout and
+            last["low"] < range_bot and
+            (range_bot - last["low"]) > min_wick_extension and
+            last_green and last["close"] > range_bot):
+        fakeout_bull = True
+        reasons.append("fakeout below range bot")
+
+    # Fakeout at EQH (wick above EQH, close below → bearish)
+    if eqh_detected and eqh_level:
+        if (last["high"] > eqh_level and
+                (last["high"] - eqh_level) > min_wick_extension and
+                last["close"] < eqh_level):
+            fakeout_bear = True
+            reasons.append("fakeout above EQH")
+
+    # Fakeout at EQL (wick below EQL, close above → bullish)
+    if eql_detected and eql_level:
+        if (last["low"] < eql_level and
+                (eql_level - last["low"]) > min_wick_extension and
+                last["close"] > eql_level):
+            fakeout_bull = True
+            reasons.append("fakeout below EQL")
+
+    # ══════════════════════════════════════════════════════════
+    # 8. EXTENSION FROM SMA
+    # ══════════════════════════════════════════════════════════
+    sma_period = min(10, n)
+    sma = sum(c["close"] for c in candles[-sma_period:]) / sma_period
+    extension_from_sma = (last_close - sma) / sma * 100 if sma > 0 else 0
+    overextended_up = extension_from_sma > 0.15
+    overextended_down = extension_from_sma < -0.15
+
+    # ══════════════════════════════════════════════════════════
+    # 9. FIB EXHAUSTION
+    #    Recent swing retraced 61.8%+ → move likely exhausted.
+    # ══════════════════════════════════════════════════════════
+    swing_high = max(c["high"] for c in candles[-min(15, n):])
+    swing_low = min(c["low"] for c in candles[-min(15, n):])
+    swing_range = swing_high - swing_low
+    fib_exhausted = False
+    if swing_range > 0:
+        if trend == "UP":
+            fib_retrace = (swing_high - last_close) / swing_range
+            if fib_retrace >= 0.618:
+                fib_exhausted = True
+        elif trend == "DOWN":
+            fib_retrace = (last_close - swing_low) / swing_range
+            if fib_retrace >= 0.618:
+                fib_exhausted = True
+
+    # ══════════════════════════════════════════════════════════
+    # ═══════════════ SCORING ════════════════════════════════
+    # ══════════════════════════════════════════════════════════
+
+    # NOISE GUARD: If ATR is < 0.03% of price, the candles are near-
+    # identical (nano-range). In this case, only score trend/range.
+    # Skip momentum, EQH/EQL, fakeout, extension, fib — they produce
+    # false signals on meaningless candle variations.
+    price_ref = last_close if last_close > 0 else 1
+    noise_market = atr_approx < price_ref * 0.0005  # < 0.05% of price
+
+    # --- Trend alignment ---
     if trend == "UP":
-        if sig_bull: score += 1; reasons.append("trend UP matches signal")
-        else: score -= 1; reasons.append("trend UP opposes DOWN signal")
+        if sig_bull: score += 1; reasons.append("trend UP matches")
+        else: score -= 1; reasons.append("trend UP opposes DOWN")
     elif trend == "DOWN":
-        if sig_bear: score += 1; reasons.append("trend DOWN matches signal")
-        else: score -= 1; reasons.append("trend DOWN opposes UP signal")
+        if sig_bear: score += 1; reasons.append("trend DOWN matches")
+        else: score -= 1; reasons.append("trend DOWN opposes UP")
     else:
-        if sig_bull and near_bottom: score += 1; reasons.append("range: PTB near floor + UP = bounce")
-        elif sig_bear and near_top: score += 1; reasons.append("range: PTB near ceiling + DOWN = rejection")
-        elif sig_bull and near_top: score -= 1; reasons.append("range: PTB near ceiling + UP = hard")
-        elif sig_bear and near_bottom: score -= 1; reasons.append("range: PTB near floor + DOWN = hard")
-        else: reasons.append("range: mid-range, neutral")
-    
-    # Momentum alignment
-    if sig_bull and greens >= 2 and not body_shrinking:
-        score += 1; reasons.append("{}g in last 3".format(greens))
-    elif sig_bear and reds >= 2 and not body_shrinking:
-        score += 1; reasons.append("{}r in last 3".format(reds))
-    elif sig_bull and reds >= 2:
-        score -= 1; reasons.append("{}r oppose UP".format(reds))
-    elif sig_bear and greens >= 2:
-        score -= 1; reasons.append("{}g oppose DOWN".format(greens))
-    
-    # Candle pattern
+        if sig_bull and near_bottom: score += 1; reasons.append("range: near floor + UP")
+        elif sig_bear and near_top: score += 1; reasons.append("range: near ceiling + DOWN")
+        elif sig_bull and near_top: score -= 1; reasons.append("range: ceiling + UP = hard")
+        elif sig_bear and near_bottom: score -= 1; reasons.append("range: floor + DOWN = hard")
+        else: reasons.append("range: mid, neutral")
+
+    # If noise market, skip all advanced scoring — just return trend score
+    if noise_market:
+        reasons.append("nano-range (ATR {:.4f}% of price) — only trend scored".format(
+            atr_approx / price_ref * 100))
+        return max(-3, min(3, score)), reasons
+
+    # --- Momentum alignment ---
+    # Guard: candle bodies must be > 15% of ATR to count as real momentum.
+    # In flat markets, alternating tiny green/red creates false 2/3 majority.
+    avg_last3_body = sum(abs(cc["close"] - cc["open"]) for cc in last3) / 3 if last3 else 0
+    momentum_meaningful = avg_last3_body > atr_approx * 0.15 if atr_approx > 0 else False
+
+    if momentum_meaningful:
+        if sig_bull and greens >= 2 and not body_shrinking:
+            score += 1; reasons.append("{}g last3".format(greens))
+        elif sig_bear and reds >= 2 and not body_shrinking:
+            score += 1; reasons.append("{}r last3".format(reds))
+        elif sig_bull and reds >= 2:
+            score -= 1; reasons.append("{}r oppose UP".format(reds))
+        elif sig_bear and greens >= 2:
+            score -= 1; reasons.append("{}g oppose DOWN".format(greens))
+    else:
+        reasons.append("weak momentum (bodies < 15% ATR)")
+
+    # --- Candle pattern ---
     if sig_bull and bull_engulf: score += 1; reasons.append("bull engulf")
     elif sig_bear and bear_engulf: score += 1; reasons.append("bear engulf")
     elif sig_bull and shooting_star: score -= 1; reasons.append("shooting star")
@@ -902,41 +1068,82 @@ def _sv3_score_timeframe(candles, signal_direction):
     elif is_doji: reasons.append("doji")
     elif sig_bull and last_green and strong_close: reasons.append("strong green")
     elif sig_bear and last_red and strong_close: reasons.append("strong red")
-    
-    # Retracement risk: is the last candle overextended?
-    # If the last candle made a big move in the signal direction,
-    # the PTB (= its close) is at the extreme — next candle likely pulls back.
-    # Compare last candle body to average body of previous 5 candles.
+
+    # --- BOS / CHoCH ---
+    if bullish_bos and sig_bull and not choch_bull:
+        score += 1; reasons.append("bull BOS")
+    elif bearish_bos and sig_bear and not choch_bear:
+        score += 1; reasons.append("bear BOS")
+    elif choch_bull and sig_bull:
+        score += 1; reasons.append("CHoCH bull")
+    elif choch_bear and sig_bear:
+        score += 1; reasons.append("CHoCH bear")
+    elif bullish_bos and sig_bear:
+        score -= 1; reasons.append("bull BOS opposes")
+    elif bearish_bos and sig_bull:
+        score -= 1; reasons.append("bear BOS opposes")
+
+    # --- Equal Highs / Lows (Liquidity Pools) ---
+    # Guard: EQH/EQL only meaningful if the level is separated from
+    # current price by at least 20% of ATR. In tight ranges, all
+    # highs/lows are "equal" — that's noise, not a liquidity pool.
+    eqh_significant = eqh_detected and eqh_level and abs(last_close - eqh_level) > atr_approx * 0.2
+    eql_significant = eql_detected and eql_level and abs(last_close - eql_level) > atr_approx * 0.2
+
+    if eqh_significant:
+        if last_close < eqh_level:
+            if sig_bull: score += 1; reasons.append("EQH liq magnet UP")
+            else: reasons.append("EQH above — caution")
+        else:
+            if sig_bear: score += 1; reasons.append("EQH swept → reversal DOWN")
+            elif sig_bull: reasons.append("EQH swept — no fuel UP")
+
+    if eql_significant:
+        if last_close > eql_level:
+            if sig_bear: score += 1; reasons.append("EQL liq magnet DOWN")
+            else: reasons.append("EQL below — caution")
+        else:
+            if sig_bull: score += 1; reasons.append("EQL swept → reversal UP")
+            elif sig_bear: reasons.append("EQL swept — no fuel DOWN")
+
+    # --- Fakeout scoring ---
+    if fakeout_bull and sig_bull:
+        score += 1; reasons.append("fakeout → supports UP")
+    elif fakeout_bull and sig_bear:
+        score -= 1; reasons.append("fakeout → opposes DOWN")
+    elif fakeout_bear and sig_bear:
+        score += 1; reasons.append("fakeout → supports DOWN")
+    elif fakeout_bear and sig_bull:
+        score -= 1; reasons.append("fakeout → opposes UP")
+
+    # --- Extension from SMA ---
+    if overextended_up and sig_bull:
+        score -= 1; reasons.append("overext UP — revert risk")
+    elif overextended_down and sig_bear:
+        score -= 1; reasons.append("overext DOWN — revert risk")
+    elif overextended_up and sig_bear:
+        score += 1; reasons.append("overext UP → mean revert DOWN")
+    elif overextended_down and sig_bull:
+        score += 1; reasons.append("overext DOWN → mean revert UP")
+
+    # --- Fib Exhaustion ---
+    if fib_exhausted:
+        if (trend == "UP" and sig_bull) or (trend == "DOWN" and sig_bear):
+            score -= 1; reasons.append("fib exhaustion — move spent")
+        else:
+            score += 1; reasons.append("fib exhaustion → reversal")
+
+    # --- Candle overextension (last candle body vs avg) ---
     if len(candles) >= 6:
         prev5_bodies = [abs(c["close"] - c["open"]) for c in candles[-6:-1]]
         avg_body = sum(prev5_bodies) / len(prev5_bodies) if prev5_bodies else 0
-        
         if avg_body > 0:
             extension_ratio = last_body / avg_body
-            
-            # Last candle is 2x+ bigger than average AND in signal direction
-            # → PTB at the extreme of an overextended move → retracement likely
-            overextended_bull = sig_bull and last_green and extension_ratio >= 2.0
-            overextended_bear = sig_bear and last_red and extension_ratio >= 2.0
-            
-            if overextended_bull or overextended_bear:
+            if ((sig_bull and last_green) or (sig_bear and last_red)) and extension_ratio >= 2.0:
                 score -= 1
-                reasons.append("overextended {:.1f}x avg".format(extension_ratio))
-            
-            # Last candle is tiny (< 0.3x average) → indecision at PTB
-            # Not a strong penalty, just noted
-            elif extension_ratio < 0.3 and not is_doji:
-                reasons.append("tiny candle {:.1f}x avg".format(extension_ratio))
-    
-    # BOS/CHoCH
-    if bullish_bos and sig_bull and not choch_bull: score += 1; reasons.append("bull BOS")
-    elif bearish_bos and sig_bear and not choch_bear: score += 1; reasons.append("bear BOS")
-    elif choch_bull and sig_bull: score += 1; reasons.append("CHoCH bull")
-    elif choch_bear and sig_bear: score += 1; reasons.append("CHoCH bear")
-    elif bullish_bos and sig_bear: score -= 1; reasons.append("bull BOS opposes")
-    elif bearish_bos and sig_bull: score -= 1; reasons.append("bear BOS opposes")
-    
-    return max(-2, min(2, score)), reasons
+                reasons.append("candle {:.1f}x overext".format(extension_ratio))
+
+    return max(-3, min(3, score)), reasons
 
 
 # Cache for Phase 1 results — populated at T-22s, read at T+0
@@ -948,12 +1155,13 @@ _sv3_wait_queue = {}  # {"BTC_1234567": {"asset":..., "direction":..., ...}}
 def _sv3_score_and_record(asset, token_map_entry, boundary_ts, now_str):
     """SV3 Paper Bot v3 — Multi-Timeframe PTB Gatekeeper.
 
-    Reads candle structure on 1H, 30M, and 15M.
-    Each timeframe scores -2 to +2 for the signal direction.
-    Total score -6 to +6 determines TAKE or WAIT.
+    Reads candle structure on 1H, 30M, and 15M with Smart Price Action v2.
+    Each timeframe scores -3 to +3 (reads BOS, CHoCH, EQH/EQL, fakeouts,
+    extension, fib exhaustion relative to PTB).
+    Total score -9 to +9 determines TAKE or WAIT.
 
-    TAKE (+3 to +6): all timeframes confirm signal → fire at T+0 at 50¢
-    WAIT (-6 to +2): structure unclear or opposes → wait 2-3 min for confirmation
+    TAKE (+4 to +9): 2+ timeframes strongly confirm → fire at T+0 at 50c
+    WAIT (-9 to +3): structure unclear or opposes → wait 2-3 min for confirmation
     
     No SKIPs. Every signal gets either TAKE or WAIT.
     """
@@ -990,7 +1198,7 @@ def _sv3_score_and_record(asset, token_map_entry, boundary_ts, now_str):
     total_score = s1h + s30 + s15
 
     # ── Step 4: Decide TAKE or WAIT ──
-    if total_score >= 3:
+    if total_score >= 4:
         action = "TAKE"
     else:
         action = "WAIT"
@@ -1046,13 +1254,15 @@ def _sv3_score_and_record(asset, token_map_entry, boundary_ts, now_str):
         return False
 
     # ── Step 6: Handle TAKE — fire paper trade at T+0 ──
-    # Stake: scaled by confidence (MTF score)
+    # Stake: scaled by confidence (MTF smart PA score)
     bal = _sv3_state["balance"]
-    if total_score >= 5:
-        stake = round(max(2.50, min(bal * 0.04, 5.00)), 2)  # High confidence
-    elif total_score >= 4:
+    if total_score >= 7:
+        stake = round(max(2.50, min(bal * 0.045, 5.50)), 2)  # Very high confidence
+    elif total_score >= 6:
+        stake = round(max(2.50, min(bal * 0.04, 5.00)), 2)   # High confidence
+    elif total_score >= 5:
         stake = round(max(2.50, min(bal * 0.035, 4.00)), 2)
-    else:  # score = 3
+    else:  # score = 4
         stake = round(max(2.50, min(bal * 0.03, 3.50)), 2)
 
     if stake > bal - 5:
@@ -16056,7 +16266,10 @@ def sniper_v3_page():
     peak = _sv3_state["peak_balance"]
 
     total_w = total_l = total_pnl = 0
-    tier_stats = {"MTF6":{"w":0,"l":0,"pnl":0.0},
+    tier_stats = {"MTF9":{"w":0,"l":0,"pnl":0.0},
+                  "MTF8":{"w":0,"l":0,"pnl":0.0},
+                  "MTF7":{"w":0,"l":0,"pnl":0.0},
+                  "MTF6":{"w":0,"l":0,"pnl":0.0},
                   "MTF5":{"w":0,"l":0,"pnl":0.0},
                   "MTF4":{"w":0,"l":0,"pnl":0.0},
                   "MTF3":{"w":0,"l":0,"pnl":0.0},
@@ -16064,7 +16277,8 @@ def sniper_v3_page():
                   "MTF1":{"w":0,"l":0,"pnl":0.0},
                   "MTF0":{"w":0,"l":0,"pnl":0.0},
                   "MTF-1":{"w":0,"l":0,"pnl":0.0},
-                  "MTF-2":{"w":0,"l":0,"pnl":0.0}}
+                  "MTF-2":{"w":0,"l":0,"pnl":0.0},
+                  "MTF-3":{"w":0,"l":0,"pnl":0.0}}
     asset_stats = {}
     today_trades = today_wins = today_losses = 0
 
@@ -16104,15 +16318,19 @@ def sniper_v3_page():
     # Tier rows
     tier_rows_html = ""
     tier_labels = {
-        "MTF6": "MTF +6 — All TFs agree (TAKE)",
-        "MTF5": "MTF +5 — Strong agreement (TAKE)",
-        "MTF4": "MTF +4 — Good agreement (TAKE)",
-        "MTF3": "MTF +3 — Minimum TAKE",
-        "MTF2": "MTF +2 — Borderline (WAIT→confirmed)",
-        "MTF1": "MTF +1 — Weak (WAIT→confirmed)",
+        "MTF9": "MTF +9 — Perfect alignment (TAKE)",
+        "MTF8": "MTF +8 — Near-perfect (TAKE)",
+        "MTF7": "MTF +7 — Very strong (TAKE)",
+        "MTF6": "MTF +6 — Strong (TAKE)",
+        "MTF5": "MTF +5 — Good (TAKE)",
+        "MTF4": "MTF +4 — Minimum TAKE",
+        "MTF3": "MTF +3 — Borderline (WAIT→confirmed)",
+        "MTF2": "MTF +2 — Weak (WAIT→confirmed)",
+        "MTF1": "MTF +1 — Marginal (WAIT→confirmed)",
         "MTF0": "MTF 0 — Neutral (WAIT→confirmed)",
         "MTF-1": "MTF -1 — Opposed (WAIT→confirmed)",
         "MTF-2": "MTF -2 — Strongly opposed (WAIT→confirmed)",
+        "MTF-3": "MTF -3 — Max opposed (WAIT→confirmed)",
     }
     for tier_key, label in tier_labels.items():
         ts = tier_stats[tier_key]
@@ -16213,7 +16431,7 @@ h2{{font-size:16px;font-weight:700;color:#1a3d2e;margin-bottom:12px}}
 <div style="padding:20px 16px 8px">
   <h1 style="font-size:20px;font-weight:700;color:#1a3d2e">📊 Paper Sniper V3</h1>
   <p style="color:#666;font-size:13px;margin-top:4px">
-    P2.9 Candle + Price Position · T2.1/T2.2/T2.3/T2.4 · T-22s · Polymarket 15M · $100 Paper Capital
+    Smart PA v2 · BOS/CHoCH · EQH/EQL · Fakeouts · Extension · Fib Exhaustion · 3-TF MTF · $100 Paper
   </p>
 </div>
 
@@ -16239,8 +16457,8 @@ h2{{font-size:16px;font-weight:700;color:#1a3d2e;margin-bottom:12px}}
 <tbody>{tier_rows}</tbody>
 </table>
 <p style="font-size:11px;color:#888;margin-top:8px;padding:0 4px">
-  T2.1: Signal+candle+price agree at structure · T2.2: Mean reversion at structure ·
-  T2.3: Retest continuation (prev closed high, price in middle) · T2.4: Breakout through middle (prev closed low)
+  Scoring: Trend + Momentum + Candle Pattern + BOS/CHoCH + EQH/EQL + Fakeout + SMA Extension + Fib Exhaustion ·
+  Each TF: -3 to +3 · Combined: -9 to +9 · TAKE ≥ +4 · WAIT &lt; +4
 </p>
 </div>
 
@@ -16270,7 +16488,7 @@ h2{{font-size:16px;font-weight:700;color:#1a3d2e;margin-bottom:12px}}
 </div>
 
 <p style="text-align:center;color:#999;font-size:12px;padding:16px">
-  Paper trading · $100 simulated capital · T-22s pre-clear cache · Polymarket 15M · Auto-refresh 60s
+  Paper trading · $100 simulated · Smart PA v2 (8 concepts × 3 TFs) · TAKE ≥ +4 · Auto-refresh 60s
 </p>
 </div>
 <script>setTimeout(()=>location.reload(),60000)</script>
