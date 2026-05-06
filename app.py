@@ -415,17 +415,21 @@ _poly_alpha3_traded_markets = set()
 def _poly_alpha3_load_recent():
 
     # ── POLY ALPHA 4.0 SNIPER init ──
-    _saved_pa4 = _saved_balances.get("poly_alpha4", {})
-    if _saved_pa4 and _saved_pa4.get("balance", 0) > 0:
-        _poly_alpha4_state["balance"] = _saved_pa4["balance"]
-        _poly_alpha4_state["peak_balance"] = _saved_pa4.get("peak_balance", _saved_pa4["balance"])
+    # Force balance to $50 (with SV3 gatekeeper upgrade)
+    _poly_alpha4_state["balance"] = 50.0
+    _poly_alpha4_state["peak_balance"] = 50.0
+    _poly_alpha4_state["starting_balance"] = 50.0
+    _poly_alpha4_state["floor_balance"] = 5.0
+    _poly_alpha4_state["enabled"] = True
+    _save_bot_balance("poly_alpha4", _poly_alpha4_state)
+    print("SNIPER A4: $50.00 pool (fresh + SV3 gatekeeper) | P2.1 at boundary | 15M")
+    
+    # ── A41 PAUSED — not trading on Polymarket until further notice ──
     _saved_pa41 = _saved_balances.get("poly_alpha41", {})
     if _saved_pa41 and _saved_pa41.get("balance", 0) > 0:
         _poly_alpha41_state["balance"] = _saved_pa41["balance"]
-    _poly_alpha4_state["floor_balance"] = 5.0
-    _poly_alpha4_state["enabled"] = True
-    print("SNIPER A4: ${:.2f} pool (restored from DB) | P2.1 at boundary | 15M | 50¢ fills".format(
-        _poly_alpha4_state["balance"]))
+    _poly_alpha41_state["enabled"] = False
+    print("SNIPER A41: PAUSED (${:.2f} pool preserved)".format(_poly_alpha41_state["balance"]))
     _sv2_load_balance()  # Load SV2 paper pool from DB
     _save_bot_balance("sv2_paper", _sv2_state)  # Ensure row exists in DB
     _save_bot_balance("sv3_paper", _sv3_state)  # Ensure SV3 row exists in DB
@@ -475,13 +479,24 @@ def _poly_alpha3_load_recent():
         _conn_sv3_fresh.close()
     except Exception as _sv3_fresh_e:
         print("SV3 fresh start error: {} — continuing with existing table".format(_sv3_fresh_e))
-    # Reset pool to $100 fresh
-    _sv3_state["balance"] = 100.0
-    _sv3_state["peak_balance"] = 100.0
-    _sv3_state["starting_balance"] = 100.0
+    # Load SV3 balance from DB (don't reset on deploy)
+    try:
+        _saved_sv3 = _saved_balances.get("sv3_paper", {})
+        if _saved_sv3 and _saved_sv3.get("balance", 0) > 0:
+            _sv3_state["balance"] = _saved_sv3["balance"]
+            _sv3_state["peak_balance"] = _saved_sv3.get("peak_balance", _saved_sv3["balance"])
+            _sv3_state["starting_balance"] = _saved_sv3.get("starting_balance", 100.0)
+            print("SV3: ${:.2f} pool (restored from DB)".format(_sv3_state["balance"]))
+        else:
+            _sv3_state["balance"] = 100.0
+            _sv3_state["peak_balance"] = 100.0
+            _sv3_state["starting_balance"] = 100.0
+            print("SV3: $100 fresh pool (no saved balance)")
+    except Exception as _sv3_load_e:
+        print("SV3 balance load error: {} — using $100".format(_sv3_load_e))
     _sv3_state["trades_today"] = 0
     _save_bot_balance("sv3_paper", _sv3_state)
-    print("SV3 v2: $100 fresh pool | S1-S5 structure tiers | 20-candle analysis")
+    print("SV3 v2: ${:.2f} pool | Smart PA v2 | 8 concepts × 3 TFs".format(_sv3_state["balance"]))
 
     try:
         conn = get_db()
@@ -1955,10 +1970,10 @@ def _sniper_thread():
                 print("SV3 T0 block error: {}".format(_sv3_err))
 
             # ── SV3 Phase 3: Process WAIT queue after 2 minutes ──
-            # Sleep 60s first (normal cycle), then check WAITs at T+2min
+            # Sleep 60s first (normal cycle), then check WAITs
             _time.sleep(60)
 
-            # Check if any WAIT entries are ready (2+ minutes old)
+            # First check at T+60s — SV3 paper waits (120s minimum)
             if _sv3_wait_queue:
                 try:
                     _sv3_wait_processed = _sv3_process_wait_queue()
@@ -1969,16 +1984,22 @@ def _sniper_thread():
                 except Exception as _sv3_we:
                     print("SV3 WAIT error: {}".format(_sv3_we))
 
-            # ── A4 SV3 WAIT QUEUE: Process after 2 minutes ──
-            # For each queued A4 trade: check if price confirmed the direction.
-            # If yes → place the real order. If no → skip.
+            # A4 wait queue — first check (items are ~60s old, need 90s)
+            # Won't fire yet but log if any are pending
+            if _a4_sv3_wait_queue:
+                print("A4 WAIT queue: {} entries waiting for 90s age...".format(len(_a4_sv3_wait_queue)))
+
+            # ── Sleep another 45s → total T+105s from boundary ──
+            _time.sleep(45)
+
+            # Second check at T+105s — A4 waits now old enough (90s+)
             if _a4_sv3_wait_queue:
                 _a4w_keys_done = []
                 _a4w_now = datetime.now(timezone.utc)
                 for _a4w_key, _a4w in list(_a4_sv3_wait_queue.items()):
                     _a4w_age = (_a4w_now - _a4w["queued_at"]).total_seconds()
                     if _a4w_age < 90:
-                        continue  # Not ready yet (wait at least 90s)
+                        continue  # Still not ready
                     if _a4w_age > 300:
                         # Expired — 5 minutes is too long
                         print("A4 WAIT expired: {} {} ({}s)".format(
@@ -2147,6 +2168,16 @@ def _sniper_thread():
 
                 for _a4w_k in _a4w_keys_done:
                     _a4_sv3_wait_queue.pop(_a4w_k, None)
+
+            # Also check SV3 paper waits again at T+105s
+            if _sv3_wait_queue:
+                try:
+                    _sv3_wait_p2 = _sv3_process_wait_queue()
+                    if _sv3_wait_p2:
+                        print("SV3 WAIT pass2: {} confirmed | pool=${:.2f}".format(
+                            _sv3_wait_p2, _sv3_state["balance"]))
+                        _save_bot_balance("sv3_paper", _sv3_state)
+                except: pass
 
         except Exception as e:
             print("SNIPER thread error: {}".format(e))
@@ -19852,7 +19883,7 @@ def run_poly_scan():
                     # ── A41 HYBRID: P2.1 + P31 Independent Dynamic Entry ──
                     # GTC limit orders at cap price or better — maker orders, zero fees
                     # Catches pullbacks on confirmed signals
-                    if strat in ("p21", "p31") and section == "all15m" and scored:
+                    if strat in ("p21", "p31") and section == "all15m" and scored and _poly_alpha41_state.get("enabled", True):
                         print("A41 EVAL: {} {} dir={} odds={} conf={}".format(
                             asset, strat, scored.get("bet_side"), scored.get("bet_odds"), scored.get("confidence")))
                         try:
