@@ -4485,13 +4485,42 @@ def _score_paper210_trade(p, price, indicators=None, ind_macro=None, expiry_minu
 
 def parse_market(market):
     title = market.get("title", "")
+    
+    # ── Format 1: Old style "BTC above $81,176.09" ──
     m = re.search(r'(?:\$)?([A-Z]+)\s+(above|below)\s+\$([\d,]+\.?\d*)', title)
-    if not m:
-        return None
-
-    asset     = m.group(1)
-    direction = m.group(2)
-    baseline  = float(m.group(3).replace(",", ""))
+    if m:
+        asset     = m.group(1)
+        direction = m.group(2)
+        baseline  = float(m.group(3).replace(",", ""))
+    else:
+        # ── Format 2: New Limitless "BTC Up or Down - 1 hour" / "ETH Up or Down - 15 mins" ──
+        m2 = re.search(r'([A-Z]+)\s+Up or Down\s*[-–]\s*(\d+\s*(?:hour|mins?|min))', title, re.IGNORECASE)
+        if m2:
+            asset = m2.group(1)
+            direction = "above"  # Default — actual direction determined by signal
+            # Get baseline from metadata.openPrice
+            metadata = market.get("metadata") or {}
+            open_price = metadata.get("openPrice")
+            if open_price:
+                try:
+                    baseline = float(str(open_price))
+                except:
+                    baseline = 0
+            else:
+                baseline = 0
+        else:
+            # ── Format 3: Sub-market "above $81176.09" (inside group markets) ──
+            m3 = re.search(r'(above|below)\s+\$([\d,]+\.?\d*)', title)
+            if m3:
+                direction = m3.group(1)
+                baseline = float(m3.group(2).replace(",", ""))
+                # Get asset from priceOracleMetadata
+                oracle = market.get("priceOracleMetadata") or {}
+                asset = oracle.get("ticker", "")
+                if not asset:
+                    return None
+            else:
+                return None
 
     exp_ts = market.get("expirationTimestamp", 0)
     if not exp_ts:
@@ -4525,7 +4554,7 @@ def parse_market(market):
     # Use stableSlug to accurately distinguish 15M from 1H
     stable_slug = market.get("stableSlug", "")
     is_15m_market = "15min" in stable_slug or "5min" in stable_slug or "30min" in stable_slug
-    is_hourly_market = "hourly" in stable_slug
+    is_hourly_market = "hourly" in stable_slug or "Hourly" in cats or "Hourly" in tags
 
     return {
         "market_id":  str(market.get("id", "")),
