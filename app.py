@@ -429,16 +429,59 @@ def _poly_alpha3_load_recent():
     _sv2_load_balance()  # Load SV2 paper pool from DB
     _save_bot_balance("sv2_paper", _sv2_state)  # Ensure row exists in DB
     _save_bot_balance("sv3_paper", _sv3_state)  # Ensure SV3 row exists in DB
-    # Mark old unresolvable LOSS trades as RETURNED (excluded from WR)
-    # These are trades where outcomePrices data is gone from Polymarket
+    # ── SV3 v2 FRESH START: Archive all old T2.x trades, reset pool ──
+    # Old SV3 used single-candle T2.1-T2.4 tiers. New SV3 uses multi-candle
+    # structure analysis with S1-S5 tiers. Old data is not comparable.
+    # Rename old table to preserve data, create fresh table for new system.
     try:
-        _conn_sv3_fix = get_db()
-        _conn_sv3_fix.run("""UPDATE sniper_v3_paper_trades
-            SET outcome='RETURNED', sim_pnl=0
-            WHERE status='Resolved' AND outcome='LOSS'
-            AND fired_at < '2026-05-04 07:00:00'""")
-        _conn_sv3_fix.close()
-    except: pass
+        _conn_sv3_fresh = get_db()
+        # Check if old data exists
+        _sv3_old_count = _conn_sv3_fresh.run(
+            "SELECT COUNT(*) FROM sniper_v3_paper_trades")[0][0]
+        if _sv3_old_count > 0:
+            # Check if we already archived (avoid double-archiving on restart)
+            try:
+                _sv3_archive_exists = _conn_sv3_fresh.run(
+                    "SELECT COUNT(*) FROM sniper_v3_paper_trades_v1")[0][0]
+            except:
+                _sv3_archive_exists = 0
+            if _sv3_archive_exists == 0:
+                # Archive: rename old table
+                _conn_sv3_fresh.run(
+                    "ALTER TABLE sniper_v3_paper_trades RENAME TO sniper_v3_paper_trades_v1")
+                print("SV3 FRESH START: archived {} old trades to sniper_v3_paper_trades_v1".format(
+                    _sv3_old_count))
+                # Create fresh table
+                _conn_sv3_fresh.run("""CREATE TABLE IF NOT EXISTS sniper_v3_paper_trades (
+                    id SERIAL PRIMARY KEY,
+                    market_id TEXT, title TEXT, asset TEXT,
+                    bet_side TEXT, tier TEXT,
+                    stake REAL, fill_price REAL DEFAULT 0.50,
+                    pool_after REAL, payout REAL,
+                    signals_agree INTEGER,
+                    indicators TEXT,
+                    prev_candle_tag TEXT,
+                    prev_high REAL, prev_low REAL, prev_close REAL,
+                    price_to_beat REAL, price_position REAL,
+                    slug TEXT, condition_id TEXT,
+                    status TEXT DEFAULT 'Pending', outcome TEXT,
+                    sim_pnl REAL,
+                    fired_at TEXT, resolved_at TEXT
+                )""")
+                print("SV3 FRESH START: new table created for S1-S5 structure tiers")
+            else:
+                print("SV3: archive already exists ({} old trades), keeping fresh table".format(
+                    _sv3_archive_exists))
+        _conn_sv3_fresh.close()
+    except Exception as _sv3_fresh_e:
+        print("SV3 fresh start error: {} — continuing with existing table".format(_sv3_fresh_e))
+    # Reset pool to $100 fresh
+    _sv3_state["balance"] = 100.0
+    _sv3_state["peak_balance"] = 100.0
+    _sv3_state["starting_balance"] = 100.0
+    _sv3_state["trades_today"] = 0
+    _save_bot_balance("sv3_paper", _sv3_state)
+    print("SV3 v2: $100 fresh pool | S1-S5 structure tiers | 20-candle analysis")
 
     try:
         conn = get_db()
@@ -712,27 +755,335 @@ def _sniper_get_direction(asset, timeframe="15m"):
 
 
 
+def _sv3_analyze_candle_structure(asset, num_candles=20):
+    """SV3 Phase 1: Fetch candles and analyze market structure.
+    Call at T-22s. Returns cached structure result (no PTB needed yet).
+    """
+    candles = _fetch_binance_candles_small(asset, "15m", num_candles + 5)
+    if not candles or len(candles) < 8:
+        return None
+
+    # Filter to completed candles only
+    from datetime import datetime, timezone
+    now_ts = int(datetime.now(timezone.utc).timestamp() * 1000)
+    completed = [c for c in candles if c["ts"] + (15 * 60 * 1000) <= now_ts]
+    if len(completed) < 8:
+        # Fallback: use indicator cache candles
+        try:
+            ind = _calculate_indicators(asset, "15m")
+            if ind and ind.get("_opens") and len(ind["_opens"]) >= 10:
+                completed = []
+                n = min(len(ind["_opens"]), num_candles)
+                for i in range(-n, 0):
+                    completed.append({
+                        "ts": 0, "open": ind["_opens"][i], "high": ind["_highs"][i],
+                        "low": ind["_lows"][i], "close": ind["_closes"][i],
+                    })
+        except:
+            pass
+    if len(completed) < 8:
+        return None
+
+    # Use last num_candles completed candles
+    completed = completed[-num_candles:] if len(completed) > num_candles else completed
+
+    # ── Swing detection ──
+    swings = []
+    direction_track = None
+    swing_high = completed[0]["high"]
+    swing_low = completed[0]["low"]
+    swing_high_idx = 0
+    swing_low_idx = 0
+    min_move_pct = 0.08
+
+    for i in range(1, len(completed)):
+        c = completed[i]
+        if c["high"] > swing_high:
+            swing_high = c["high"]
+            swing_high_idx = i
+        if c["low"] < swing_low:
+            swing_low = c["low"]
+            swing_low_idx = i
+
+        if direction_track is None:
+            if c["close"] > completed[0]["open"]:
+                direction_track = "UP"
+            elif c["close"] < completed[0]["open"]:
+                direction_track = "DOWN"
+            continue
+
+        if direction_track == "UP":
+            drop = (swing_high - c["low"]) / swing_high * 100 if swing_high > 0 else 0
+            if drop >= min_move_pct and swing_high_idx < i:
+                swings.append({"type": "high", "index": swing_high_idx, "price": swing_high})
+                direction_track = "DOWN"
+                swing_low = c["low"]
+                swing_low_idx = i
+        elif direction_track == "DOWN":
+            rise = (c["high"] - swing_low) / swing_low * 100 if swing_low > 0 else 0
+            if rise >= min_move_pct and swing_low_idx < i:
+                swings.append({"type": "low", "index": swing_low_idx, "price": swing_low})
+                direction_track = "UP"
+                swing_high = c["high"]
+                swing_high_idx = i
+
+    # ── Trend detection ──
+    highs = [s for s in swings if s["type"] == "high"]
+    lows = [s for s in swings if s["type"] == "low"]
+    recent_highs = highs[-4:] if len(highs) >= 2 else highs
+    recent_lows = lows[-4:] if len(lows) >= 2 else lows
+    high_prices = [h["price"] for h in recent_highs]
+    low_prices = [l["price"] for l in recent_lows]
+
+    hh = lh = hl = ll = 0
+    for i in range(1, len(high_prices)):
+        if high_prices[i] > high_prices[i-1]: hh += 1
+        elif high_prices[i] < high_prices[i-1]: lh += 1
+    for i in range(1, len(low_prices)):
+        if low_prices[i] > low_prices[i-1]: hl += 1
+        elif low_prices[i] < low_prices[i-1]: ll += 1
+
+    bull_score = hh + hl
+    bear_score = lh + ll
+    total_cmp = max(bull_score + bear_score, 1)
+
+    if bull_score > bear_score and hl >= 1:
+        trend = "UP"
+        strength = int(bull_score / total_cmp * 100)
+    elif bear_score > bull_score and lh >= 1:
+        trend = "DOWN"
+        strength = int(bear_score / total_cmp * 100)
+    else:
+        trend = "RANGE"
+        strength = 0
+
+    last_sh = high_prices[-1] if high_prices else None
+    last_sl = low_prices[-1] if low_prices else None
+
+    # ── BOS detection (last 5 candles) ──
+    bos = None
+    bos_level = None
+    sh_idx = None
+    sl_idx = None
+    for s in swings:
+        if s["type"] == "high" and last_sh and s["price"] == last_sh:
+            sh_idx = s["index"]
+        if s["type"] == "low" and last_sl and s["price"] == last_sl:
+            sl_idx = s["index"]
+
+    for i in range(max(0, len(completed) - 5), len(completed)):
+        c = completed[i]
+        if last_sh and c["close"] > last_sh and sh_idx is not None and i > sh_idx:
+            bos = "BULLISH"
+            bos_level = last_sh
+        if last_sl and c["close"] < last_sl and sl_idx is not None and i > sl_idx:
+            bos = "BEARISH"
+            bos_level = last_sl
+
+    # ── Reversal detection (last 2-3 candles) ──
+    reversal = None
+    rev_pattern = None
+    rev_confidence = None
+
+    if len(completed) >= 5:
+        last_c = completed[-1]
+        prev_c = completed[-2]
+        last_green = last_c["close"] > last_c["open"]
+        last_red = last_c["close"] < last_c["open"]
+        prev_body = abs(prev_c["close"] - prev_c["open"])
+        prev_range = prev_c["high"] - prev_c["low"]
+        last_body = abs(last_c["close"] - last_c["open"])
+
+        lookback = completed[-7:-2] if len(completed) >= 7 else completed[:-2]
+        recent_reds = sum(1 for c in lookback if c["close"] < c["open"])
+        recent_greens = sum(1 for c in lookback if c["close"] > c["open"])
+
+        if prev_range > 0:
+            prev_lower_wick = (min(prev_c["open"], prev_c["close"]) - prev_c["low"]) / prev_range
+            prev_upper_wick = (prev_c["high"] - max(prev_c["open"], prev_c["close"])) / prev_range
+            prev_body_ratio = prev_body / prev_range
+
+            # Hammer after selling
+            if prev_lower_wick > 0.5 and prev_body_ratio < 0.35 and recent_reds >= 3:
+                if last_green:
+                    reversal = "BULLISH"; rev_pattern = "HAMMER_CONFIRMED"; rev_confidence = "STRONG"
+                else:
+                    reversal = "BULLISH"; rev_pattern = "HAMMER_UNCONFIRMED"; rev_confidence = "WEAK"
+
+            # Shooting star after rally
+            if not reversal and prev_upper_wick > 0.5 and prev_body_ratio < 0.35 and recent_greens >= 3:
+                if last_red:
+                    reversal = "BEARISH"; rev_pattern = "STAR_CONFIRMED"; rev_confidence = "STRONG"
+                else:
+                    reversal = "BEARISH"; rev_pattern = "STAR_UNCONFIRMED"; rev_confidence = "WEAK"
+
+        # Bullish engulfing
+        if not reversal:
+            prev_red = prev_c["close"] < prev_c["open"]
+            if prev_red and last_green and last_body > prev_body * 1.2:
+                if last_c["close"] > prev_c["open"] and last_c["open"] < prev_c["close"]:
+                    conf = "STRONG" if recent_reds >= 2 else "WEAK"
+                    reversal = "BULLISH"; rev_pattern = "BULLISH_ENGULF"; rev_confidence = conf
+
+        # Bearish engulfing
+        if not reversal:
+            prev_green = prev_c["close"] > prev_c["open"]
+            if prev_green and last_red and last_body > prev_body * 1.2:
+                if last_c["close"] < prev_c["open"] and last_c["open"] > prev_c["close"]:
+                    conf = "STRONG" if recent_greens >= 2 else "WEAK"
+                    reversal = "BEARISH"; rev_pattern = "BEARISH_ENGULF"; rev_confidence = conf
+
+        # CHoCH starting
+        if not reversal:
+            if recent_reds >= 3 and last_green and prev_c["close"] > prev_c["open"] and last_c["low"] > prev_c["low"]:
+                reversal = "BULLISH"; rev_pattern = "CHOCH_STARTING"; rev_confidence = "WEAK"
+            elif recent_greens >= 3 and last_red and prev_c["close"] < prev_c["open"] and last_c["high"] < prev_c["high"]:
+                reversal = "BEARISH"; rev_pattern = "CHOCH_STARTING"; rev_confidence = "WEAK"
+
+    return {
+        "candles": completed,
+        "swings": swings,
+        "trend": trend,
+        "strength": strength,
+        "high_prices": high_prices,
+        "low_prices": low_prices,
+        "last_swing_high": last_sh,
+        "last_swing_low": last_sl,
+        "hh": hh, "lh": lh, "hl": hl, "ll": ll,
+        "bos": bos,
+        "bos_level": bos_level,
+        "reversal": reversal,
+        "rev_pattern": rev_pattern,
+        "rev_confidence": rev_confidence,
+    }
+
+
+# Cache for Phase 1 results — populated at T-22s, read at T+0
+_sv3_structure_cache = {}  # {"BTC": {structure_result}, "ETH": ...}
+# WAIT queue — assets waiting for confirmation at T+2-3min
+_sv3_wait_queue = {}  # {"BTC_1234567": {"asset":..., "direction":..., "token_map_entry":..., ...}}
+
+
+def _sv3_classify_tier(structure, ptb, signal_direction):
+    """SV3 Phase 2: Given cached structure + exact PTB + signal, decide TAKE/WAIT/SKIP.
+    Call at T+0 when exact PTB is available.
+    """
+    if not structure or not ptb or ptb <= 0 or not signal_direction:
+        return "S5", "SKIP", "", "Invalid inputs"
+
+    trend = structure["trend"]
+    strength = structure["strength"]
+    bos = structure["bos"]
+    bos_level = structure.get("bos_level")
+    reversal = structure.get("reversal")
+    rev_pattern = structure.get("rev_pattern")
+    rev_confidence = structure.get("rev_confidence")
+    last_sh = structure.get("last_swing_high")
+    last_sl = structure.get("last_swing_low")
+    high_prices = structure.get("high_prices", [])
+    low_prices = structure.get("low_prices", [])
+
+    # Signal vs trend
+    if trend == "UP":
+        sig_vs_trend = "AGREES" if signal_direction == "UP" else "DISAGREES"
+    elif trend == "DOWN":
+        sig_vs_trend = "AGREES" if signal_direction == "DOWN" else "DISAGREES"
+    else:
+        sig_vs_trend = "NEUTRAL"
+
+    # PTB zone relative to structure
+    supports = sorted([p for p in low_prices if p <= ptb * 1.005], reverse=True)
+    resistances = sorted([p for p in high_prices if p >= ptb * 0.995])
+    nearest_sup = supports[0] if supports else None
+    nearest_res = resistances[0] if resistances else None
+    dist_sup = abs(ptb - nearest_sup) / ptb * 100 if nearest_sup else 999
+    dist_res = abs(nearest_res - ptb) / ptb * 100 if nearest_res else 999
+
+    if dist_sup < 0.15:
+        ptb_zone = "AT_SUPPORT"
+    elif dist_res < 0.15:
+        ptb_zone = "AT_RESISTANCE"
+    elif nearest_sup and nearest_res:
+        ptb_zone = "BETWEEN"
+    elif nearest_sup:
+        ptb_zone = "ABOVE_ALL"
+    elif nearest_res:
+        ptb_zone = "BELOW_ALL"
+    else:
+        ptb_zone = "BETWEEN"
+
+    # ── Tier classification — TAKE / WAIT / SKIP ──
+
+    # S2: Breakout confirmed (BOS agrees with signal)
+    if bos == "BULLISH" and signal_direction == "UP":
+        return "S2", "TAKE", ptb_zone, "Bullish BOS at {:.2f} + signal UP".format(bos_level or 0)
+    if bos == "BEARISH" and signal_direction == "DOWN":
+        return "S2", "TAKE", ptb_zone, "Bearish BOS at {:.2f} + signal DOWN".format(bos_level or 0)
+
+    # BOS opposes signal
+    if bos and ((bos == "BEARISH" and signal_direction == "UP") or
+                (bos == "BULLISH" and signal_direction == "DOWN")):
+        return "S4", "SKIP", ptb_zone, "{} BOS opposes {} signal".format(bos, signal_direction)
+
+    # S1: Trend continuation (signal agrees with trend)
+    if sig_vs_trend == "AGREES" and strength >= 50:
+        return "S1", "TAKE", ptb_zone, "{} trend ({}%) + signal {}".format(trend, strength, signal_direction)
+
+    # S1 weak: trend agrees but weak → WAIT
+    if sig_vs_trend == "AGREES" and 0 < strength < 50:
+        return "S1", "WAIT", ptb_zone, "Weak {} trend ({}%) — wait to confirm".format(trend, strength)
+
+    # S3: Signal disagrees with trend
+    if sig_vs_trend == "DISAGREES":
+        if reversal:
+            rev_matches = (reversal == "BULLISH" and signal_direction == "UP") or \
+                          (reversal == "BEARISH" and signal_direction == "DOWN")
+            if rev_matches and rev_confidence == "STRONG":
+                good_zone = (signal_direction == "UP" and ptb_zone in ("AT_SUPPORT","BELOW_ALL","BETWEEN")) or \
+                            (signal_direction == "DOWN" and ptb_zone in ("AT_RESISTANCE","ABOVE_ALL","BETWEEN"))
+                if good_zone:
+                    return "S3", "TAKE", ptb_zone, "STRONG {} reversal ({}) vs {} trend, PTB {}".format(
+                        reversal, rev_pattern, trend, ptb_zone)
+                else:
+                    return "S3", "WAIT", ptb_zone, "Strong reversal but PTB at {} — wait".format(ptb_zone)
+            elif rev_matches and rev_confidence == "WEAK":
+                return "S3", "WAIT", ptb_zone, "WEAK reversal ({}) — wait for confirmation".format(rev_pattern)
+            else:
+                return "S4", "SKIP", ptb_zone, "Signal {} vs trend {} + reversal opposes".format(signal_direction, trend)
+        else:
+            return "S4", "SKIP", ptb_zone, "Signal {} fights {} trend, no reversal".format(signal_direction, trend)
+
+    # S5: Ranging
+    if trend == "RANGE":
+        if signal_direction == "UP" and ptb_zone in ("AT_SUPPORT", "BELOW_ALL"):
+            return "S5", "TAKE", ptb_zone, "Range bounce — PTB at support"
+        elif signal_direction == "DOWN" and ptb_zone in ("AT_RESISTANCE", "ABOVE_ALL"):
+            return "S5", "TAKE", ptb_zone, "Range rejection — PTB at resistance"
+        else:
+            return "S5", "WAIT", ptb_zone, "Ranging, PTB mid-range — wait for direction"
+
+    return "S5", "SKIP", ptb_zone, "Unclassified"
+
+
 def _sv3_score_and_record(asset, token_map_entry, boundary_ts, now_str):
-    """SV3 Paper Bot — T2.1 and T2.2 sub-tiers.
+    """SV3 Paper Bot v2 — Structure-based gatekeeper.
 
-    Uses P2.9 previous candle logic + price-to-beat location.
+    Multi-candle trend analysis (20 candles → swing highs/lows → trend/BOS/reversal)
+    combined with P2.1 signal direction and Chainlink PTB.
 
-    T2.1: Signal agrees + candle confirms + price near structure support
-          Signal=UP, prev candle green, price near prev LOW (pullback in trend)
-          Signal=DOWN, prev candle red, price near prev HIGH (bounce rejected)
+    Three actions: TAKE (fire at T+0), WAIT (watch 2-3 min), SKIP (don't fire).
 
-    T2.2: Signal fires BUT candle opposes + price at structural extreme
-          Signal=UP, prev candle red, BUT price near prev LOW (mean reversion)
-          Signal=DOWN, prev candle green, BUT price near prev HIGH (mean reversion)
-
-    Both fire at T-22s using stale cache (same as SV2)
-    Uses Chainlink RTDS price as price-to-beat estimate
+    Tiers:
+      S1 — Trend continuation (signal agrees with structure)
+      S2 — Breakout confirmed (BOS agrees with signal)
+      S3 — Counter-trend with reversal evidence
+      S4 — Signal fights structure (SKIP)
+      S5 — Ranging / unclear
     """
     fee = 0.03
     wp = (1 / 0.50) * (1 - fee)
 
     # ── Step 1: Get signal direction ──
-    # Use direction from snipe_targets if available (avoids stale cache issue)
     forced = token_map_entry.get("forced_direction")
     if forced:
         direction, signals_agree, ind_str, confidence = forced, 3, "sniper_confirmed", "HIGH"
@@ -742,154 +1093,141 @@ def _sv3_score_and_record(asset, token_map_entry, boundary_ts, now_str):
         print("SV3 SKIP {}: no direction (dir={} agree={})".format(asset, direction, signals_agree))
         return False
 
-    # ── Step 2: Get previous candle via P2.9 logic ──
-    candle = _p28_read_prev_candle(asset, "15m")
-    if not candle:
-        print("SV3 SKIP {}: no prev candle".format(asset))
+    # ── Step 2: Get structure from cache (Phase 1 ran at T-22s) ──
+    structure = _sv3_structure_cache.get(asset.upper())
+    if not structure:
+        # Fallback: run Phase 1 now (slower but ensures data)
+        try:
+            structure = _sv3_analyze_candle_structure(asset.upper())
+        except Exception as e:
+            print("SV3 SKIP {}: structure analysis failed: {}".format(asset, e))
+            return False
+    if not structure:
+        print("SV3 SKIP {}: no structure data".format(asset))
         return False
 
-    prev_high  = candle.get("high", 0)
-    prev_low   = candle.get("low", 0)
-    prev_close = candle.get("close", 0)
-    is_green   = candle.get("is_green", False)
-    is_red     = candle.get("is_red", False)
-    body_ratio = candle.get("body_ratio", 0)
-    pattern    = candle.get("pattern", "normal")
-    candle_tag = candle.get("tag", "")
-
-    if not prev_high or not prev_low or prev_high <= prev_low:
-        print("SV3 SKIP {}: bad candle range h={} l={}".format(asset, prev_high, prev_low))
+    # ── Step 3: Get PTB (Chainlink RTDS price) ──
+    # At T+0 the exact PTB from _chainlink_ptb may be available
+    ptb_key = "{}_15M".format(asset.upper())
+    ptb_entry = _chainlink_ptb.get(ptb_key)
+    if ptb_entry:
+        price_to_beat = ptb_entry[1]  # Exact boundary PTB
+    else:
+        price_to_beat = _chainlink_prices.get(asset.upper())
+    if not price_to_beat or price_to_beat <= 0:
+        print("SV3 SKIP {}: no PTB".format(asset))
         return False
 
-    # ── Step 3: Get current price (Chainlink RTDS estimate of price to beat) ──
-    rtds_price = _chainlink_prices.get(asset.upper())
-    if not rtds_price:
-        print("SV3 SKIP {}: no RTDS price".format(asset))
+    # ── Step 4: Classify tier ──
+    tier, action, ptb_zone, description = _sv3_classify_tier(structure, price_to_beat, direction)
+
+    # Build indicator string with full structure info
+    struct_tag = "{} {} | trend={}({}%) | BOS={} | rev={}({}) | PTB={} | {}".format(
+        tier, action,
+        structure["trend"], structure["strength"],
+        structure.get("bos", "none"),
+        structure.get("reversal", "none"),
+        structure.get("rev_pattern", ""),
+        ptb_zone,
+        description[:60])
+
+    # ── Step 5: Handle SKIP ──
+    if action == "SKIP":
+        print("SV3 {} SKIP {}: {}".format(tier, asset, description[:60]))
+        # Still record the SKIP in DB for analysis (with stake=0)
+        try:
+            c_sv3 = get_db()
+            c_sv3.run("""INSERT INTO sniper_v3_paper_trades
+                (market_id, title, asset, bet_side, tier, stake, fill_price,
+                 pool_after, payout, signals_agree, indicators,
+                 prev_candle_tag, prev_high, prev_low, prev_close,
+                 price_to_beat, price_position, slug, condition_id,
+                 status, fired_at)
+                VALUES (:mid, :ttl, :ast, :bs, :tier, 0, 0,
+                        :pool, 0, :sa, :ind,
+                        :ctag, :ph, :pl, :pc,
+                        :ptb, 0, :slg, :cid,
+                        'Skipped', :now)""",
+                mid="sv3_{}_15M_{}".format(asset, boundary_ts),
+                ttl="{} {} 15M {} SKIP".format(asset, direction, boundary_ts),
+                ast=asset, bs=direction, tier=tier,
+                pool=_sv3_state["balance"],
+                sa=signals_agree, ind=struct_tag,
+                ctag=description[:50],
+                ph=structure.get("last_swing_high") or 0,
+                pl=structure.get("last_swing_low") or 0,
+                pc=structure["candles"][-1]["close"] if structure.get("candles") else 0,
+                ptb=round(price_to_beat, 6),
+                slg=token_map_entry.get("slug", ""),
+                cid=token_map_entry.get("condition_id", ""),
+                now=now_str)
+            c_sv3.close()
+        except Exception as e:
+            print("SV3 skip record error: {}".format(e))
         return False
 
-    price_to_beat = rtds_price
+    # ── Step 6: Handle WAIT ──
+    if action == "WAIT":
+        wait_key = "sv3_{}_15M_{}".format(asset, boundary_ts)
+        _sv3_wait_queue[wait_key] = {
+            "asset": asset,
+            "direction": direction,
+            "signals_agree": signals_agree,
+            "ind_str": ind_str,
+            "struct_tag": struct_tag,
+            "tier": tier,
+            "ptb_zone": ptb_zone,
+            "description": description,
+            "price_to_beat": price_to_beat,
+            "token_map_entry": token_map_entry,
+            "boundary_ts": boundary_ts,
+            "queued_at": datetime.now(timezone.utc),
+            "structure": structure,
+        }
+        print("SV3 {} WAIT {}: {} — will check at T+2-3min".format(tier, asset, description[:50]))
+        return False  # Not fired yet — will be processed by wait checker
 
-    # ── Step 4: Calculate price position within previous candle range ──
-    prev_range = prev_high - prev_low
-    if prev_range <= 0:
-        print("SV3 SKIP {}: zero range h={} l={}".format(asset, prev_high, prev_low))
-        return False
+    # ── Step 7: Handle TAKE — fire paper trade at T+0 ──
+    # Get previous candle info for DB record
+    last_candle = structure["candles"][-1] if structure.get("candles") else {}
+    prev_high = structure.get("last_swing_high") or last_candle.get("high", 0)
+    prev_low = structure.get("last_swing_low") or last_candle.get("low", 0)
+    prev_close = last_candle.get("close", 0)
 
-    price_position = (price_to_beat - prev_low) / prev_range
-    # 0.0 = at bottom of prev candle, 1.0 = at top
+    # Price position within last candle range (for backwards compatibility)
+    lc_range = last_candle.get("high", 0) - last_candle.get("low", 0)
+    if lc_range > 0:
+        price_position = (price_to_beat - last_candle.get("low", 0)) / lc_range
+    else:
+        price_position = 0.5
 
-    near_low  = price_position <= 0.30   # bottom 30% = support zone
-    near_high = price_position >= 0.70   # top 70% = resistance zone
-    in_middle = not near_low and not near_high
-
-    # ── Step 5: Skip reversal patterns (same as P2.9) ──
-    if pattern in ("hammer", "shooting_star", "engulfing"):
-        trend_data = _p28_read_candle_series(asset, "15m", count=5)
-        if trend_data and len(trend_data) >= 4:
-            recent_reds = sum(1 for c in trend_data[-4:-1] if c.get("close",0) < c.get("open",0))
-            recent_greens = sum(1 for c in trend_data[-4:-1] if c.get("close",0) > c.get("open",0))
-            if pattern == "hammer" and recent_reds >= 3:
-                return False  # Real reversal — skip
-            if pattern == "shooting_star" and recent_greens >= 3:
-                return False  # Real reversal — skip
-
-    # ── Step 6: Classify tier ──
-    # Support/resistance zones: near_low, near_high, in_middle
-    # Previous close position: where did prev candle close?
-    prev_close_pos = (prev_close - prev_low) / prev_range if prev_range > 0 else 0.5
-    prev_closed_high = prev_close_pos >= 0.65   # closed in upper 35%
-    prev_closed_low  = prev_close_pos <= 0.35   # closed in lower 35%
-    prev_closed_mid  = not prev_closed_high and not prev_closed_low
-    prev_was_doji    = pattern == "doji" or body_ratio < 0.15
-
-    tier = None
-
-    # ── Classify tier using candle direction + price position
-    # Following P2.9: never skip based on assumed support/resistance
-    # Price position within prev candle is context only — not proven S/R
-    # Only genuine skip: both prev AND current candle are doji (zero info)
-
-    if prev_was_doji and body_ratio < 0.15:
-        print("SV3 SKIP {}: double doji".format(asset))
-        return False    # Both candles flat — genuinely zero directional info
-
-    if direction == "UP":
-        if near_low:
-            if is_green:
-                tier = "T2.1"   # Signal UP + green candle + price at low of prev range
-            else:
-                tier = "T2.2"   # Signal UP + red/doji candle + price at low of prev range
-        elif near_high:
-            if is_green:
-                tier = "T2.1"   # Signal UP + green candle + price at high of prev range
-            else:
-                tier = "T2.2"   # Signal UP + red/doji candle + price at high of prev range
-        else:  # in_middle
-            if prev_closed_high:
-                tier = "T2.3"   # Signal UP + price in middle + prev closed high = retest
-            elif prev_closed_low:
-                tier = "T2.4"   # Signal UP + price in middle + prev closed low = breakout
-            elif is_green:
-                tier = "T2.3"   # Signal UP + green candle in middle = continuation
-            else:
-                tier = "T2.4"   # Signal UP + red candle in middle = mean reversion
-
-    elif direction == "DOWN":
-        if near_high:
-            if is_red:
-                tier = "T2.1"   # Signal DOWN + red candle + price at high of prev range
-            else:
-                tier = "T2.2"   # Signal DOWN + green/doji candle + price at high
-        elif near_low:
-            if is_red:
-                tier = "T2.1"   # Signal DOWN + red candle + price at low of prev range
-            else:
-                tier = "T2.2"   # Signal DOWN + green/doji candle + price at low
-        else:  # in_middle
-            if prev_closed_low:
-                tier = "T2.3"   # Signal DOWN + price in middle + prev closed low = retest
-            elif prev_closed_high:
-                tier = "T2.4"   # Signal DOWN + price in middle + prev closed high = breakout
-            elif is_red:
-                tier = "T2.3"   # Signal DOWN + red candle in middle = continuation
-            else:
-                tier = "T2.4"   # Signal DOWN + green candle in middle = mean reversion
-
-    if not tier:
-        print("SV3 SKIP {}: no tier (dir={} near_low={} near_high={} in_mid={} green={} red={} prev_h={} prev_l={})".format(
-            asset, direction, near_low, near_high, in_middle, is_green, is_red,
-            round(prev_closed_high,2) if isinstance(prev_closed_high,float) else prev_closed_high,
-            round(prev_closed_low,2) if isinstance(prev_closed_low,float) else prev_closed_low))
-        return False
-
-    # ── Step 8: Stake calculation ──
+    # Stake: tiered by confidence
     bal = _sv3_state["balance"]
-    if tier == "T2.1":
-        stake = round(max(2.50, min(bal * 0.04, 5.00)), 2)   # Best setup — larger stake
-    elif tier == "T2.2":
-        stake = round(max(2.50, min(bal * 0.025, 2.50)), 2)  # Mean reversion — base stake
-    elif tier == "T2.3":
-        stake = round(max(2.50, min(bal * 0.03, 3.00)), 2)   # Retest continuation — medium
-    else:  # T2.4
-        stake = round(max(2.50, min(bal * 0.025, 2.50)), 2)  # Breakout middle — base stake
+    if tier == "S1":
+        stake = round(max(2.50, min(bal * 0.035, 4.00)), 2)
+    elif tier == "S2":
+        stake = round(max(2.50, min(bal * 0.04, 5.00)), 2)
+    elif tier == "S3":
+        stake = round(max(2.50, min(bal * 0.025, 3.00)), 2)
+    else:  # S5 range bounce
+        stake = round(max(2.50, min(bal * 0.02, 2.50)), 2)
 
     if stake > bal - 5:
-        print("SV3 SKIP {}: insufficient balance bal={} stake={}".format(asset, bal, stake))
+        print("SV3 SKIP {}: insufficient balance bal={:.2f} stake={:.2f}".format(asset, bal, stake))
         return False
 
-    # ── Step 9: Dedup ──
+    # Dedup
     market_key = "sv3_{}_15M_{}".format(asset, boundary_ts)
     if market_key in _sv3_fired_markets:
-        print("SV3 SKIP {}: already fired {}".format(asset, market_key))
         return False
     _sv3_fired_markets.add(market_key)
 
-    # ── Step 10: Update balance ──
+    # Update balance
     pool_before = bal
     _sv3_state["balance"] = round(bal - stake, 2)
     _sv3_state["trades_today"] += 1
 
-    # ── Step 11: Save to DB ──
+    # Save to DB
     try:
         c_sv3 = get_db()
         c_sv3.run("""INSERT INTO sniper_v3_paper_trades
@@ -908,8 +1246,8 @@ def _sv3_score_and_record(asset, token_map_entry, boundary_ts, now_str):
             ast=asset, bs=direction, tier=tier,
             stake=stake, pool=_sv3_state["balance"],
             payout=round(stake * wp, 2),
-            sa=signals_agree, ind=ind_str,
-            ctag=candle_tag or pattern,
+            sa=signals_agree, ind=struct_tag,
+            ctag=description[:50],
             ph=round(prev_high, 6), pl=round(prev_low, 6),
             pc=round(prev_close, 6),
             ptb=round(price_to_beat, 6),
@@ -922,10 +1260,9 @@ def _sv3_score_and_record(asset, token_map_entry, boundary_ts, now_str):
         if _sv3_state["balance"] > _sv3_state["peak_balance"]:
             _sv3_state["peak_balance"] = _sv3_state["balance"]
 
-        print("SV3 {}: {} {} ${:.2f} | prev={} pos={:.0f}% | pool=${:.2f}".format(
+        print("SV3 {} TAKE: {} {} ${:.2f} | {} | pool=${:.2f}".format(
             tier, direction, asset, stake,
-            candle_tag or pattern,
-            price_position * 100,
+            description[:40],
             _sv3_state["balance"]))
         return True
 
@@ -933,6 +1270,143 @@ def _sv3_score_and_record(asset, token_map_entry, boundary_ts, now_str):
         print("SV3 record error: {}".format(e))
         _sv3_state["balance"] = pool_before
         return False
+
+
+def _sv3_process_wait_queue():
+    """SV3 Phase 3: Process WAIT queue 2-3 minutes after boundary.
+    Called from sniper thread at T+2-3min.
+    Checks if the new candle confirms the signal direction.
+    If confirmed → record trade at current market odds.
+    If not → skip.
+    """
+    if not _sv3_wait_queue:
+        return 0
+
+    fee = 0.03
+    now = datetime.now(timezone.utc)
+    processed = 0
+    keys_to_remove = []
+
+    for wait_key, entry in list(_sv3_wait_queue.items()):
+        queued_at = entry.get("queued_at")
+        if not queued_at:
+            keys_to_remove.append(wait_key)
+            continue
+
+        # Wait at least 2 minutes, max 4 minutes
+        age_secs = (now - queued_at).total_seconds()
+        if age_secs < 120:
+            continue  # Not ready yet
+        if age_secs > 240:
+            # Expired — skip
+            print("SV3 WAIT expired {}: {} (waited {:.0f}s)".format(
+                entry["asset"], entry["description"][:40], age_secs))
+            keys_to_remove.append(wait_key)
+            continue
+
+        asset = entry["asset"]
+        direction = entry["direction"]
+        boundary_ts = entry["boundary_ts"]
+        token_map_entry = entry["token_map_entry"]
+        tier = entry["tier"]
+
+        # Check confirmation: has the new candle moved in the signal direction?
+        current_price = _chainlink_prices.get(asset.upper())
+        ptb = entry["price_to_beat"]
+        if not current_price or not ptb:
+            keys_to_remove.append(wait_key)
+            continue
+
+        # Confirmation logic:
+        # Signal UP: current price should be ABOVE PTB (market is moving up)
+        # Signal DOWN: current price should be BELOW PTB (market is moving down)
+        if direction == "UP":
+            confirmed = current_price > ptb
+            price_move_pct = (current_price - ptb) / ptb * 100
+        else:
+            confirmed = current_price < ptb
+            price_move_pct = (ptb - current_price) / ptb * 100
+
+        if not confirmed:
+            print("SV3 WAIT not confirmed {}: {} signal but price {}={:.2f} vs PTB={:.2f}".format(
+                asset, direction, "below" if direction == "UP" else "above",
+                current_price, ptb))
+            keys_to_remove.append(wait_key)
+            continue
+
+        # Confirmed — record the trade
+        # Entry price is NOT 50¢ anymore — estimate from price movement
+        # If price moved 0.1% in our direction, odds are roughly 55-60¢
+        fill_price = min(0.65, max(0.50, 0.50 + price_move_pct * 5))  # rough estimate
+        wp_wait = (1 / fill_price) * (1 - fee) if fill_price > 0 else 0
+
+        bal = _sv3_state["balance"]
+        stake = round(max(2.50, min(bal * 0.025, 3.00)), 2)
+        if stake > bal - 5:
+            keys_to_remove.append(wait_key)
+            continue
+
+        market_key = "sv3_{}_15M_{}".format(asset, boundary_ts)
+        if market_key in _sv3_fired_markets:
+            keys_to_remove.append(wait_key)
+            continue
+        _sv3_fired_markets.add(market_key)
+
+        pool_before = bal
+        _sv3_state["balance"] = round(bal - stake, 2)
+        _sv3_state["trades_today"] += 1
+
+        struct_tag = entry.get("struct_tag", "")
+        wait_tag = "{} | WAIT_CONFIRMED after {:.0f}s | move={:.3f}% | fill={:.2f}c".format(
+            struct_tag[:80], age_secs, price_move_pct, fill_price * 100)
+
+        try:
+            c_sv3 = get_db()
+            c_sv3.run("""INSERT INTO sniper_v3_paper_trades
+                (market_id, title, asset, bet_side, tier, stake, fill_price,
+                 pool_after, payout, signals_agree, indicators,
+                 prev_candle_tag, prev_high, prev_low, prev_close,
+                 price_to_beat, price_position, slug, condition_id,
+                 status, fired_at)
+                VALUES (:mid, :ttl, :ast, :bs, :tier, :stake, :fill,
+                        :pool, :payout, :sa, :ind,
+                        :ctag, :ph, :pl, :pc,
+                        :ptb, :pos, :slg, :cid,
+                        'Pending', :now)""",
+                mid=market_key,
+                ttl="{} {} 15M {} WAIT".format(asset, direction, boundary_ts),
+                ast=asset, bs=direction, tier=tier + "w",  # "S1w", "S3w", "S5w" for WAIT trades
+                stake=stake, fill=round(fill_price, 4),
+                pool=_sv3_state["balance"],
+                payout=round(stake * wp_wait, 2),
+                sa=entry.get("signals_agree", 0),
+                ind=wait_tag,
+                ctag="WAIT_CONFIRMED",
+                ph=0, pl=0, pc=0,
+                ptb=round(ptb, 6), pos=round(price_move_pct, 4),
+                slg=token_map_entry.get("slug", ""),
+                cid=token_map_entry.get("condition_id", ""),
+                now=now.isoformat())
+            c_sv3.close()
+
+            if _sv3_state["balance"] > _sv3_state["peak_balance"]:
+                _sv3_state["peak_balance"] = _sv3_state["balance"]
+
+            print("SV3 {}w TAKE (WAIT confirmed): {} {} ${:.2f} @{:.0f}c | +{:.3f}% | pool=${:.2f}".format(
+                tier, direction, asset, stake, fill_price * 100,
+                price_move_pct, _sv3_state["balance"]))
+            processed += 1
+
+        except Exception as e:
+            print("SV3 WAIT record error: {}".format(e))
+            _sv3_state["balance"] = pool_before
+
+        keys_to_remove.append(wait_key)
+
+    for k in keys_to_remove:
+        _sv3_wait_queue.pop(k, None)
+
+    return processed
 
 
 
@@ -1043,7 +1517,9 @@ def _sniper_thread():
             print("SV2: {} paper trades recorded | pool=${:.2f}".format(
                 _sv2_count, _sv2_state.get("balance", 0)) if hasattr(_sv2_state, 'get') else "SV2: scored")
 
-            # ── SV3: Capture directions with STALE cache (before clear) ──
+            # ── SV3: Phase 1 — Analyze candle structure at T-22s (before cache clear) ──
+            # Heavy work: fetch 20 candles from Binance, detect swings/trend/BOS/reversals
+            # Results cached in _sv3_structure_cache, read at T+0 in Phase 2
             _sv3_directions = {}
             for _pre_asset in SNIPER_ASSETS:
                 try:
@@ -1051,6 +1527,15 @@ def _sniper_thread():
                     if _pre_d and _pre_da >= 2:
                         _sv3_directions[_pre_asset] = _pre_d
                 except: pass
+                try:
+                    _sv3_struct = _sv3_analyze_candle_structure(_pre_asset)
+                    if _sv3_struct:
+                        _sv3_structure_cache[_pre_asset] = _sv3_struct
+                        print("SV3 Phase1 {}: trend={}({}%) BOS={} rev={}".format(
+                            _pre_asset, _sv3_struct["trend"], _sv3_struct["strength"],
+                            _sv3_struct.get("bos","none"), _sv3_struct.get("reversal","none")))
+                except Exception as _sv3_p1_e:
+                    print("SV3 Phase1 error {}: {}".format(_pre_asset, _sv3_p1_e))
 
             # ── Wait until T-15s before clearing cache ──
             _now_pre_wait = datetime.now(timezone.utc)
@@ -1353,14 +1838,27 @@ def _sniper_thread():
                             _sv3_cnt += 1
                     except Exception as _sv3_ie:
                         print("SV3 T0 error {}: {}".format(_sv3_asset, _sv3_ie))
-                if _sv3_cnt:
-                    print("SV3: {} paper trades at T+0 | pool=${:.2f}".format(
-                        _sv3_cnt, _sv3_state["balance"]))
+                _sv3_wait_cnt = len([k for k in _sv3_wait_queue if k.endswith(str(window_ts))])
+                if _sv3_cnt or _sv3_wait_cnt:
+                    print("SV3: {} TAKE at T+0, {} in WAIT queue | pool=${:.2f}".format(
+                        _sv3_cnt, _sv3_wait_cnt, _sv3_state["balance"]))
             except Exception as _sv3_err:
                 print("SV3 T0 block error: {}".format(_sv3_err))
 
-            # Sleep until next cycle (at least 60s to avoid double-firing)
+            # ── SV3 Phase 3: Process WAIT queue after 2 minutes ──
+            # Sleep 60s first (normal cycle), then check WAITs at T+2min
             _time.sleep(60)
+
+            # Check if any WAIT entries are ready (2+ minutes old)
+            if _sv3_wait_queue:
+                try:
+                    _sv3_wait_processed = _sv3_process_wait_queue()
+                    if _sv3_wait_processed:
+                        print("SV3 WAIT: {} confirmed trades | pool=${:.2f}".format(
+                            _sv3_wait_processed, _sv3_state["balance"]))
+                        _save_bot_balance("sv3_paper", _sv3_state)
+                except Exception as _sv3_we:
+                    print("SV3 WAIT error: {}".format(_sv3_we))
 
         except Exception as e:
             print("SNIPER thread error: {}".format(e))
@@ -2189,15 +2687,25 @@ def _limitless_sniper_thread():
 
             # ── T-15s: Clear cache + read fresh P2.1 direction ──
             # Clear 1H cache first so signal is current at fire time
+            print("LMTS SNIPER: clearing 1H cache + recalculating indicators...")
             for _lmts_asset in SNIPER_ASSETS:
                 _indicator_cache.pop("{}_1h".format(_lmts_asset.upper()), None)
                 _indicator_cache.pop("{}_1h".format(_lmts_asset.lower()), None)
             _indicator_cache.pop("BTC_1h", None)
+            _lmts_refresh_ok = 0
+            _lmts_refresh_fail = 0
             for _lmts_asset in SNIPER_ASSETS:
                 try:
-                    _calculate_indicators(_lmts_asset, "1h")
+                    _lmts_ind_result = _calculate_indicators(_lmts_asset, "1h")
+                    if _lmts_ind_result and _lmts_ind_result.get("sma10"):
+                        _lmts_refresh_ok += 1
+                    else:
+                        _lmts_refresh_fail += 1
+                        print("LMTS cache refresh {}: returned empty/no sma10".format(_lmts_asset))
                 except Exception as _lce:
-                    print("LMTS cache refresh {}: {}".format(_lmts_asset, _lce))
+                    _lmts_refresh_fail += 1
+                    print("LMTS cache refresh {}: EXCEPTION {}".format(_lmts_asset, _lce))
+            print("LMTS SNIPER: indicator refresh {}/{} OK".format(_lmts_refresh_ok, len(SNIPER_ASSETS)))
 
             # Wait until T-15s before boundary
             _now_pre = datetime.now(timezone.utc)
@@ -2217,10 +2725,28 @@ def _limitless_sniper_thread():
                         "bet_side": "YES" if direction == "UP" else "NO",
                         "signals_agree": signals_agree, "indicators": ind_str, "tier": tier,
                     })
+                    print("LMTS DIR {}: {} ({}/3) [{}] → tier={}".format(
+                        asset, direction, signals_agree, ind_str[:40], tier))
+                else:
+                    # Diagnose WHY no direction
+                    _lmts_diag_tv = _tv_trends.get(asset)
+                    _lmts_diag_sma = _pair_sma_cache.get(asset)
+                    _lmts_diag_ind = _indicator_cache.get("{}_1h".format(asset))
+                    _lmts_diag_btc = _indicator_cache.get("BTC_1h")
+                    print("LMTS NO DIR {}: dir={} agree={} | TV={} SMA_cache={} ind_1h={} btc_1h={}".format(
+                        asset, direction, signals_agree,
+                        _lmts_diag_tv.get("dir") if _lmts_diag_tv else "None",
+                        _lmts_diag_sma.get("trend") if _lmts_diag_sma else "None",
+                        "has_data" if (_lmts_diag_ind and _lmts_diag_ind.get("data")) else "EMPTY",
+                        "has_data" if (_lmts_diag_btc and _lmts_diag_btc.get("data")) else "EMPTY"))
 
             if not snipe_targets:
+                print("LMTS SNIPER: 0 targets — ALL assets failed direction check. Skipping boundary.")
                 _time.sleep(max(secs_to_boundary + 5, 5))
                 continue
+            else:
+                print("LMTS SNIPER: {} targets ready: {}".format(
+                    len(snipe_targets), ", ".join("{}={}".format(t["asset"], t["direction"]) for t in snipe_targets)))
 
             # ── T-30s: Find 1H markets ──
             market_map = {}
@@ -15653,7 +16179,15 @@ def sniper_v3_page():
     peak = _sv3_state["peak_balance"]
 
     total_w = total_l = total_pnl = 0
-    tier_stats = {"T2.1":{"w":0,"l":0,"pnl":0.0},
+    tier_stats = {"S1":{"w":0,"l":0,"pnl":0.0},
+                  "S2":{"w":0,"l":0,"pnl":0.0},
+                  "S3":{"w":0,"l":0,"pnl":0.0},
+                  "S4":{"w":0,"l":0,"pnl":0.0},
+                  "S5":{"w":0,"l":0,"pnl":0.0},
+                  "S1w":{"w":0,"l":0,"pnl":0.0},
+                  "S3w":{"w":0,"l":0,"pnl":0.0},
+                  "S5w":{"w":0,"l":0,"pnl":0.0},
+                  "T2.1":{"w":0,"l":0,"pnl":0.0},
                   "T2.2":{"w":0,"l":0,"pnl":0.0},
                   "T2.3":{"w":0,"l":0,"pnl":0.0},
                   "T2.4":{"w":0,"l":0,"pnl":0.0}}
@@ -15696,10 +16230,18 @@ def sniper_v3_page():
     # Tier rows
     tier_rows_html = ""
     tier_labels = {
-        "T2.1": "T2.1 — Trend+Structure",
-        "T2.2": "T2.2 — Mean Reversion",
-        "T2.3": "T2.3 — Retest Continuation",
-        "T2.4": "T2.4 — Breakout Middle",
+        "S1": "S1 — Trend Continuation",
+        "S2": "S2 — Breakout Confirmed",
+        "S3": "S3 — Counter-Trend Reversal",
+        "S4": "S4 — Signal vs Structure (SKIP)",
+        "S5": "S5 — Ranging",
+        "S1w": "S1w — Weak Trend (WAIT)",
+        "S3w": "S3w — Weak Reversal (WAIT)",
+        "S5w": "S5w — Range Mid (WAIT)",
+        "T2.1": "T2.1 — Legacy Trend+Structure",
+        "T2.2": "T2.2 — Legacy Mean Reversion",
+        "T2.3": "T2.3 — Legacy Retest",
+        "T2.4": "T2.4 — Legacy Breakout",
     }
     for tier_key, label in tier_labels.items():
         ts = tier_stats[tier_key]
