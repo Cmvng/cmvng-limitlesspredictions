@@ -417,10 +417,12 @@ def _poly_alpha3_load_recent():
     # ── POLY ALPHA 4.0 SNIPER init ──
     # Load balance from DB (no more force-reset on deploy)
     _saved_pa4 = _saved_balances.get("poly_alpha4", {})
-    if _saved_pa4 and _saved_pa4.get("balance", 0) > 0:
+    # Load saved balance. Force $100 only if no balance or old system leftover.
+    if _saved_pa4 and _saved_pa4.get("balance", 0) >= 10:
         _poly_alpha4_state["balance"] = _saved_pa4["balance"]
         _poly_alpha4_state["peak_balance"] = _saved_pa4.get("peak_balance", _saved_pa4["balance"])
     else:
+        # First deploy or old system with depleted balance — start fresh at $100
         _poly_alpha4_state["balance"] = 100.0
         _poly_alpha4_state["peak_balance"] = 100.0
     _poly_alpha4_state["starting_balance"] = 100.0
@@ -1583,12 +1585,12 @@ def _a4_get_stake(sv3_score, pool_balance):
         return 0  # Score tier not in profitable list → SKIP
     
     stake = round(pool_balance * pct, 2)
-    stake = max(1.00, stake)  # Minimum $1.00
+    stake = max(2.50, stake)  # Minimum $2.50 (Polymarket requires 5 shares minimum at 50c)
     stake = min(stake, pool_balance / 10)  # Max 10% of pool per trade
     stake = min(stake, pool_balance - 5)  # Keep $5 reserve
     
-    if stake < 1.00:
-        return 0  # Pool too low
+    if stake < 2.50:
+        return 0  # Pool too low for minimum order
     
     return round(stake, 2)
 
@@ -22152,7 +22154,7 @@ h2{{font-size:16px;font-weight:700;color:#1a3d2e;margin-bottom:12px}}
 
 @app.route("/app/poly-alpha4")
 def poly_alpha4_page():
-    """Sniper A4 dashboard — with SV3 Smart PA gatekeeper."""
+    """Sniper A4 dashboard — Binance SMA + SV3 Tiered Stakes."""
     try:
         db = get_db()
         trades = db.run("SELECT * FROM poly_alpha4_trades ORDER BY fired_at DESC LIMIT 200")
@@ -22160,7 +22162,7 @@ def poly_alpha4_page():
         trades = [dict(zip(cols, row)) for row in trades] if trades else []
     except:
         trades = []
-    # Only count trades with SV3 gate tags (MTF in indicators) for stats
+    # Count all trades with MTF tag for stats
     gate_trades = [t for t in trades if "MTF" in str(t.get("indicators","")) or t.get("status") == "Skipped"]
     resolved = [t for t in gate_trades if t.get("outcome") in ("WIN","LOSS")]
     pending = [t for t in gate_trades if t.get("outcome") == "PENDING"]
@@ -22169,8 +22171,35 @@ def poly_alpha4_page():
     wr = round(wins/len(resolved)*100, 1) if resolved else 0
     pnl = round(sum((float(t.get("payout") or 0) - float(t.get("stake") or 0)) if t["outcome"]=="WIN" else -float(t.get("stake") or 0) for t in resolved), 2)
     bal = _poly_alpha4_state["balance"]
+    
+    # Count by score tier
+    tier_stats = {}
+    for t in resolved:
+        ind = str(t.get("indicators",""))
+        sc = "?"
+        if "MTF" in ind:
+            try:
+                sc = ind.split("MTF")[1].split(" ")[0]
+            except:
+                sc = "?"
+        if sc not in tier_stats:
+            tier_stats[sc] = {"w": 0, "l": 0, "stake": 0}
+        if t["outcome"] == "WIN":
+            tier_stats[sc]["w"] += 1
+        else:
+            tier_stats[sc]["l"] += 1
+        tier_stats[sc]["stake"] += float(t.get("stake") or 0)
+    
+    tier_rows = ""
+    for sc in sorted(tier_stats.keys(), key=lambda x: str(x)):
+        d = tier_stats[sc]
+        tt = d["w"] + d["l"]
+        twr = round(d["w"]/tt*100,1) if tt > 0 else 0
+        twc = "#4ade80" if twr >= 55 else "#f87171" if twr < 50 else "#fbbf24"
+        tier_rows += "<tr><td>MTF%s</td><td>%d</td><td style='color:%s'>%.1f%%</td><td>$%.2f</td></tr>" % (sc, tt, twc, twr, d["stake"])
+    
     rows = ""
-    for t in gate_trades[:50]:
+    for t in gate_trades[:60]:
         o = t.get("outcome","PENDING")
         s_status = t.get("status","")
         ic = "W" if o=="WIN" else "L" if o=="LOSS" else "S" if s_status=="Skipped" else "P"
@@ -22179,21 +22208,29 @@ def poly_alpha4_page():
         sv3_tag = ""
         ind = str(t.get("indicators",""))
         if "MTF" in ind:
-            sv3_tag = ind.split("|")[0].strip()[:15]
-        rows += "<tr><td>%s</td><td>%s</td><td>%s</td><td>$%.2f</td><td>%s</td><td style=\"font-size:11px;color:#8b949e\">%s</td><td style=\"color:%s\">%s</td></tr>" % (ic,t.get("asset","?"),t.get("bet_side","?"),float(t.get("stake") or 0),str(t.get("fired_at",""))[:16],sv3_tag,tc,tp)
+            sv3_tag = ind.split("|")[0].strip()[:20]
+        stake_str = "$%.2f" % float(t.get("stake") or 0)
+        rows += "<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td style=\"font-size:11px;color:#8b949e\">%s</td><td style=\"color:%s\">%s</td></tr>" % (ic,t.get("asset","?"),t.get("bet_side","?"),stake_str,str(t.get("fired_at",""))[:16],sv3_tag,tc,tp)
     wc = "#4ade80" if wr>=52 else "#f87171" if wr<48 else "#fbbf24"
     pc = "#4ade80" if pnl>=0 else "#f87171"
-    html = "<!DOCTYPE html><html><head><title>Sniper A4</title><meta name=viewport content=\"width=device-width,initial-scale=1\"><style>body{background:#0d1117;color:#e6edf3;font-family:sans-serif;margin:0;padding:16px}.c{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:20px;margin-bottom:16px}.s{display:inline-block;min-width:100px;margin:8px 12px 8px 0}.s .v{font-size:24px;font-weight:700}.s .l{font-size:11px;color:#8b949e}table{width:100%%;border-collapse:collapse;font-size:13px}th{text-align:left;color:#8b949e;padding:6px;border-bottom:1px solid #30363d}td{padding:6px;border-bottom:1px solid #21262d}</style></head><body>"
-    html += "<nav style=\"background:#161b22;padding:8px 16px;display:flex;gap:8px;border-bottom:1px solid #30363d\"><a href=/app/poly-alpha4 style=\"color:#58a6ff;text-decoration:none;padding:4px 10px;font-size:13px;font-weight:bold\">A4</a><a href=/app/poly-alpha41 style=\"color:#58a6ff;text-decoration:none;padding:4px 10px;font-size:13px\">A41 P31</a><a href=/app/sv21 style=\"color:#58a6ff;text-decoration:none;padding:4px 10px;font-size:13px\">SV2.1</a><a href=/app/limitless-sniper style=\"color:#58a6ff;text-decoration:none;padding:4px 10px;font-size:13px\">LMTS</a><a href=/app/sniper-v2 style=\"color:#58a6ff;text-decoration:none;padding:4px 10px;font-size:13px\">SV2</a></nav>"
-    html += "<h1>Sniper A4 + SV3 Gate</h1>"
-    html += "<p style=\"color:#8b949e\">TV+SMA+BTC 2/3 agree | SV3 score≥+4=instant, &lt;+4=WAIT 2min confirm | 50c GTC</p>"
-    html += "<div class=c><div class=s><div class=v>$%.2f</div><div class=l>Pool</div></div>" % bal
+    html = "<!DOCTYPE html><html><head><title>Sniper A4</title><meta name=viewport content=\"width=device-width,initial-scale=1\"><style>body{background:#0d1117;color:#e6edf3;font-family:sans-serif;margin:0;padding:16px}.c{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:20px;margin-bottom:16px}.s{display:inline-block;min-width:100px;margin:8px 12px 8px 0}.s .v{font-size:24px;font-weight:700}.s .l{font-size:11px;color:#8b949e}table{width:100%%;border-collapse:collapse;font-size:13px}th{text-align:left;color:#8b949e;padding:6px;border-bottom:1px solid #30363d}td{padding:6px;border-bottom:1px solid #21262d}h2{font-size:15px;color:#58a6ff;margin:14px 0 8px}</style></head><body>"
+    html += "<nav style=\"background:#161b22;padding:8px 16px;display:flex;gap:8px;border-bottom:1px solid #30363d\"><a href=/app/poly-alpha4 style=\"color:#58a6ff;text-decoration:none;padding:4px 10px;font-size:13px;font-weight:bold\">A4</a><a href=/app/poly-alpha41 style=\"color:#58a6ff;text-decoration:none;padding:4px 10px;font-size:13px\">A41 P31</a><a href=/app/sv21 style=\"color:#58a6ff;text-decoration:none;padding:4px 10px;font-size:13px\">SV2.1</a><a href=/app/limitless-sniper style=\"color:#58a6ff;text-decoration:none;padding:4px 10px;font-size:13px\">LMTS</a><a href=/app/sniper-v2 style=\"color:#58a6ff;text-decoration:none;padding:4px 10px;font-size:13px\">SV2</a><a href=/app/backtest style=\"color:#58a6ff;text-decoration:none;padding:4px 10px;font-size:13px\">Backtest</a></nav>"
+    html += "<h1>Sniper A4 — Binance SMA + SV3 Tiered</h1>"
+    html += "<p style=\"color:#8b949e\">Binance SMA(10) 1H direction | SV3 score tiers stakes | Skip 3,5 | 50c GTC at T+0</p>"
+    html += "<div class=c><div class=s><div class=v>$%.2f</div><div class=l>Pool ($100 start)</div></div>" % bal
     html += "<div class=s><div class=v style=\"color:%s\">%.1f%%</div><div class=l>Win Rate</div></div>" % (wc, wr)
     html += "<div class=s><div class=v>%d</div><div class=l>Resolved</div></div>" % len(resolved)
-    html += "<div class=s><div class=v style=\"color:%s\">$%+.2f</div><div class=l>P&L (today)</div></div>" % (pc, pnl)
+    html += "<div class=s><div class=v style=\"color:%s\">$%+.2f</div><div class=l>P&L</div></div>" % (pc, pnl)
     html += "<div class=s><div class=v>%d</div><div class=l>Pending</div></div>" % len(pending)
     html += "<div class=s><div class=v style=\"color:#58a6ff\">%d</div><div class=l>Skipped</div></div></div>" % len(skipped)
-    html += "<div class=c><p style=\"color:#8b949e;font-size:13px\">SV3 gatekeeper: 8 price action concepts × 3 TFs (1H+30M+15M).<br>Score ≥+4 → fire instant at 50c. Score &lt;+4 → WAIT 2min → price confirms → fire or skip.<br>Skipped = SV3 blocked (saved money). Today only.</p></div>"
+    html += "<div class=c><p style=\"color:#8b949e;font-size:13px\">Backtested 7 days / 2,688 boundaries / 4 assets.<br>"
+    html += "Score 8: $5 (87%WR) | Score 6: $5 (63%WR) | Score 4: $3.50 (59%WR)<br>"
+    html += "Score 7: $2.50 | Score 2: $2.50 (55%WR) | Score 1: $2.50 (54%WR) | Score 0: $2 (54%WR)<br>"
+    html += "<b style=\"color:#f87171\">SKIP: Score 3 (48%WR) | Score 5 (49%WR) | Score -1,-2 (oppose)</b></p></div>"
+    if tier_rows:
+        html += "<h2>Performance by Score Tier</h2>"
+        html += "<div class=c><table><tr><th>Tier</th><th>Trades</th><th>WR</th><th>Total Staked</th></tr>%s</table></div>" % tier_rows
+    html += "<h2>Trade Log</h2>"
     html += "<div class=c><table><tr><th></th><th>Asset</th><th>Side</th><th>Stake</th><th>Time</th><th>SV3</th><th>P&L</th></tr>%s</table></div>" % rows
     html += "<script>setTimeout(function(){location.reload()},60000)</script></body></html>"
     return html
