@@ -421,10 +421,10 @@ def _poly_alpha3_load_recent():
         _poly_alpha4_state["balance"] = _saved_pa4["balance"]
         _poly_alpha4_state["peak_balance"] = _saved_pa4.get("peak_balance", _saved_pa4["balance"])
     else:
-        _poly_alpha4_state["balance"] = 50.0
-        _poly_alpha4_state["peak_balance"] = 50.0
-    _poly_alpha4_state["starting_balance"] = 50.0
-    _poly_alpha4_state["floor_balance"] = 5.0
+        _poly_alpha4_state["balance"] = 100.0
+        _poly_alpha4_state["peak_balance"] = 100.0
+    _poly_alpha4_state["starting_balance"] = 100.0
+    _poly_alpha4_state["floor_balance"] = 10.0
     _poly_alpha4_state["enabled"] = True
     _save_bot_balance("poly_alpha4", _poly_alpha4_state)
     
@@ -441,7 +441,7 @@ def _poly_alpha3_load_recent():
     except Exception as _a4c_e:
         print("A4 cleanup error: {}".format(_a4c_e))
     
-    print("SNIPER A4: ${:.2f} pool (SV3 gatekeeper) | P2.1 at boundary | 15M".format(
+    print("SNIPER A4: ${:.2f} pool | Binance SMA + SV3 tiered stakes | skip 3,5 | 15M".format(
         _poly_alpha4_state["balance"]))
     
     # ── A41 PAUSED — not trading on Polymarket until further notice ──
@@ -1513,6 +1513,86 @@ def _sv3_process_wait_queue():
 
 
 
+# ── New A4 system: Binance SMA direction + SV3 tiered stakes ──
+# Proven by 7-day backtest: 1,865 trades, 55.7% WR, +$470
+_A4_SCORE_TIERS = {
+    # score: stake_pct (percentage of pool balance)
+    8: 0.05,   # 87.5% WR — max conviction
+    7: 0.025,  # 52.9% WR — moderate
+    6: 0.05,   # 63.3% WR — high conviction
+    4: 0.035,  # 59.4% WR — strong
+    2: 0.025,  # 55.4% WR — moderate volume
+    1: 0.025,  # 54.1% WR — moderate volume
+    0: 0.02,   # 53.7% WR — weak but profitable
+    # SKIP tiers (not in dict):
+    # 9: too few trades, 0% WR in backtest
+    # 5: 49.4% WR — proven loser
+    # 3: 47.7% WR — proven loser
+    # -1: 45.9% WR — candles oppose
+    # -2: 50.0% WR — candles oppose
+}
+
+
+def _a4_get_binance_sma_direction(asset):
+    """Calculate SMA(10) direction from Binance 1H candles.
+    
+    This is the EXACT method used in the backtest that proved profitable.
+    Returns: ("UP"/"DOWN", sma10_value, current_price) or (None, None, None)
+    """
+    import requests as _sma_req
+    try:
+        BMAP = {"BTC": "BTCUSDT", "ETH": "ETHUSDT", "SOL": "SOLUSDT", "XRP": "XRPUSDT"}
+        symbol = BMAP.get(asset.upper())
+        if not symbol:
+            return None, None, None
+        
+        r = _sma_req.get("https://api.binance.com/api/v3/klines",
+                         params={"symbol": symbol, "interval": "1h", "limit": 12},
+                         timeout=5)
+        if r.status_code != 200:
+            return None, None, None
+        
+        klines = r.json()
+        if not klines or len(klines) < 10:
+            return None, None, None
+        
+        # Use completed candles only (exclude the last one which may be in-progress)
+        closes = [float(k[4]) for k in klines[:-1]]
+        if len(closes) < 10:
+            return None, None, None
+        
+        sma10 = sum(closes[-10:]) / 10
+        current = closes[-1]
+        direction = "UP" if current > sma10 else "DOWN"
+        
+        return direction, sma10, current
+        
+    except Exception as e:
+        print("A4 SMA error {}: {}".format(asset, e))
+        return None, None, None
+
+
+def _a4_get_stake(sv3_score, pool_balance):
+    """Get stake amount based on SV3 score tier.
+    
+    Returns stake in dollars, or 0 if score tier should be skipped.
+    Stake is percentage of pool balance, floored at $1.00 and capped at pool/10.
+    """
+    pct = _A4_SCORE_TIERS.get(sv3_score)
+    if pct is None:
+        return 0  # Score tier not in profitable list → SKIP
+    
+    stake = round(pool_balance * pct, 2)
+    stake = max(1.00, stake)  # Minimum $1.00
+    stake = min(stake, pool_balance / 10)  # Max 10% of pool per trade
+    stake = min(stake, pool_balance - 5)  # Keep $5 reserve
+    
+    if stake < 1.00:
+        return 0  # Pool too low
+    
+    return round(stake, 2)
+
+
 # ── Sniper shared config (used by A4 and A41 threads) ──
 SNIPER_ASSETS = ["BTC", "ETH", "SOL", "XRP"]
 SNIPER_SLUGS = {
@@ -1665,14 +1745,16 @@ def _sniper_thread():
             snipe_targets = []
             _sniper_debug = []
             for asset in SNIPER_ASSETS:
-                direction, signals_agree, ind_str, _confidence = _sniper_get_direction(asset, "15m")
-                if direction and signals_agree >= 2:
-                    _sniper_debug.append("{}={}".format(asset, direction))
+                # NEW: Binance SMA direction (proven by 7-day backtest)
+                _sma_dir, _sma_val, _sma_price = _a4_get_binance_sma_direction(asset)
+                if _sma_dir:
+                    _sniper_debug.append("{}={}".format(asset, _sma_dir))
                     snipe_targets.append({
                         "asset": asset,
-                        "direction": direction,
-                        "signals_agree": signals_agree,
-                        "indicators": ind_str,
+                        "direction": _sma_dir,
+                        "signals_agree": 2,  # SMA is proven signal
+                        "indicators": "SMA10={:.2f} price={:.2f} dir={}".format(
+                            _sma_val or 0, _sma_price or 0, _sma_dir),
                     })
 
             # ── Original A4: fire all qualified targets (no filter) ──
@@ -1845,16 +1927,10 @@ def _sniper_thread():
                 if not _fa4_token:
                     continue
                 
-                # Fixed 50¢ entry, flat $2.50 stake
+                # Fixed 50¢ entry, tiered stake based on SV3 score
                 _fa4_price = 0.50
-                _fa4_shares = 5.0  # $2.50 stake at 50¢ = 5 shares
-                _fa4_cost = 2.50
                 
-                # Check pool balance
-                if _poly_alpha4_state["balance"] < _fa4_cost + 2:
-                    continue
-                
-                # ── SV3 GATEKEEPER: Check candle structure score ──
+                # ── SV3 SCORING: Calculate candle structure score ──
                 _fa4_sv3_score = None
                 _fa4_sv3_tag = ""
                 try:
@@ -1867,36 +1943,29 @@ def _sniper_thread():
                         _fa4_sv3_tag = "MTF{} 1H={} 30M={} 15M={}".format(
                             _fa4_sv3_score, _fa4_s1h, _fa4_s30, _fa4_s15)
                 except Exception as _fa4_sv3_e:
-                    print("A4 SV3 gate error {}: {}".format(_fa4_asset, _fa4_sv3_e))
+                    print("A4 SV3 score error {}: {}".format(_fa4_asset, _fa4_sv3_e))
                 
-                # Decision: score >= +4 → fire now, score < +4 → wait queue
-                if _fa4_sv3_score is not None and _fa4_sv3_score < 4:
-                    # ── WAIT: candle structure doesn't strongly confirm ──
-                    _fa4_wk = "a4_wait_{}_{}".format(_fa4_asset, window_ts)
-                    _a4_sv3_wait_queue[_fa4_wk] = {
-                        "asset": _fa4_asset,
-                        "direction": _fa4_dir,
-                        "indicators": _fa4_ind,
-                        "agree": _fa4_agree,
-                        "token_id": _fa4_token,
-                        "price": _fa4_price,
-                        "shares": _fa4_shares,
-                        "cost": _fa4_cost,
-                        "slug": _fa4_entry.get("slug", ""),
-                        "condition_id": _fa4_entry.get("condition_id", ""),
-                        "sv3_score": _fa4_sv3_score,
-                        "sv3_tag": _fa4_sv3_tag,
-                        "boundary_ts": window_ts,
-                        "queued_at": datetime.now(timezone.utc),
-                    }
-                    print("A4 SV3 WAIT: {} {} score={} — needs confirmation | {}".format(
+                # ── TIERED STAKE: score determines stake size ──
+                if _fa4_sv3_score is None:
+                    _fa4_sv3_score = 0  # No candle data → treat as score 0 (lowest profitable tier)
+                
+                _fa4_cost = _a4_get_stake(_fa4_sv3_score, _poly_alpha4_state["balance"])
+                
+                if _fa4_cost <= 0:
+                    # Score is in SKIP tier (3, 5, -1, -2, 9)
+                    print("A4 SKIP: {} {} score={} — not in profitable tier | {}".format(
                         _fa4_dir, _fa4_asset, _fa4_sv3_score, _fa4_sv3_tag))
                     continue
                 
-                # ── FIRE: score >= +4 or no candle data (fallback to old behavior) ──
-                if _fa4_sv3_score is not None:
-                    print("A4 SV3 PASS: {} {} score={} — firing | {}".format(
-                        _fa4_dir, _fa4_asset, _fa4_sv3_score, _fa4_sv3_tag))
+                _fa4_shares = round(_fa4_cost / _fa4_price, 1)  # shares = stake / price_per_share
+                
+                # Check pool balance
+                if _poly_alpha4_state["balance"] < _fa4_cost + 2:
+                    continue
+                
+                # ── FIRE: Score is in profitable tier ──
+                print("A4 FIRE: {} {} score={} stake=${:.2f} | {}".format(
+                    _fa4_dir, _fa4_asset, _fa4_sv3_score, _fa4_cost, _fa4_sv3_tag))
                 
                 try:
                     _fa4_args = OrderArgs(
