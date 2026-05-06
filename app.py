@@ -415,16 +415,20 @@ _poly_alpha3_traded_markets = set()
 def _poly_alpha3_load_recent():
 
     # ── POLY ALPHA 4.0 SNIPER init ──
-    # Force balance to $50 (with SV3 gatekeeper upgrade)
-    _poly_alpha4_state["balance"] = 50.0
-    _poly_alpha4_state["peak_balance"] = 50.0
+    # Load balance from DB (no more force-reset on deploy)
+    _saved_pa4 = _saved_balances.get("poly_alpha4", {})
+    if _saved_pa4 and _saved_pa4.get("balance", 0) > 0:
+        _poly_alpha4_state["balance"] = _saved_pa4["balance"]
+        _poly_alpha4_state["peak_balance"] = _saved_pa4.get("peak_balance", _saved_pa4["balance"])
+    else:
+        _poly_alpha4_state["balance"] = 50.0
+        _poly_alpha4_state["peak_balance"] = 50.0
     _poly_alpha4_state["starting_balance"] = 50.0
     _poly_alpha4_state["floor_balance"] = 5.0
     _poly_alpha4_state["enabled"] = True
     _save_bot_balance("poly_alpha4", _poly_alpha4_state)
     
-    # Cancel all old pending A4 trades so resolver doesn't add their payouts
-    # to the fresh $50 pool. These were from before the SV3 gate.
+    # Cancel old pre-gate pending trades (no MTF tag) so resolver ignores them
     try:
         _a4_cleanup = get_db()
         _a4_old_count = _a4_cleanup.run(
@@ -437,7 +441,8 @@ def _poly_alpha3_load_recent():
     except Exception as _a4c_e:
         print("A4 cleanup error: {}".format(_a4c_e))
     
-    print("SNIPER A4: $50.00 pool (fresh + SV3 gatekeeper) | P2.1 at boundary | 15M")
+    print("SNIPER A4: ${:.2f} pool (SV3 gatekeeper) | P2.1 at boundary | 15M".format(
+        _poly_alpha4_state["balance"]))
     
     # ── A41 PAUSED — not trading on Polymarket until further notice ──
     _saved_pa41 = _saved_balances.get("poly_alpha41", {})
@@ -2060,8 +2065,43 @@ def _sniper_thread():
                         _a4w_keys_done.append(_a4w_key)
                         continue
 
-                    # Confirmation: price moved past PTB + 0.02% in signal direction
-                    _a4w_threshold = _a4w_ptb * 0.0002
+                    # Confirmation logic scales with SV3 score:
+                    # Score +3: fire if price is just above/below PTB (any direction move)
+                    # Score +1/+2: need price past PTB + 0.02% 
+                    # Score 0 or negative: skip — signal opposes candle structure
+                    _a4w_sv3 = _a4w.get("sv3_score", 0)
+                    
+                    if _a4w_sv3 <= 0:
+                        # Negative or zero score — candles oppose the signal, skip
+                        print("A4 WAIT skip (score {}): {} {} — candles oppose signal".format(
+                            _a4w_sv3, _a4w_dir, _a4w_asset))
+                        try:
+                            _a4w_skip_db = get_db()
+                            _a4w_skip_db.run("""INSERT INTO poly_alpha4_trades
+                                (market_id,title,asset,timeframe,bet_side,stake,fill_price,
+                                 pool_after,order_id,token_id,condition_id,slug,filled,
+                                 status,outcome,indicators,signals_agree,fired_at)
+                                VALUES (:mid,:ttl,:ast,:tf,:bs,0,0,
+                                 :pa,'','','','',FALSE,
+                                 'Skipped','SV3_OPPOSED',:ind,:sa,:fa)""",
+                                mid="sniper_{}_15M_{}_wait".format(_a4w_asset, _a4w["boundary_ts"]),
+                                ttl="A4 {} {} 15M SV3 OPPOSED score={}".format(_a4w_asset, _a4w_dir, _a4w_sv3),
+                                ast=_a4w_asset, tf="15M", bs=_a4w_dir,
+                                pa=_poly_alpha4_state["balance"],
+                                ind=_a4w.get("sv3_tag", "")[:200],
+                                sa=_a4w.get("agree", 0),
+                                fa=datetime.now(timezone.utc).isoformat())
+                            _a4w_skip_db.close()
+                        except: pass
+                        _a4w_keys_done.append(_a4w_key)
+                        continue
+                    
+                    # Score +1 to +3: check price confirmation
+                    if _a4w_sv3 >= 3:
+                        _a4w_threshold = 0  # Score +3: any move past PTB confirms
+                    else:
+                        _a4w_threshold = _a4w_ptb * 0.0002  # Score +1/+2: need 0.02%
+                    
                     if _a4w_dir == "UP":
                         _a4w_confirmed = _a4w_current > _a4w_ptb + _a4w_threshold
                     else:
