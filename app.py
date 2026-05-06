@@ -430,16 +430,23 @@ def _poly_alpha3_load_recent():
     _poly_alpha4_state["enabled"] = True
     _save_bot_balance("poly_alpha4", _poly_alpha4_state)
     
-    # Cancel old pre-gate pending trades (no MTF tag) so resolver ignores them
+    # Archive ALL old A4 trades — new tiered stakes system starts fresh
     try:
         _a4_cleanup = get_db()
-        _a4_old_count = _a4_cleanup.run(
-            "UPDATE poly_alpha4_trades SET status='Cancelled', outcome='OLD_PRE_GATE' "
-            "WHERE status='Pending' AND (indicators IS NULL OR indicators NOT LIKE '%MTF%') "
-            "RETURNING id")
+        # First check if archive table exists, create if not
+        _a4_cleanup.run("""CREATE TABLE IF NOT EXISTS poly_alpha4_trades_archive AS 
+            SELECT * FROM poly_alpha4_trades WHERE 1=0""")
+        # Move all existing trades to archive
+        _a4_moved = _a4_cleanup.run(
+            "INSERT INTO poly_alpha4_trades_archive SELECT * FROM poly_alpha4_trades "
+            "WHERE status != 'ARCHIVED' RETURNING id")
+        _a4_deleted = _a4_cleanup.run(
+            "DELETE FROM poly_alpha4_trades RETURNING id")
         _a4_cleanup.close()
-        if _a4_old_count:
-            print("A4: cancelled {} old pre-gate pending trades".format(len(_a4_old_count)))
+        _moved_count = len(_a4_moved) if _a4_moved else 0
+        _del_count = len(_a4_deleted) if _a4_deleted else 0
+        if _del_count:
+            print("A4: archived {} old trades, cleared table for new system".format(_del_count))
     except Exception as _a4c_e:
         print("A4 cleanup error: {}".format(_a4c_e))
     
@@ -1957,6 +1964,28 @@ def _sniper_thread():
                     # Score is in SKIP tier (3, 5, -1, -2, 9)
                     print("A4 SKIP: {} {} score={} — not in profitable tier | {}".format(
                         _fa4_dir, _fa4_asset, _fa4_sv3_score, _fa4_sv3_tag))
+                    # Record skip in DB for dashboard tracking
+                    try:
+                        _skip_db = get_db()
+                        _skip_db.run("""INSERT INTO poly_alpha4_trades
+                            (market_id,title,asset,timeframe,bet_side,stake,fill_price,
+                             pool_after,order_id,token_id,condition_id,slug,filled,
+                             status,outcome,indicators,signals_agree,fired_at)
+                            VALUES (:mid,:ttl,:ast,:tf,:bs,:stk,:fp,
+                             :pa,:oid,:tid,:cid,:slg,:fld,
+                             :sts,:out,:ind,:sa,:fa)""",
+                            mid="skip_{}_15M_{}".format(_fa4_asset, window_ts),
+                            ttl="A4 SKIP {} {} 15M".format(_fa4_asset, _fa4_dir),
+                            ast=_fa4_asset, tf="15M", bs=_fa4_dir,
+                            stk=0, fp=0,
+                            pa=_poly_alpha4_state["balance"],
+                            oid="", tid="", cid="", slg="",
+                            fld=False,
+                            sts="Skipped", out="SKIPPED",
+                            ind="{} | SKIP score {} | {}".format(_fa4_sv3_tag, _fa4_sv3_score, _fa4_ind),
+                            sa=0,
+                            fa=datetime.now(timezone.utc).isoformat())
+                    except: pass
                     continue
                 
                 _fa4_shares = round(_fa4_cost / _fa4_price, 1)  # shares = stake / price_per_share
@@ -1984,7 +2013,8 @@ def _sniper_thread():
                     
                     fired_results.append({
                         "asset": _fa4_asset, "direction": _fa4_dir,
-                        "indicators": _fa4_ind, "agree": _fa4_agree,
+                        "indicators": "{} | {}".format(_fa4_sv3_tag, _fa4_ind),
+                        "agree": _fa4_agree,
                         "order_id": _fa4_oid, "cost": _fa4_cost,
                         "price": _fa4_price, "shares": _fa4_shares,
                         "token_id": _fa4_token,
