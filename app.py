@@ -755,330 +755,182 @@ def _sniper_get_direction(asset, timeframe="15m"):
 
 
 
-def _sv3_analyze_candle_structure(asset, num_candles=20):
-    """SV3 Phase 1: Fetch candles and analyze market structure.
-    Call at T-22s. Returns cached structure result (no PTB needed yet).
+def _sv3_fetch_mtf_candles(asset, num_candles=20):
+    """SV3 Phase 1: Fetch candles on 1H, 30M, and 15M from Binance.
+    Call at T-22s. Returns dict with 3 sets of candles, or None on failure.
     """
-    candles = _fetch_binance_candles_small(asset, "15m", num_candles + 5)
-    if not candles or len(candles) < 8:
+    import time as _t
+    result = {}
+    for tf in ["1h", "30m", "15m"]:
+        candles = _fetch_binance_candles_small(asset, tf, num_candles + 5)
+        if candles and len(candles) >= 5:
+            # Filter to completed candles only
+            now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+            tf_ms = {"1h": 3600000, "30m": 1800000, "15m": 900000}.get(tf, 900000)
+            completed = [c for c in candles if c["ts"] + tf_ms <= now_ms]
+            if len(completed) >= 5:
+                result[tf] = completed[-num_candles:]
+            else:
+                result[tf] = candles[-num_candles:]  # Use what we have
+        else:
+            result[tf] = None
+    
+    # Need at least 15M to do anything
+    if not result.get("15m"):
         return None
+    
+    return result
 
-    # Filter to completed candles only
-    from datetime import datetime, timezone
-    now_ts = int(datetime.now(timezone.utc).timestamp() * 1000)
-    completed = [c for c in candles if c["ts"] + (15 * 60 * 1000) <= now_ts]
-    if len(completed) < 8:
-        # Fallback: use indicator cache candles
-        try:
-            ind = _calculate_indicators(asset, "15m")
-            if ind and ind.get("_opens") and len(ind["_opens"]) >= 10:
-                completed = []
-                n = min(len(ind["_opens"]), num_candles)
-                for i in range(-n, 0):
-                    completed.append({
-                        "ts": 0, "open": ind["_opens"][i], "high": ind["_highs"][i],
-                        "low": ind["_lows"][i], "close": ind["_closes"][i],
-                    })
-        except:
-            pass
-    if len(completed) < 8:
-        return None
 
-    # Use last num_candles completed candles
-    completed = completed[-num_candles:] if len(completed) > num_candles else completed
-
-    # ── Swing detection ──
-    swings = []
-    direction_track = None
-    swing_high = completed[0]["high"]
-    swing_low = completed[0]["low"]
-    swing_high_idx = 0
-    swing_low_idx = 0
-    min_move_pct = 0.08
-
-    for i in range(1, len(completed)):
-        c = completed[i]
-        if c["high"] > swing_high:
-            swing_high = c["high"]
-            swing_high_idx = i
-        if c["low"] < swing_low:
-            swing_low = c["low"]
-            swing_low_idx = i
-
-        if direction_track is None:
-            if c["close"] > completed[0]["open"]:
-                direction_track = "UP"
-            elif c["close"] < completed[0]["open"]:
-                direction_track = "DOWN"
-            continue
-
-        if direction_track == "UP":
-            drop = (swing_high - c["low"]) / swing_high * 100 if swing_high > 0 else 0
-            if drop >= min_move_pct and swing_high_idx < i:
-                swings.append({"type": "high", "index": swing_high_idx, "price": swing_high})
-                direction_track = "DOWN"
-                swing_low = c["low"]
-                swing_low_idx = i
-        elif direction_track == "DOWN":
-            rise = (c["high"] - swing_low) / swing_low * 100 if swing_low > 0 else 0
-            if rise >= min_move_pct and swing_low_idx < i:
-                swings.append({"type": "low", "index": swing_low_idx, "price": swing_low})
-                direction_track = "UP"
-                swing_high = c["high"]
-                swing_high_idx = i
-
-    # ── Trend detection ──
-    highs = [s for s in swings if s["type"] == "high"]
-    lows = [s for s in swings if s["type"] == "low"]
-    recent_highs = highs[-4:] if len(highs) >= 2 else highs
-    recent_lows = lows[-4:] if len(lows) >= 2 else lows
-    high_prices = [h["price"] for h in recent_highs]
-    low_prices = [l["price"] for l in recent_lows]
-
-    hh = lh = hl = ll = 0
-    for i in range(1, len(high_prices)):
-        if high_prices[i] > high_prices[i-1]: hh += 1
-        elif high_prices[i] < high_prices[i-1]: lh += 1
-    for i in range(1, len(low_prices)):
-        if low_prices[i] > low_prices[i-1]: hl += 1
-        elif low_prices[i] < low_prices[i-1]: ll += 1
-
-    bull_score = hh + hl
-    bear_score = lh + ll
-    total_cmp = max(bull_score + bear_score, 1)
-
-    if bull_score > bear_score and hl >= 1:
+def _sv3_score_timeframe(candles, signal_direction):
+    """Score a single timeframe's support for the signal direction.
+    Returns (score, reasons) where score is -2 to +2.
+    """
+    if not candles or len(candles) < 5:
+        return 0, ["insufficient candles"]
+    
+    reasons = []
+    score = 0
+    sig_bull = signal_direction == "UP"
+    sig_bear = signal_direction == "DOWN"
+    n = len(candles)
+    
+    # ── TREND: compare first third vs last third ──
+    third = max(3, n // 3)
+    avg_start = sum(c["close"] for c in candles[:third]) / third
+    avg_end = sum(c["close"] for c in candles[-third:]) / third
+    move_pct = (avg_end - avg_start) / avg_start * 100 if avg_start > 0 else 0
+    
+    last5 = candles[-5:]
+    greens_5 = sum(1 for c in last5 if c["close"] > c["open"])
+    reds_5 = sum(1 for c in last5 if c["close"] < c["open"])
+    
+    if move_pct > 0.1 and greens_5 >= 3:
         trend = "UP"
-        strength = int(bull_score / total_cmp * 100)
-    elif bear_score > bull_score and lh >= 1:
+    elif move_pct < -0.1 and reds_5 >= 3:
         trend = "DOWN"
-        strength = int(bear_score / total_cmp * 100)
+    elif abs(move_pct) < 0.05:
+        trend = "RANGE"
+    elif move_pct > 0.05:
+        trend = "UP"
+    elif move_pct < -0.05:
+        trend = "DOWN"
     else:
         trend = "RANGE"
-        strength = 0
-
-    last_sh = high_prices[-1] if high_prices else None
-    last_sl = low_prices[-1] if low_prices else None
-
-    # ── BOS detection (last 5 candles) ──
-    bos = None
-    bos_level = None
-    sh_idx = None
-    sl_idx = None
-    for s in swings:
-        if s["type"] == "high" and last_sh and s["price"] == last_sh:
-            sh_idx = s["index"]
-        if s["type"] == "low" and last_sl and s["price"] == last_sl:
-            sl_idx = s["index"]
-
-    for i in range(max(0, len(completed) - 5), len(completed)):
-        c = completed[i]
-        if last_sh and c["close"] > last_sh and sh_idx is not None and i > sh_idx:
-            bos = "BULLISH"
-            bos_level = last_sh
-        if last_sl and c["close"] < last_sl and sl_idx is not None and i > sl_idx:
-            bos = "BEARISH"
-            bos_level = last_sl
-
-    # ── Reversal detection (last 2-3 candles) ──
-    reversal = None
-    rev_pattern = None
-    rev_confidence = None
-
-    if len(completed) >= 5:
-        last_c = completed[-1]
-        prev_c = completed[-2]
-        last_green = last_c["close"] > last_c["open"]
-        last_red = last_c["close"] < last_c["open"]
-        prev_body = abs(prev_c["close"] - prev_c["open"])
-        prev_range = prev_c["high"] - prev_c["low"]
-        last_body = abs(last_c["close"] - last_c["open"])
-
-        lookback = completed[-7:-2] if len(completed) >= 7 else completed[:-2]
-        recent_reds = sum(1 for c in lookback if c["close"] < c["open"])
-        recent_greens = sum(1 for c in lookback if c["close"] > c["open"])
-
-        if prev_range > 0:
-            prev_lower_wick = (min(prev_c["open"], prev_c["close"]) - prev_c["low"]) / prev_range
-            prev_upper_wick = (prev_c["high"] - max(prev_c["open"], prev_c["close"])) / prev_range
-            prev_body_ratio = prev_body / prev_range
-
-            # Hammer after selling
-            if prev_lower_wick > 0.5 and prev_body_ratio < 0.35 and recent_reds >= 3:
-                if last_green:
-                    reversal = "BULLISH"; rev_pattern = "HAMMER_CONFIRMED"; rev_confidence = "STRONG"
-                else:
-                    reversal = "BULLISH"; rev_pattern = "HAMMER_UNCONFIRMED"; rev_confidence = "WEAK"
-
-            # Shooting star after rally
-            if not reversal and prev_upper_wick > 0.5 and prev_body_ratio < 0.35 and recent_greens >= 3:
-                if last_red:
-                    reversal = "BEARISH"; rev_pattern = "STAR_CONFIRMED"; rev_confidence = "STRONG"
-                else:
-                    reversal = "BEARISH"; rev_pattern = "STAR_UNCONFIRMED"; rev_confidence = "WEAK"
-
-        # Bullish engulfing
-        if not reversal:
-            prev_red = prev_c["close"] < prev_c["open"]
-            if prev_red and last_green and last_body > prev_body * 1.2:
-                if last_c["close"] > prev_c["open"] and last_c["open"] < prev_c["close"]:
-                    conf = "STRONG" if recent_reds >= 2 else "WEAK"
-                    reversal = "BULLISH"; rev_pattern = "BULLISH_ENGULF"; rev_confidence = conf
-
-        # Bearish engulfing
-        if not reversal:
-            prev_green = prev_c["close"] > prev_c["open"]
-            if prev_green and last_red and last_body > prev_body * 1.2:
-                if last_c["close"] < prev_c["open"] and last_c["open"] > prev_c["close"]:
-                    conf = "STRONG" if recent_greens >= 2 else "WEAK"
-                    reversal = "BEARISH"; rev_pattern = "BEARISH_ENGULF"; rev_confidence = conf
-
-        # CHoCH starting
-        if not reversal:
-            if recent_reds >= 3 and last_green and prev_c["close"] > prev_c["open"] and last_c["low"] > prev_c["low"]:
-                reversal = "BULLISH"; rev_pattern = "CHOCH_STARTING"; rev_confidence = "WEAK"
-            elif recent_greens >= 3 and last_red and prev_c["close"] < prev_c["open"] and last_c["high"] < prev_c["high"]:
-                reversal = "BEARISH"; rev_pattern = "CHOCH_STARTING"; rev_confidence = "WEAK"
-
-    return {
-        "candles": completed,
-        "swings": swings,
-        "trend": trend,
-        "strength": strength,
-        "high_prices": high_prices,
-        "low_prices": low_prices,
-        "last_swing_high": last_sh,
-        "last_swing_low": last_sl,
-        "hh": hh, "lh": lh, "hl": hl, "ll": ll,
-        "bos": bos,
-        "bos_level": bos_level,
-        "reversal": reversal,
-        "rev_pattern": rev_pattern,
-        "rev_confidence": rev_confidence,
-    }
+    
+    # ── MOMENTUM: last 3 candles ──
+    last3 = candles[-3:]
+    greens = sum(1 for c in last3 if c["close"] > c["open"])
+    reds = sum(1 for c in last3 if c["close"] < c["open"])
+    bodies = [abs(c["close"] - c["open"]) for c in last3]
+    body_shrinking = bodies[-1] < bodies[0] * 0.5 if bodies[0] > 0 else False
+    
+    # ── LAST CANDLE PATTERN ──
+    last = candles[-1]
+    prev = candles[-2]
+    last_range = last["high"] - last["low"]
+    last_body = abs(last["close"] - last["open"])
+    last_green = last["close"] > last["open"]
+    last_red = last["close"] < last["open"]
+    
+    strong_close = (last_body / last_range > 0.6) if last_range > 0 else False
+    is_doji = (last_body / last_range < 0.15) if last_range > 0 else True
+    
+    upper_wick = last["high"] - max(last["open"], last["close"])
+    lower_wick = min(last["open"], last["close"]) - last["low"]
+    shooting_star = False
+    hammer = False
+    if last_range > 0:
+        if upper_wick / last_range > 0.55 and last_body / last_range < 0.3:
+            shooting_star = True
+        if lower_wick / last_range > 0.55 and last_body / last_range < 0.3:
+            hammer = True
+    
+    prev_body = abs(prev["close"] - prev["open"])
+    bull_engulf = last_green and prev["close"] < prev["open"] and last_body > prev_body * 1.2
+    bear_engulf = last_red and prev["close"] > prev["open"] and last_body > prev_body * 1.2
+    
+    # ── RANGE POSITION (only used when trend=RANGE) ──
+    range_top = max(c["high"] for c in candles)
+    range_bot = min(c["low"] for c in candles)
+    full_range = range_top - range_bot
+    last_close = last["close"]
+    position = (last_close - range_bot) / full_range if full_range > 0 else 0.5
+    near_top = position >= 0.75
+    near_bottom = position <= 0.25
+    
+    # ── BOS (simplified: did recent candles break first-half extremes?) ──
+    half = max(3, n // 2)
+    first_half_high = max(c["high"] for c in candles[:half])
+    first_half_low = min(c["low"] for c in candles[:half])
+    bullish_bos = any(c["close"] > first_half_high for c in candles[-3:])
+    bearish_bos = any(c["close"] < first_half_low for c in candles[-3:])
+    choch_bull = trend == "DOWN" and bullish_bos
+    choch_bear = trend == "UP" and bearish_bos
+    
+    # ═══ SCORING ═══
+    
+    # Trend alignment
+    if trend == "UP":
+        if sig_bull: score += 1; reasons.append("trend UP matches signal")
+        else: score -= 1; reasons.append("trend UP opposes DOWN signal")
+    elif trend == "DOWN":
+        if sig_bear: score += 1; reasons.append("trend DOWN matches signal")
+        else: score -= 1; reasons.append("trend DOWN opposes UP signal")
+    else:
+        if sig_bull and near_bottom: score += 1; reasons.append("range: PTB near floor + UP = bounce")
+        elif sig_bear and near_top: score += 1; reasons.append("range: PTB near ceiling + DOWN = rejection")
+        elif sig_bull and near_top: score -= 1; reasons.append("range: PTB near ceiling + UP = hard")
+        elif sig_bear and near_bottom: score -= 1; reasons.append("range: PTB near floor + DOWN = hard")
+        else: reasons.append("range: mid-range, neutral")
+    
+    # Momentum alignment
+    if sig_bull and greens >= 2 and not body_shrinking:
+        score += 1; reasons.append("{}g in last 3".format(greens))
+    elif sig_bear and reds >= 2 and not body_shrinking:
+        score += 1; reasons.append("{}r in last 3".format(reds))
+    elif sig_bull and reds >= 2:
+        score -= 1; reasons.append("{}r oppose UP".format(reds))
+    elif sig_bear and greens >= 2:
+        score -= 1; reasons.append("{}g oppose DOWN".format(greens))
+    
+    # Candle pattern
+    if sig_bull and bull_engulf: score += 1; reasons.append("bull engulf")
+    elif sig_bear and bear_engulf: score += 1; reasons.append("bear engulf")
+    elif sig_bull and shooting_star: score -= 1; reasons.append("shooting star")
+    elif sig_bear and hammer: score -= 1; reasons.append("hammer")
+    elif is_doji: reasons.append("doji")
+    elif sig_bull and last_green and strong_close: reasons.append("strong green")
+    elif sig_bear and last_red and strong_close: reasons.append("strong red")
+    
+    # BOS/CHoCH
+    if bullish_bos and sig_bull and not choch_bull: score += 1; reasons.append("bull BOS")
+    elif bearish_bos and sig_bear and not choch_bear: score += 1; reasons.append("bear BOS")
+    elif choch_bull and sig_bull: score += 1; reasons.append("CHoCH bull")
+    elif choch_bear and sig_bear: score += 1; reasons.append("CHoCH bear")
+    elif bullish_bos and sig_bear: score -= 1; reasons.append("bull BOS opposes")
+    elif bearish_bos and sig_bull: score -= 1; reasons.append("bear BOS opposes")
+    
+    return max(-2, min(2, score)), reasons
 
 
 # Cache for Phase 1 results — populated at T-22s, read at T+0
-_sv3_structure_cache = {}  # {"BTC": {structure_result}, "ETH": ...}
+_sv3_structure_cache = {}  # {"BTC": {"1h":[candles], "30m":[...], "15m":[...]}, ...}
 # WAIT queue — assets waiting for confirmation at T+2-3min
-_sv3_wait_queue = {}  # {"BTC_1234567": {"asset":..., "direction":..., "token_map_entry":..., ...}}
-
-
-def _sv3_classify_tier(structure, ptb, signal_direction):
-    """SV3 Phase 2: Given cached structure + exact PTB + signal, decide TAKE/WAIT/SKIP.
-    Call at T+0 when exact PTB is available.
-    """
-    if not structure or not ptb or ptb <= 0 or not signal_direction:
-        return "S5", "SKIP", "", "Invalid inputs"
-
-    trend = structure["trend"]
-    strength = structure["strength"]
-    bos = structure["bos"]
-    bos_level = structure.get("bos_level")
-    reversal = structure.get("reversal")
-    rev_pattern = structure.get("rev_pattern")
-    rev_confidence = structure.get("rev_confidence")
-    last_sh = structure.get("last_swing_high")
-    last_sl = structure.get("last_swing_low")
-    high_prices = structure.get("high_prices", [])
-    low_prices = structure.get("low_prices", [])
-
-    # Signal vs trend
-    if trend == "UP":
-        sig_vs_trend = "AGREES" if signal_direction == "UP" else "DISAGREES"
-    elif trend == "DOWN":
-        sig_vs_trend = "AGREES" if signal_direction == "DOWN" else "DISAGREES"
-    else:
-        sig_vs_trend = "NEUTRAL"
-
-    # PTB zone relative to structure
-    supports = sorted([p for p in low_prices if p <= ptb * 1.005], reverse=True)
-    resistances = sorted([p for p in high_prices if p >= ptb * 0.995])
-    nearest_sup = supports[0] if supports else None
-    nearest_res = resistances[0] if resistances else None
-    dist_sup = abs(ptb - nearest_sup) / ptb * 100 if nearest_sup else 999
-    dist_res = abs(nearest_res - ptb) / ptb * 100 if nearest_res else 999
-
-    if dist_sup < 0.15:
-        ptb_zone = "AT_SUPPORT"
-    elif dist_res < 0.15:
-        ptb_zone = "AT_RESISTANCE"
-    elif nearest_sup and nearest_res:
-        ptb_zone = "BETWEEN"
-    elif nearest_sup:
-        ptb_zone = "ABOVE_ALL"
-    elif nearest_res:
-        ptb_zone = "BELOW_ALL"
-    else:
-        ptb_zone = "BETWEEN"
-
-    # ── Tier classification — TAKE / WAIT / SKIP ──
-
-    # S2: Breakout confirmed (BOS agrees with signal)
-    if bos == "BULLISH" and signal_direction == "UP":
-        return "S2", "TAKE", ptb_zone, "Bullish BOS at {:.2f} + signal UP".format(bos_level or 0)
-    if bos == "BEARISH" and signal_direction == "DOWN":
-        return "S2", "TAKE", ptb_zone, "Bearish BOS at {:.2f} + signal DOWN".format(bos_level or 0)
-
-    # BOS opposes signal
-    if bos and ((bos == "BEARISH" and signal_direction == "UP") or
-                (bos == "BULLISH" and signal_direction == "DOWN")):
-        return "S4", "SKIP", ptb_zone, "{} BOS opposes {} signal".format(bos, signal_direction)
-
-    # S1: Trend continuation (signal agrees with trend)
-    if sig_vs_trend == "AGREES" and strength >= 50:
-        return "S1", "TAKE", ptb_zone, "{} trend ({}%) + signal {}".format(trend, strength, signal_direction)
-
-    # S1 weak: trend agrees but weak → WAIT
-    if sig_vs_trend == "AGREES" and 0 < strength < 50:
-        return "S1", "WAIT", ptb_zone, "Weak {} trend ({}%) — wait to confirm".format(trend, strength)
-
-    # S3: Signal disagrees with trend
-    if sig_vs_trend == "DISAGREES":
-        if reversal:
-            rev_matches = (reversal == "BULLISH" and signal_direction == "UP") or \
-                          (reversal == "BEARISH" and signal_direction == "DOWN")
-            if rev_matches and rev_confidence == "STRONG":
-                good_zone = (signal_direction == "UP" and ptb_zone in ("AT_SUPPORT","BELOW_ALL","BETWEEN")) or \
-                            (signal_direction == "DOWN" and ptb_zone in ("AT_RESISTANCE","ABOVE_ALL","BETWEEN"))
-                if good_zone:
-                    return "S3", "TAKE", ptb_zone, "STRONG {} reversal ({}) vs {} trend, PTB {}".format(
-                        reversal, rev_pattern, trend, ptb_zone)
-                else:
-                    return "S3", "WAIT", ptb_zone, "Strong reversal but PTB at {} — wait".format(ptb_zone)
-            elif rev_matches and rev_confidence == "WEAK":
-                return "S3", "WAIT", ptb_zone, "WEAK reversal ({}) — wait for confirmation".format(rev_pattern)
-            else:
-                return "S4", "SKIP", ptb_zone, "Signal {} vs trend {} + reversal opposes".format(signal_direction, trend)
-        else:
-            return "S4", "SKIP", ptb_zone, "Signal {} fights {} trend, no reversal".format(signal_direction, trend)
-
-    # S5: Ranging
-    if trend == "RANGE":
-        if signal_direction == "UP" and ptb_zone in ("AT_SUPPORT", "BELOW_ALL"):
-            return "S5", "TAKE", ptb_zone, "Range bounce — PTB at support"
-        elif signal_direction == "DOWN" and ptb_zone in ("AT_RESISTANCE", "ABOVE_ALL"):
-            return "S5", "TAKE", ptb_zone, "Range rejection — PTB at resistance"
-        else:
-            return "S5", "WAIT", ptb_zone, "Ranging, PTB mid-range — wait for direction"
-
-    return "S5", "SKIP", ptb_zone, "Unclassified"
+_sv3_wait_queue = {}  # {"BTC_1234567": {"asset":..., "direction":..., ...}}
 
 
 def _sv3_score_and_record(asset, token_map_entry, boundary_ts, now_str):
-    """SV3 Paper Bot v2 — Structure-based gatekeeper.
+    """SV3 Paper Bot v3 — Multi-Timeframe PTB Gatekeeper.
 
-    Multi-candle trend analysis (20 candles → swing highs/lows → trend/BOS/reversal)
-    combined with P2.1 signal direction and Chainlink PTB.
+    Reads candle structure on 1H, 30M, and 15M.
+    Each timeframe scores -2 to +2 for the signal direction.
+    Total score -6 to +6 determines TAKE or WAIT.
 
-    Three actions: TAKE (fire at T+0), WAIT (watch 2-3 min), SKIP (don't fire).
-
-    Tiers:
-      S1 — Trend continuation (signal agrees with structure)
-      S2 — Breakout confirmed (BOS agrees with signal)
-      S3 — Counter-trend with reversal evidence
-      S4 — Signal fights structure (SKIP)
-      S5 — Ranging / unclear
+    TAKE (+3 to +6): all timeframes confirm signal → fire at T+0 at 50¢
+    WAIT (-6 to +2): structure unclear or opposes → wait 2-3 min for confirmation
+    
+    No SKIPs. Every signal gets either TAKE or WAIT.
     """
     fee = 0.03
     wp = (1 / 0.50) * (1 - fee)
@@ -1093,80 +945,39 @@ def _sv3_score_and_record(asset, token_map_entry, boundary_ts, now_str):
         print("SV3 SKIP {}: no direction (dir={} agree={})".format(asset, direction, signals_agree))
         return False
 
-    # ── Step 2: Get structure from cache (Phase 1 ran at T-22s) ──
-    structure = _sv3_structure_cache.get(asset.upper())
-    if not structure:
-        # Fallback: run Phase 1 now (slower but ensures data)
+    # ── Step 2: Get MTF candles from cache (Phase 1 ran at T-22s) ──
+    mtf_data = _sv3_structure_cache.get(asset.upper())
+    if not mtf_data:
+        # Fallback: fetch now
         try:
-            structure = _sv3_analyze_candle_structure(asset.upper())
+            mtf_data = _sv3_fetch_mtf_candles(asset.upper())
         except Exception as e:
-            print("SV3 SKIP {}: structure analysis failed: {}".format(asset, e))
+            print("SV3 SKIP {}: MTF fetch failed: {}".format(asset, e))
             return False
-    if not structure:
-        print("SV3 SKIP {}: no structure data".format(asset))
+    if not mtf_data or not mtf_data.get("15m"):
+        print("SV3 SKIP {}: no candle data".format(asset))
         return False
 
-    # ── Step 3: Get PTB (Chainlink RTDS price) ──
-    # At T+0 the exact PTB from _chainlink_ptb may be available
-    ptb_key = "{}_15M".format(asset.upper())
-    ptb_entry = _chainlink_ptb.get(ptb_key)
-    if ptb_entry:
-        price_to_beat = ptb_entry[1]  # Exact boundary PTB
+    # ── Step 3: Score each timeframe ──
+    s1h, r1h = _sv3_score_timeframe(mtf_data.get("1h"), direction)
+    s30, r30 = _sv3_score_timeframe(mtf_data.get("30m"), direction)
+    s15, r15 = _sv3_score_timeframe(mtf_data.get("15m"), direction)
+    total_score = s1h + s30 + s15
+
+    # ── Step 4: Decide TAKE or WAIT ──
+    if total_score >= 3:
+        action = "TAKE"
     else:
-        price_to_beat = _chainlink_prices.get(asset.upper())
-    if not price_to_beat or price_to_beat <= 0:
-        print("SV3 SKIP {}: no PTB".format(asset))
-        return False
+        action = "WAIT"
 
-    # ── Step 4: Classify tier ──
-    tier, action, ptb_zone, description = _sv3_classify_tier(structure, price_to_beat, direction)
+    # Build indicator tag
+    mtf_tag = "MTF {} {} | 1H={}({}) 30M={}({}) 15M={}({})".format(
+        total_score, action,
+        s1h, "/".join(r1h[:1]),
+        s30, "/".join(r30[:1]),
+        s15, "/".join(r15[:1]))
 
-    # Build indicator string with full structure info
-    struct_tag = "{} {} | trend={}({}%) | BOS={} | rev={}({}) | PTB={} | {}".format(
-        tier, action,
-        structure["trend"], structure["strength"],
-        structure.get("bos", "none"),
-        structure.get("reversal", "none"),
-        structure.get("rev_pattern", ""),
-        ptb_zone,
-        description[:60])
-
-    # ── Step 5: Handle SKIP ──
-    if action == "SKIP":
-        print("SV3 {} SKIP {}: {}".format(tier, asset, description[:60]))
-        # Still record the SKIP in DB for analysis (with stake=0)
-        try:
-            c_sv3 = get_db()
-            c_sv3.run("""INSERT INTO sniper_v3_paper_trades
-                (market_id, title, asset, bet_side, tier, stake, fill_price,
-                 pool_after, payout, signals_agree, indicators,
-                 prev_candle_tag, prev_high, prev_low, prev_close,
-                 price_to_beat, price_position, slug, condition_id,
-                 status, fired_at)
-                VALUES (:mid, :ttl, :ast, :bs, :tier, 0, 0,
-                        :pool, 0, :sa, :ind,
-                        :ctag, :ph, :pl, :pc,
-                        :ptb, 0, :slg, :cid,
-                        'Skipped', :now)""",
-                mid="sv3_{}_15M_{}".format(asset, boundary_ts),
-                ttl="{} {} 15M {} SKIP".format(asset, direction, boundary_ts),
-                ast=asset, bs=direction, tier=tier,
-                pool=_sv3_state["balance"],
-                sa=signals_agree, ind=struct_tag,
-                ctag=description[:50],
-                ph=structure.get("last_swing_high") or 0,
-                pl=structure.get("last_swing_low") or 0,
-                pc=structure["candles"][-1]["close"] if structure.get("candles") else 0,
-                ptb=round(price_to_beat, 6),
-                slg=token_map_entry.get("slug", ""),
-                cid=token_map_entry.get("condition_id", ""),
-                now=now_str)
-            c_sv3.close()
-        except Exception as e:
-            print("SV3 skip record error: {}".format(e))
-        return False
-
-    # ── Step 6: Handle WAIT ──
+    # ── Step 5: Handle WAIT ──
     if action == "WAIT":
         wait_key = "sv3_{}_15M_{}".format(asset, boundary_ts)
         _sv3_wait_queue[wait_key] = {
@@ -1174,43 +985,50 @@ def _sv3_score_and_record(asset, token_map_entry, boundary_ts, now_str):
             "direction": direction,
             "signals_agree": signals_agree,
             "ind_str": ind_str,
-            "struct_tag": struct_tag,
-            "tier": tier,
-            "ptb_zone": ptb_zone,
-            "description": description,
-            "price_to_beat": price_to_beat,
+            "mtf_tag": mtf_tag,
+            "total_score": total_score,
             "token_map_entry": token_map_entry,
             "boundary_ts": boundary_ts,
             "queued_at": datetime.now(timezone.utc),
-            "structure": structure,
+            "mtf_data": mtf_data,
         }
-        print("SV3 {} WAIT {}: {} — will check at T+2-3min".format(tier, asset, description[:50]))
-        return False  # Not fired yet — will be processed by wait checker
+        print("SV3 MTF WAIT {}: {} score={} | 1H={} 30M={} 15M={}".format(
+            asset, direction, total_score, s1h, s30, s15))
+        
+        # Record WAIT in DB for analysis
+        try:
+            c_sv3 = get_db()
+            c_sv3.run("""INSERT INTO sniper_v3_paper_trades
+                (market_id, title, asset, bet_side, tier, stake, fill_price,
+                 pool_after, payout, signals_agree, indicators,
+                 prev_candle_tag, price_to_beat,
+                 slug, condition_id, status, fired_at)
+                VALUES (:mid, :ttl, :ast, :bs, :tier, 0, 0,
+                        :pool, 0, :sa, :ind, :ctag, 0,
+                        :slg, :cid, 'Waiting', :now)""",
+                mid="sv3_{}_15M_{}".format(asset, boundary_ts),
+                ttl="{} {} 15M {} WAIT".format(asset, direction, boundary_ts),
+                ast=asset, bs=direction, tier="MTF{}".format(total_score),
+                pool=_sv3_state["balance"],
+                sa=signals_agree, ind=mtf_tag[:200],
+                ctag="WAIT score={}".format(total_score),
+                slg=token_map_entry.get("slug", ""),
+                cid=token_map_entry.get("condition_id", ""),
+                now=now_str)
+            c_sv3.close()
+        except Exception as e:
+            print("SV3 WAIT record error: {}".format(e))
+        return False
 
-    # ── Step 7: Handle TAKE — fire paper trade at T+0 ──
-    # Get previous candle info for DB record
-    last_candle = structure["candles"][-1] if structure.get("candles") else {}
-    prev_high = structure.get("last_swing_high") or last_candle.get("high", 0)
-    prev_low = structure.get("last_swing_low") or last_candle.get("low", 0)
-    prev_close = last_candle.get("close", 0)
-
-    # Price position within last candle range (for backwards compatibility)
-    lc_range = last_candle.get("high", 0) - last_candle.get("low", 0)
-    if lc_range > 0:
-        price_position = (price_to_beat - last_candle.get("low", 0)) / lc_range
-    else:
-        price_position = 0.5
-
-    # Stake: tiered by confidence
+    # ── Step 6: Handle TAKE — fire paper trade at T+0 ──
+    # Stake: scaled by confidence (MTF score)
     bal = _sv3_state["balance"]
-    if tier == "S1":
+    if total_score >= 5:
+        stake = round(max(2.50, min(bal * 0.04, 5.00)), 2)  # High confidence
+    elif total_score >= 4:
         stake = round(max(2.50, min(bal * 0.035, 4.00)), 2)
-    elif tier == "S2":
-        stake = round(max(2.50, min(bal * 0.04, 5.00)), 2)
-    elif tier == "S3":
-        stake = round(max(2.50, min(bal * 0.025, 3.00)), 2)
-    else:  # S5 range bounce
-        stake = round(max(2.50, min(bal * 0.02, 2.50)), 2)
+    else:  # score = 3
+        stake = round(max(2.50, min(bal * 0.03, 3.50)), 2)
 
     if stake > bal - 5:
         print("SV3 SKIP {}: insufficient balance bal={:.2f} stake={:.2f}".format(asset, bal, stake))
@@ -1238,20 +1056,18 @@ def _sv3_score_and_record(asset, token_map_entry, boundary_ts, now_str):
              status, fired_at)
             VALUES (:mid, :ttl, :ast, :bs, :tier, :stake, 0.50,
                     :pool, :payout, :sa, :ind,
-                    :ctag, :ph, :pl, :pc,
-                    :ptb, :pos, :slg, :cid,
+                    :ctag, 0, 0, 0,
+                    0, :pos, :slg, :cid,
                     'Pending', :now)""",
             mid=market_key,
             ttl="{} {} 15M {}".format(asset, direction, boundary_ts),
-            ast=asset, bs=direction, tier=tier,
+            ast=asset, bs=direction,
+            tier="MTF{}".format(total_score),
             stake=stake, pool=_sv3_state["balance"],
             payout=round(stake * wp, 2),
-            sa=signals_agree, ind=struct_tag,
-            ctag=description[:50],
-            ph=round(prev_high, 6), pl=round(prev_low, 6),
-            pc=round(prev_close, 6),
-            ptb=round(price_to_beat, 6),
-            pos=round(price_position, 3),
+            sa=signals_agree, ind=mtf_tag[:200],
+            ctag="TAKE score={}".format(total_score),
+            pos=total_score,
             slg=token_map_entry.get("slug", ""),
             cid=token_map_entry.get("condition_id", ""),
             now=now_str)
@@ -1260,9 +1076,9 @@ def _sv3_score_and_record(asset, token_map_entry, boundary_ts, now_str):
         if _sv3_state["balance"] > _sv3_state["peak_balance"]:
             _sv3_state["peak_balance"] = _sv3_state["balance"]
 
-        print("SV3 {} TAKE: {} {} ${:.2f} | {} | pool=${:.2f}".format(
-            tier, direction, asset, stake,
-            description[:40],
+        print("SV3 MTF TAKE: {} {} ${:.2f} score={} | 1H={} 30M={} 15M={} | pool=${:.2f}".format(
+            direction, asset, stake, total_score,
+            s1h, s30, s15,
             _sv3_state["balance"]))
         return True
 
@@ -1274,9 +1090,8 @@ def _sv3_score_and_record(asset, token_map_entry, boundary_ts, now_str):
 
 def _sv3_process_wait_queue():
     """SV3 Phase 3: Process WAIT queue 2-3 minutes after boundary.
-    Called from sniper thread at T+2-3min.
     Checks if the new candle confirms the signal direction.
-    If confirmed → record trade at current market odds.
+    If confirmed → record trade at estimated market odds.
     If not → skip.
     """
     if not _sv3_wait_queue:
@@ -1293,14 +1108,19 @@ def _sv3_process_wait_queue():
             keys_to_remove.append(wait_key)
             continue
 
-        # Wait at least 2 minutes, max 4 minutes
         age_secs = (now - queued_at).total_seconds()
         if age_secs < 120:
             continue  # Not ready yet
         if age_secs > 240:
-            # Expired — skip
             print("SV3 WAIT expired {}: {} (waited {:.0f}s)".format(
-                entry["asset"], entry["description"][:40], age_secs))
+                entry["asset"], entry.get("mtf_tag", "")[:40], age_secs))
+            # Update DB status
+            try:
+                c = get_db()
+                c.run("UPDATE sniper_v3_paper_trades SET status='Expired' WHERE market_id=:mid AND status='Waiting'",
+                      mid=wait_key)
+                c.close()
+            except: pass
             keys_to_remove.append(wait_key)
             continue
 
@@ -1308,36 +1128,48 @@ def _sv3_process_wait_queue():
         direction = entry["direction"]
         boundary_ts = entry["boundary_ts"]
         token_map_entry = entry["token_map_entry"]
-        tier = entry["tier"]
 
-        # Check confirmation: has the new candle moved in the signal direction?
+        # Get the PTB (Chainlink price at boundary = the reference price)
+        ptb_key = "{}_15M".format(asset.upper())
+        ptb_entry = _chainlink_ptb.get(ptb_key)
+        ptb = ptb_entry[1] if ptb_entry else _chainlink_prices.get(asset.upper())
         current_price = _chainlink_prices.get(asset.upper())
-        ptb = entry["price_to_beat"]
+
         if not current_price or not ptb:
             keys_to_remove.append(wait_key)
             continue
 
-        # Confirmation logic:
-        # Signal UP: current price should be ABOVE PTB (market is moving up)
-        # Signal DOWN: current price should be BELOW PTB (market is moving down)
+        # Confirmation: has price moved in the signal direction from PTB?
+        # PTB = price at boundary. If signal=UP, we need current > PTB.
+        # Threshold: 0.02% (about $16 BTC, $0.50 ETH, $0.02 SOL)
+        threshold = ptb * 0.0002
+
         if direction == "UP":
-            confirmed = current_price > ptb
-            price_move_pct = (current_price - ptb) / ptb * 100
+            confirmed = current_price > ptb + threshold
+            price_move = current_price - ptb
+            move_pct = price_move / ptb * 100 if ptb > 0 else 0
         else:
-            confirmed = current_price < ptb
-            price_move_pct = (ptb - current_price) / ptb * 100
+            confirmed = current_price < ptb - threshold
+            price_move = ptb - current_price
+            move_pct = price_move / ptb * 100 if ptb > 0 else 0
 
         if not confirmed:
-            print("SV3 WAIT not confirmed {}: {} signal but price {}={:.2f} vs PTB={:.2f}".format(
-                asset, direction, "below" if direction == "UP" else "above",
-                current_price, ptb))
+            print("SV3 WAIT not confirmed {}: {} signal, price={:.2f} vs PTB={:.2f} (need {})".format(
+                asset, direction,
+                current_price, ptb,
+                "above" if direction == "UP" else "below"))
+            # Update DB
+            try:
+                c = get_db()
+                c.run("UPDATE sniper_v3_paper_trades SET status='Unconfirmed' WHERE market_id=:mid AND status='Waiting'",
+                      mid=wait_key)
+                c.close()
+            except: pass
             keys_to_remove.append(wait_key)
             continue
 
-        # Confirmed — record the trade
-        # Entry price is NOT 50¢ anymore — estimate from price movement
-        # If price moved 0.1% in our direction, odds are roughly 55-60¢
-        fill_price = min(0.65, max(0.50, 0.50 + price_move_pct * 5))  # rough estimate
+        # Confirmed — fire the trade
+        fill_price = min(0.65, max(0.50, 0.50 + move_pct * 5))
         wp_wait = (1 / fill_price) * (1 - fee) if fill_price > 0 else 0
 
         bal = _sv3_state["balance"]
@@ -1346,7 +1178,7 @@ def _sv3_process_wait_queue():
             keys_to_remove.append(wait_key)
             continue
 
-        market_key = "sv3_{}_15M_{}".format(asset, boundary_ts)
+        market_key = wait_key
         if market_key in _sv3_fired_markets:
             keys_to_remove.append(wait_key)
             continue
@@ -1356,45 +1188,34 @@ def _sv3_process_wait_queue():
         _sv3_state["balance"] = round(bal - stake, 2)
         _sv3_state["trades_today"] += 1
 
-        struct_tag = entry.get("struct_tag", "")
-        wait_tag = "{} | WAIT_CONFIRMED after {:.0f}s | move={:.3f}% | fill={:.2f}c".format(
-            struct_tag[:80], age_secs, price_move_pct, fill_price * 100)
+        mtf_tag = entry.get("mtf_tag", "")
+        total_score = entry.get("total_score", 0)
+        wait_tag = "{} | CONFIRMED {:.0f}s | move={:.3f}% | fill={:.0f}c".format(
+            mtf_tag[:80], age_secs, move_pct, fill_price * 100)
 
         try:
             c_sv3 = get_db()
-            c_sv3.run("""INSERT INTO sniper_v3_paper_trades
-                (market_id, title, asset, bet_side, tier, stake, fill_price,
-                 pool_after, payout, signals_agree, indicators,
-                 prev_candle_tag, prev_high, prev_low, prev_close,
-                 price_to_beat, price_position, slug, condition_id,
-                 status, fired_at)
-                VALUES (:mid, :ttl, :ast, :bs, :tier, :stake, :fill,
-                        :pool, :payout, :sa, :ind,
-                        :ctag, :ph, :pl, :pc,
-                        :ptb, :pos, :slg, :cid,
-                        'Pending', :now)""",
-                mid=market_key,
-                ttl="{} {} 15M {} WAIT".format(asset, direction, boundary_ts),
-                ast=asset, bs=direction, tier=tier + "w",  # "S1w", "S3w", "S5w" for WAIT trades
+            # Update the Waiting record to Pending
+            c_sv3.run("""UPDATE sniper_v3_paper_trades 
+                SET status='Pending', stake=:stake, fill_price=:fill,
+                    pool_after=:pool, payout=:payout, 
+                    indicators=:ind, prev_candle_tag='WAIT_CONFIRMED',
+                    price_to_beat=:ptb, price_position=:pos
+                WHERE market_id=:mid AND status='Waiting'""",
                 stake=stake, fill=round(fill_price, 4),
                 pool=_sv3_state["balance"],
                 payout=round(stake * wp_wait, 2),
-                sa=entry.get("signals_agree", 0),
-                ind=wait_tag,
-                ctag="WAIT_CONFIRMED",
-                ph=0, pl=0, pc=0,
-                ptb=round(ptb, 6), pos=round(price_move_pct, 4),
-                slg=token_map_entry.get("slug", ""),
-                cid=token_map_entry.get("condition_id", ""),
-                now=now.isoformat())
+                ind=wait_tag[:200],
+                ptb=round(ptb, 6), pos=round(move_pct, 4),
+                mid=market_key)
             c_sv3.close()
 
             if _sv3_state["balance"] > _sv3_state["peak_balance"]:
                 _sv3_state["peak_balance"] = _sv3_state["balance"]
 
-            print("SV3 {}w TAKE (WAIT confirmed): {} {} ${:.2f} @{:.0f}c | +{:.3f}% | pool=${:.2f}".format(
-                tier, direction, asset, stake, fill_price * 100,
-                price_move_pct, _sv3_state["balance"]))
+            print("SV3 MTF WAIT→TAKE: {} {} ${:.2f} @{:.0f}c | +{:.3f}% after {:.0f}s | pool=${:.2f}".format(
+                direction, asset, stake, fill_price * 100,
+                move_pct, age_secs, _sv3_state["balance"]))
             processed += 1
 
         except Exception as e:
@@ -1517,9 +1338,9 @@ def _sniper_thread():
             print("SV2: {} paper trades recorded | pool=${:.2f}".format(
                 _sv2_count, _sv2_state.get("balance", 0)) if hasattr(_sv2_state, 'get') else "SV2: scored")
 
-            # ── SV3: Phase 1 — Analyze candle structure at T-22s (before cache clear) ──
-            # Heavy work: fetch 20 candles from Binance, detect swings/trend/BOS/reversals
-            # Results cached in _sv3_structure_cache, read at T+0 in Phase 2
+            # ── SV3: Phase 1 — Fetch MTF candles at T-22s (before cache clear) ──
+            # Fetch 1H + 30M + 15M candles from Binance for each asset
+            # Results cached in _sv3_structure_cache, scored at T+0 in Phase 2
             _sv3_directions = {}
             for _pre_asset in SNIPER_ASSETS:
                 try:
@@ -1528,12 +1349,14 @@ def _sniper_thread():
                         _sv3_directions[_pre_asset] = _pre_d
                 except: pass
                 try:
-                    _sv3_struct = _sv3_analyze_candle_structure(_pre_asset)
-                    if _sv3_struct:
-                        _sv3_structure_cache[_pre_asset] = _sv3_struct
-                        print("SV3 Phase1 {}: trend={}({}%) BOS={} rev={}".format(
-                            _pre_asset, _sv3_struct["trend"], _sv3_struct["strength"],
-                            _sv3_struct.get("bos","none"), _sv3_struct.get("reversal","none")))
+                    _sv3_mtf = _sv3_fetch_mtf_candles(_pre_asset)
+                    if _sv3_mtf:
+                        _sv3_structure_cache[_pre_asset] = _sv3_mtf
+                        _c1h = len(_sv3_mtf.get("1h") or [])
+                        _c30 = len(_sv3_mtf.get("30m") or [])
+                        _c15 = len(_sv3_mtf.get("15m") or [])
+                        print("SV3 Phase1 {}: 1H={}c 30M={}c 15M={}c".format(
+                            _pre_asset, _c1h, _c30, _c15))
                 except Exception as _sv3_p1_e:
                     print("SV3 Phase1 error {}: {}".format(_pre_asset, _sv3_p1_e))
 
@@ -16179,18 +16002,15 @@ def sniper_v3_page():
     peak = _sv3_state["peak_balance"]
 
     total_w = total_l = total_pnl = 0
-    tier_stats = {"S1":{"w":0,"l":0,"pnl":0.0},
-                  "S2":{"w":0,"l":0,"pnl":0.0},
-                  "S3":{"w":0,"l":0,"pnl":0.0},
-                  "S4":{"w":0,"l":0,"pnl":0.0},
-                  "S5":{"w":0,"l":0,"pnl":0.0},
-                  "S1w":{"w":0,"l":0,"pnl":0.0},
-                  "S3w":{"w":0,"l":0,"pnl":0.0},
-                  "S5w":{"w":0,"l":0,"pnl":0.0},
-                  "T2.1":{"w":0,"l":0,"pnl":0.0},
-                  "T2.2":{"w":0,"l":0,"pnl":0.0},
-                  "T2.3":{"w":0,"l":0,"pnl":0.0},
-                  "T2.4":{"w":0,"l":0,"pnl":0.0}}
+    tier_stats = {"MTF6":{"w":0,"l":0,"pnl":0.0},
+                  "MTF5":{"w":0,"l":0,"pnl":0.0},
+                  "MTF4":{"w":0,"l":0,"pnl":0.0},
+                  "MTF3":{"w":0,"l":0,"pnl":0.0},
+                  "MTF2":{"w":0,"l":0,"pnl":0.0},
+                  "MTF1":{"w":0,"l":0,"pnl":0.0},
+                  "MTF0":{"w":0,"l":0,"pnl":0.0},
+                  "MTF-1":{"w":0,"l":0,"pnl":0.0},
+                  "MTF-2":{"w":0,"l":0,"pnl":0.0}}
     asset_stats = {}
     today_trades = today_wins = today_losses = 0
 
@@ -16230,18 +16050,15 @@ def sniper_v3_page():
     # Tier rows
     tier_rows_html = ""
     tier_labels = {
-        "S1": "S1 — Trend Continuation",
-        "S2": "S2 — Breakout Confirmed",
-        "S3": "S3 — Counter-Trend Reversal",
-        "S4": "S4 — Signal vs Structure (SKIP)",
-        "S5": "S5 — Ranging",
-        "S1w": "S1w — Weak Trend (WAIT)",
-        "S3w": "S3w — Weak Reversal (WAIT)",
-        "S5w": "S5w — Range Mid (WAIT)",
-        "T2.1": "T2.1 — Legacy Trend+Structure",
-        "T2.2": "T2.2 — Legacy Mean Reversion",
-        "T2.3": "T2.3 — Legacy Retest",
-        "T2.4": "T2.4 — Legacy Breakout",
+        "MTF6": "MTF +6 — All TFs agree (TAKE)",
+        "MTF5": "MTF +5 — Strong agreement (TAKE)",
+        "MTF4": "MTF +4 — Good agreement (TAKE)",
+        "MTF3": "MTF +3 — Minimum TAKE",
+        "MTF2": "MTF +2 — Borderline (WAIT→confirmed)",
+        "MTF1": "MTF +1 — Weak (WAIT→confirmed)",
+        "MTF0": "MTF 0 — Neutral (WAIT→confirmed)",
+        "MTF-1": "MTF -1 — Opposed (WAIT→confirmed)",
+        "MTF-2": "MTF -2 — Strongly opposed (WAIT→confirmed)",
     }
     for tier_key, label in tier_labels.items():
         ts = tier_stats[tier_key]
