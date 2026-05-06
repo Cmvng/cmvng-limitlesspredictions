@@ -2175,6 +2175,7 @@ def _limitless_sniper_thread():
 
             # ── Time to next hour boundary ──
             now = datetime.now(timezone.utc)
+            print("LMTS heartbeat: {}:{:02d} | next boundary in {}m".format(now.hour, now.minute, 60 - now.minute if now.minute > 0 else 0))
             mins_to_next = 60 - now.minute
             if mins_to_next == 60:
                 mins_to_next = 0
