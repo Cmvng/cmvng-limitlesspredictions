@@ -2162,6 +2162,8 @@ def _sniper_thread():
                 _time.sleep(max(secs_to_boundary + 5, 5))
                 continue
 
+            snipe_targets = []  # initialized here, built after boundary with Chainlink data
+
             # ── Wait until T+0 (exact boundary) ──
             now2 = datetime.now(timezone.utc)
             wait_secs = (next_boundary - now2).total_seconds()
@@ -19310,10 +19312,9 @@ if SIGNALS_DB_URL:
     if _saved_bot2s and _saved_bot2s.get("balance", 0) > 0:
         _bot2_sniper_state["balance"] = _saved_bot2s["balance"]
         _bot2_sniper_state["peak_balance"] = _saved_bot2s.get("peak_balance", _saved_bot2s["balance"])
-    _bot2_sniper_state["enabled"] = True
+    _bot2_sniper_state["enabled"] = False  # PAUSED — A4 Chainlink is live instead
     _save_bot_balance("bot2_sniper", _bot2_sniper_state)
-    print("BOT2 SNIPER: ${:.2f} pool | SMA+BTC agree | Chainlink T+0 | 50c GTC".format(
-        _bot2_sniper_state["balance"]))
+    print("BOT2 SNIPER: PAUSED — A4 Chainlink is live")
     threading.Thread(target=_bot2_sniper_thread, daemon=True).start()
     print("BOT2 SNIPER thread launched")
     
