@@ -773,17 +773,15 @@ def _bot2_sniper_thread():
     # ── POLY ALPHA 4.0 SNIPER init ──
     # Load balance from DB (no more force-reset on deploy)
     _saved_pa4 = _saved_balances.get("poly_alpha4", {})
-    # Load saved balance. Force $100 only if no balance or old system leftover.
     if _saved_pa4 and _saved_pa4.get("balance", 0) >= 10:
         _poly_alpha4_state["balance"] = _saved_pa4["balance"]
         _poly_alpha4_state["peak_balance"] = _saved_pa4.get("peak_balance", _saved_pa4["balance"])
     else:
-        # First deploy or old system with depleted balance — start fresh at $100
-        _poly_alpha4_state["balance"] = 100.0
-        _poly_alpha4_state["peak_balance"] = 100.0
+        _poly_alpha4_state["balance"] = 50.0
+        _poly_alpha4_state["peak_balance"] = 50.0
     _poly_alpha4_state["starting_balance"] = 50.0
     _poly_alpha4_state["floor_balance"] = 10.0
-    _poly_alpha4_state["enabled"] = True  # LIVE — original A4 with Chainlink-settled data
+    _poly_alpha4_state["enabled"] = True
     _save_bot_balance("poly_alpha4", _poly_alpha4_state)
     
     print("SNIPER A4 CHAINLINK: ${:.2f} pool | TV+SMA+BTC 2/3 | Chainlink T+0 | LIVE".format(
@@ -2801,6 +2799,7 @@ def _sv2_score_and_record(asset, token_map_entry, boundary_ts, now_str, forced_d
             adx=adx_val, cdir=candle_dir,
             slg=slug, cid=condition_id, now=now_str)
         c.close()
+        _save_bot_balance("sv2_paper", _sv2_state)
         print("SV2 {}: {} {} ${:.2f} ({:.0f}% WR est) | pool=${:.2f}".format(
             tier, direction, asset, stake, exp_wr*100, _sv2_state["balance"]))
         return True
