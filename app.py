@@ -1522,20 +1522,15 @@ def _sv3_process_wait_queue():
 # ── New A4 system: Binance SMA direction + SV3 tiered stakes ──
 # Proven by 7-day backtest: 1,865 trades, 55.7% WR, +$470
 _A4_SCORE_TIERS = {
-    # score: stake_pct (percentage of pool balance)
-    8: 0.05,   # 87.5% WR — max conviction
-    7: 0.025,  # 52.9% WR — moderate
-    6: 0.05,   # 63.3% WR — high conviction
-    4: 0.035,  # 59.4% WR — strong
-    2: 0.025,  # 55.4% WR — moderate volume
-    1: 0.025,  # 54.1% WR — moderate volume
-    0: 0.02,   # 53.7% WR — weak but profitable
-    # SKIP tiers (not in dict):
-    # 9: too few trades, 0% WR in backtest
-    # 5: 49.4% WR — proven loser
-    # 3: 47.7% WR — proven loser
-    # -1: 45.9% WR — candles oppose
-    # -2: 50.0% WR — candles oppose
+    # Flat $2.50 on all profitable tiers — edge is volume × WR, not bigger bets
+    # Skip tiers (3, 5, 9, -1, -2) not in dict = stake 0 = SKIP
+    8: 0.025,
+    7: 0.025,
+    6: 0.025,
+    4: 0.025,
+    2: 0.025,
+    1: 0.025,
+    0: 0.025,
 }
 
 
