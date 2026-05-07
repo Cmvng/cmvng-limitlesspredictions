@@ -430,23 +430,6 @@ def _poly_alpha3_load_recent():
     _poly_alpha4_state["enabled"] = True
     _save_bot_balance("poly_alpha4", _poly_alpha4_state)
     
-    # Archive old A4 trades if any exist (new tiered system starts fresh)
-    try:
-        _a4_cleanup = get_db()
-        _a4_check = _a4_cleanup.run("SELECT COUNT(*) FROM poly_alpha4_trades")
-        _a4_existing = _a4_check[0][0] if _a4_check else 0
-        if _a4_existing > 0:
-            _a4_cleanup.run("""CREATE TABLE IF NOT EXISTS poly_alpha4_trades_archive AS 
-                SELECT * FROM poly_alpha4_trades WHERE 1=0""")
-            _a4_moved = _a4_cleanup.run(
-                "INSERT INTO poly_alpha4_trades_archive SELECT * FROM poly_alpha4_trades RETURNING id")
-            _a4_cleanup.run("DELETE FROM poly_alpha4_trades")
-            _moved_count = len(_a4_moved) if _a4_moved else 0
-            print("A4: archived {} old trades, cleared table for new system".format(_moved_count))
-        _a4_cleanup.close()
-    except Exception as _a4c_e:
-        print("A4 cleanup error: {}".format(_a4c_e))
-    
     print("SNIPER A4: ${:.2f} pool | Binance SMA + SV3 tiered stakes | skip 3,5 | 15M".format(
         _poly_alpha4_state["balance"]))
     
