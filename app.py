@@ -21706,7 +21706,7 @@ a{{color:#00d4aa}}
 </style></head><body>
 <div class="nav">
 <a href="/app/poly-alpha3" class="nav-tab active">⚡ Poly A3</a>
-    <a href="/app/poly-alpha4" class="nav-tab""" + (" active" if nav_active == "poly-alpha4" else "") + """">🎯 Sniper A4</a>
+<a href="/app/poly-alpha4" class="nav-tab">🎯 Sniper A4</a>
 <a href="/app/poly-alpha2" class="nav-tab">⚡ Poly A2</a>
 <a href="/app/paper28poly" class="nav-tab">P2.8 Poly</a>
 <a href="/app/paper29poly" class="nav-tab">P2.9 Poly</a>
@@ -22774,6 +22774,42 @@ print("Limitless Bot v4 — {} threads running (Polymarket + Chainlink RTDS{})".
 # ═══════════════════════════════════════════════════════════
 # CSV EXPORT ROUTES — Data analysis
 # ═══════════════════════════════════════════════════════════
+
+@app.route("/csv/<table_name>")
+def csv_export(table_name):
+    """Export any paper/alpha table as CSV for analysis.
+    Usage: /csv/paper23_trades, /csv/alpha_trades, /csv/poly_alpha3_trades, etc.
+    """
+    allowed = [
+        "paper21_trades", "paper22_trades", "paper23_trades", "paper33_trades",
+        "paper24_trades", "paper34_trades", "paper25_trades", "paper35_trades",
+        "paper26_trades", "paper36_trades", "paper27_trades", "paper37_trades",
+        "paper28_trades", "paper29_trades", "paper210_trades",
+        "alpha_trades", "poly_alpha3_trades", "limitless_sniper_trades",
+        "poly_trades", "poly_alpha41_trades",
+    ]
+    if table_name not in allowed:
+        return "Table not allowed. Allowed: {}".format(", ".join(allowed)), 400
+    try:
+        conn = get_db()
+        rows = conn.run("SELECT * FROM {} ORDER BY id DESC".format(table_name))
+        cols = [c['name'] for c in conn.columns]
+        conn.close()
+        
+        import csv
+        import io
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow(cols)
+        for row in rows:
+            writer.writerow([str(v) if v is not None else "" for v in row])
+        
+        resp = app.make_response(output.getvalue())
+        resp.headers["Content-Type"] = "text/csv"
+        resp.headers["Content-Disposition"] = "attachment; filename={}.csv".format(table_name)
+        return resp
+    except Exception as e:
+        return "Error: {}".format(e), 500
 
 @app.route("/app/poly-alpha41")
 def poly_alpha41_page():
