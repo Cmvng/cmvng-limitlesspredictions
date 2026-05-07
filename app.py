@@ -938,8 +938,8 @@ def _bot2_sniper_thread():
             
             # Calculate direction for each asset
             snipe_targets = []
-            # Only build Bot2 targets if enabled and BTC direction available
-            if btc_dir and _bot2_sniper_state["enabled"]:
+            # Build Bot2 targets if BTC direction available (paper or live)
+            if btc_dir:
               for asset in SNIPER_ASSETS:
                 if asset not in token_map:
                     continue
@@ -985,18 +985,19 @@ def _bot2_sniper_thread():
             
             if not snipe_targets:
                 print("BOT2: 0 targets at boundary {}".format(window_ts))
-                _time.sleep(60)
-                continue
             
-            # ── T+0.5s: FIRE ORDERS ──
-            client = _get_poly_client()
-            if not client:
-                print("BOT2: no CLOB client — skipping")
-                _time.sleep(20)
-                continue
+            # ── T+0.5s: FIRE ORDERS (live) or RECORD (paper) ──
+            bot2_is_live = _bot2_sniper_state["enabled"]
+            client = None
+            if snipe_targets and bot2_is_live:
+                client = _get_poly_client()
+                if not client:
+                    print("BOT2: no CLOB client — recording as paper")
+                    bot2_is_live = False
             
-            from py_clob_client_v2 import Side, OrderArgs, OrderType
-            BUY = Side.BUY
+            if bot2_is_live and client and snipe_targets:
+                from py_clob_client_v2 import Side, OrderArgs, OrderType
+                BUY = Side.BUY
             
             fired = []
             for target in snipe_targets:
@@ -1007,40 +1008,41 @@ def _bot2_sniper_thread():
                 
                 token_id = entry["up_token"] if target["bet_side"] == "UP" else entry["down_token"]
                 shares = STAKE / MAX_FILL  # $2.50 / 0.50 = 5 shares
+                order_id = None
                 
-                try:
-                    args = OrderArgs(
-                        token_id=str(token_id),
-                        price=MAX_FILL,
-                        size=shares,
-                        side=BUY,
-                    )
-                    signed = client.create_order(args)
-                    resp = client.post_order(signed, OrderType.GTC)
-                    order_id = None
-                    if resp:
-                        order_id = resp.get("orderID") or resp.get("id") or "placed"
-                    
-                    # Update state
-                    _bot2_sniper_state["balance"] = round(_bot2_sniper_state["balance"] - STAKE, 2)
-                    _bot2_sniper_state["trades_today"] += 1
-                    _bot2_sniper_traded.add(target["market_key"])
-                    if _bot2_sniper_state["balance"] > _bot2_sniper_state["peak_balance"]:
-                        _bot2_sniper_state["peak_balance"] = _bot2_sniper_state["balance"]
-                    
-                    fired.append({
-                        "asset": asset, "bet_side": target["bet_side"],
-                        "indicators": target["indicators"],
-                        "order_id": order_id, "slug": entry["slug"],
-                        "condition_id": entry["condition_id"],
-                        "token_id": token_id,
-                    })
-                    
-                    print("BOT2 FIRED: {} {} @50c ${:.2f} | pool=${:.2f}".format(
-                        target["bet_side"], asset, STAKE, _bot2_sniper_state["balance"]))
-                    
-                except Exception as e:
-                    print("BOT2 order error {}: {}".format(asset, e))
+                if bot2_is_live and client:
+                    try:
+                        args = OrderArgs(
+                            token_id=str(token_id),
+                            price=MAX_FILL,
+                            size=shares,
+                            side=BUY,
+                        )
+                        signed = client.create_order(args)
+                        resp = client.post_order(signed, OrderType.GTC)
+                        if resp:
+                            order_id = resp.get("orderID") or resp.get("id") or "placed"
+                    except Exception as e:
+                        print("BOT2 order error {}: {}".format(asset, e))
+                
+                # Update state (both paper and live)
+                _bot2_sniper_state["balance"] = round(_bot2_sniper_state["balance"] - STAKE, 2)
+                _bot2_sniper_state["trades_today"] += 1
+                _bot2_sniper_traded.add(target["market_key"])
+                if _bot2_sniper_state["balance"] > _bot2_sniper_state["peak_balance"]:
+                    _bot2_sniper_state["peak_balance"] = _bot2_sniper_state["balance"]
+                
+                fired.append({
+                    "asset": asset, "bet_side": target["bet_side"],
+                    "indicators": target["indicators"],
+                    "order_id": order_id, "slug": entry["slug"],
+                    "condition_id": entry["condition_id"],
+                    "token_id": token_id,
+                })
+                
+                _mode = "FIRED" if bot2_is_live else "PAPER"
+                print("BOT2 {}: {} {} @50c ${:.2f} | pool=${:.2f}".format(
+                    _mode, target["bet_side"], asset, STAKE, _bot2_sniper_state["balance"]))
             
             # ── Save to DB + Telegram ──
             for fr in fired:
@@ -1183,6 +1185,9 @@ def _bot2_sniper_thread():
                 if _p29cl_count > 0:
                     _save_bot_balance("p29cl", _p29cl_state)
                     print("P29CL: {} paper trades | pool=${:.2f}".format(_p29cl_count, _p29cl_state["balance"]))
+                else:
+                    print("P29CL: 0 trades (no momentum signal) | candles={} chainlink={}".format(
+                        len(_p29cl_candle_prefetch), len(_chainlink_prices)))
             except Exception as _p29cl_err:
                 print("P29CL error: {}".format(_p29cl_err))
 
@@ -19619,10 +19624,10 @@ try:
             _alpha_state["peak_balance"] = _saved_alpha.get("peak_balance", _saved_alpha["balance"])
             _alpha_restored = True
     
-    # Clear old bot balances (not Alpha)
+    # Clear only old/deprecated bot balances (keep active bots)
     try:
         _rc = get_db()
-        _rc.run("DELETE FROM bot_balances WHERE bot_name != 'alpha'")
+        _rc.run("DELETE FROM bot_balances WHERE bot_name IN ('p21','p31','p22','p32','p24','p34','p25','p35')")
         _rc.close()
     except:
         pass
