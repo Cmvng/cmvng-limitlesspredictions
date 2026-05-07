@@ -1068,7 +1068,8 @@ def _bot2_sniper_thread():
                     print("BOT2 DB error: {}".format(e))
                 
                 try:
-                    send_telegram("🤖 <b>BOT2 SNIPER</b>\n{} {} @50c ${:.2f}\n{}\nPool: ${:.2f}".format(
+                    if bot2_is_live:
+                        send_telegram("🤖 <b>BOT2 SNIPER</b>\n{} {} @50c ${:.2f}\n{}\nPool: ${:.2f}".format(
                         fr["bet_side"], fr["asset"], STAKE,
                         fr["indicators"][:60], _bot2_sniper_state["balance"]))
                 except:
