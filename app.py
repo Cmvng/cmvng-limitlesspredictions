@@ -427,10 +427,10 @@ def _poly_alpha3_load_recent():
         _poly_alpha4_state["peak_balance"] = 100.0
     _poly_alpha4_state["starting_balance"] = 100.0
     _poly_alpha4_state["floor_balance"] = 10.0
-    _poly_alpha4_state["enabled"] = True
+    _poly_alpha4_state["enabled"] = False  # PAUSED — replaced by Poly Alpha 3.0 (P2.3)
     _save_bot_balance("poly_alpha4", _poly_alpha4_state)
     
-    print("SNIPER A4: ${:.2f} pool | Binance SMA + SV3 tiered stakes | skip 3,5 | 15M".format(
+    print("SNIPER A4: PAUSED (${:.2f} pool) — replaced by Poly Alpha 3.0 (P2.3)".format(
         _poly_alpha4_state["balance"]))
     
     # ── A41 PAUSED — not trading on Polymarket until further notice ──
@@ -18953,21 +18953,21 @@ try:
         _poly_alpha2_state["balance"], " (restored)" if _poly_alpha2_restored else " (fresh)"))
     _poly_alpha2_load_recent()
 
-    # ── POLY ALPHA 3.0 init ──
-    _poly_alpha3_restored = False
+    # ── POLY ALPHA 3.0 init — Pure P2.3 with compounding stakes ──
+    # P2.3: 59.6% WR over 2,329 paper trades. Proven profitable.
     _saved_pa3 = _saved_balances.get("poly_alpha3", {})
-    if _saved_pa3 and _saved_pa3.get("balance", 0) > 0:
+    if _saved_pa3 and _saved_pa3.get("balance", 0) >= 10:
         _poly_alpha3_state["balance"] = _saved_pa3["balance"]
         _poly_alpha3_state["peak_balance"] = _saved_pa3.get("peak_balance", _saved_pa3["balance"])
-        _poly_alpha3_restored = True
-    if not _poly_alpha3_restored:
-        _poly_alpha3_state["balance"] = 60.0
-        _poly_alpha3_state["peak_balance"] = 60.0
-    _poly_alpha3_state["starting_balance"] = 60.0
+    else:
+        _poly_alpha3_state["balance"] = 100.0
+        _poly_alpha3_state["peak_balance"] = 100.0
+    _poly_alpha3_state["starting_balance"] = 100.0
     _poly_alpha3_state["floor_balance"] = 5.0
-    _poly_alpha3_state["enabled"] = False  # PAUSED — replaced by Sniper A4
-    print("POLY ALPHA 3.0: ${:.2f} pool{} | PAUSED (replaced by Sniper A4)".format(
-        _poly_alpha3_state["balance"], " (restored)" if _poly_alpha3_restored else " (fresh)"))
+    _poly_alpha3_state["enabled"] = True
+    _save_bot_balance("poly_alpha3", _poly_alpha3_state)
+    print("POLY ALPHA 3.0: ${:.2f} pool | ENABLED — Pure P2.3 (59.6% WR proven)".format(
+        _poly_alpha3_state["balance"]))
     _poly_alpha3_load_recent()
 
     _poly_alpha_load_recent_trades()
