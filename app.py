@@ -735,6 +735,68 @@ def _p29cl_calc_stake(balance):
         return 0
     return stake
 
+def _p29cl_calc_dist(asset, chainlink_close):
+    """Calculate DIST_PROB from settled 15M candles at T+0.5s.
+    
+    At boundary, price == PTB (Chainlink close IS the baseline).
+    DIST = momentum / (sigma * sqrt(T)) — how many standard deviations
+    of typical movement the current momentum is carrying price.
+    
+    Returns: (dist_prob_int, dist_zone_str)
+      dist_prob_int: 0-100 (probability price closes ABOVE baseline)
+      dist_zone_str: EXTREME_DOWN / TRANSITION / NEUTRAL / EXTREME_UP
+    """
+    import math
+    candles = _p29cl_candle_prefetch.get(asset)
+    if not candles or len(candles) < 5:
+        return 50, "NEUTRAL"
+    
+    # Settle last candle with Chainlink close
+    settled = list(candles)
+    last = settled[-1]
+    settled[-1] = (last[0], max(last[1], chainlink_close),
+                   min(last[2], chainlink_close), chainlink_close)
+    
+    closes = [c[3] for c in settled]
+    n = len(closes)
+    
+    # Sigma: std dev of close-to-close changes
+    cc_changes = [closes[j] - closes[j-1] for j in range(1, n)]
+    if len(cc_changes) < 3:
+        return 50, "NEUTRAL"
+    
+    cc_mean = sum(cc_changes) / len(cc_changes)
+    variance = sum((x - cc_mean) ** 2 for x in cc_changes) / len(cc_changes)
+    sigma = max(0.0001, math.sqrt(variance))
+    
+    # Momentum: weighted last 3 changes (recent = heavier)
+    c2 = closes[-1] - closes[-2]
+    c1 = closes[-2] - closes[-3]
+    if n >= 5:
+        c0 = closes[-3] - closes[-4]
+        dist_momentum = c0 * 0.2 + c1 * 0.3 + c2 * 0.5
+    else:
+        dist_momentum = c1 * 0.4 + c2 * 0.6
+    
+    # z-score: momentum normalized by volatility
+    z = dist_momentum / (sigma * math.sqrt(1.0))
+    prob_above = 0.5 * (1 + math.erf(z / math.sqrt(2)))
+    prob_pct = max(0, min(100, int(round(prob_above * 100))))
+    
+    # Zone classification
+    if prob_pct <= 25:
+        zone = "EXTREME_DOWN"
+    elif prob_pct <= 40:
+        zone = "TRANSITION"
+    elif prob_pct <= 60:
+        zone = "NEUTRAL"
+    elif prob_pct <= 75:
+        zone = "TRANSITION"
+    else:
+        zone = "EXTREME_UP"
+    
+    return prob_pct, zone
+
 def _bot2_sniper_calc_direction(asset, chainlink_close):
     """Bot2 strategy: SMA10 on 1H + BTC trend agree.
     Uses 9 pre-fetched completed candles + Chainlink close as 10th.
@@ -1125,6 +1187,9 @@ def _bot2_sniper_thread():
                         if not _p29cl_dir:
                             continue
                         
+                        # Calculate DIST_PROB (tracking data)
+                        _p29cl_dist_prob, _p29cl_dist_zone = _p29cl_calc_dist(_p29cl_asset, _p29cl_price)
+                        
                         # Dedup
                         _p29cl_key = "p29cl_{}_{}".format(_p29cl_asset, window_ts)
                         if _p29cl_key in _p29cl_traded:
@@ -1134,8 +1199,6 @@ def _bot2_sniper_thread():
                         _p29cl_stake = _p29cl_calc_stake(_p29cl_state["balance"])
                         if _p29cl_stake <= 0 or _p29cl_stake > _p29cl_state["balance"]:
                             continue
-                        
-                        _p29cl_bet_side = _p29cl_dir  # UP or DOWN
                         
                         # Get token info for slug
                         _p29cl_entry = token_map.get(_p29cl_asset, {})
@@ -1156,19 +1219,23 @@ def _bot2_sniper_thread():
                             _p29cl_db.run("""INSERT INTO p29cl_trades
                                 (market_id, title, asset, bet_side, stake, fill_price,
                                  pool_after, indicators, confidence, momentum_score,
+                                 dist_prob, dist_zone,
                                  slug, condition_id, token_id,
                                  status, outcome, fired_at)
                                 VALUES (:mid, :ttl, :ast, :bs, :stk, 0.50,
                                         :pa, :ind, :conf, :ms,
+                                        :dp, :dz,
                                         :slg, :cid, :tid,
                                         'Pending', 'PENDING', :fa)""",
                                 mid=_p29cl_key,
                                 ttl="P29CL {} {} 15M".format(_p29cl_asset, _p29cl_dir),
-                                ast=_p29cl_asset, bs=_p29cl_bet_side, stk=_p29cl_stake,
+                                ast=_p29cl_asset, bs=_p29cl_dir, stk=_p29cl_stake,
                                 pa=_p29cl_state["balance"],
-                                ind="[{}] {} | P21={} | BTC={}".format(
-                                    _p29cl_conf, _p29cl_tag, _p29cl_p21_dir or "NONE", _p29cl_btc_dir or "NONE"),
+                                ind="[{}] {} | P21={} | BTC={} | DIST={}({})".format(
+                                    _p29cl_conf, _p29cl_tag, _p29cl_p21_dir or "NONE",
+                                    _p29cl_btc_dir or "NONE", _p29cl_dist_zone, _p29cl_dist_prob),
                                 conf=_p29cl_conf, ms=_p29cl_score,
+                                dp=_p29cl_dist_prob, dz=_p29cl_dist_zone,
                                 slg=_p29cl_slug, cid=_p29cl_cid, tid=_p29cl_tid,
                                 fa=_p29cl_now)
                             _p29cl_db.close()
@@ -1176,9 +1243,10 @@ def _bot2_sniper_thread():
                             print("P29CL DB error {}: {}".format(_p29cl_asset, _p29cl_dbe))
                         
                         _p29cl_count += 1
-                        print("P29CL: {} {} S{} [{}] ${:.2f} | pool=${:.2f}".format(
+                        print("P29CL: {} {} S{} [{}] ${:.2f} DIST={}({}) | pool=${:.2f}".format(
                             _p29cl_dir, _p29cl_asset, _p29cl_score, _p29cl_conf,
-                            _p29cl_stake, _p29cl_state["balance"]))
+                            _p29cl_stake, _p29cl_dist_zone, _p29cl_dist_prob,
+                            _p29cl_state["balance"]))
                         
                     except Exception as _p29cl_ae:
                         print("P29CL error {}: {}".format(_p29cl_asset, _p29cl_ae))
@@ -5080,11 +5148,18 @@ def init_db():
             bet_side TEXT, stake REAL, fill_price REAL DEFAULT 0.50,
             pool_after REAL, payout REAL, indicators TEXT,
             confidence TEXT, momentum_score INTEGER,
+            dist_prob INTEGER DEFAULT 50, dist_zone TEXT DEFAULT 'NEUTRAL',
             slug TEXT, condition_id TEXT, token_id TEXT,
             status TEXT DEFAULT 'Pending', outcome TEXT DEFAULT 'PENDING',
             fired_at TEXT, resolved_at TEXT
         )
     """)
+    # Add dist columns if table already exists without them
+    try:
+        conn.run("ALTER TABLE p29cl_trades ADD COLUMN IF NOT EXISTS dist_prob INTEGER DEFAULT 50")
+        conn.run("ALTER TABLE p29cl_trades ADD COLUMN IF NOT EXISTS dist_zone TEXT DEFAULT 'NEUTRAL'")
+    except:
+        pass
     conn.run("""
         CREATE TABLE IF NOT EXISTS poly_alpha4_trades (
             id SERIAL PRIMARY KEY,
