@@ -432,6 +432,206 @@ _bot2_sniper_traded = set()  # dedup: "asset_boundary_ts"
 # Pre-fetched 1H candle closes (9 completed candles, fetched at T-22s)
 _bot2_prefetch = {}  # {"BTC": [close1, close2, ..., close9], "ETH": [...], ...}
 
+# ═══════════════════════════════════════════════════════════
+# P2.9 CHAINLINK PAPER — Momentum-based candle analysis at T+0.5s
+# Reads settled candle + previous candles + P2.1 direction
+# Thinks for itself instead of rigid pattern matching
+# ═══════════════════════════════════════════════════════════
+_p29cl_state = {
+    "enabled": True,
+    "balance": 100.0,
+    "peak_balance": 100.0,
+    "starting_balance": 100.0,
+    "floor_balance": 10.0,
+    "trades_today": 0,
+    "wins_today": 0,
+    "losses_today": 0,
+    "profit_today": 0.0,
+}
+_p29cl_traded = set()
+
+# Pre-fetched 15M candle series (fetched at T-22s, 6 completed candles)
+_p29cl_candle_prefetch = {}  # {"BTC": [(o,h,l,c), (o,h,l,c), ...], ...}
+
+def _p29cl_momentum_score(asset, chainlink_close, p21_dir, btc_dir):
+    """P2.9 Chainlink: Momentum-based candle analysis.
+    
+    Instead of rigid patterns, scores multiple factors:
+    1. Candle momentum — are bodies growing or shrinking?
+    2. Wick story — who's winning (buyers or sellers)?
+    3. Trend strength — total distance in last 5 candles
+    4. Exhaustion — body shrinking + wicks growing = trend ending
+    5. New candle opening position — where does it open relative to recent range?
+    6. P2.1 agreement — indicators confirm or oppose?
+    
+    Returns: (direction, confidence, score, tag) or (None, None, 0, "")
+    """
+    candles = _p29cl_candle_prefetch.get(asset)
+    if not candles or len(candles) < 4:
+        return None, None, 0, "NO_CANDLES"
+    
+    # The last candle in prefetch is the one that just closed
+    # But we need to construct it with the Chainlink close
+    # prefetch has completed candles BEFORE the boundary candle
+    # The boundary candle = last prefetch open + chainlink close
+    
+    # Actually: prefetch is 15M candles fetched at T-22s
+    # The last one is the candle that's STILL OPEN (has 22s left)
+    # We replace its close with Chainlink close to "settle" it
+    
+    settled_candles = list(candles)  # copy
+    if len(settled_candles) >= 1:
+        last = settled_candles[-1]
+        # Replace close with Chainlink close, recalculate high/low
+        settled_candles[-1] = (
+            last[0],  # open stays
+            max(last[1], chainlink_close),  # high = max of old high and close
+            min(last[2], chainlink_close),  # low = min of old low and close
+            chainlink_close  # close = Chainlink
+        )
+    
+    # Now analyze the settled candles
+    if len(settled_candles) < 4:
+        return None, None, 0, "TOO_FEW"
+    
+    # Extract last 5 candles (or whatever we have)
+    recent = settled_candles[-5:] if len(settled_candles) >= 5 else settled_candles
+    
+    # ── Factor 1: Current candle direction and strength ──
+    curr = recent[-1]
+    curr_open, curr_high, curr_low, curr_close = curr
+    curr_body = abs(curr_close - curr_open)
+    curr_range = curr_high - curr_low if curr_high > curr_low else 0.0001
+    curr_body_ratio = curr_body / curr_range
+    curr_is_green = curr_close > curr_open
+    curr_is_red = curr_close < curr_open
+    curr_upper_wick = curr_high - max(curr_open, curr_close)
+    curr_lower_wick = min(curr_open, curr_close) - curr_low
+    
+    score = 0  # positive = DOWN, negative = UP (will flip at end)
+    tags = []
+    
+    # ── Factor 2: Momentum — are candle bodies growing or shrinking? ──
+    bodies = []
+    directions = []
+    for c in recent:
+        o, h, l, cl = c
+        bodies.append(abs(cl - o))
+        directions.append("GREEN" if cl > o else "RED" if cl < o else "FLAT")
+    
+    # Count consecutive same-direction candles
+    last_dir = directions[-1]
+    consecutive = 1
+    for d in reversed(directions[:-1]):
+        if d == last_dir:
+            consecutive += 1
+        else:
+            break
+    
+    # Momentum acceleration: are bodies getting bigger?
+    if len(bodies) >= 3:
+        if bodies[-1] > bodies[-2] > bodies[-3]:
+            # Accelerating — strong trend
+            score += 3 if last_dir == "RED" else -3
+            tags.append("ACCEL_{}".format(last_dir))
+        elif bodies[-1] < bodies[-2] < bodies[-3]:
+            # Exhausting — trend weakening
+            score += -1 if last_dir == "RED" else 1
+            tags.append("EXHAUST_{}".format(last_dir))
+        elif bodies[-1] > bodies[-2]:
+            score += 1 if last_dir == "RED" else -1
+            tags.append("GROW_{}".format(last_dir))
+    
+    # ── Factor 3: Consecutive direction ──
+    if consecutive >= 4:
+        score += 2 if last_dir == "RED" else -2
+        tags.append("RUN{}{}".format(consecutive, last_dir[0]))
+    elif consecutive >= 3:
+        score += 1 if last_dir == "RED" else -1
+        tags.append("RUN{}{}".format(consecutive, last_dir[0]))
+    
+    # ── Factor 4: Wick analysis on current candle ──
+    if curr_range > 0:
+        upper_ratio = curr_upper_wick / curr_range
+        lower_ratio = curr_lower_wick / curr_range
+        
+        # Long lower wick = buyers defending (bullish)
+        if lower_ratio > 0.5 and curr_body_ratio < 0.3:
+            score -= 2  # bullish signal
+            tags.append("BUYER_WICK")
+        # Long upper wick = sellers rejecting (bearish)
+        elif upper_ratio > 0.5 and curr_body_ratio < 0.3:
+            score += 2  # bearish signal
+            tags.append("SELLER_WICK")
+    
+    # ── Factor 5: Trend distance — how far has price moved? ──
+    if len(recent) >= 3:
+        first_open = recent[0][0]
+        last_close = recent[-1][3]
+        total_move_pct = abs(last_close - first_open) / first_open * 100 if first_open > 0 else 0
+        
+        if total_move_pct > 1.5:
+            # Big move — momentum is strong
+            move_dir = "RED" if last_close < first_open else "GREEN"
+            score += 2 if move_dir == "RED" else -2
+            tags.append("BIG_MOVE_{:.1f}%".format(total_move_pct))
+        elif total_move_pct > 0.5:
+            move_dir = "RED" if last_close < first_open else "GREEN"
+            score += 1 if move_dir == "RED" else -1
+    
+    # ── Factor 6: P2.1 agreement ──
+    if p21_dir:
+        if p21_dir == "DOWN":
+            score += 2
+            tags.append("P21=DOWN")
+        else:
+            score -= 2
+            tags.append("P21=UP")
+    
+    # ── Factor 7: BTC agreement (macro trend) ──
+    if btc_dir:
+        if btc_dir == "SELL":
+            score += 1
+            tags.append("BTC=SELL")
+        else:
+            score -= 1
+            tags.append("BTC=BUY")
+    
+    # ── Factor 8: Exhaustion detection ──
+    # If we have 4+ same-direction candles but the last one has big opposing wick
+    if consecutive >= 3:
+        if last_dir == "RED" and curr_lower_wick > curr_body * 2:
+            score -= 3  # exhaustion — buyers stepping in after sell-off
+            tags.append("EXHAUST_HAMMER")
+        elif last_dir == "GREEN" and curr_upper_wick > curr_body * 2:
+            score += 3  # exhaustion — sellers stepping in after rally
+            tags.append("EXHAUST_STAR")
+    
+    # ── Decision ──
+    if abs(score) < 2:
+        return None, None, score, "NEUTRAL({})".format("+".join(tags))
+    
+    direction = "DOWN" if score > 0 else "UP"
+    
+    if abs(score) >= 6:
+        confidence = "HIGH"
+    elif abs(score) >= 4:
+        confidence = "MEDIUM"
+    else:
+        confidence = "LOW"
+    
+    tag = "S{} {}".format(score, "+".join(tags[:4]))
+    return direction, confidence, score, tag
+
+def _p29cl_calc_stake(balance):
+    """Compounding stake: 5% of pool, min $2.50, max $8."""
+    stake = round(balance * 0.05, 2)
+    stake = max(stake, 2.50)
+    stake = min(stake, 8.00)
+    if stake > balance * 0.15:
+        return 0
+    return stake
+
 def _bot2_sniper_calc_direction(asset, chainlink_close):
     """Bot2 strategy: SMA10 on 1H + BTC trend agree.
     Uses 9 pre-fetched completed candles + Chainlink close as 10th.
@@ -519,6 +719,24 @@ def _bot2_sniper_thread():
                         print("BOT2 prefetch {}: HTTP {}".format(asset, r.status_code))
                 except Exception as e:
                     print("BOT2 prefetch error {}: {}".format(asset, e))
+            
+            # ── T-22s: P2.9CL — Pre-fetch 15M candles (OHLC for candle analysis) ──
+            _15m_boundary_ms = (now_ms // 900000) * 900000  # last completed 15M boundary
+            for asset in SNIPER_ASSETS:
+                try:
+                    symbol = {"BTC": "BTCUSDT", "ETH": "ETHUSDT", "SOL": "SOLUSDT", "XRP": "XRPUSDT"}.get(asset)
+                    r = _req.get("https://api.binance.com/api/v3/klines",
+                        params={"symbol": symbol, "interval": "15m", "limit": 8},
+                        timeout=3)
+                    if r.status_code == 200:
+                        klines = r.json()
+                        if klines and len(klines) >= 4:
+                            # Store as (open, high, low, close) tuples
+                            # Include the current (incomplete) candle — we'll fix its close with Chainlink
+                            ohlc = [(float(k[1]), float(k[2]), float(k[3]), float(k[4])) for k in klines]
+                            _p29cl_candle_prefetch[asset] = ohlc
+                except Exception as e:
+                    print("P29CL prefetch error {}: {}".format(asset, e))
             
             # ── T-15s: Fetch token IDs from Polymarket ──
             # Calculate next boundary timestamp
@@ -767,6 +985,111 @@ def _bot2_sniper_thread():
             import traceback
             traceback.print_exc()
             _time.sleep(60)
+
+        # ── P2.9CL: Momentum-based paper trades at T+0.5s ──
+        try:
+            if not _p29cl_state["enabled"]:
+                continue
+            
+            _p29cl_now = datetime.now(timezone.utc).isoformat()
+            _p29cl_count = 0
+            
+            # Get BTC direction for P2.1 and BTC trend
+            _p29cl_btc_price = _chainlink_prices.get("BTC")
+            _p29cl_btc_prefetch = _bot2_prefetch.get("BTC")
+            _p29cl_btc_dir = None
+            if _p29cl_btc_price and _p29cl_btc_prefetch and len(_p29cl_btc_prefetch) >= 9:
+                _p29cl_btc_closes = _p29cl_btc_prefetch[-9:] + [_p29cl_btc_price]
+                _p29cl_btc_sma = sum(_p29cl_btc_closes) / 10.0
+                _p29cl_btc_dir = "SELL" if _p29cl_btc_price < _p29cl_btc_sma else "BUY"
+            
+            for _p29cl_asset in ["BTC", "ETH", "SOL", "XRP"]:
+                try:
+                    _p29cl_price = _chainlink_prices.get(_p29cl_asset)
+                    if not _p29cl_price:
+                        continue
+                    
+                    # Get P2.1 direction from settled SMA
+                    _p29cl_prefetch = _bot2_prefetch.get(_p29cl_asset)
+                    _p29cl_p21_dir = None
+                    if _p29cl_prefetch and len(_p29cl_prefetch) >= 9:
+                        _p29cl_closes = _p29cl_prefetch[-9:] + [_p29cl_price]
+                        _p29cl_sma = sum(_p29cl_closes) / 10.0
+                        _p29cl_asset_dir = "BUY" if _p29cl_price > _p29cl_sma else "SELL"
+                        # P2.1: SMA + BTC agree
+                        if _p29cl_asset_dir == _p29cl_btc_dir:
+                            _p29cl_p21_dir = "DOWN" if _p29cl_asset_dir == "SELL" else "UP"
+                    
+                    # Run momentum scoring
+                    _p29cl_dir, _p29cl_conf, _p29cl_score, _p29cl_tag = _p29cl_momentum_score(
+                        _p29cl_asset, _p29cl_price, _p29cl_p21_dir, _p29cl_btc_dir)
+                    
+                    if not _p29cl_dir:
+                        continue
+                    
+                    # Dedup
+                    _p29cl_key = "p29cl_{}_{}".format(_p29cl_asset, window_ts)
+                    if _p29cl_key in _p29cl_traded:
+                        continue
+                    
+                    # Calculate stake (compounding)
+                    _p29cl_stake = _p29cl_calc_stake(_p29cl_state["balance"])
+                    if _p29cl_stake <= 0 or _p29cl_stake > _p29cl_state["balance"]:
+                        continue
+                    
+                    _p29cl_bet_side = _p29cl_dir  # UP or DOWN
+                    
+                    # Get token info for slug
+                    _p29cl_entry = token_map.get(_p29cl_asset, {})
+                    _p29cl_slug = _p29cl_entry.get("slug", "")
+                    _p29cl_cid = _p29cl_entry.get("condition_id", "")
+                    _p29cl_tid = _p29cl_entry.get("up_token" if _p29cl_dir == "UP" else "down_token", "")
+                    
+                    # Update balance
+                    _p29cl_state["balance"] = round(_p29cl_state["balance"] - _p29cl_stake, 2)
+                    _p29cl_state["trades_today"] += 1
+                    _p29cl_traded.add(_p29cl_key)
+                    if _p29cl_state["balance"] > _p29cl_state["peak_balance"]:
+                        _p29cl_state["peak_balance"] = _p29cl_state["balance"]
+                    
+                    # Save to DB
+                    try:
+                        _p29cl_db = get_db()
+                        _p29cl_db.run("""INSERT INTO p29cl_trades
+                            (market_id, title, asset, bet_side, stake, fill_price,
+                             pool_after, indicators, confidence, momentum_score,
+                             slug, condition_id, token_id,
+                             status, outcome, fired_at)
+                            VALUES (:mid, :ttl, :ast, :bs, :stk, 0.50,
+                                    :pa, :ind, :conf, :ms,
+                                    :slg, :cid, :tid,
+                                    'Pending', 'PENDING', :fa)""",
+                            mid=_p29cl_key,
+                            ttl="P29CL {} {} 15M".format(_p29cl_asset, _p29cl_dir),
+                            ast=_p29cl_asset, bs=_p29cl_bet_side, stk=_p29cl_stake,
+                            pa=_p29cl_state["balance"],
+                            ind="[{}] {} | P21={} | BTC={}".format(
+                                _p29cl_conf, _p29cl_tag, _p29cl_p21_dir or "NONE", _p29cl_btc_dir or "NONE"),
+                            conf=_p29cl_conf, ms=_p29cl_score,
+                            slg=_p29cl_slug, cid=_p29cl_cid, tid=_p29cl_tid,
+                            fa=_p29cl_now)
+                        _p29cl_db.close()
+                    except Exception as _p29cl_dbe:
+                        print("P29CL DB error {}: {}".format(_p29cl_asset, _p29cl_dbe))
+                    
+                    _p29cl_count += 1
+                    print("P29CL: {} {} S{} [{}] ${:.2f} | pool=${:.2f}".format(
+                        _p29cl_dir, _p29cl_asset, _p29cl_score, _p29cl_conf,
+                        _p29cl_stake, _p29cl_state["balance"]))
+                    
+                except Exception as _p29cl_ae:
+                    print("P29CL error {}: {}".format(_p29cl_asset, _p29cl_ae))
+            
+            if _p29cl_count > 0:
+                _save_bot_balance("p29cl", _p29cl_state)
+                print("P29CL: {} paper trades | pool=${:.2f}".format(_p29cl_count, _p29cl_state["balance"]))
+        except Exception as _p29cl_err:
+            print("P29CL error: {}".format(_p29cl_err))
 
 
 
@@ -4632,6 +4955,18 @@ def init_db():
             pool_after REAL, payout REAL, order_id TEXT, token_id TEXT,
             condition_id TEXT, slug TEXT,
             indicators TEXT,
+            status TEXT DEFAULT 'Pending', outcome TEXT DEFAULT 'PENDING',
+            fired_at TEXT, resolved_at TEXT
+        )
+    """)
+    conn.run("""
+        CREATE TABLE IF NOT EXISTS p29cl_trades (
+            id SERIAL PRIMARY KEY,
+            market_id TEXT, title TEXT, asset TEXT,
+            bet_side TEXT, stake REAL, fill_price REAL DEFAULT 0.50,
+            pool_after REAL, payout REAL, indicators TEXT,
+            confidence TEXT, momentum_score INTEGER,
+            slug TEXT, condition_id TEXT, token_id TEXT,
             status TEXT DEFAULT 'Pending', outcome TEXT DEFAULT 'PENDING',
             fired_at TEXT, resolved_at TEXT
         )
@@ -21638,6 +21973,85 @@ def _resolve_bot2_sniper_trades():
     except Exception as e:
         print("Bot2 resolve error: {}".format(e)); return 0
 
+def _resolve_p29cl_trades():
+    """Resolve P2.9 Chainlink paper trades."""
+    try:
+        conn = get_db()
+        rows = conn.run("SELECT * FROM p29cl_trades WHERE status='Pending' ORDER BY id")
+        cols = [c['name'] for c in conn.columns]
+        items = [dict(zip(cols, r)) for r in rows]
+        conn.close()
+        if not items: return 0
+        now = datetime.now(timezone.utc)
+        resolved = 0
+        for p in items:
+            try:
+                if not p.get("fired_at"): continue
+                fired = datetime.fromisoformat(str(p["fired_at"]).replace("+00:00","").replace("Z","")[:26])
+                if fired.tzinfo is None: fired = fired.replace(tzinfo=timezone.utc)
+                m15 = (fired.minute // 15) * 15
+                window_start = fired.replace(minute=m15, second=0, microsecond=0)
+                expiry = window_start + timedelta(minutes=15)
+                if now < expiry + timedelta(minutes=2): continue
+                stake = float(p.get("stake") or 2.50)
+                won = None
+                slug = p.get("slug", "")
+                bs = p.get("bet_side", "UP")
+                try:
+                    import requests as req
+                    if slug:
+                        r = req.get("https://gamma-api.polymarket.com/markets/slug/{}".format(slug), timeout=8)
+                        if r.status_code == 200:
+                            md = r.json()
+                            ops = md.get("outcomePrices")
+                            if ops:
+                                if isinstance(ops, str):
+                                    try: ops = json.loads(ops)
+                                    except: ops = None
+                                if isinstance(ops, list) and len(ops) >= 2:
+                                    p0 = float(ops[0]); p1 = float(ops[1])
+                                    _oc = md.get("outcomes")
+                                    if isinstance(_oc, str):
+                                        try: _oc = json.loads(_oc)
+                                        except: _oc = None
+                                    _up_idx = 0
+                                    if isinstance(_oc, list) and len(_oc) >= 2:
+                                        o0 = str(_oc[0]).lower().strip()
+                                        if o0 in ("no", "down", "below"): _up_idx = 1
+                                    if _up_idx == 0:
+                                        if p0 >= 0.95: won = (bs == "UP")
+                                        elif p1 >= 0.95: won = (bs == "DOWN")
+                                    else:
+                                        if p1 >= 0.95: won = (bs == "UP")
+                                        elif p0 >= 0.95: won = (bs == "DOWN")
+                except: pass
+                if won is None:
+                    if now > expiry + timedelta(hours=1): won = False
+                    else: continue
+                fill = float(p.get("fill_price") or 0.50)
+                payout = round(stake / fill, 4) if won else 0
+                c3 = get_db()
+                c3.run("UPDATE p29cl_trades SET status=:s,outcome=:o,resolved_at=:r,payout=:p WHERE id=:i",
+                    s="Won" if won else "Lost", o="WIN" if won else "LOSS",
+                    r=now.isoformat(), p=payout, i=p["id"])
+                c3.close()
+                resolved += 1
+                if won:
+                    _p29cl_state["balance"] = round(_p29cl_state["balance"] + payout, 2)
+                    _p29cl_state["wins_today"] += 1
+                else:
+                    _p29cl_state["losses_today"] += 1
+                if _p29cl_state["balance"] > _p29cl_state["peak_balance"]:
+                    _p29cl_state["peak_balance"] = _p29cl_state["balance"]
+                _pnl = "+${:.2f}".format(payout - stake) if won else "-${:.2f}".format(stake)
+                print("P29CL #{} {}: {} | pool=${:.2f}".format(p["id"], "WIN" if won else "LOSS", _pnl, _p29cl_state["balance"]))
+                _save_bot_balance("p29cl", _p29cl_state)
+            except Exception as e:
+                print("P29CL resolve error #{}: {}".format(p.get("id"), e))
+        return resolved
+    except Exception as e:
+        print("P29CL resolve error: {}".format(e)); return 0
+
 def _poly_scan_loop():
     """Background thread for Polymarket scanning and resolving."""
     time.sleep(60)  # Wait for init
@@ -21699,6 +22113,12 @@ def _poly_scan_loop():
                 print("Bot2 Sniper resolved: {}".format(_bot2s_resolved))
         except Exception as e:
             print("Bot2 Sniper resolve error: {}".format(e))
+        try:
+            _p29cl_resolved = _resolve_p29cl_trades()
+            if _p29cl_resolved:
+                print("P29CL resolved: {}".format(_p29cl_resolved))
+        except Exception as e:
+            print("P29CL resolve error: {}".format(e))
         try:
             _sv3_resolved = _resolve_sv3_trades()
             if _sv3_resolved:
@@ -22131,6 +22551,98 @@ a{{color:#00d4aa}}
         today="{}T {}W {}L".format(_bot2_sniper_state["trades_today"],
             _bot2_sniper_state["wins_today"], _bot2_sniper_state["losses_today"]),
         asset_html=asset_html, trade_rows=trade_rows)
+
+@app.route("/app/p29cl")
+def p29cl_page():
+    """P2.9 Chainlink — Momentum paper bot dashboard."""
+    try:
+        conn = get_db()
+        rows = conn.run("SELECT * FROM p29cl_trades ORDER BY id DESC LIMIT 200")
+        cols = [c['name'] for c in conn.columns]
+        trades = [dict(zip(cols, r)) for r in rows]
+        conn.close()
+    except:
+        trades = []
+    resolved = [t for t in trades if t.get("outcome") in ("WIN", "LOSS")]
+    pending = [t for t in trades if t.get("outcome") == "PENDING"]
+    wins = sum(1 for t in resolved if t["outcome"] == "WIN")
+    wr = round(wins / len(resolved) * 100, 1) if resolved else 0
+    pnl = sum(float(t.get("payout") or 0) - float(t.get("stake") or 0) if t["outcome"] == "WIN" else -float(t.get("stake") or 0) for t in resolved)
+    pnl = round(pnl, 2)
+    asset_stats = {}
+    for t in resolved:
+        a = t.get("asset", "?")
+        if a not in asset_stats: asset_stats[a] = {"w": 0, "l": 0, "pnl": 0}
+        if t["outcome"] == "WIN":
+            asset_stats[a]["w"] += 1; asset_stats[a]["pnl"] += float(t.get("payout") or 0) - float(t.get("stake") or 0)
+        else:
+            asset_stats[a]["l"] += 1; asset_stats[a]["pnl"] -= float(t.get("stake") or 0)
+    asset_html = ""
+    for a in sorted(asset_stats.keys()):
+        s = asset_stats[a]; tt = s["w"]+s["l"]; awr = round(s["w"]/tt*100,1) if tt else 0
+        asset_html += "<tr><td>{}</td><td>{}W/{}L</td><td>{:.1f}%</td><td>${:.2f}</td></tr>".format(a, s["w"], s["l"], awr, s["pnl"])
+    conf_stats = {}
+    for t in resolved:
+        c = t.get("confidence", "?")
+        if c not in conf_stats: conf_stats[c] = {"w": 0, "l": 0}
+        if t["outcome"] == "WIN": conf_stats[c]["w"] += 1
+        else: conf_stats[c]["l"] += 1
+    conf_html = ""
+    for c in ["HIGH", "MEDIUM", "LOW"]:
+        s = conf_stats.get(c, {"w": 0, "l": 0}); tt = s["w"]+s["l"]
+        if tt == 0: continue
+        cwr = round(s["w"]/tt*100,1)
+        conf_html += "<tr><td>{}</td><td>{}W/{}L</td><td>{:.1f}%</td></tr>".format(c, s["w"], s["l"], cwr)
+    trade_rows = ""
+    for t in trades[:100]:
+        o = t.get("outcome", "PENDING")
+        icon = "✅" if o == "WIN" else "❌" if o == "LOSS" else "⏳"
+        pstr = "+${:.2f}".format(float(t.get("payout") or 0) - float(t.get("stake") or 0)) if o == "WIN" else "-${:.2f}".format(float(t.get("stake") or 0)) if o == "LOSS" else ""
+        fired = (t.get("fired_at") or "")[:16].replace("T", " ")
+        trade_rows += "<tr><td>{}</td><td>{}</td><td>{}</td><td>${:.2f}</td><td>{}</td><td style='font-size:11px;color:#888'>{}</td><td>{}</td></tr>".format(
+            icon, t.get("asset","?"), t.get("bet_side","?"), float(t.get("stake") or 0), fired, str(t.get("indicators",""))[:50], pstr)
+    wrc = "#3fb950" if wr >= 55 else "#f85149" if wr < 50 else "#d29922"
+    pnlc = "#3fb950" if pnl >= 0 else "#f85149"
+    return """<!DOCTYPE html><html><head><title>P2.9 Chainlink</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>body{{background:#0a0a0a;color:#e0e0e0;font-family:sans-serif;max-width:900px;margin:0 auto;padding:10px}}
+h1{{color:#00d4aa}}h2{{color:#888;font-size:14px}}
+.stats{{display:grid;grid-template-columns:repeat(auto-fit,minmax(100px,1fr));gap:8px;margin:10px 0}}
+.stat{{background:#1a1a2e;padding:12px;border-radius:8px;text-align:center}}
+.stat .val{{font-size:24px;font-weight:700}}.stat .lbl{{font-size:11px;color:#888}}
+table{{width:100%;border-collapse:collapse;font-size:13px;margin:10px 0}}
+th,td{{padding:6px 8px;border-bottom:1px solid #222;text-align:left}}
+th{{background:#1a1a2e;color:#888;font-size:11px}}
+.nav{{display:flex;gap:4px;flex-wrap:wrap;margin:10px 0}}
+.nav a{{padding:6px 12px;background:#1a1a2e;color:#888;text-decoration:none;border-radius:4px;font-size:12px}}
+.nav a.active{{background:#00d4aa;color:#000}}
+a{{color:#00d4aa}}
+</style></head><body>
+<div class="nav">
+<a href="/app/p29cl" class="active">🧠 P2.9CL</a>
+<a href="/app/poly-alpha4">🎯 A4</a>
+<a href="/app/bot2-sniper">🤖 Bot2</a>
+<a href="/app/sniper-v2">📊 SV2</a>
+<a href="/">Home</a>
+</div>
+<h1>🧠 P2.9 Chainlink — Momentum Engine</h1>
+<h2>Settled 15M candles at T+0.5s · Momentum scoring · Compounding 5% · Paper</h2>
+<div class="stats">
+<div class="stat"><div class="val" style="color:{wrc}">${bal:.2f}</div><div class="lbl">Pool</div></div>
+<div class="stat"><div class="val" style="color:{wrc}">{wr:.1f}%</div><div class="lbl">Win Rate</div></div>
+<div class="stat"><div class="val">{total}</div><div class="lbl">Trades</div></div>
+<div class="stat"><div class="val" style="color:{pnlc}">${pnl:+.2f}</div><div class="lbl">P&L</div></div>
+<div class="stat"><div class="val">{pending}</div><div class="lbl">Pending</div></div>
+<div class="stat"><div class="val">${peak:.2f}</div><div class="lbl">Peak</div></div>
+</div>
+<h2>By Confidence</h2><table><tr><th>Level</th><th>Record</th><th>WR</th></tr>{conf_html}</table>
+<h2>By Asset</h2><table><tr><th>Asset</th><th>Record</th><th>WR</th><th>P&L</th></tr>{asset_html}</table>
+<h2>Trades</h2><table><tr><th></th><th>Asset</th><th>Side</th><th>Stake</th><th>Time</th><th>Indicators</th><th>P&L</th></tr>{trade_rows}</table>
+<p style="color:#444;font-size:11px">P2.9 Chainlink · Momentum scoring · Paper · Auto-refresh 60s</p>
+<script>setTimeout(()=>location.reload(),60000)</script>
+</body></html>""".format(wrc=wrc, bal=_p29cl_state["balance"], wr=wr, total=len(trades),
+        pnlc=pnlc, pnl=pnl, pending=len(pending), peak=_p29cl_state["peak_balance"],
+        conf_html=conf_html, asset_html=asset_html, trade_rows=trade_rows)
 
 
 def poly_alpha3_page():
@@ -23342,7 +23854,7 @@ def csv_export(table_name):
         "paper26_trades", "paper36_trades", "paper27_trades", "paper37_trades",
         "paper28_trades", "paper29_trades", "paper210_trades",
         "alpha_trades", "poly_alpha3_trades", "limitless_sniper_trades",
-        "poly_trades", "poly_alpha41_trades", "bot2_sniper_trades",
+        "poly_trades", "poly_alpha41_trades", "bot2_sniper_trades", "p29cl_trades",
     ]
     if table_name not in allowed:
         return "Table not allowed. Allowed: {}".format(", ".join(allowed)), 400
