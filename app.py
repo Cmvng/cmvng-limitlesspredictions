@@ -1995,50 +1995,7 @@ def _sniper_thread():
                 _time.sleep(min(secs_to_boundary - 35, 60))
                 continue
 
-            # ── T-35s: SV2 scores with STALE cache (before any cache clear) ──
-            _sv2_now_str = datetime.now(timezone.utc).isoformat()
-            for _sv2_t30_asset in SNIPER_ASSETS:
-                try:
-                    _sv2_t30_entry = None
-                    _sv2_t30_slug = SNIPER_SLUGS[_sv2_t30_asset].format(
-                        int((now.replace(second=0, microsecond=0) +
-                             timedelta(minutes=(15 - (now.minute % 15)) if (now.minute % 15) != 0 else 0)).timestamp()))
-                    import requests as _sv2_req
-                    _sv2_t30_r = _sv2_req.get("{}/markets/slug/{}".format(GAMMA_API, _sv2_t30_slug), timeout=5)
-                    if _sv2_t30_r.status_code == 200:
-                        _sv2_t30_md = _sv2_t30_r.json()
-                        _sv2_t30_toks = _sv2_t30_md.get("clobTokenIds")
-                        if isinstance(_sv2_t30_toks, str):
-                            try:
-                                import json as _sv2_j
-                                _sv2_t30_toks = _sv2_j.loads(_sv2_t30_toks)
-                            except: _sv2_t30_toks = None
-                        _sv2_t30_oc = _sv2_t30_md.get("outcomes")
-                        if isinstance(_sv2_t30_oc, str):
-                            try: _sv2_t30_oc = _sv2_j.loads(_sv2_t30_oc)
-                            except: _sv2_t30_oc = None
-                        if isinstance(_sv2_t30_toks, list) and len(_sv2_t30_toks) >= 2:
-                            _sv2_t30_up = 0
-                            if isinstance(_sv2_t30_oc, list) and len(_sv2_t30_oc) >= 2:
-                                if str(_sv2_t30_oc[0]).lower().strip() in ("no","down","below"):
-                                    _sv2_t30_up = 1
-                            _sv2_t30_entry = {
-                                "up_token": _sv2_t30_toks[_sv2_t30_up],
-                                "down_token": _sv2_t30_toks[1-_sv2_t30_up],
-                                "condition_id": _sv2_t30_md.get("conditionId",""),
-                                "slug": _sv2_t30_slug,
-                                "title": _sv2_t30_md.get("question",""),
-                            }
-                    if _sv2_t30_entry:
-                        _sv2_score_and_record(_sv2_t30_asset, _sv2_t30_entry,
-                            int((now.replace(second=0, microsecond=0) +
-                                 timedelta(minutes=(15 - (now.minute % 15)) if (now.minute % 15) != 0 else 0)).timestamp()),
-                            _sv2_now_str)
-                except Exception as _sv2_t30_e:
-                    pass
-            _sv2_count = sum(1 for a in SNIPER_ASSETS if _indicator_cache.get("{}_15m".format(a)))
-            print("SV2: {} paper trades recorded | pool=${:.2f}".format(
-                _sv2_count, _sv2_state.get("balance", 0)) if hasattr(_sv2_state, 'get') else "SV2: scored")
+            # ── SV2 scores at T+0.3s now (moved below boundary wait — uses Chainlink close) ──
 
             # ── SV3: Phase 1 — Fetch MTF candles at T-22s (before cache clear) ──
             # Fetch 1H + 30M + 15M candles from Binance for each asset
@@ -2247,6 +2204,60 @@ def _sniper_thread():
             BUY = Side.BUY
 
             # SV2 already scored at T-35s (before cache clear)
+            
+            # ── T+0.3s: SV2 CHAINLINK — update SMA cache with settled data, then score ──
+            _sv2_chainlink_count = 0
+            try:
+                _sv2_now_str = datetime.now(timezone.utc).isoformat()
+                
+                # Update the pair SMA cache and BTC trend using Bot2's prefetch + Chainlink close
+                # This gives SV2 the same settled indicator data as Bot2
+                for _sv2_cl_asset in SNIPER_ASSETS:
+                    _sv2_cl_price = _chainlink_prices.get(_sv2_cl_asset)
+                    _sv2_cl_prefetch = _bot2_prefetch.get(_sv2_cl_asset)
+                    if _sv2_cl_price and _sv2_cl_prefetch and len(_sv2_cl_prefetch) >= 9:
+                        _sv2_cl_closes = _sv2_cl_prefetch[-9:] + [_sv2_cl_price]
+                        _sv2_cl_sma10 = sum(_sv2_cl_closes) / 10.0
+                        _sv2_cl_trend = "BUY" if _sv2_cl_price > _sv2_cl_sma10 else "SELL"
+                        # Update the pair SMA cache (what _sniper_get_direction reads)
+                        _pair_sma_cache[_sv2_cl_asset.upper()] = {
+                            "trend": _sv2_cl_trend, "price": _sv2_cl_price,
+                            "sma10": _sv2_cl_sma10,
+                            "updated": datetime.now(timezone.utc).isoformat()
+                        }
+                        # Update BTC trend cache if this is BTC
+                        if _sv2_cl_asset == "BTC":
+                            _btc_trend_cache["trend"] = _sv2_cl_trend
+                            _btc_trend_cache["price"] = _sv2_cl_price
+                            _btc_trend_cache["sma10"] = _sv2_cl_sma10
+                            _btc_trend_cache["updated"] = datetime.now(timezone.utc).isoformat()
+                        # Also update the indicator cache entry so _sniper_get_direction picks it up
+                        _sv2_cl_cache_key = "{}_1h".format(_sv2_cl_asset.upper())
+                        _sv2_cl_existing = _indicator_cache.get(_sv2_cl_cache_key)
+                        if _sv2_cl_existing and _sv2_cl_existing.get("data"):
+                            _sv2_cl_existing["data"]["sma10"] = _sv2_cl_sma10
+                            _sv2_cl_existing["data"]["current"] = _sv2_cl_price
+                            _sv2_cl_existing["data"]["sma_trend"] = _sv2_cl_trend
+                            _sv2_cl_existing["updated"] = datetime.now(timezone.utc)
+                
+                # Now score SV2 with the updated (settled) cache
+                for _sv2_cl_asset in SNIPER_ASSETS:
+                    try:
+                        _sv2_cl_slug = SNIPER_SLUGS[_sv2_cl_asset].format(window_ts)
+                        _sv2_cl_entry = token_map.get(_sv2_cl_asset)
+                        if not _sv2_cl_entry:
+                            # Try from SV3 token map
+                            _sv2_cl_entry = _sv3_token_map.get(_sv2_cl_asset) if '_sv3_token_map' in dir() else None
+                        if _sv2_cl_entry:
+                            if _sv2_score_and_record(_sv2_cl_asset, _sv2_cl_entry, window_ts, _sv2_now_str):
+                                _sv2_chainlink_count += 1
+                    except Exception as _sv2_cl_e:
+                        print("SV2 Chainlink score error {}: {}".format(_sv2_cl_asset, _sv2_cl_e))
+                
+                print("SV2 CHAINLINK: {} trades scored at T+0 with settled SMA | pool=${:.2f}".format(
+                    _sv2_chainlink_count, _sv2_state.get("balance", 0)))
+            except Exception as _sv2_cl_err:
+                print("SV2 Chainlink error: {}".format(_sv2_cl_err))
 
             # ── T+0: FIRE A4 ORDERS at 50¢ (with SV3 gatekeeper) ──
             fired_results = []
