@@ -417,7 +417,7 @@ _poly_alpha3_traded_markets = set()
 # Strategy: Bot2 (SMA+BTC agree on 1H) + Chainlink close at T+0
 # ═══════════════════════════════════════════════════════════
 _bot2_sniper_state = {
-    "enabled": True,
+    "enabled": False,  # PAUSED — testing A4 with Chainlink instead
     "balance": 50.0,
     "peak_balance": 50.0,
     "starting_balance": 50.0,
@@ -781,12 +781,12 @@ def _bot2_sniper_thread():
         # First deploy or old system with depleted balance — start fresh at $100
         _poly_alpha4_state["balance"] = 100.0
         _poly_alpha4_state["peak_balance"] = 100.0
-    _poly_alpha4_state["starting_balance"] = 100.0
+    _poly_alpha4_state["starting_balance"] = 50.0
     _poly_alpha4_state["floor_balance"] = 10.0
-    _poly_alpha4_state["enabled"] = False  # PAUSED — replaced by Poly Alpha 3.0 (P2.3)
+    _poly_alpha4_state["enabled"] = True  # LIVE — original A4 with Chainlink-settled data
     _save_bot_balance("poly_alpha4", _poly_alpha4_state)
     
-    print("SNIPER A4: PAUSED (${:.2f} pool) — replaced by Poly Alpha 3.0 (P2.3)".format(
+    print("SNIPER A4 CHAINLINK: ${:.2f} pool | TV+SMA+BTC 2/3 | Chainlink T+0 | LIVE".format(
         _poly_alpha4_state["balance"]))
     
     # ── A41 PAUSED — not trading on Polymarket until further notice ──
@@ -894,11 +894,11 @@ def _poly_alpha3_calc_stake(pool_balance):
 _poly_alpha41_state = {"balance": 130.00, "enabled": False}  # PAUSED — only Bot2 trades
 _sv21_paper_state = {"balance": 100.00}
 _poly_alpha4_state = {
-    "enabled": True,
-    "balance": 60.0,
-    "peak_balance": 60.0,
-    "starting_balance": 60.0,
-    "floor_balance": 5.0,
+    "enabled": True,  # LIVE — original A4 with Chainlink-settled data
+    "balance": 50.0,
+    "peak_balance": 50.0,
+    "starting_balance": 50.0,
+    "floor_balance": 10.0,
     "trades_today": 0,
     "wins_today": 0,
     "losses_today": 0,
@@ -2293,80 +2293,9 @@ def _sniper_thread():
                 if _poly_alpha4_state["balance"] < _fa4_cost + 2:
                     continue
                 
-                # ── SV3 GATEKEEPER: Check candle structure score ──
-                _fa4_sv3_score = None
-                _fa4_sv3_tag = ""
-                try:
-                    _fa4_mtf = _sv3_structure_cache.get(_fa4_asset.upper())
-                    if _fa4_mtf and _fa4_mtf.get("15m"):
-                        _fa4_s1h, _fa4_r1h = _sv3_score_timeframe(_fa4_mtf.get("1h"), _fa4_dir)
-                        _fa4_s30, _fa4_r30 = _sv3_score_timeframe(_fa4_mtf.get("30m"), _fa4_dir)
-                        _fa4_s15, _fa4_r15 = _sv3_score_timeframe(_fa4_mtf.get("15m"), _fa4_dir)
-                        _fa4_sv3_score = _fa4_s1h + _fa4_s30 + _fa4_s15
-                        _fa4_sv3_tag = "MTF{} 1H={} 30M={} 15M={}".format(
-                            _fa4_sv3_score, _fa4_s1h, _fa4_s30, _fa4_s15)
-                except Exception as _fa4_sv3_e:
-                    print("A4 SV3 gate error {}: {}".format(_fa4_asset, _fa4_sv3_e))
-                
-                # Gate: score ≥ +4 → fire, score 5 → skip, score < +4 → skip
-                if _fa4_sv3_score is not None:
-                    if _fa4_sv3_score == 5:
-                        # Score 5 is a proven loser — skip
-                        print("A4 SKIP: {} {} score=5 — proven loser tier | {}".format(
-                            _fa4_dir, _fa4_asset, _fa4_sv3_tag))
-                        try:
-                            _skip_db = get_db()
-                            _skip_db.run("""INSERT INTO poly_alpha4_trades
-                                (market_id,title,asset,timeframe,bet_side,stake,fill_price,
-                                 pool_after,order_id,token_id,condition_id,slug,filled,
-                                 status,outcome,indicators,signals_agree,fired_at)
-                                VALUES (:mid,:ttl,:ast,:tf,:bs,:stk,:fp,
-                                 :pa,:oid,:tid,:cid,:slg,:fld,
-                                 :sts,:out,:ind,:sa,:fa)""",
-                                mid="skip_{}_15M_{}".format(_fa4_asset, window_ts),
-                                ttl="A4 SKIP {} {} 15M".format(_fa4_asset, _fa4_dir),
-                                ast=_fa4_asset, tf="15M", bs=_fa4_dir,
-                                stk=0, fp=0,
-                                pa=_poly_alpha4_state["balance"],
-                                oid="", tid="", cid="", slg="",
-                                fld=False,
-                                sts="Skipped", out="SKIPPED",
-                                ind="{} | SKIP score 5 | {}".format(_fa4_sv3_tag, _fa4_ind),
-                                sa=0,
-                                fa=datetime.now(timezone.utc).isoformat())
-                        except: pass
-                        continue
-                    
-                    if _fa4_sv3_score < 4:
-                        # Score too low — skip
-                        print("A4 SKIP: {} {} score={} — below gate | {}".format(
-                            _fa4_dir, _fa4_asset, _fa4_sv3_score, _fa4_sv3_tag))
-                        try:
-                            _skip_db = get_db()
-                            _skip_db.run("""INSERT INTO poly_alpha4_trades
-                                (market_id,title,asset,timeframe,bet_side,stake,fill_price,
-                                 pool_after,order_id,token_id,condition_id,slug,filled,
-                                 status,outcome,indicators,signals_agree,fired_at)
-                                VALUES (:mid,:ttl,:ast,:tf,:bs,:stk,:fp,
-                                 :pa,:oid,:tid,:cid,:slg,:fld,
-                                 :sts,:out,:ind,:sa,:fa)""",
-                                mid="skip_{}_15M_{}".format(_fa4_asset, window_ts),
-                                ttl="A4 SKIP {} {} 15M".format(_fa4_asset, _fa4_dir),
-                                ast=_fa4_asset, tf="15M", bs=_fa4_dir,
-                                stk=0, fp=0,
-                                pa=_poly_alpha4_state["balance"],
-                                oid="", tid="", cid="", slg="",
-                                fld=False,
-                                sts="Skipped", out="SKIPPED",
-                                ind="{} | SKIP score {} | {}".format(_fa4_sv3_tag, _fa4_sv3_score, _fa4_ind),
-                                sa=0,
-                                fa=datetime.now(timezone.utc).isoformat())
-                        except: pass
-                        continue
-                
-                # ── FIRE: score ≥ +4 (not 5) or no candle data ──
-                print("A4 FIRE: {} {} score={} stake=$2.50 | {}".format(
-                    _fa4_dir, _fa4_asset, _fa4_sv3_score, _fa4_sv3_tag))
+                # ── FIRE: Original A4 — no SV3 gate, all 2/3 agree targets fire ──
+                print("A4 FIRE: {} {} stake=$2.50 | {}".format(
+                    _fa4_dir, _fa4_asset, _fa4_ind[:60]))
                 
                 try:
                     _fa4_args = OrderArgs(
@@ -2383,7 +2312,7 @@ def _sniper_thread():
                     
                     fired_results.append({
                         "asset": _fa4_asset, "direction": _fa4_dir,
-                        "indicators": "{} | {}".format(_fa4_sv3_tag, _fa4_ind),
+                        "indicators": _fa4_ind,
                         "agree": _fa4_agree,
                         "order_id": _fa4_oid, "cost": _fa4_cost,
                         "price": _fa4_price, "shares": _fa4_shares,
