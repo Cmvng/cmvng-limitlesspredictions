@@ -22813,14 +22813,31 @@ def p29cl_page():
         if tt == 0: continue
         cwr = round(s["w"]/tt*100,1)
         conf_html += "<tr><td>{}</td><td>{}W/{}L</td><td>{:.1f}%</td></tr>".format(c, s["w"], s["l"], cwr)
+    # By DIST zone
+    dist_stats = {}
+    for t in resolved:
+        dz = t.get("dist_zone", "NEUTRAL")
+        if dz not in dist_stats: dist_stats[dz] = {"w": 0, "l": 0}
+        if t["outcome"] == "WIN": dist_stats[dz]["w"] += 1
+        else: dist_stats[dz]["l"] += 1
+    dist_html = ""
+    for dz in ["EXTREME_DOWN", "TRANSITION", "NEUTRAL", "EXTREME_UP"]:
+        s = dist_stats.get(dz, {"w": 0, "l": 0}); tt = s["w"]+s["l"]
+        if tt == 0: continue
+        dzwr = round(s["w"]/tt*100,1)
+        dist_html += "<tr><td>{}</td><td>{}W/{}L</td><td>{:.1f}%</td></tr>".format(dz, s["w"], s["l"], dzwr)
+    
     trade_rows = ""
     for t in trades[:100]:
         o = t.get("outcome", "PENDING")
         icon = "✅" if o == "WIN" else "❌" if o == "LOSS" else "⏳"
         pstr = "+${:.2f}".format(float(t.get("payout") or 0) - float(t.get("stake") or 0)) if o == "WIN" else "-${:.2f}".format(float(t.get("stake") or 0)) if o == "LOSS" else ""
         fired = (t.get("fired_at") or "")[:16].replace("T", " ")
-        trade_rows += "<tr><td>{}</td><td>{}</td><td>{}</td><td>${:.2f}</td><td>{}</td><td style='font-size:11px;color:#888'>{}</td><td>{}</td></tr>".format(
-            icon, t.get("asset","?"), t.get("bet_side","?"), float(t.get("stake") or 0), fired, str(t.get("indicators",""))[:50], pstr)
+        dp = t.get("dist_prob", "")
+        dz = t.get("dist_zone", "")
+        dist_str = "{}({})".format(dz, dp) if dp else ""
+        trade_rows += "<tr><td>{}</td><td>{}</td><td>{}</td><td>${:.2f}</td><td>{}</td><td style='font-size:11px;color:#888'>{}</td><td style='font-size:11px;color:#58a6ff'>{}</td><td>{}</td></tr>".format(
+            icon, t.get("asset","?"), t.get("bet_side","?"), float(t.get("stake") or 0), fired, str(t.get("indicators",""))[:45], dist_str, pstr)
     wrc = "#3fb950" if wr >= 55 else "#f85149" if wr < 50 else "#d29922"
     pnlc = "#3fb950" if pnl >= 0 else "#f85149"
     return """<!DOCTYPE html><html><head><title>P2.9 Chainlink</title>
@@ -22856,13 +22873,14 @@ a{{color:#00d4aa}}
 <div class="stat"><div class="val">${peak:.2f}</div><div class="lbl">Peak</div></div>
 </div>
 <h2>By Confidence</h2><table><tr><th>Level</th><th>Record</th><th>WR</th></tr>{conf_html}</table>
+<h2>By DIST Zone</h2><table><tr><th>Zone</th><th>Record</th><th>WR</th></tr>{dist_html}</table>
 <h2>By Asset</h2><table><tr><th>Asset</th><th>Record</th><th>WR</th><th>P&L</th></tr>{asset_html}</table>
-<h2>Trades</h2><table><tr><th></th><th>Asset</th><th>Side</th><th>Stake</th><th>Time</th><th>Indicators</th><th>P&L</th></tr>{trade_rows}</table>
-<p style="color:#444;font-size:11px">P2.9 Chainlink · Momentum scoring · Paper · Auto-refresh 60s</p>
+<h2>Trades</h2><table><tr><th></th><th>Asset</th><th>Side</th><th>Stake</th><th>Time</th><th>Indicators</th><th>DIST</th><th>P&L</th></tr>{trade_rows}</table>
+<p style="color:#444;font-size:11px">P2.9 Chainlink · Momentum scoring · DIST tracking · Paper · Auto-refresh 60s</p>
 <script>setTimeout(()=>location.reload(),60000)</script>
 </body></html>""".format(wrc=wrc, bal=_p29cl_state["balance"], wr=wr, total=len(trades),
         pnlc=pnlc, pnl=pnl, pending=len(pending), peak=_p29cl_state["peak_balance"],
-        conf_html=conf_html, asset_html=asset_html, trade_rows=trade_rows)
+        conf_html=conf_html, dist_html=dist_html, asset_html=asset_html, trade_rows=trade_rows)
 
 
 def poly_alpha3_page():
