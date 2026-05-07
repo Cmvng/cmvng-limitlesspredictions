@@ -2091,9 +2091,8 @@ def _sniper_thread():
                             }
                 except: pass
 
-            for target in snipe_targets:
-                asset = target["asset"]
-                slug = SNIPER_SLUGS[asset].format(window_ts)
+            for _tf_asset in SNIPER_ASSETS:
+                slug = SNIPER_SLUGS[_tf_asset].format(window_ts)
                 try:
                     r = _req.get("{}/markets/slug/{}".format(GAMMA_API, slug), timeout=8)
                     if r.status_code == 200:
@@ -2118,7 +2117,7 @@ def _sniper_thread():
                                 if o0 in ("no", "down", "below"):
                                     up_idx = 1
                             down_idx = 1 - up_idx
-                            token_map[asset] = {
+                            token_map[_tf_asset] = {
                                 "up_token": tokens[up_idx],
                                 "down_token": tokens[down_idx],
                                 "condition_id": md.get("conditionId", ""),
@@ -2147,7 +2146,7 @@ def _sniper_thread():
                                         if o0 in ("no", "down", "below"):
                                             up_idx = 1
                                     down_idx = 1 - up_idx
-                                    token_map[asset] = {
+                                    token_map[_tf_asset] = {
                                         "up_token": tokens[up_idx],
                                         "down_token": tokens[down_idx],
                                         "condition_id": md.get("conditionId", ""),
@@ -2155,7 +2154,7 @@ def _sniper_thread():
                                         "title": md.get("question", slug),
                                     }
                 except Exception as e:
-                    print("SNIPER fetch {} error: {}".format(asset, e))
+                    print("SNIPER fetch {} error: {}".format(_tf_asset, e))
 
             if not token_map:
                 print("SNIPER: no markets found for boundary {} — tokens not deployed yet".format(window_ts))
