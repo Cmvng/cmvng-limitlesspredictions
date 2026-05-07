@@ -19752,7 +19752,37 @@ if SIGNALS_DB_URL:
         _bot2_sniper_state["peak_balance"] = _saved_bot2s.get("peak_balance", _saved_bot2s["balance"])
     _bot2_sniper_state["enabled"] = False  # PAUSED — A4 Chainlink is live instead
     _save_bot_balance("bot2_sniper", _bot2_sniper_state)
-    print("BOT2 SNIPER: PAUSED — A4 Chainlink is live")
+    print("BOT2 SNIPER: PAUSED — paper mode | ${:.2f} pool".format(_bot2_sniper_state["balance"]))
+    
+    # ── SNIPER A4 CHAINLINK init ──
+    _saved_pa4 = _saved_balances.get("poly_alpha4", {})
+    if _saved_pa4 and _saved_pa4.get("balance", 0) >= 10:
+        _poly_alpha4_state["balance"] = _saved_pa4["balance"]
+        _poly_alpha4_state["peak_balance"] = _saved_pa4.get("peak_balance", _saved_pa4["balance"])
+        print("SNIPER A4: restored ${:.2f} from DB".format(_poly_alpha4_state["balance"]))
+    else:
+        print("SNIPER A4: fresh start ${:.2f}".format(_poly_alpha4_state["balance"]))
+    _poly_alpha4_state["enabled"] = True
+    _save_bot_balance("poly_alpha4", _poly_alpha4_state)
+    print("SNIPER A4 CHAINLINK: ${:.2f} pool | LIVE".format(_poly_alpha4_state["balance"]))
+    
+    # ── SV2 PAPER init ──
+    _saved_sv2 = _saved_balances.get("sv2_paper", {})
+    if _saved_sv2 and _saved_sv2.get("balance", 0) > 0:
+        _sv2_state["balance"] = _saved_sv2["balance"]
+        _sv2_state["peak_balance"] = _saved_sv2.get("peak_balance", _saved_sv2["balance"])
+        print("SV2: restored ${:.2f} from DB".format(_sv2_state["balance"]))
+    else:
+        print("SV2: fresh start ${:.2f}".format(_sv2_state["balance"]))
+    _save_bot_balance("sv2_paper", _sv2_state)
+    
+    # ── P2.9CL init ──
+    _saved_p29cl = _saved_balances.get("p29cl", {})
+    if _saved_p29cl and _saved_p29cl.get("balance", 0) > 0:
+        _p29cl_state["balance"] = _saved_p29cl["balance"]
+        _p29cl_state["peak_balance"] = _saved_p29cl.get("peak_balance", _saved_p29cl["balance"])
+        print("P29CL: restored ${:.2f} from DB".format(_p29cl_state["balance"]))
+    _save_bot_balance("p29cl", _p29cl_state)
     threading.Thread(target=_bot2_sniper_thread, daemon=True).start()
     print("BOT2 SNIPER thread launched")
     
