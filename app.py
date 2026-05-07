@@ -22811,7 +22811,35 @@ def csv_export(table_name):
     except Exception as e:
         return "Error: {}".format(e), 500
 
-@app.route("/app/poly-alpha41")
+@app.route("/csv/poly/<strategy>")
+def csv_poly_strategy(strategy):
+    """Export Polymarket paper trades filtered by strategy.
+    Usage: /csv/poly/p23, /csv/poly/p21, /csv/poly/p33, etc.
+    """
+    allowed_strats = ["p21", "p23", "p31", "p33", "p24", "p34", "p25", "p35", "p26", "p36", "p28", "p29", "p210", "bot2"]
+    if strategy not in allowed_strats:
+        return "Strategy not allowed. Allowed: {}".format(", ".join(allowed_strats)), 400
+    try:
+        conn = get_db()
+        rows = conn.run("SELECT * FROM poly_trades WHERE strategy = :s ORDER BY id DESC", s=strategy)
+        cols = [c['name'] for c in conn.columns]
+        conn.close()
+        
+        import csv
+        import io
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow(cols)
+        for row in rows:
+            writer.writerow([str(v) if v is not None else "" for v in row])
+        
+        resp = app.make_response(output.getvalue())
+        resp.headers["Content-Type"] = "text/csv"
+        resp.headers["Content-Disposition"] = "attachment; filename=poly_{}_trades.csv".format(strategy)
+        return resp
+    except Exception as e:
+        return "Error: {}".format(e), 500
+
 def poly_alpha41_page():
     try:
         db = get_db()
