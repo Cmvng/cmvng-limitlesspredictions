@@ -19252,6 +19252,7 @@ td{padding:8px 12px;border-bottom:1px solid #f4f3ed;color:var(--ink-2)}tr:last-c
     <a href="/app/paper29poly" class="nav-tab""" + (" active" if nav_active == "paper29poly" else "") + """">P2.9 Poly</a>
     <a href="/app/paper210" class="nav-tab""" + (" active" if nav_active == "paper210" else "") + """">Paper 2.10</a>
     <a href="/app/bot2-sniper" class="nav-tab""" + (" active" if nav_active == "bot2-sniper" else "") + """">🤖 Bot2 Sniper</a>
+    <a href="/app/p29cl" class="nav-tab""" + (" active" if nav_active == "p29cl" else "") + """">🧠 P2.9CL</a>
     <a href="/app/poly-alpha3" class="nav-tab""" + (" active" if nav_active == "poly-alpha3" else "") + """">⚡ Poly A3</a>
     <a href="/app/poly-alpha4" class="nav-tab""" + (" active" if nav_active == "poly-alpha4" else "") + """">🎯 Sniper A4</a>
     <a href="/app/lmts-sniper" class="nav-tab""" + (" active" if nav_active == "lmts-sniper" else "") + """">🎯 LMTS Sniper</a>
