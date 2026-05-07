@@ -978,6 +978,111 @@ def _bot2_sniper_thread():
                 print("BOT2 STOPPED: balance ${:.2f} hit floor".format(_bot2_sniper_state["balance"]))
                 send_telegram("🛑 BOT2 SNIPER STOPPED — balance ${:.2f}".format(_bot2_sniper_state["balance"]))
             
+    # ── P2.9CL: Momentum-based paper trades at T+0.5s ──
+            try:
+                if not _p29cl_state["enabled"]:
+                    continue
+                
+                _p29cl_now = datetime.now(timezone.utc).isoformat()
+                _p29cl_count = 0
+                
+                # Get BTC direction for P2.1 and BTC trend
+                _p29cl_btc_price = _chainlink_prices.get("BTC")
+                _p29cl_btc_prefetch = _bot2_prefetch.get("BTC")
+                _p29cl_btc_dir = None
+                if _p29cl_btc_price and _p29cl_btc_prefetch and len(_p29cl_btc_prefetch) >= 9:
+                    _p29cl_btc_closes = _p29cl_btc_prefetch[-9:] + [_p29cl_btc_price]
+                    _p29cl_btc_sma = sum(_p29cl_btc_closes) / 10.0
+                    _p29cl_btc_dir = "SELL" if _p29cl_btc_price < _p29cl_btc_sma else "BUY"
+                
+                for _p29cl_asset in ["BTC", "ETH", "SOL", "XRP"]:
+                    try:
+                        _p29cl_price = _chainlink_prices.get(_p29cl_asset)
+                        if not _p29cl_price:
+                            continue
+                        
+                        # Get P2.1 direction from settled SMA
+                        _p29cl_prefetch = _bot2_prefetch.get(_p29cl_asset)
+                        _p29cl_p21_dir = None
+                        if _p29cl_prefetch and len(_p29cl_prefetch) >= 9:
+                            _p29cl_closes = _p29cl_prefetch[-9:] + [_p29cl_price]
+                            _p29cl_sma = sum(_p29cl_closes) / 10.0
+                            _p29cl_asset_dir = "BUY" if _p29cl_price > _p29cl_sma else "SELL"
+                            # P2.1: SMA + BTC agree
+                            if _p29cl_asset_dir == _p29cl_btc_dir:
+                                _p29cl_p21_dir = "DOWN" if _p29cl_asset_dir == "SELL" else "UP"
+                        
+                        # Run momentum scoring
+                        _p29cl_dir, _p29cl_conf, _p29cl_score, _p29cl_tag = _p29cl_momentum_score(
+                            _p29cl_asset, _p29cl_price, _p29cl_p21_dir, _p29cl_btc_dir)
+                        
+                        if not _p29cl_dir:
+                            continue
+                        
+                        # Dedup
+                        _p29cl_key = "p29cl_{}_{}".format(_p29cl_asset, window_ts)
+                        if _p29cl_key in _p29cl_traded:
+                            continue
+                        
+                        # Calculate stake (compounding)
+                        _p29cl_stake = _p29cl_calc_stake(_p29cl_state["balance"])
+                        if _p29cl_stake <= 0 or _p29cl_stake > _p29cl_state["balance"]:
+                            continue
+                        
+                        _p29cl_bet_side = _p29cl_dir  # UP or DOWN
+                        
+                        # Get token info for slug
+                        _p29cl_entry = token_map.get(_p29cl_asset, {})
+                        _p29cl_slug = _p29cl_entry.get("slug", "")
+                        _p29cl_cid = _p29cl_entry.get("condition_id", "")
+                        _p29cl_tid = _p29cl_entry.get("up_token" if _p29cl_dir == "UP" else "down_token", "")
+                        
+                        # Update balance
+                        _p29cl_state["balance"] = round(_p29cl_state["balance"] - _p29cl_stake, 2)
+                        _p29cl_state["trades_today"] += 1
+                        _p29cl_traded.add(_p29cl_key)
+                        if _p29cl_state["balance"] > _p29cl_state["peak_balance"]:
+                            _p29cl_state["peak_balance"] = _p29cl_state["balance"]
+                        
+                        # Save to DB
+                        try:
+                            _p29cl_db = get_db()
+                            _p29cl_db.run("""INSERT INTO p29cl_trades
+                                (market_id, title, asset, bet_side, stake, fill_price,
+                                 pool_after, indicators, confidence, momentum_score,
+                                 slug, condition_id, token_id,
+                                 status, outcome, fired_at)
+                                VALUES (:mid, :ttl, :ast, :bs, :stk, 0.50,
+                                        :pa, :ind, :conf, :ms,
+                                        :slg, :cid, :tid,
+                                        'Pending', 'PENDING', :fa)""",
+                                mid=_p29cl_key,
+                                ttl="P29CL {} {} 15M".format(_p29cl_asset, _p29cl_dir),
+                                ast=_p29cl_asset, bs=_p29cl_bet_side, stk=_p29cl_stake,
+                                pa=_p29cl_state["balance"],
+                                ind="[{}] {} | P21={} | BTC={}".format(
+                                    _p29cl_conf, _p29cl_tag, _p29cl_p21_dir or "NONE", _p29cl_btc_dir or "NONE"),
+                                conf=_p29cl_conf, ms=_p29cl_score,
+                                slg=_p29cl_slug, cid=_p29cl_cid, tid=_p29cl_tid,
+                                fa=_p29cl_now)
+                            _p29cl_db.close()
+                        except Exception as _p29cl_dbe:
+                            print("P29CL DB error {}: {}".format(_p29cl_asset, _p29cl_dbe))
+                        
+                        _p29cl_count += 1
+                        print("P29CL: {} {} S{} [{}] ${:.2f} | pool=${:.2f}".format(
+                            _p29cl_dir, _p29cl_asset, _p29cl_score, _p29cl_conf,
+                            _p29cl_stake, _p29cl_state["balance"]))
+                        
+                    except Exception as _p29cl_ae:
+                        print("P29CL error {}: {}".format(_p29cl_asset, _p29cl_ae))
+                
+                if _p29cl_count > 0:
+                    _save_bot_balance("p29cl", _p29cl_state)
+                    print("P29CL: {} paper trades | pool=${:.2f}".format(_p29cl_count, _p29cl_state["balance"]))
+            except Exception as _p29cl_err:
+                print("P29CL error: {}".format(_p29cl_err))
+
             _time.sleep(60)  # Wait before next cycle
             
         except Exception as e:
@@ -986,110 +1091,7 @@ def _bot2_sniper_thread():
             traceback.print_exc()
             _time.sleep(60)
 
-        # ── P2.9CL: Momentum-based paper trades at T+0.5s ──
-        try:
-            if not _p29cl_state["enabled"]:
-                continue
-            
-            _p29cl_now = datetime.now(timezone.utc).isoformat()
-            _p29cl_count = 0
-            
-            # Get BTC direction for P2.1 and BTC trend
-            _p29cl_btc_price = _chainlink_prices.get("BTC")
-            _p29cl_btc_prefetch = _bot2_prefetch.get("BTC")
-            _p29cl_btc_dir = None
-            if _p29cl_btc_price and _p29cl_btc_prefetch and len(_p29cl_btc_prefetch) >= 9:
-                _p29cl_btc_closes = _p29cl_btc_prefetch[-9:] + [_p29cl_btc_price]
-                _p29cl_btc_sma = sum(_p29cl_btc_closes) / 10.0
-                _p29cl_btc_dir = "SELL" if _p29cl_btc_price < _p29cl_btc_sma else "BUY"
-            
-            for _p29cl_asset in ["BTC", "ETH", "SOL", "XRP"]:
-                try:
-                    _p29cl_price = _chainlink_prices.get(_p29cl_asset)
-                    if not _p29cl_price:
-                        continue
-                    
-                    # Get P2.1 direction from settled SMA
-                    _p29cl_prefetch = _bot2_prefetch.get(_p29cl_asset)
-                    _p29cl_p21_dir = None
-                    if _p29cl_prefetch and len(_p29cl_prefetch) >= 9:
-                        _p29cl_closes = _p29cl_prefetch[-9:] + [_p29cl_price]
-                        _p29cl_sma = sum(_p29cl_closes) / 10.0
-                        _p29cl_asset_dir = "BUY" if _p29cl_price > _p29cl_sma else "SELL"
-                        # P2.1: SMA + BTC agree
-                        if _p29cl_asset_dir == _p29cl_btc_dir:
-                            _p29cl_p21_dir = "DOWN" if _p29cl_asset_dir == "SELL" else "UP"
-                    
-                    # Run momentum scoring
-                    _p29cl_dir, _p29cl_conf, _p29cl_score, _p29cl_tag = _p29cl_momentum_score(
-                        _p29cl_asset, _p29cl_price, _p29cl_p21_dir, _p29cl_btc_dir)
-                    
-                    if not _p29cl_dir:
-                        continue
-                    
-                    # Dedup
-                    _p29cl_key = "p29cl_{}_{}".format(_p29cl_asset, window_ts)
-                    if _p29cl_key in _p29cl_traded:
-                        continue
-                    
-                    # Calculate stake (compounding)
-                    _p29cl_stake = _p29cl_calc_stake(_p29cl_state["balance"])
-                    if _p29cl_stake <= 0 or _p29cl_stake > _p29cl_state["balance"]:
-                        continue
-                    
-                    _p29cl_bet_side = _p29cl_dir  # UP or DOWN
-                    
-                    # Get token info for slug
-                    _p29cl_entry = token_map.get(_p29cl_asset, {})
-                    _p29cl_slug = _p29cl_entry.get("slug", "")
-                    _p29cl_cid = _p29cl_entry.get("condition_id", "")
-                    _p29cl_tid = _p29cl_entry.get("up_token" if _p29cl_dir == "UP" else "down_token", "")
-                    
-                    # Update balance
-                    _p29cl_state["balance"] = round(_p29cl_state["balance"] - _p29cl_stake, 2)
-                    _p29cl_state["trades_today"] += 1
-                    _p29cl_traded.add(_p29cl_key)
-                    if _p29cl_state["balance"] > _p29cl_state["peak_balance"]:
-                        _p29cl_state["peak_balance"] = _p29cl_state["balance"]
-                    
-                    # Save to DB
-                    try:
-                        _p29cl_db = get_db()
-                        _p29cl_db.run("""INSERT INTO p29cl_trades
-                            (market_id, title, asset, bet_side, stake, fill_price,
-                             pool_after, indicators, confidence, momentum_score,
-                             slug, condition_id, token_id,
-                             status, outcome, fired_at)
-                            VALUES (:mid, :ttl, :ast, :bs, :stk, 0.50,
-                                    :pa, :ind, :conf, :ms,
-                                    :slg, :cid, :tid,
-                                    'Pending', 'PENDING', :fa)""",
-                            mid=_p29cl_key,
-                            ttl="P29CL {} {} 15M".format(_p29cl_asset, _p29cl_dir),
-                            ast=_p29cl_asset, bs=_p29cl_bet_side, stk=_p29cl_stake,
-                            pa=_p29cl_state["balance"],
-                            ind="[{}] {} | P21={} | BTC={}".format(
-                                _p29cl_conf, _p29cl_tag, _p29cl_p21_dir or "NONE", _p29cl_btc_dir or "NONE"),
-                            conf=_p29cl_conf, ms=_p29cl_score,
-                            slg=_p29cl_slug, cid=_p29cl_cid, tid=_p29cl_tid,
-                            fa=_p29cl_now)
-                        _p29cl_db.close()
-                    except Exception as _p29cl_dbe:
-                        print("P29CL DB error {}: {}".format(_p29cl_asset, _p29cl_dbe))
-                    
-                    _p29cl_count += 1
-                    print("P29CL: {} {} S{} [{}] ${:.2f} | pool=${:.2f}".format(
-                        _p29cl_dir, _p29cl_asset, _p29cl_score, _p29cl_conf,
-                        _p29cl_stake, _p29cl_state["balance"]))
-                    
-                except Exception as _p29cl_ae:
-                    print("P29CL error {}: {}".format(_p29cl_asset, _p29cl_ae))
-            
-            if _p29cl_count > 0:
-                _save_bot_balance("p29cl", _p29cl_state)
-                print("P29CL: {} paper trades | pool=${:.2f}".format(_p29cl_count, _p29cl_state["balance"]))
-        except Exception as _p29cl_err:
-            print("P29CL error: {}".format(_p29cl_err))
+
 
 
 
