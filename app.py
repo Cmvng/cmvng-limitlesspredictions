@@ -412,7 +412,363 @@ _poly_alpha3_state = {
 }
 _poly_alpha3_traded_markets = set()
 
-def _poly_alpha3_load_recent():
+# ═══════════════════════════════════════════════════════════
+# BOT2 CHAINLINK SNIPER — fires at T+0.5s with settled indicators
+# Strategy: Bot2 (SMA+BTC agree on 1H) + Chainlink close at T+0
+# ═══════════════════════════════════════════════════════════
+_bot2_sniper_state = {
+    "enabled": True,
+    "balance": 50.0,
+    "peak_balance": 50.0,
+    "starting_balance": 50.0,
+    "floor_balance": 10.0,
+    "trades_today": 0,
+    "wins_today": 0,
+    "losses_today": 0,
+    "profit_today": 0.0,
+}
+_bot2_sniper_traded = set()  # dedup: "asset_boundary_ts"
+
+# Pre-fetched 1H candle closes (9 completed candles, fetched at T-22s)
+_bot2_prefetch = {}  # {"BTC": [close1, close2, ..., close9], "ETH": [...], ...}
+
+def _bot2_sniper_calc_direction(asset, chainlink_close):
+    """Bot2 strategy: SMA10 on 1H + BTC trend agree.
+    Uses 9 pre-fetched completed candles + Chainlink close as 10th.
+    Returns (direction, sma10, current) or (None, None, None)."""
+    prefetched = _bot2_prefetch.get(asset.upper())
+    if not prefetched or len(prefetched) < 9:
+        return None, None, None
+    
+    # 9 completed closes + Chainlink close = 10 settled data points
+    closes = prefetched[-9:] + [chainlink_close]
+    sma10 = sum(closes) / 10.0
+    current = chainlink_close
+    direction = "BUY" if current > sma10 else "SELL"
+    return direction, sma10, current
+
+def _bot2_sniper_thread():
+    """Bot2 Chainlink Sniper — fires at T+0.5s with settled 1H indicators.
+    
+    Timeline every 15 minutes:
+      T-22s: Fetch 1H candles from Binance (completed only) for all assets + BTC
+      T-15s: Fetch token IDs from Polymarket (prepare orders)
+      T+0.0s: Chainlink websocket delivers boundary price = candle close
+      T+0.3s: Calculate SMA10 = (9 pre-fetched closes + Chainlink close) / 10
+      T+0.3s: Check: asset SMA direction == BTC SMA direction? If yes → fire
+      T+0.5s: Place GTC at 50¢, $2.50 stake
+    """
+    import time as _time
+    import requests as _req
+    
+    SNIPER_ASSETS = ["BTC", "ETH", "SOL", "XRP"]
+    SNIPER_SLUGS = {
+        "BTC": "btc-updown-15m-{}",
+        "ETH": "eth-updown-15m-{}",
+        "SOL": "sol-updown-15m-{}",
+        "XRP": "xrp-updown-15m-{}",
+    }
+    GAMMA_API = "https://gamma-api.polymarket.com"
+    STAKE = 2.50
+    MAX_FILL = 0.50
+    
+    print("BOT2 CHAINLINK SNIPER STARTED — waiting for first boundary...")
+    
+    while True:
+        try:
+            if not _bot2_sniper_state["enabled"]:
+                _time.sleep(30)
+                continue
+            
+            if not _poly_has_creds():
+                _time.sleep(30)
+                continue
+            
+            # ── Calculate time to next 15M boundary ──
+            now = datetime.now(timezone.utc)
+            mins_to_next = 15 - (now.minute % 15)
+            if mins_to_next == 15:
+                mins_to_next = 0
+            secs_to_boundary = mins_to_next * 60 - now.second
+            
+            if secs_to_boundary > 35:
+                _time.sleep(min(secs_to_boundary - 35, 60))
+                continue
+            
+            # ── T-22s: Pre-fetch 1H candles (COMPLETED only) ──
+            # Use endTime to exclude the current incomplete candle
+            now_ms = int(_time.time() * 1000)
+            # Round down to last completed 1H boundary
+            hour_boundary_ms = (now_ms // 3600000) * 3600000
+            
+            for asset in SNIPER_ASSETS:
+                try:
+                    symbol = {"BTC": "BTCUSDT", "ETH": "ETHUSDT", "SOL": "SOLUSDT", "XRP": "XRPUSDT"}.get(asset)
+                    r = _req.get("https://api.binance.com/api/v3/klines",
+                        params={"symbol": symbol, "interval": "1h", "limit": 12, "endTime": hour_boundary_ms - 1},
+                        timeout=3)
+                    if r.status_code == 200:
+                        klines = r.json()
+                        if klines and len(klines) >= 10:
+                            closes = [float(k[4]) for k in klines]
+                            _bot2_prefetch[asset] = closes
+                            print("BOT2 prefetch {}: {} closes, last={:.2f}".format(asset, len(closes), closes[-1]))
+                        else:
+                            print("BOT2 prefetch {}: only {} candles".format(asset, len(klines) if klines else 0))
+                    else:
+                        print("BOT2 prefetch {}: HTTP {}".format(asset, r.status_code))
+                except Exception as e:
+                    print("BOT2 prefetch error {}: {}".format(asset, e))
+            
+            # ── T-15s: Fetch token IDs from Polymarket ──
+            # Calculate next boundary timestamp
+            next_boundary = now.replace(second=0, microsecond=0)
+            next_min = ((now.minute // 15) + 1) * 15
+            if next_min >= 60:
+                next_boundary = next_boundary.replace(minute=0) + timedelta(hours=1)
+            else:
+                next_boundary = next_boundary.replace(minute=next_min)
+            window_ts = int(next_boundary.timestamp())
+            
+            token_map = {}
+            for asset in SNIPER_ASSETS:
+                try:
+                    slug = SNIPER_SLUGS[asset].format(window_ts)
+                    r = _req.get("{}/markets/slug/{}".format(GAMMA_API, slug), timeout=8)
+                    if r.status_code == 200:
+                        md = r.json()
+                        tokens = md.get("clobTokenIds")
+                        outcomes = md.get("outcomes")
+                        if isinstance(tokens, str):
+                            try: tokens = json.loads(tokens)
+                            except: tokens = None
+                        if isinstance(outcomes, str):
+                            try: outcomes = json.loads(outcomes)
+                            except: outcomes = None
+                        if tokens and isinstance(tokens, list) and len(tokens) >= 2:
+                            up_idx = 0
+                            if isinstance(outcomes, list) and len(outcomes) >= 2:
+                                if str(outcomes[0]).lower().strip() in ("no", "down", "below"):
+                                    up_idx = 1
+                            token_map[asset] = {
+                                "up_token": tokens[up_idx],
+                                "down_token": tokens[1 - up_idx],
+                                "condition_id": md.get("conditionId", ""),
+                                "slug": slug,
+                                "title": md.get("question", slug),
+                            }
+                    else:
+                        # Try search fallback
+                        r2 = _req.get("{}/markets?slug={}".format(GAMMA_API, slug), timeout=8)
+                        if r2.status_code == 200:
+                            results = r2.json()
+                            if isinstance(results, list) and len(results) > 0:
+                                md = results[0]
+                                tokens = md.get("clobTokenIds")
+                                outcomes = md.get("outcomes")
+                                if isinstance(tokens, str):
+                                    try: tokens = json.loads(tokens)
+                                    except: tokens = None
+                                if isinstance(outcomes, str):
+                                    try: outcomes = json.loads(outcomes)
+                                    except: outcomes = None
+                                if tokens and isinstance(tokens, list) and len(tokens) >= 2:
+                                    up_idx = 0
+                                    if isinstance(outcomes, list) and len(outcomes) >= 2:
+                                        if str(outcomes[0]).lower().strip() in ("no", "down", "below"):
+                                            up_idx = 1
+                                    token_map[asset] = {
+                                        "up_token": tokens[up_idx],
+                                        "down_token": tokens[1 - up_idx],
+                                        "condition_id": md.get("conditionId", ""),
+                                        "slug": slug,
+                                        "title": md.get("question", slug),
+                                    }
+                except Exception as e:
+                    print("BOT2 token fetch error {}: {}".format(asset, e))
+            
+            if not token_map:
+                print("BOT2: no markets found for boundary {}".format(window_ts))
+                _time.sleep(max(secs_to_boundary + 5, 5))
+                continue
+            
+            print("BOT2: {} tokens ready, {} prefetched, waiting for boundary...".format(
+                len(token_map), len(_bot2_prefetch)))
+            
+            # ── Wait until T+0 ──
+            now2 = datetime.now(timezone.utc)
+            wait_secs = (next_boundary - now2).total_seconds()
+            if 0 < wait_secs < 120:
+                _time.sleep(max(wait_secs + 0.3, 0))  # Wait 0.3s AFTER boundary for Chainlink to settle
+            
+            # ── T+0.3s: Read Chainlink prices and calculate direction ──
+            # Get BTC direction first (needed for all assets)
+            btc_chainlink = _chainlink_prices.get("BTC")
+            if not btc_chainlink:
+                print("BOT2: no Chainlink price for BTC — skipping boundary")
+                _time.sleep(60)
+                continue
+            
+            btc_dir, btc_sma, btc_price = _bot2_sniper_calc_direction("BTC", btc_chainlink)
+            if not btc_dir:
+                print("BOT2: BTC direction calc failed — no prefetch data")
+                _time.sleep(60)
+                continue
+            
+            print("BOT2 BTC: {} (price={:.0f} sma={:.0f})".format(btc_dir, btc_price, btc_sma))
+            
+            # Calculate direction for each asset
+            snipe_targets = []
+            for asset in SNIPER_ASSETS:
+                if asset not in token_map:
+                    continue
+                
+                chainlink_price = _chainlink_prices.get(asset)
+                if not chainlink_price:
+                    print("BOT2: no Chainlink price for {} — skip".format(asset))
+                    continue
+                
+                asset_dir, asset_sma, asset_price = _bot2_sniper_calc_direction(asset, chainlink_price)
+                if not asset_dir:
+                    print("BOT2: {} direction calc failed".format(asset))
+                    continue
+                
+                # Bot2 core rule: SMA + BTC must agree
+                if asset_dir == btc_dir:
+                    # Check dedup
+                    market_key = "bot2_{}_{}".format(asset, window_ts)
+                    if market_key in _bot2_sniper_traded:
+                        continue
+                    
+                    # Check balance
+                    if _bot2_sniper_state["balance"] < STAKE + 1:
+                        continue
+                    
+                    bet_side = "UP" if asset_dir == "BUY" else "DOWN"
+                    snipe_targets.append({
+                        "asset": asset,
+                        "direction": asset_dir,
+                        "bet_side": bet_side,
+                        "sma10": asset_sma,
+                        "price": asset_price,
+                        "btc_dir": btc_dir,
+                        "market_key": market_key,
+                        "indicators": "SMA={} BTC={} price={:.2f} sma10={:.2f}".format(
+                            asset_dir, btc_dir, asset_price, asset_sma),
+                    })
+                    print("BOT2 TARGET: {} {} (sma={:.2f} price={:.2f} btc={})".format(
+                        asset, asset_dir, asset_sma, asset_price, btc_dir))
+                else:
+                    print("BOT2 SKIP: {} asset={} btc={} — disagree".format(
+                        asset, asset_dir, btc_dir))
+            
+            if not snipe_targets:
+                print("BOT2: 0 targets at boundary {}".format(window_ts))
+                _time.sleep(60)
+                continue
+            
+            # ── T+0.5s: FIRE ORDERS ──
+            client = _get_poly_client()
+            if not client:
+                print("BOT2: no CLOB client — skipping")
+                _time.sleep(20)
+                continue
+            
+            from py_clob_client_v2 import Side, OrderArgs, OrderType
+            BUY = Side.BUY
+            
+            fired = []
+            for target in snipe_targets:
+                asset = target["asset"]
+                entry = token_map.get(asset)
+                if not entry:
+                    continue
+                
+                token_id = entry["up_token"] if target["bet_side"] == "UP" else entry["down_token"]
+                shares = STAKE / MAX_FILL  # $2.50 / 0.50 = 5 shares
+                
+                try:
+                    args = OrderArgs(
+                        token_id=str(token_id),
+                        price=MAX_FILL,
+                        size=shares,
+                        side=BUY,
+                    )
+                    signed = client.create_order(args)
+                    resp = client.post_order(signed, OrderType.GTC)
+                    order_id = None
+                    if resp:
+                        order_id = resp.get("orderID") or resp.get("id") or "placed"
+                    
+                    # Update state
+                    _bot2_sniper_state["balance"] = round(_bot2_sniper_state["balance"] - STAKE, 2)
+                    _bot2_sniper_state["trades_today"] += 1
+                    _bot2_sniper_traded.add(target["market_key"])
+                    if _bot2_sniper_state["balance"] > _bot2_sniper_state["peak_balance"]:
+                        _bot2_sniper_state["peak_balance"] = _bot2_sniper_state["balance"]
+                    
+                    fired.append({
+                        "asset": asset, "bet_side": target["bet_side"],
+                        "indicators": target["indicators"],
+                        "order_id": order_id, "slug": entry["slug"],
+                        "condition_id": entry["condition_id"],
+                        "token_id": token_id,
+                    })
+                    
+                    print("BOT2 FIRED: {} {} @50c ${:.2f} | pool=${:.2f}".format(
+                        target["bet_side"], asset, STAKE, _bot2_sniper_state["balance"]))
+                    
+                except Exception as e:
+                    print("BOT2 order error {}: {}".format(asset, e))
+            
+            # ── Save to DB + Telegram ──
+            for fr in fired:
+                try:
+                    db = get_db()
+                    db.run("""INSERT INTO bot2_sniper_trades
+                        (market_id, title, asset, bet_side, stake, fill_price,
+                         pool_after, order_id, token_id, condition_id, slug,
+                         indicators, status, outcome, fired_at)
+                        VALUES (:mid, :ttl, :ast, :bs, :stk, :fp,
+                                :pa, :oid, :tid, :cid, :slg,
+                                :ind, 'Pending', 'PENDING', :fa)""",
+                        mid="bot2_{}_15M_{}".format(fr["asset"], window_ts),
+                        ttl="Bot2 {} {} 15M".format(fr["asset"], fr["bet_side"]),
+                        ast=fr["asset"], bs=fr["bet_side"], stk=STAKE, fp=MAX_FILL,
+                        pa=_bot2_sniper_state["balance"],
+                        oid=str(fr["order_id"]) if fr["order_id"] else "",
+                        tid=fr["token_id"], cid=fr["condition_id"], slg=fr["slug"],
+                        ind=fr["indicators"],
+                        fa=datetime.now(timezone.utc).isoformat())
+                    db.close()
+                except Exception as e:
+                    print("BOT2 DB error: {}".format(e))
+                
+                try:
+                    send_telegram("🤖 <b>BOT2 SNIPER</b>\n{} {} @50c ${:.2f}\n{}\nPool: ${:.2f}".format(
+                        fr["bet_side"], fr["asset"], STAKE,
+                        fr["indicators"][:60], _bot2_sniper_state["balance"]))
+                except:
+                    pass
+            
+            # Save balance
+            _save_bot_balance("bot2_sniper", _bot2_sniper_state)
+            
+            # Floor check
+            if _bot2_sniper_state["balance"] <= _bot2_sniper_state["floor_balance"]:
+                _bot2_sniper_state["enabled"] = False
+                print("BOT2 STOPPED: balance ${:.2f} hit floor".format(_bot2_sniper_state["balance"]))
+                send_telegram("🛑 BOT2 SNIPER STOPPED — balance ${:.2f}".format(_bot2_sniper_state["balance"]))
+            
+            _time.sleep(60)  # Wait before next cycle
+            
+        except Exception as e:
+            print("BOT2 SNIPER ERROR: {}".format(e))
+            import traceback
+            traceback.print_exc()
+            _time.sleep(60)
+
+
 
     # ── POLY ALPHA 4.0 SNIPER init ──
     # Load balance from DB (no more force-reset on deploy)
@@ -4326,6 +4682,18 @@ def init_db():
             pool_after REAL, payout REAL, order_id TEXT, token_id TEXT,
             condition_id TEXT, slug TEXT, filled BOOLEAN DEFAULT FALSE,
             status TEXT DEFAULT 'Pending', outcome TEXT,
+            fired_at TEXT, resolved_at TEXT
+        )
+    """)
+    conn.run("""
+        CREATE TABLE IF NOT EXISTS bot2_sniper_trades (
+            id SERIAL PRIMARY KEY,
+            market_id TEXT, title TEXT, asset TEXT,
+            bet_side TEXT, stake REAL, fill_price REAL,
+            pool_after REAL, payout REAL, order_id TEXT, token_id TEXT,
+            condition_id TEXT, slug TEXT,
+            indicators TEXT,
+            status TEXT DEFAULT 'Pending', outcome TEXT DEFAULT 'PENDING',
             fired_at TEXT, resolved_at TEXT
         )
     """)
@@ -18609,6 +18977,7 @@ td{padding:8px 12px;border-bottom:1px solid #f4f3ed;color:var(--ink-2)}tr:last-c
     <a href="/app/paper29" class="nav-tab""" + (" active" if nav_active == "paper29" else "") + """">Paper 2.9</a>
     <a href="/app/paper29poly" class="nav-tab""" + (" active" if nav_active == "paper29poly" else "") + """">P2.9 Poly</a>
     <a href="/app/paper210" class="nav-tab""" + (" active" if nav_active == "paper210" else "") + """">Paper 2.10</a>
+    <a href="/app/bot2-sniper" class="nav-tab""" + (" active" if nav_active == "bot2-sniper" else "") + """">🤖 Bot2 Sniper</a>
     <a href="/app/poly-alpha3" class="nav-tab""" + (" active" if nav_active == "poly-alpha3" else "") + """">⚡ Poly A3</a>
     <a href="/app/poly-alpha4" class="nav-tab""" + (" active" if nav_active == "poly-alpha4" else "") + """">🎯 Sniper A4</a>
     <a href="/app/lmts-sniper" class="nav-tab""" + (" active" if nav_active == "lmts-sniper" else "") + """">🎯 LMTS Sniper</a>
@@ -18988,6 +19357,22 @@ if SIGNALS_DB_URL:
     print("SNIPER A4 thread launched")
     threading.Thread(target=_sniper_a41_thread, daemon=True).start()
     print("SNIPER A41 (P31): ${:.2f} pool | launched".format(_poly_alpha41_state["balance"]))
+    
+    # ── BOT2 CHAINLINK SNIPER init ──
+    _saved_bot2s = _saved_balances.get("bot2_sniper", {})
+    if _saved_bot2s and _saved_bot2s.get("balance", 0) > 0:
+        _bot2_sniper_state["balance"] = _saved_bot2s["balance"]
+        _bot2_sniper_state["peak_balance"] = _saved_bot2s.get("peak_balance", _saved_bot2s["balance"])
+    _bot2_sniper_state["enabled"] = True
+    _save_bot_balance("bot2_sniper", _bot2_sniper_state)
+    print("BOT2 SNIPER: ${:.2f} pool | SMA+BTC agree | Chainlink T+0 | 50c GTC".format(
+        _bot2_sniper_state["balance"]))
+    threading.Thread(target=_bot2_sniper_thread, daemon=True).start()
+    print("BOT2 SNIPER thread launched")
+    
+    # ── PAUSE Alpha 3.0 — replaced by Bot2 Sniper ──
+    _poly_alpha3_state["enabled"] = False
+    print("POLY ALPHA 3.0: PAUSED — replaced by Bot2 Chainlink Sniper")
 
     # ── LIMITLESS SNIPER init ──
     _saved_lmts = _saved_balances.get("limitless_sniper", {})
@@ -21227,6 +21612,95 @@ def _resolve_poly_alpha3_trades():
     except Exception as e:
         print("Poly A3 resolve error: {}".format(e)); return 0
 
+POLY_GAMMA_API2 = "https://gamma-api.polymarket.com"
+
+def _resolve_bot2_sniper_trades():
+    """Resolve Bot2 Chainlink Sniper trades using Gamma API outcome prices."""
+    try:
+        conn = get_db()
+        rows = conn.run("SELECT * FROM bot2_sniper_trades WHERE status='Pending' ORDER BY id")
+        cols = [c['name'] for c in conn.columns]
+        items = [dict(zip(cols, r)) for r in rows]
+        conn.close()
+        if not items: return 0
+        now = datetime.now(timezone.utc)
+        resolved = 0
+        for p in items:
+            try:
+                if not p.get("fired_at"): continue
+                fired = datetime.fromisoformat(str(p["fired_at"]).replace("+00:00","").replace("Z","")[:26])
+                if fired.tzinfo is None: fired = fired.replace(tzinfo=timezone.utc)
+                m15 = (fired.minute // 15) * 15
+                window_start = fired.replace(minute=m15, second=0, microsecond=0)
+                expiry = window_start + timedelta(minutes=15)
+                if now < expiry + timedelta(minutes=2): continue
+                stake = float(p.get("stake") or 2.50)
+                won = None
+                slug = p.get("slug", "")
+                bs = p.get("bet_side", "UP")
+                try:
+                    import requests as req
+                    if slug:
+                        r = req.get("{}/markets/slug/{}".format(POLY_GAMMA_API2, slug), timeout=8)
+                        if r.status_code == 200:
+                            md = r.json()
+                            ops = md.get("outcomePrices")
+                            if ops:
+                                if isinstance(ops, str):
+                                    try: ops = json.loads(ops)
+                                    except: ops = None
+                                if isinstance(ops, list) and len(ops) >= 2:
+                                    p0 = float(ops[0]); p1 = float(ops[1])
+                                    _oc = md.get("outcomes")
+                                    if isinstance(_oc, str):
+                                        try: _oc = json.loads(_oc)
+                                        except: _oc = None
+                                    _up_idx = 0
+                                    if isinstance(_oc, list) and len(_oc) >= 2:
+                                        o0 = str(_oc[0]).lower().strip()
+                                        if o0 in ("no", "down", "below"): _up_idx = 1
+                                    if _up_idx == 0:
+                                        if p0 >= 0.95: won = (bs == "UP")
+                                        elif p1 >= 0.95: won = (bs == "DOWN")
+                                    else:
+                                        if p1 >= 0.95: won = (bs == "UP")
+                                        elif p0 >= 0.95: won = (bs == "DOWN")
+                except: pass
+                if won is None:
+                    if now > expiry + timedelta(hours=1): won = False
+                    else: continue
+                fill = float(p.get("fill_price") or 0.50)
+                payout = round(stake / fill, 4) if won else 0
+                status = "Won" if won else "Lost"
+                c3 = get_db()
+                c3.run("UPDATE bot2_sniper_trades SET status=:s,outcome=:o,resolved_at=:r,payout=:p WHERE id=:i",
+                    s=status, o="WIN" if won else "LOSS", r=now.isoformat(), p=payout, i=p["id"])
+                c3.close()
+                resolved += 1
+                if won:
+                    _bot2_sniper_state["balance"] = round(_bot2_sniper_state["balance"] + payout, 2)
+                    _bot2_sniper_state["wins_today"] += 1
+                    _bot2_sniper_state["profit_today"] = round(_bot2_sniper_state["profit_today"] + (payout - stake), 2)
+                else:
+                    _bot2_sniper_state["losses_today"] += 1
+                    _bot2_sniper_state["profit_today"] = round(_bot2_sniper_state["profit_today"] - stake, 2)
+                if _bot2_sniper_state["balance"] > _bot2_sniper_state["peak_balance"]:
+                    _bot2_sniper_state["peak_balance"] = _bot2_sniper_state["balance"]
+                if _bot2_sniper_state["balance"] <= _bot2_sniper_state["floor_balance"]:
+                    _bot2_sniper_state["enabled"] = False
+                    send_telegram("🛑 BOT2 SNIPER STOPPED — Floor ${:.2f}".format(_bot2_sniper_state["balance"]))
+                _pnl = "+${:.2f}".format(payout - stake) if won else "-${:.2f}".format(stake)
+                print("BOT2 #{} {}: {} | pool=${:.2f}".format(p["id"], "WIN" if won else "LOSS", _pnl, _bot2_sniper_state["balance"]))
+                send_telegram("{} <b>BOT2 {}</b>\n{} {} ${:.2f}\nPool: ${:.2f}".format(
+                    "✅" if won else "❌", "WIN" if won else "LOSS", _pnl,
+                    p.get("asset", "?"), stake, _bot2_sniper_state["balance"]))
+                _save_bot_balance("bot2_sniper", _bot2_sniper_state)
+            except Exception as e:
+                print("Bot2 resolve error #{}: {}".format(p.get("id"), e))
+        return resolved
+    except Exception as e:
+        print("Bot2 resolve error: {}".format(e)); return 0
+
 def _poly_scan_loop():
     """Background thread for Polymarket scanning and resolving."""
     time.sleep(60)  # Wait for init
@@ -21282,6 +21756,12 @@ def _poly_scan_loop():
                 print("SV2 paper resolved: {}".format(_sv2_resolved))
         except Exception as e:
             print("SV2 resolve error: {}".format(e))
+        try:
+            _bot2s_resolved = _resolve_bot2_sniper_trades()
+            if _bot2s_resolved:
+                print("Bot2 Sniper resolved: {}".format(_bot2s_resolved))
+        except Exception as e:
+            print("Bot2 Sniper resolve error: {}".format(e))
         try:
             _sv3_resolved = _resolve_sv3_trades()
             if _sv3_resolved:
@@ -21609,7 +22089,113 @@ th{{background:#f0f0f0;padding:6px 4px;text-align:left;font-size:12px}}td{{paddi
         _poly_alpha2_state["trades_today"], _poly_alpha2_state["wins_today"],
         _poly_alpha2_state["losses_today"], tier_html, asset_html, trade_rows)
 
-@app.route("/app/poly-alpha3")
+@app.route("/app/bot2-sniper")
+def bot2_sniper_page():
+    """Bot2 Chainlink Sniper dashboard."""
+    try:
+        conn = get_db()
+        rows = conn.run("SELECT * FROM bot2_sniper_trades ORDER BY id DESC LIMIT 200")
+        cols = [c['name'] for c in conn.columns]
+        trades = [dict(zip(cols, r)) for r in rows]
+        conn.close()
+    except:
+        trades = []
+    
+    total = len(trades)
+    wins = sum(1 for t in trades if t.get("outcome") == "WIN")
+    losses = sum(1 for t in trades if t.get("outcome") == "LOSS")
+    pending = sum(1 for t in trades if t.get("outcome") == "PENDING")
+    resolved = wins + losses
+    wr = round(wins / resolved * 100, 1) if resolved > 0 else 0
+    total_pnl = 0
+    for t in trades:
+        if t.get("outcome") == "WIN":
+            total_pnl += float(t.get("payout") or 0) - float(t.get("stake") or 0)
+        elif t.get("outcome") == "LOSS":
+            total_pnl -= float(t.get("stake") or 0)
+    total_pnl = round(total_pnl, 2)
+    
+    asset_stats = {}
+    for t in trades:
+        a = t.get("asset", "?")
+        if a not in asset_stats: asset_stats[a] = {"w": 0, "l": 0, "pnl": 0}
+        if t.get("outcome") == "WIN":
+            asset_stats[a]["w"] += 1
+            asset_stats[a]["pnl"] += float(t.get("payout") or 0) - float(t.get("stake") or 0)
+        elif t.get("outcome") == "LOSS":
+            asset_stats[a]["l"] += 1
+            asset_stats[a]["pnl"] -= float(t.get("stake") or 0)
+    
+    asset_html = ""
+    for a in sorted(asset_stats.keys()):
+        s = asset_stats[a]
+        awr = round(s["w"] / (s["w"] + s["l"]) * 100, 1) if (s["w"] + s["l"]) > 0 else 0
+        ac = "#3fb950" if awr >= 55 else "#f85149" if awr < 50 else "#d29922"
+        asset_html += "<tr><td>{}</td><td>{}W/{}L</td><td style='color:{}'>{:.1f}%</td><td>${:.2f}</td></tr>".format(
+            a, s["w"], s["l"], ac, awr, s["pnl"])
+    
+    trade_rows = ""
+    for t in trades[:100]:
+        outcome = t.get("outcome", "PENDING")
+        icon = "✅" if outcome == "WIN" else "❌" if outcome == "LOSS" else "⏳"
+        pnl_str = ""
+        if outcome == "WIN":
+            pnl_str = "+${:.2f}".format(float(t.get("payout") or 0) - float(t.get("stake") or 0))
+        elif outcome == "LOSS":
+            pnl_str = "-${:.2f}".format(float(t.get("stake") or 0))
+        fired = (t.get("fired_at") or "")[:16].replace("T", " ")
+        trade_rows += "<tr><td>{}</td><td>{}</td><td>{}</td><td>${:.2f}</td><td>{}</td><td>{}</td><td>{}</td><td>${:.2f}</td></tr>".format(
+            t.get("id", ""), icon, t.get("asset", "?"),
+            float(t.get("stake") or 0), t.get("bet_side", "?"),
+            fired, pnl_str, float(t.get("pool_after") or 0))
+    
+    wrc = "#3fb950" if wr >= 55 else "#f85149" if wr < 50 else "#d29922"
+    pnlc = "#3fb950" if total_pnl >= 0 else "#f85149"
+    
+    return """<!DOCTYPE html><html><head><title>Bot2 Chainlink Sniper</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>body{{font-family:-apple-system,sans-serif;max-width:900px;margin:0 auto;padding:10px;background:#0a0a0a;color:#e0e0e0}}
+h1{{color:#00d4aa}}h2{{color:#888;font-size:14px}}
+.stats{{display:grid;grid-template-columns:repeat(auto-fit,minmax(100px,1fr));gap:8px;margin:10px 0}}
+.stat{{background:#1a1a2e;padding:12px;border-radius:8px;text-align:center}}
+.stat .val{{font-size:24px;font-weight:700}}.stat .lbl{{font-size:11px;color:#888}}
+table{{width:100%;border-collapse:collapse;font-size:13px;margin:10px 0}}
+th,td{{padding:6px 8px;border-bottom:1px solid #222;text-align:left}}
+th{{background:#1a1a2e;color:#888;font-size:11px}}
+.nav{{display:flex;gap:4px;flex-wrap:wrap;margin:10px 0}}
+.nav-tab{{padding:6px 12px;background:#1a1a2e;color:#888;text-decoration:none;border-radius:4px;font-size:12px}}
+.nav-tab.active{{background:#00d4aa;color:#000}}
+a{{color:#00d4aa}}
+</style></head><body>
+<div class="nav">
+<a href="/app/bot2-sniper" class="nav-tab active">🤖 Bot2 Sniper</a>
+<a href="/app/poly-alpha3" class="nav-tab">⚡ Poly A3</a>
+<a href="/app/poly-alpha4" class="nav-tab">🎯 Sniper A4</a>
+<a href="/app/lmts-sniper" class="nav-tab">🎯 LMTS</a>
+<a href="/" class="nav-tab">Home</a>
+</div>
+<h1>🤖 Bot2 Chainlink Sniper</h1>
+<h2>SMA+BTC Agree · Chainlink T+0 Close · 15M · 50¢ GTC · $2.50 Flat</h2>
+<div class="stats">
+<div class="stat"><div class="val" style="color:{wrc}">${bal:.2f}</div><div class="lbl">Pool</div></div>
+<div class="stat"><div class="val" style="color:{wrc}">{wr:.1f}%</div><div class="lbl">Win Rate</div></div>
+<div class="stat"><div class="val">{total}</div><div class="lbl">Trades</div></div>
+<div class="stat"><div class="val" style="color:{pnlc}">${pnl:+.2f}</div><div class="lbl">P&L</div></div>
+<div class="stat"><div class="val">${peak:.2f}</div><div class="lbl">Peak</div></div>
+<div class="stat"><div class="val">{today}</div><div class="lbl">Today</div></div>
+</div>
+<h2>By Asset</h2><table><tr><th>Asset</th><th>Record</th><th>WR</th><th>P&L</th></tr>{asset_html}</table>
+<h2>Trade History</h2><table><tr><th>#</th><th></th><th>Asset</th><th>Stake</th><th>Side</th><th>Time</th><th>P&L</th><th>Pool</th></tr>{trade_rows}</table>
+<p style="color:#444;font-size:11px">Bot2 strategy · Chainlink T+0 close · SMA+BTC agree on 1H · 50¢ GTC · Auto-refresh 60s</p>
+<script>setTimeout(()=>location.reload(),60000)</script>
+</body></html>""".format(
+        wrc=wrc, bal=_bot2_sniper_state["balance"], wr=wr, total=total,
+        pnlc=pnlc, pnl=total_pnl, peak=_bot2_sniper_state["peak_balance"],
+        today="{}T {}W {}L".format(_bot2_sniper_state["trades_today"],
+            _bot2_sniper_state["wins_today"], _bot2_sniper_state["losses_today"]),
+        asset_html=asset_html, trade_rows=trade_rows)
+
+
 def poly_alpha3_page():
     """Polymarket Alpha 3.0 — Pure P2.3 with Compounding."""
     try:
@@ -22786,7 +23372,7 @@ def csv_export(table_name):
         "paper26_trades", "paper36_trades", "paper27_trades", "paper37_trades",
         "paper28_trades", "paper29_trades", "paper210_trades",
         "alpha_trades", "poly_alpha3_trades", "limitless_sniper_trades",
-        "poly_trades", "poly_alpha41_trades",
+        "poly_trades", "poly_alpha41_trades", "bot2_sniper_trades",
     ]
     if table_name not in allowed:
         return "Table not allowed. Allowed: {}".format(", ".join(allowed)), 400
