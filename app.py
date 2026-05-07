@@ -454,15 +454,16 @@ _p29cl_traded = set()
 _p29cl_candle_prefetch = {}  # {"BTC": [(o,h,l,c), (o,h,l,c), ...], ...}
 
 def _p29cl_momentum_score(asset, chainlink_close, p21_dir, btc_dir):
-    """P2.9 Chainlink: Momentum-based candle analysis.
+    """P2.9 Chainlink: P2.1 direction + candle analysis + momentum tiebreaker.
     
-    Instead of rigid patterns, scores multiple factors:
-    1. Candle momentum — are bodies growing or shrinking?
-    2. Wick story — who's winning (buyers or sellers)?
-    3. Trend strength — total distance in last 5 candles
-    4. Exhaustion — body shrinking + wicks growing = trend ending
-    5. New candle opening position — where does it open relative to recent range?
-    6. P2.1 agreement — indicators confirm or oppose?
+    Flow:
+    1. P2.1 decides direction (SMA+BTC agree). If no P2.1 → check momentum alone.
+    2. Read settled candle (Chainlink close) — same pattern logic as original P2.9.
+    3. When old P2.9 would SKIP (reversal pattern, strong opposing candle):
+       → Momentum engine gets a vote. If momentum is strong enough, override the skip.
+    4. When old P2.9 would TRADE (candle confirms):
+       → Momentum engine double-checks. If exhaustion detected, skip instead.
+    5. Entry at 50¢.
     
     Returns: (direction, confidence, score, tag) or (None, None, 0, "")
     """
@@ -470,158 +471,260 @@ def _p29cl_momentum_score(asset, chainlink_close, p21_dir, btc_dir):
     if not candles or len(candles) < 4:
         return None, None, 0, "NO_CANDLES"
     
-    # The last candle in prefetch is the one that just closed
-    # But we need to construct it with the Chainlink close
-    # prefetch has completed candles BEFORE the boundary candle
-    # The boundary candle = last prefetch open + chainlink close
+    # ── Settle the last candle with Chainlink close ──
+    settled = list(candles)
+    last = settled[-1]
+    settled[-1] = (
+        last[0],
+        max(last[1], chainlink_close),
+        min(last[2], chainlink_close),
+        chainlink_close
+    )
     
-    # Actually: prefetch is 15M candles fetched at T-22s
-    # The last one is the candle that's STILL OPEN (has 22s left)
-    # We replace its close with Chainlink close to "settle" it
+    recent = settled[-5:] if len(settled) >= 5 else settled
     
-    settled_candles = list(candles)  # copy
-    if len(settled_candles) >= 1:
-        last = settled_candles[-1]
-        # Replace close with Chainlink close, recalculate high/low
-        settled_candles[-1] = (
-            last[0],  # open stays
-            max(last[1], chainlink_close),  # high = max of old high and close
-            min(last[2], chainlink_close),  # low = min of old low and close
-            chainlink_close  # close = Chainlink
-        )
-    
-    # Now analyze the settled candles
-    if len(settled_candles) < 4:
-        return None, None, 0, "TOO_FEW"
-    
-    # Extract last 5 candles (or whatever we have)
-    recent = settled_candles[-5:] if len(settled_candles) >= 5 else settled_candles
-    
-    # ── Factor 1: Current candle direction and strength ──
-    curr = recent[-1]
-    curr_open, curr_high, curr_low, curr_close = curr
-    curr_body = abs(curr_close - curr_open)
-    curr_range = curr_high - curr_low if curr_high > curr_low else 0.0001
+    # ── Read current (just-closed) candle ──
+    curr_o, curr_h, curr_l, curr_c = recent[-1]
+    curr_body = abs(curr_c - curr_o)
+    curr_range = curr_h - curr_l if curr_h > curr_l else 0.0001
     curr_body_ratio = curr_body / curr_range
-    curr_is_green = curr_close > curr_open
-    curr_is_red = curr_close < curr_open
-    curr_upper_wick = curr_high - max(curr_open, curr_close)
-    curr_lower_wick = min(curr_open, curr_close) - curr_low
+    curr_is_green = curr_c > curr_o
+    curr_is_red = curr_c < curr_o
+    curr_upper_wick = curr_h - max(curr_o, curr_c)
+    curr_lower_wick = min(curr_o, curr_c) - curr_l
+    upper_ratio = curr_upper_wick / curr_range
+    lower_ratio = curr_lower_wick / curr_range
     
-    score = 0  # positive = DOWN, negative = UP (will flip at end)
-    tags = []
+    # ── Read previous candle (the one before the just-closed one) ──
+    prev_o, prev_h, prev_l, prev_c = recent[-2] if len(recent) >= 2 else (0,0,0,0)
+    prev_body = abs(prev_c - prev_o)
+    prev_is_green = prev_c > prev_o
+    prev_is_red = prev_c < prev_o
     
-    # ── Factor 2: Momentum — are candle bodies growing or shrinking? ──
-    bodies = []
-    directions = []
-    for c in recent:
-        o, h, l, cl = c
-        bodies.append(abs(cl - o))
-        directions.append("GREEN" if cl > o else "RED" if cl < o else "FLAT")
+    # ── Candle pattern (same logic as original P2.9) ──
+    pattern = "unclear"
+    if lower_ratio > 0.6 and curr_body_ratio < 0.35:
+        pattern = "hammer"
+    elif upper_ratio > 0.6 and curr_body_ratio < 0.35:
+        pattern = "shooting_star"
+    elif curr_body_ratio < 0.1:
+        pattern = "doji"
+    elif curr_is_red and curr_body_ratio > 0.7:
+        pattern = "strong_red"
+    elif curr_is_green and curr_body_ratio > 0.7:
+        pattern = "strong_green"
+    elif curr_is_red and curr_body_ratio > 0.4:
+        pattern = "moderate_red"
+    elif curr_is_green and curr_body_ratio > 0.4:
+        pattern = "moderate_green"
+    elif curr_is_red:
+        pattern = "weak_red"
+    elif curr_is_green:
+        pattern = "weak_green"
     
-    # Count consecutive same-direction candles
-    last_dir = directions[-1]
+    # ── Momentum factors (calculated regardless of P2.1) ──
+    bodies = [abs(c[3] - c[0]) for c in recent]
+    directions = ["GREEN" if c[3] > c[0] else "RED" if c[3] < c[0] else "FLAT" for c in recent]
+    
+    # Consecutive same-direction count
+    last_candle_dir = directions[-1]
     consecutive = 1
     for d in reversed(directions[:-1]):
-        if d == last_dir:
-            consecutive += 1
-        else:
-            break
+        if d == last_candle_dir: consecutive += 1
+        else: break
     
-    # Momentum acceleration: are bodies getting bigger?
+    # Momentum score (positive = bearish, negative = bullish)
+    m_score = 0
+    m_tags = []
+    
+    # Body acceleration
     if len(bodies) >= 3:
         if bodies[-1] > bodies[-2] > bodies[-3]:
-            # Accelerating — strong trend
-            score += 3 if last_dir == "RED" else -3
-            tags.append("ACCEL_{}".format(last_dir))
+            m_score += 3 if last_candle_dir == "RED" else -3
+            m_tags.append("ACCEL")
         elif bodies[-1] < bodies[-2] < bodies[-3]:
-            # Exhausting — trend weakening
-            score += -1 if last_dir == "RED" else 1
-            tags.append("EXHAUST_{}".format(last_dir))
+            m_score += -2 if last_candle_dir == "RED" else 2
+            m_tags.append("EXHAUST")
         elif bodies[-1] > bodies[-2]:
-            score += 1 if last_dir == "RED" else -1
-            tags.append("GROW_{}".format(last_dir))
+            m_score += 1 if last_candle_dir == "RED" else -1
+            m_tags.append("GROW")
     
-    # ── Factor 3: Consecutive direction ──
+    # Consecutive run
     if consecutive >= 4:
-        score += 2 if last_dir == "RED" else -2
-        tags.append("RUN{}{}".format(consecutive, last_dir[0]))
+        m_score += 2 if last_candle_dir == "RED" else -2
+        m_tags.append("RUN{}".format(consecutive))
     elif consecutive >= 3:
-        score += 1 if last_dir == "RED" else -1
-        tags.append("RUN{}{}".format(consecutive, last_dir[0]))
+        m_score += 1 if last_candle_dir == "RED" else -1
+        m_tags.append("RUN{}".format(consecutive))
     
-    # ── Factor 4: Wick analysis on current candle ──
-    if curr_range > 0:
-        upper_ratio = curr_upper_wick / curr_range
-        lower_ratio = curr_lower_wick / curr_range
-        
-        # Long lower wick = buyers defending (bullish)
-        if lower_ratio > 0.5 and curr_body_ratio < 0.3:
-            score -= 2  # bullish signal
-            tags.append("BUYER_WICK")
-        # Long upper wick = sellers rejecting (bearish)
-        elif upper_ratio > 0.5 and curr_body_ratio < 0.3:
-            score += 2  # bearish signal
-            tags.append("SELLER_WICK")
+    # Wick story
+    if lower_ratio > 0.5 and curr_body_ratio < 0.3:
+        m_score -= 2; m_tags.append("BUYER_WICK")
+    elif upper_ratio > 0.5 and curr_body_ratio < 0.3:
+        m_score += 2; m_tags.append("SELLER_WICK")
     
-    # ── Factor 5: Trend distance — how far has price moved? ──
+    # Trend distance
     if len(recent) >= 3:
         first_open = recent[0][0]
         last_close = recent[-1][3]
-        total_move_pct = abs(last_close - first_open) / first_open * 100 if first_open > 0 else 0
-        
-        if total_move_pct > 1.5:
-            # Big move — momentum is strong
+        move_pct = abs(last_close - first_open) / first_open * 100 if first_open > 0 else 0
+        if move_pct > 3.0:
             move_dir = "RED" if last_close < first_open else "GREEN"
-            score += 2 if move_dir == "RED" else -2
-            tags.append("BIG_MOVE_{:.1f}%".format(total_move_pct))
-        elif total_move_pct > 0.5:
+            m_score += 4 if move_dir == "RED" else -4
+            m_tags.append("HUGE_MOVE_{:.1f}%".format(move_pct))
+        elif move_pct > 1.0:
             move_dir = "RED" if last_close < first_open else "GREEN"
-            score += 1 if move_dir == "RED" else -1
+            m_score += 2 if move_dir == "RED" else -2
+            m_tags.append("MOVE_{:.1f}%".format(move_pct))
     
-    # ── Factor 6: P2.1 agreement ──
-    if p21_dir:
-        if p21_dir == "DOWN":
-            score += 2
-            tags.append("P21=DOWN")
-        else:
-            score -= 2
-            tags.append("P21=UP")
-    
-    # ── Factor 7: BTC agreement (macro trend) ──
-    if btc_dir:
-        if btc_dir == "SELL":
-            score += 1
-            tags.append("BTC=SELL")
-        else:
-            score -= 1
-            tags.append("BTC=BUY")
-    
-    # ── Factor 8: Exhaustion detection ──
-    # If we have 4+ same-direction candles but the last one has big opposing wick
+    # Exhaustion after run: big opposing wick (replaces simple wick score)
+    exhaustion_detected = False
     if consecutive >= 3:
-        if last_dir == "RED" and curr_lower_wick > curr_body * 2:
-            score -= 3  # exhaustion — buyers stepping in after sell-off
-            tags.append("EXHAUST_HAMMER")
-        elif last_dir == "GREEN" and curr_upper_wick > curr_body * 2:
-            score += 3  # exhaustion — sellers stepping in after rally
-            tags.append("EXHAUST_STAR")
+        if last_candle_dir == "RED" and curr_lower_wick > curr_body * 2:
+            # Undo buyer_wick if it was added, replace with exhaustion
+            if "BUYER_WICK" in m_tags:
+                m_score += 2  # undo buyer_wick
+                m_tags.remove("BUYER_WICK")
+            m_score -= 3; m_tags.append("HAMMER_EXHAUST")
+            exhaustion_detected = True
+        elif last_candle_dir == "GREEN" and curr_upper_wick > curr_body * 2:
+            if "SELLER_WICK" in m_tags:
+                m_score -= 2  # undo seller_wick
+                m_tags.remove("SELLER_WICK")
+            m_score += 3; m_tags.append("STAR_EXHAUST")
+            exhaustion_detected = True
     
-    # ── Decision ──
-    if abs(score) < 2:
-        return None, None, score, "NEUTRAL({})".format("+".join(tags))
+    momentum_dir = "DOWN" if m_score > 0 else "UP" if m_score < 0 else None
+    momentum_strong = abs(m_score) >= 4
+    momentum_moderate = abs(m_score) >= 2
     
-    direction = "DOWN" if score > 0 else "UP"
+    # ══════════════════════════════════════════════════════
+    # DECISION ENGINE
+    # ══════════════════════════════════════════════════════
     
-    if abs(score) >= 6:
-        confidence = "HIGH"
-    elif abs(score) >= 4:
-        confidence = "MEDIUM"
-    else:
+    direction = None
+    confidence = None
+    tag = ""
+    
+    # ── PATH 1: P2.1 has direction ──
+    if p21_dir:
+        is_down = p21_dir == "DOWN"
+        candle_confirms = (is_down and curr_is_red) or (not is_down and curr_is_green)
+        candle_strong_opposes = (is_down and curr_is_green and curr_body_ratio >= 0.5) or \
+                                (not is_down and curr_is_red and curr_body_ratio >= 0.5)
+        is_reversal_pattern = (is_down and pattern == "hammer") or (not is_down and pattern == "shooting_star")
+        
+        # Check if reversal pattern is after extended run
+        real_reversal = False
+        if is_reversal_pattern and consecutive >= 3:
+            real_reversal = True
+        
+        # Check reversal patterns FIRST — hammer/shooting_star override simple color
+        if is_reversal_pattern:
+            # Reversal detected — is it real or fake?
+            # Calculate trend distance for override
+            _rev_first = recent[0][0] if len(recent) >= 3 else 0
+            _rev_last = recent[-1][3]
+            _rev_move_pct = abs(_rev_last - _rev_first) / _rev_first * 100 if _rev_first > 0 else 0
+            
+            if consecutive >= 3:
+                # Extended run + reversal pattern
+                if momentum_strong and momentum_dir == p21_dir:
+                    # Momentum says trend is too strong — reversal is fake
+                    direction = p21_dir
+                    confidence = "MEDIUM"
+                    tag = "P21+FAKE_{}_M{}".format(pattern.upper(), m_score)
+                elif _rev_move_pct > 2.5 and momentum_dir == p21_dir:
+                    # Huge move — even moderate momentum overrides the hammer
+                    direction = p21_dir
+                    confidence = "LOW"
+                    tag = "P21+FAKE_{}_BIG_MOVE_{:.1f}%_M{}".format(pattern.upper(), _rev_move_pct, m_score)
+                elif momentum_strong and momentum_dir != p21_dir:
+                    # Momentum confirms the reversal — skip
+                    tag = "SKIP_REAL_REVERSAL_M{}".format(m_score)
+                else:
+                    # Momentum neutral — skip to be safe
+                    tag = "SKIP_REVERSAL_NEUTRAL_M{}".format(m_score)
+            else:
+                # Reversal pattern but no extended run — weak signal, trust P2.1
+                direction = p21_dir
+                confidence = "LOW"
+                tag = "P21+WEAK_{}_M{}".format(pattern.upper(), m_score)
+        
+        elif candle_confirms and curr_body_ratio > 0.5:
+            # ── Strong candle confirms P2.1 ──
+            # But check: is momentum exhausting?
+            if "EXHAUST" in " ".join(m_tags) and not momentum_strong:
+                # Candle confirms but bodies are shrinking — trend weakening
+                direction = p21_dir
+                confidence = "LOW"
+                tag = "P21+CANDLE_CONFIRM_EXHAUST"
+            else:
+                direction = p21_dir
+                confidence = "HIGH"
+                tag = "P21+STRONG_{}_CONFIRMS".format(pattern.upper())
+        
+        elif candle_confirms:
+            # ── Moderate/weak candle confirms P2.1 ──
+            direction = p21_dir
+            confidence = "MEDIUM"
+            tag = "P21+{}_CONFIRMS".format(pattern.upper())
+        
+        elif candle_strong_opposes:
+            # ── Old P2.9 would SKIP or go LOW ──
+            # Momentum tiebreaker
+            if momentum_strong and momentum_dir == p21_dir:
+                # Strong candle against but momentum still with P2.1
+                direction = p21_dir
+                confidence = "LOW"
+                tag = "P21+OPPOSE_BUT_MOMENTUM_M{}".format(m_score)
+            else:
+                # Skip — too risky
+                tag = "SKIP_STRONG_OPPOSE_M{}".format(m_score)
+        
+        elif pattern == "doji":
+            # ── Doji — no candle signal ──
+            if momentum_moderate and momentum_dir == p21_dir:
+                direction = p21_dir
+                confidence = "MEDIUM"
+                tag = "P21+DOJI+MOMENTUM_M{}".format(m_score)
+            elif momentum_moderate:
+                direction = p21_dir
+                confidence = "LOW"
+                tag = "P21+DOJI_M{}".format(m_score)
+            else:
+                # P2.1 only, no help from candle or momentum
+                direction = p21_dir
+                confidence = "LOW"
+                tag = "P21_ONLY_DOJI"
+        
+        else:
+            # ── Weak/unclear candle ──
+            direction = p21_dir
+            confidence = "MEDIUM" if momentum_dir == p21_dir else "LOW"
+            tag = "P21+WEAK_{}_M{}".format(pattern.upper(), m_score)
+    
+    # ── PATH 2: No P2.1 direction — momentum alone ──
+    elif momentum_strong:
+        # P2.1 couldn't decide (SMA+BTC disagree) but momentum is clear
+        direction = momentum_dir
         confidence = "LOW"
+        tag = "MOMENTUM_ONLY_M{}".format(m_score)
+        # Only take if BTC agrees with momentum
+        if btc_dir:
+            btc_agrees = (btc_dir == "SELL" and direction == "DOWN") or (btc_dir == "BUY" and direction == "UP")
+            if not btc_agrees:
+                direction = None
+                tag = "SKIP_MOMENTUM_VS_BTC_M{}".format(m_score)
     
-    tag = "S{} {}".format(score, "+".join(tags[:4]))
-    return direction, confidence, score, tag
+    if not direction:
+        return None, None, m_score, tag if tag else "NO_SIGNAL_M{}".format(m_score)
+    
+    # Add BTC and P2.1 to tag
+    full_tag = "{} | P21={} BTC={} | {}".format(
+        tag, p21_dir or "NONE", btc_dir or "NONE", "+".join(m_tags[:3]))
+    
+    return direction, confidence, m_score, full_tag
 
 def _p29cl_calc_stake(balance):
     """Compounding stake: 5% of pool, min $2.50, max $8."""
@@ -676,7 +779,7 @@ def _bot2_sniper_thread():
     
     while True:
         try:
-            if not _bot2_sniper_state["enabled"]:
+            if not _bot2_sniper_state["enabled"] and not _p29cl_state["enabled"]:
                 _time.sleep(30)
                 continue
             
@@ -822,22 +925,22 @@ def _bot2_sniper_thread():
             # ── T+0.3s: Read Chainlink prices and calculate direction ──
             # Get BTC direction first (needed for all assets)
             btc_chainlink = _chainlink_prices.get("BTC")
-            if not btc_chainlink:
-                print("BOT2: no Chainlink price for BTC — skipping boundary")
-                _time.sleep(60)
-                continue
+            btc_dir = None
+            btc_sma = None
+            btc_price = None
+            snipe_targets = []
             
-            btc_dir, btc_sma, btc_price = _bot2_sniper_calc_direction("BTC", btc_chainlink)
-            if not btc_dir:
-                print("BOT2: BTC direction calc failed — no prefetch data")
-                _time.sleep(60)
-                continue
+            if btc_chainlink:
+                btc_dir, btc_sma, btc_price = _bot2_sniper_calc_direction("BTC", btc_chainlink)
             
-            print("BOT2 BTC: {} (price={:.0f} sma={:.0f})".format(btc_dir, btc_price, btc_sma))
+            if btc_dir:
+                print("BOT2 BTC: {} (price={:.0f} sma={:.0f})".format(btc_dir, btc_price, btc_sma))
             
             # Calculate direction for each asset
             snipe_targets = []
-            for asset in SNIPER_ASSETS:
+            # Only build Bot2 targets if enabled and BTC direction available
+            if btc_dir and _bot2_sniper_state["enabled"]:
+              for asset in SNIPER_ASSETS:
                 if asset not in token_map:
                     continue
                 
@@ -1101,9 +1204,12 @@ def _bot2_sniper_thread():
     if _saved_pa4 and _saved_pa4.get("balance", 0) >= 10:
         _poly_alpha4_state["balance"] = _saved_pa4["balance"]
         _poly_alpha4_state["peak_balance"] = _saved_pa4.get("peak_balance", _saved_pa4["balance"])
+        print("SNIPER A4: restored ${:.2f} from DB".format(_poly_alpha4_state["balance"]))
     else:
         _poly_alpha4_state["balance"] = 50.0
         _poly_alpha4_state["peak_balance"] = 50.0
+        print("SNIPER A4: fresh start $50.00 (DB had ${:.2f})".format(
+            _saved_pa4.get("balance", 0) if _saved_pa4 else 0))
     _poly_alpha4_state["starting_balance"] = 50.0
     _poly_alpha4_state["floor_balance"] = 10.0
     _poly_alpha4_state["enabled"] = True
