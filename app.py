@@ -1729,16 +1729,14 @@ def _sniper_thread():
             snipe_targets = []
             _sniper_debug = []
             for asset in SNIPER_ASSETS:
-                # NEW: Binance SMA direction (proven by 7-day backtest)
-                _sma_dir, _sma_val, _sma_price = _a4_get_binance_sma_direction(asset)
-                if _sma_dir:
-                    _sniper_debug.append("{}={}".format(asset, _sma_dir))
+                direction, signals_agree, ind_str, _confidence = _sniper_get_direction(asset, "15m")
+                if direction and signals_agree >= 2:
+                    _sniper_debug.append("{}={}".format(asset, direction))
                     snipe_targets.append({
                         "asset": asset,
-                        "direction": _sma_dir,
-                        "signals_agree": 2,  # SMA is proven signal
-                        "indicators": "SMA10={:.2f} price={:.2f} dir={}".format(
-                            _sma_val or 0, _sma_price or 0, _sma_dir),
+                        "direction": direction,
+                        "signals_agree": signals_agree,
+                        "indicators": ind_str,
                     })
 
             # ── Original A4: fire all qualified targets (no filter) ──
@@ -1911,10 +1909,16 @@ def _sniper_thread():
                 if not _fa4_token:
                     continue
                 
-                # Fixed 50¢ entry, tiered stake based on SV3 score
+                # Fixed 50¢ entry, flat $2.50 stake
                 _fa4_price = 0.50
+                _fa4_shares = 5.0  # $2.50 stake at 50¢ = 5 shares
+                _fa4_cost = 2.50
                 
-                # ── SV3 SCORING: Calculate candle structure score ──
+                # Check pool balance
+                if _poly_alpha4_state["balance"] < _fa4_cost + 2:
+                    continue
+                
+                # ── SV3 GATEKEEPER: Check candle structure score ──
                 _fa4_sv3_score = None
                 _fa4_sv3_tag = ""
                 try:
@@ -1927,51 +1931,67 @@ def _sniper_thread():
                         _fa4_sv3_tag = "MTF{} 1H={} 30M={} 15M={}".format(
                             _fa4_sv3_score, _fa4_s1h, _fa4_s30, _fa4_s15)
                 except Exception as _fa4_sv3_e:
-                    print("A4 SV3 score error {}: {}".format(_fa4_asset, _fa4_sv3_e))
+                    print("A4 SV3 gate error {}: {}".format(_fa4_asset, _fa4_sv3_e))
                 
-                # ── TIERED STAKE: score determines stake size ──
-                if _fa4_sv3_score is None:
-                    _fa4_sv3_score = 0  # No candle data → treat as score 0 (lowest profitable tier)
+                # Gate: score ≥ +4 → fire, score 5 → skip, score < +4 → skip
+                if _fa4_sv3_score is not None:
+                    if _fa4_sv3_score == 5:
+                        # Score 5 is a proven loser — skip
+                        print("A4 SKIP: {} {} score=5 — proven loser tier | {}".format(
+                            _fa4_dir, _fa4_asset, _fa4_sv3_tag))
+                        try:
+                            _skip_db = get_db()
+                            _skip_db.run("""INSERT INTO poly_alpha4_trades
+                                (market_id,title,asset,timeframe,bet_side,stake,fill_price,
+                                 pool_after,order_id,token_id,condition_id,slug,filled,
+                                 status,outcome,indicators,signals_agree,fired_at)
+                                VALUES (:mid,:ttl,:ast,:tf,:bs,:stk,:fp,
+                                 :pa,:oid,:tid,:cid,:slg,:fld,
+                                 :sts,:out,:ind,:sa,:fa)""",
+                                mid="skip_{}_15M_{}".format(_fa4_asset, window_ts),
+                                ttl="A4 SKIP {} {} 15M".format(_fa4_asset, _fa4_dir),
+                                ast=_fa4_asset, tf="15M", bs=_fa4_dir,
+                                stk=0, fp=0,
+                                pa=_poly_alpha4_state["balance"],
+                                oid="", tid="", cid="", slg="",
+                                fld=False,
+                                sts="Skipped", out="SKIPPED",
+                                ind="{} | SKIP score 5 | {}".format(_fa4_sv3_tag, _fa4_ind),
+                                sa=0,
+                                fa=datetime.now(timezone.utc).isoformat())
+                        except: pass
+                        continue
+                    
+                    if _fa4_sv3_score < 4:
+                        # Score too low — skip
+                        print("A4 SKIP: {} {} score={} — below gate | {}".format(
+                            _fa4_dir, _fa4_asset, _fa4_sv3_score, _fa4_sv3_tag))
+                        try:
+                            _skip_db = get_db()
+                            _skip_db.run("""INSERT INTO poly_alpha4_trades
+                                (market_id,title,asset,timeframe,bet_side,stake,fill_price,
+                                 pool_after,order_id,token_id,condition_id,slug,filled,
+                                 status,outcome,indicators,signals_agree,fired_at)
+                                VALUES (:mid,:ttl,:ast,:tf,:bs,:stk,:fp,
+                                 :pa,:oid,:tid,:cid,:slg,:fld,
+                                 :sts,:out,:ind,:sa,:fa)""",
+                                mid="skip_{}_15M_{}".format(_fa4_asset, window_ts),
+                                ttl="A4 SKIP {} {} 15M".format(_fa4_asset, _fa4_dir),
+                                ast=_fa4_asset, tf="15M", bs=_fa4_dir,
+                                stk=0, fp=0,
+                                pa=_poly_alpha4_state["balance"],
+                                oid="", tid="", cid="", slg="",
+                                fld=False,
+                                sts="Skipped", out="SKIPPED",
+                                ind="{} | SKIP score {} | {}".format(_fa4_sv3_tag, _fa4_sv3_score, _fa4_ind),
+                                sa=0,
+                                fa=datetime.now(timezone.utc).isoformat())
+                        except: pass
+                        continue
                 
-                _fa4_cost = _a4_get_stake(_fa4_sv3_score, _poly_alpha4_state["balance"])
-                
-                if _fa4_cost <= 0:
-                    # Score is in SKIP tier (3, 5, -1, -2, 9)
-                    print("A4 SKIP: {} {} score={} — not in profitable tier | {}".format(
-                        _fa4_dir, _fa4_asset, _fa4_sv3_score, _fa4_sv3_tag))
-                    # Record skip in DB for dashboard tracking
-                    try:
-                        _skip_db = get_db()
-                        _skip_db.run("""INSERT INTO poly_alpha4_trades
-                            (market_id,title,asset,timeframe,bet_side,stake,fill_price,
-                             pool_after,order_id,token_id,condition_id,slug,filled,
-                             status,outcome,indicators,signals_agree,fired_at)
-                            VALUES (:mid,:ttl,:ast,:tf,:bs,:stk,:fp,
-                             :pa,:oid,:tid,:cid,:slg,:fld,
-                             :sts,:out,:ind,:sa,:fa)""",
-                            mid="skip_{}_15M_{}".format(_fa4_asset, window_ts),
-                            ttl="A4 SKIP {} {} 15M".format(_fa4_asset, _fa4_dir),
-                            ast=_fa4_asset, tf="15M", bs=_fa4_dir,
-                            stk=0, fp=0,
-                            pa=_poly_alpha4_state["balance"],
-                            oid="", tid="", cid="", slg="",
-                            fld=False,
-                            sts="Skipped", out="SKIPPED",
-                            ind="{} | SKIP score {} | {}".format(_fa4_sv3_tag, _fa4_sv3_score, _fa4_ind),
-                            sa=0,
-                            fa=datetime.now(timezone.utc).isoformat())
-                    except: pass
-                    continue
-                
-                _fa4_shares = round(_fa4_cost / _fa4_price, 1)  # shares = stake / price_per_share
-                
-                # Check pool balance
-                if _poly_alpha4_state["balance"] < _fa4_cost + 2:
-                    continue
-                
-                # ── FIRE: Score is in profitable tier ──
-                print("A4 FIRE: {} {} score={} stake=${:.2f} | {}".format(
-                    _fa4_dir, _fa4_asset, _fa4_sv3_score, _fa4_cost, _fa4_sv3_tag))
+                # ── FIRE: score ≥ +4 (not 5) or no candle data ──
+                print("A4 FIRE: {} {} score={} stake=$2.50 | {}".format(
+                    _fa4_dir, _fa4_asset, _fa4_sv3_score, _fa4_sv3_tag))
                 
                 try:
                     _fa4_args = OrderArgs(
@@ -1995,8 +2015,6 @@ def _sniper_thread():
                         "token_id": _fa4_token,
                         "slug": _fa4_entry.get("slug", ""),
                         "condition_id": _fa4_entry.get("condition_id", ""),
-                        "sv3_score": _fa4_sv3_score,
-                        "sv3_tag": _fa4_sv3_tag,
                     })
                 except Exception as _fa4_e:
                     print("A4 order error {}: {}".format(_fa4_asset, _fa4_e))
