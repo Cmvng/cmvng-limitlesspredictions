@@ -23235,8 +23235,8 @@ def _bt_calc_full_direction(asset, candle_data, boundary_ts):
     # ── SMA direction from 1H candles ──
     sma_dir = None
     h1_candles = candle_data.get("1h", [])
-    if h1_candles and len(h1_candles) >= 10:
-        closes = [c["close"] for c in h1_candles]
+    if h1_candles and len(h1_candles) >= 11:
+        closes = [c["close"] for c in h1_candles[:-1]]  # Exclude last (incomplete) candle — matches live
         sma10 = sum(closes[-10:]) / 10
         sma_dir = "BUY" if closes[-1] > sma10 else "SELL"
     
@@ -23364,6 +23364,9 @@ def backtest_menu():
         ("p21_gate4_no5", "P2.1 Full + Gate ≥+4 (skip 5)", "Same but skip score 5"),
         ("p28", "P2.8 Candle-First", "Single candle pattern decides direction"),
         ("p29", "P2.9 BlackRock (P2.1+candle)", "P2.1 direction + candle confidence adjustment"),
+        ("sma15m", "15M SMA Direction (all)", "SMA(10) from 15M candles — matches trading timeframe"),
+        ("sma15m_gate4", "15M SMA + SV3 Gate ≥+4", "15M SMA direction, candles agree +4"),
+        ("sma15m_skip35", "15M SMA skip score 3,5", "15M SMA direction, skip proven losers"),
     ]
     
     strat_btns = ""
@@ -23629,10 +23632,17 @@ def _backtest_fetch_worker(days, asset_filter, source):
                             candle_score = 0
                         
                         ind_dir = None
-                        if candle_data.get("1h") and len(candle_data["1h"]) >= 10:
-                            closes = [c["close"] for c in candle_data["1h"]]
+                        if candle_data.get("1h") and len(candle_data["1h"]) >= 11:
+                            closes = [c["close"] for c in candle_data["1h"][:-1]]  # Exclude last (incomplete) candle — matches live
                             sma10 = sum(closes[-10:]) / 10
                             ind_dir = "UP" if closes[-1] > sma10 else "DOWN"
+                        
+                        # 15M SMA direction — matches the trading timeframe
+                        ind_dir_15m = None
+                        if candle_data.get("15m") and len(candle_data["15m"]) >= 11:
+                            c15 = [c["close"] for c in candle_data["15m"][:-1]]
+                            sma10_15m = sum(c15[-10:]) / 10
+                            ind_dir_15m = "UP" if c15[-1] > sma10_15m else "DOWN"
                         
                         price_pos = None
                         if len(candle_data["15m"]) >= 2:
@@ -23658,6 +23668,7 @@ def _backtest_fetch_worker(days, asset_filter, source):
                             "up_detail": "{}/{}/{}".format(up_1h, up_30, up_15),
                             "dn_detail": "{}/{}/{}".format(dn_1h, dn_30, dn_15),
                             "ind_dir": ind_dir,
+                            "ind_dir_15m": ind_dir_15m,
                             "price_pos": price_pos,
                             "p21_dir": p21_dir,
                             "p21_info": p21_info,
@@ -23801,10 +23812,17 @@ def _backtest_fetch_worker(days, asset_filter, source):
                         candle_score = 0
                     
                     ind_dir = None
-                    if candle_data.get("1h") and len(candle_data["1h"]) >= 10:
-                        closes = [c["close"] for c in candle_data["1h"]]
+                    if candle_data.get("1h") and len(candle_data["1h"]) >= 11:
+                        closes = [c["close"] for c in candle_data["1h"][:-1]]  # Exclude last (incomplete) candle — matches live
                         sma10 = sum(closes[-10:]) / 10
                         ind_dir = "UP" if closes[-1] > sma10 else "DOWN"
+                    
+                    # 15M SMA direction — matches the trading timeframe
+                    ind_dir_15m = None
+                    if candle_data.get("15m") and len(candle_data["15m"]) >= 11:
+                        c15 = [c["close"] for c in candle_data["15m"][:-1]]
+                        sma10_15m = sum(c15[-10:]) / 10
+                        ind_dir_15m = "UP" if c15[-1] > sma10_15m else "DOWN"
                     
                     price_pos = None
                     if candle_data.get("15m") and len(candle_data["15m"]) >= 2:
@@ -23832,6 +23850,7 @@ def _backtest_fetch_worker(days, asset_filter, source):
                         "up_detail": "{}/{}/{}".format(up_1h, up_30, up_15),
                         "dn_detail": "{}/{}/{}".format(dn_1h, dn_30, dn_15),
                         "ind_dir": ind_dir,
+                        "ind_dir_15m": ind_dir_15m,
                         "price_pos": price_pos,
                         "p21_dir": p21_dir,
                         "p21_info": p21_info,
@@ -24101,6 +24120,31 @@ def backtest_run():
                     bet_dir = p21_d
                     tag = "P21+weak_candle"
         
+        elif strategy == "sma15m":
+            # 15M SMA direction — all trades
+            d15 = r.get("ind_dir_15m")
+            if d15:
+                bet_dir = d15
+                tag = "SMA15m"
+        
+        elif strategy == "sma15m_gate4":
+            # 15M SMA + SV3 gate ≥ +4
+            d15 = r.get("ind_dir_15m")
+            if d15:
+                score_for = up_t if d15 == "UP" else dn_t
+                if score_for >= 4:
+                    bet_dir = d15
+                    tag = "gate={}".format(score_for)
+        
+        elif strategy == "sma15m_skip35":
+            # 15M SMA direction, skip score 3 and 5
+            d15 = r.get("ind_dir_15m")
+            if d15:
+                cscore = max(up_t, dn_t) if candle_dir else 0
+                if cscore not in (3, 5):
+                    bet_dir = d15
+                    tag = "sc={}".format(cscore)
+        
         if bet_dir is None:
             continue
         
@@ -24195,6 +24239,9 @@ def backtest_run():
         "p21_gate4_no5": "P2.1 Full + Gate ≥+4 (skip 5)",
         "p28": "P2.8 Candle-First",
         "p29": "P2.9 BlackRock (P2.1+candle)",
+        "sma15m": "15M SMA Direction (all)",
+        "sma15m_gate4": "15M SMA + SV3 Gate ≥+4",
+        "sma15m_skip35": "15M SMA skip score 3,5",
     }
     strat_name = strat_names.get(strategy, strategy)
     
