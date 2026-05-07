@@ -891,7 +891,7 @@ def _poly_alpha3_calc_stake(pool_balance):
 # Independent thread, no scanner dependency
 # ═══════════════════════════════════════════════════════════
 
-_poly_alpha41_state = {"balance": 130.00}
+_poly_alpha41_state = {"balance": 130.00, "enabled": False}  # PAUSED — only Bot2 trades
 _sv21_paper_state = {"balance": 100.00}
 _poly_alpha4_state = {
     "enabled": True,
@@ -20246,7 +20246,7 @@ def run_poly_scan():
                                 _a4d_scan_dir = poly_side  # "UP" or "DOWN"
                                 _a4d_dedup_key = "{}_{}_dyn".format(asset, _a4d_boundary_ts)
                                 
-                                if _a4d_dedup_key not in _a4_dynamic_traded:
+                                if _a4d_dedup_key not in _a4_dynamic_traded and _alpha_state.get("enabled", False):
                                     # Check A4 direction lock
                                     _a4d_locks = _a4_direction_lock.get(_a4d_boundary_ts, {})
                                     _a4d_lock = _a4d_locks.get(asset)
