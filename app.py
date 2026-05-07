@@ -2039,29 +2039,8 @@ def _sniper_thread():
             # BTC 1H already refreshed in loop above (BTC is in SNIPER_ASSETS)
             # Total time: ~1.6s for 8 Binance calls — well within 30s window
 
-            snipe_targets = []
-            _sniper_debug = []
-            for asset in SNIPER_ASSETS:
-                direction, signals_agree, ind_str, _confidence = _sniper_get_direction(asset, "15m")
-                if direction and signals_agree >= 2:
-                    _sniper_debug.append("{}={}".format(asset, direction))
-                    snipe_targets.append({
-                        "asset": asset,
-                        "direction": direction,
-                        "signals_agree": signals_agree,
-                        "indicators": ind_str,
-                    })
-
-            # ── Original A4: fire all qualified targets (no filter) ──
-            if not snipe_targets:
-                print("SNIPER: 0 targets at boundary | cache: {}".format(
-                    {a: bool(_indicator_cache.get("{}_15m".format(a))) for a in SNIPER_ASSETS}))
-                _time.sleep(60)
-                continue
-
-            print("SNIPER: {} targets qualified: {}".format(
-                len(snipe_targets),
-                ", ".join("{}={}".format(t["asset"], t["direction"]) for t in snipe_targets)))
+            # ── snipe_targets built AFTER boundary (T+0.3s) using Chainlink-settled cache ──
+            # Placeholder — targets built below after boundary wait + Chainlink update
 
             # Calculate next 15M boundary
             now = datetime.now(timezone.utc)
@@ -2206,6 +2185,9 @@ def _sniper_thread():
             # SV2 already scored at T-35s (before cache clear)
             
             # ── T+0.3s: SV2 CHAINLINK — update SMA cache with settled data, then score ──
+            # Wait 0.8s extra to ensure we're past the boundary (A4 fires at T-0.5s)
+            import time as _sv2_time
+            _sv2_time.sleep(0.8)
             _sv2_chainlink_count = 0
             try:
                 _sv2_now_str = datetime.now(timezone.utc).isoformat()
@@ -2259,7 +2241,33 @@ def _sniper_thread():
             except Exception as _sv2_cl_err:
                 print("SV2 Chainlink error: {}".format(_sv2_cl_err))
 
-            # ── T+0: FIRE A4 ORDERS at 50¢ (with SV3 gatekeeper) ──
+            # ── T+0.3s: A4 builds targets using Chainlink-settled cache ──
+            # _pair_sma_cache and _btc_trend_cache were just updated by SV2 Chainlink block
+            # _sniper_get_direction now reads settled data
+            snipe_targets = []
+            _sniper_debug = []
+            for asset in SNIPER_ASSETS:
+                direction, signals_agree, ind_str, _confidence = _sniper_get_direction(asset, "15m")
+                if direction and signals_agree >= 2:
+                    _sniper_debug.append("{}={}".format(asset, direction))
+                    snipe_targets.append({
+                        "asset": asset,
+                        "direction": direction,
+                        "signals_agree": signals_agree,
+                        "indicators": ind_str,
+                    })
+
+            if not snipe_targets:
+                print("SNIPER: 0 targets at boundary (Chainlink-settled) | cache: {}".format(
+                    {a: bool(_indicator_cache.get("{}_15m".format(a))) for a in SNIPER_ASSETS}))
+                _time.sleep(60)
+                continue
+
+            print("SNIPER CHAINLINK: {} targets qualified: {}".format(
+                len(snipe_targets),
+                ", ".join("{}={}".format(t["asset"], t["direction"]) for t in snipe_targets)))
+
+            # ── T+0.5s: FIRE A4 ORDERS at 50¢ (with SV3 gatekeeper) ──
             fired_results = []
             for target in snipe_targets:
                 _fa4_asset = target["asset"]
