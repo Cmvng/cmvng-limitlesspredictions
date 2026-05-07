@@ -231,7 +231,7 @@ FAVOURITE_HOURLY = ["ADA", "BNB", "DOGE"]
 # ─── ALPHA UNIFIED TRADING SYSTEM ───
 # One pool, tiered staking by multi-bot agreement
 _alpha_state = {
-    "enabled": True,
+    "enabled": False,  # PAUSED — only Bot2 Chainlink Sniper trades live
     "balance": 100.0,
     "peak_balance": 100.0,
     "starting_balance": 100.0,
@@ -19344,10 +19344,9 @@ try:
         _poly_alpha3_state["peak_balance"] = 100.0
     _poly_alpha3_state["starting_balance"] = 100.0
     _poly_alpha3_state["floor_balance"] = 5.0
-    _poly_alpha3_state["enabled"] = True
+    _poly_alpha3_state["enabled"] = False  # PAUSED — only Bot2 Chainlink Sniper trades live
     _save_bot_balance("poly_alpha3", _poly_alpha3_state)
-    print("POLY ALPHA 3.0: ${:.2f} pool | ENABLED — Pure P2.3 (59.6% WR proven)".format(
-        _poly_alpha3_state["balance"]))
+    print("POLY ALPHA 3.0: PAUSED — only Bot2 Chainlink Sniper trades live")
     _poly_alpha3_load_recent()
 
     _poly_alpha_load_recent_trades()
