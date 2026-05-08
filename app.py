@@ -836,25 +836,21 @@ def _p29cl_calc_dist(asset, chainlink_close):
     
     return prob_pct, zone
 
-def _p29cl_get_multiplier(conf, dist_zone, dist_prob, minute, direction, asset, phase, last_all_lose, last_all_win, last_dir, btc_dir=None, is_majority_flip=False):
-    """Stake multiplier v7 — HARD REDUCES first, then PHASE BOOSTS.
+def _p29cl_get_multiplier(conf, dist_zone, dist_prob, minute, direction, asset, phase, last_all_lose, last_all_win, last_dir, btc_dir=None, is_majority_flip=False, momentum_tag=""):
+    """Stake multiplier v7.1 — hard reduces first, then phase boosts.
     
-    Critical fix: REDUCE checks run BEFORE phase boosts.
-    A FLIP boundary with EXTREME_UP(97) gets 0.4x not 2.0x.
-    
-    CASCADE ORDER:
-    1. HARD REDUCES (asset, dist, boundary) — non-negotiable
-    2. PHASE BOOSTS (FLIP, EXHAUST) — only if no reduce triggered
-    3. T1 BOOSTS (DOWN_NEUTRAL, UP_NEUTRAL)
-    4. NORMAL
-    
-    Returns: (multiplier, tier_label)
+    Added: REDUCE_EXHAUSTION when momentum engine flags exhaustion/doji.
     """
     _is_strong = minute in (15, 45)
     _btc_selling = (btc_dir == "SELL")
     _btc_buying = (btc_dir == "BUY")
+    _tag_upper = str(momentum_tag).upper()
     
     # ═══ STEP 1: HARD REDUCES (always checked first) ═══
+    
+    # Momentum engine flagged exhaustion — signal contradicting itself
+    if ("EXHAUST" in _tag_upper or "DOJI" in _tag_upper) and conf == "LOW":
+        return 0.4, "REDUCE_EXHAUSTION"
     
     # DOGE/BNB/HYPE: unproven, 32-38% WR
     if asset in ("DOGE", "BNB", "HYPE"):
@@ -1400,7 +1396,8 @@ def _bot2_sniper_thread():
                             _p29cl_bnd_minute, _p29cl_dir, _p29cl_asset,
                             _p29cl_phase, _p29cl_last_boundary_all_lose,
                             _p29cl_last_boundary_all_win, _p29cl_last_boundary_dir,
-                            btc_dir=_p29cl_btc_dir, is_majority_flip=_p29cl_is_majority_flip)
+                            btc_dir=_p29cl_btc_dir, is_majority_flip=_p29cl_is_majority_flip,
+                            momentum_tag=_p29cl_tag)
                         
                         _p29cl_stake = round(_p29cl_base_stake * _p29cl_mult, 2)
                         _p29cl_stake = max(2.50, _p29cl_stake)  # Polymarket minimum
@@ -1428,7 +1425,7 @@ def _bot2_sniper_thread():
                         _p29cl_boundary_trades.append({
                             "asset": _p29cl_asset, "key": _p29cl_key,
                             "dir": _p29cl_dir, "stake": _p29cl_stake,
-                            "conf": _p29cl_conf,
+                            "conf": _p29cl_conf, "tag": _p29cl_tag,
                         })
                         
                         # Save to DB
@@ -1520,12 +1517,14 @@ def _bot2_sniper_thread():
                                 # Reuse the same multiplier that paper calculated
                                 _p29l_dist_prob, _p29l_dist_zone = _p29cl_calc_dist(_p29l_asset, _chainlink_prices.get(_p29l_asset, 0))
                                 _p29l_conf = _p29l_t.get("conf", "MEDIUM")
+                                _p29l_tag = _p29l_t.get("tag", "")
                                 _p29l_mult, _p29l_tier = _p29cl_get_multiplier(
                                     _p29l_conf, _p29l_dist_zone, _p29l_dist_prob,
                                     _p29cl_bnd_minute, _p29l_dir, _p29l_asset,
                                     _p29cl_phase, _p29cl_last_boundary_all_lose,
                                     _p29cl_last_boundary_all_win, _p29cl_last_boundary_dir,
-                                    btc_dir=_p29cl_btc_dir, is_majority_flip=_p29cl_is_majority_flip)
+                                    btc_dir=_p29cl_btc_dir, is_majority_flip=_p29cl_is_majority_flip,
+                                    momentum_tag=_p29l_tag)
                                 
                                 _p29l_stake = round(_p29l_base * _p29l_mult, 2)
                                 _p29l_stake = max(2.50, _p29l_stake)
@@ -23347,7 +23346,8 @@ def p29cl_page():
         tier = "NORMAL"
         for label in ["PHASE_FLIP_STRONG", "PHASE_FLIP", "PHASE_EXHAUST",
                        "T1_DOWN_NEUTRAL", "T1_UP_NEUTRAL",
-                       "REDUCE_NEW_PAIR", "REDUCE_ETH_WEAK", "REDUCE_ETH_ALL", "REDUCE_30",
+                       "REDUCE_EXHAUSTION", "REDUCE_NEW_PAIR", "REDUCE_ETH_WEAK",
+                       "REDUCE_ETH_ALL", "REDUCE_30",
                        "REDUCE_EXTREME_85", "REDUCE_EXTREME_HIGH", "REDUCE_EXTREME_LOW",
                        "REDUCE_HIGH_EXTREME", "REDUCE_COUNTER_TREND"]:
             if label in ind:
