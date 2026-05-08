@@ -1545,6 +1545,22 @@ def _bot2_sniper_thread():
                                     btc_dir=_p29cl_btc_dir, is_majority_flip=_p29cl_is_majority_flip,
                                     momentum_tag=_p29l_tag)
                                 
+                                # Skip confirmed losers — paper only for data
+                                _LIVE_SKIP_TIERS = {
+                                    "REDUCE_NEW_PAIR",       # 41% WR — DOGE/BNB/HYPE
+                                    "REDUCE_ETH_WEAK",       # 30% WR — ETH TRANSITION/EXTREME_UP
+                                    "REDUCE_ETH_ALL",        # ETH all zones
+                                    "REDUCE_EXTREME_LOW",    # 0% WR — DIST 0-20
+                                    "REDUCE_COUNTER_TREND",  # 29% WR — fighting BTC
+                                    "REDUCE_EXHAUSTION",     # new, no validation
+                                    "REDUCE_30",             # 53% WR — thin edge
+                                    "REDUCE_EXTREME_85",     # 52% WR — unproven
+                                }
+                                if _p29l_tier in _LIVE_SKIP_TIERS:
+                                    print("P29CL LIVE SKIP: {} {} tier={} (paper only)".format(
+                                        _p29l_dir, _p29l_asset, _p29l_tier))
+                                    continue
+                                
                                 _p29l_stake = round(_p29l_base * _p29l_mult, 2)
                                 _p29l_stake = max(2.50, _p29l_stake)
                                 _p29l_stake = min(_p29l_stake, _p29cl_live_state["max_stake"])
