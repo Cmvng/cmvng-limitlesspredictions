@@ -2951,8 +2951,18 @@ def _sniper_thread():
                     _fa4_signed = client.create_order(_fa4_args)
                     _fa4_resp = client.post_order(_fa4_signed, OrderType.GTC)
                     _fa4_oid = None
+                    _fa4_immediately_filled = False
                     if _fa4_resp:
-                        _fa4_oid = _fa4_resp.get("orderID") or _fa4_resp.get("id") or "placed"
+                        _fa4_oid = _fa4_resp.get("orderID") or _fa4_resp.get("id") or None
+                        _fa4_status = (_fa4_resp.get("status") or "").upper()
+                        _fa4_matched = float(_fa4_resp.get("sizeMatched") or _fa4_resp.get("filledAmount") or 0)
+                        _fa4_immediately_filled = _fa4_status in ("MATCHED", "FILLED") or _fa4_matched > 0
+                        if _fa4_oid:
+                            print("A4 ORDER: {} {} oid={} status={} matched={} filled={}".format(
+                                _fa4_asset, _fa4_dir, str(_fa4_oid)[:12], _fa4_status, _fa4_matched, _fa4_immediately_filled))
+                        else:
+                            print("A4 ORDER REJECTED: {} {} resp={}".format(
+                                _fa4_asset, _fa4_dir, str(_fa4_resp)[:100]))
                     
                     fired_results.append({
                         "asset": _fa4_asset, "direction": _fa4_dir,
@@ -2963,6 +2973,7 @@ def _sniper_thread():
                         "token_id": _fa4_token,
                         "slug": _fa4_entry.get("slug", ""),
                         "condition_id": _fa4_entry.get("condition_id", ""),
+                        "immediately_filled": _fa4_immediately_filled,
                     })
                 except Exception as _fa4_e:
                     print("A4 order error {}: {}".format(_fa4_asset, _fa4_e))
@@ -2993,7 +3004,7 @@ def _sniper_thread():
                             oid=str(_fr["order_id"]) if _fr["order_id"] else "",
                             tid=_fr["token_id"],
                             cid=_fr["condition_id"], slg=_fr["slug"],
-                            fld=bool(_fr["order_id"]),
+                            fld=_fr.get("immediately_filled", False),
                             sts="Pending", out="PENDING",
                             ind=_fr["indicators"],
                             sa=_fr["agree"],
@@ -23616,10 +23627,10 @@ h2{{font-size:16px;font-weight:700;color:#1a3d2e;margin-bottom:12px}}
 @app.route("/app/a4-reset")
 def a4_reset():
     """Reset A4 pool to $100. Hit once, then it preserves balance across deploys."""
-    _poly_alpha4_state["balance"] = 100.0
-    _poly_alpha4_state["peak_balance"] = 100.0
+    _poly_alpha4_state["balance"] = 70.0
+    _poly_alpha4_state["peak_balance"] = 117.50
     _save_bot_balance("poly_alpha4", _poly_alpha4_state)
-    return '<html><head><meta http-equiv="refresh" content="2;url=/app/poly-alpha4"></head><body style="background:#0d1117;color:#4ade80;padding:20px;font-family:sans-serif">A4 pool reset to $100.00. Redirecting...</body></html>'
+    return '<html><head><meta http-equiv="refresh" content="2;url=/app/poly-alpha4"></head><body style="background:#0d1117;color:#4ade80;padding:20px;font-family:sans-serif">A4 pool reset to $70.00. Redirecting...</body></html>'
 
 
 @app.route("/app/poly-alpha4")
