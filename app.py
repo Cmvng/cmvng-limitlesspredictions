@@ -5530,6 +5530,7 @@ def init_db():
         )
     """)
     conn.run("""
+        CREATE TABLE IF NOT EXISTS poly_alpha4_trades (
             id SERIAL PRIMARY KEY,
             market_id TEXT, title TEXT, asset TEXT, timeframe TEXT,
             bet_side TEXT, stake REAL, fill_price REAL,
