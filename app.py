@@ -449,6 +449,7 @@ _p29cl_state = {
     "profit_today": 0.0,
 }
 _p29cl_traded = set()
+_p29cl_fired_boundaries = set()  # prevents entire P29CL block from running twice per boundary
 
 # Pre-fetched 15M candle series (fetched at T-22s, 6 completed candles)
 _p29cl_candle_prefetch = {}  # {"BTC": [(o,h,l,c), (o,h,l,c), ...], ...}
@@ -1322,10 +1323,16 @@ def _bot2_sniper_thread():
                 if not _p29cl_state["enabled"]:
                     continue
                 
+                # Boundary-level dedup — prevent entire block from running twice
+                _p29cl_skip_boundary = (window_ts in _p29cl_fired_boundaries)
+                if not _p29cl_skip_boundary:
+                    _p29cl_fired_boundaries.add(window_ts)
+                
                 _p29cl_now = datetime.now(timezone.utc).isoformat()
                 _p29cl_count = 0
-                _p29cl_boundary_trades = []  # track this boundary for phase update
-                _p29cl_boundary_dir = None   # main direction this boundary
+                _p29cl_paper_spent = 0.0
+                _p29cl_boundary_trades = []
+                _p29cl_boundary_dir = None
                 
                 # Get BTC direction for P2.1 and BTC trend
                 _p29cl_btc_price = _chainlink_prices.get("BTC")
@@ -1351,6 +1358,8 @@ def _bot2_sniper_thread():
                     _p29cl_last_boundary_all_lose, _p29cl_bnd_minute))
                 
                 for _p29cl_asset in P29CL_ASSETS:
+                    if _p29cl_skip_boundary:
+                        break
                     try:
                         _p29cl_price = _chainlink_prices.get(_p29cl_asset)
                         if not _p29cl_price:
@@ -1381,10 +1390,19 @@ def _bot2_sniper_thread():
                         # Calculate DIST_PROB
                         _p29cl_dist_prob, _p29cl_dist_zone = _p29cl_calc_dist(_p29cl_asset, _p29cl_price)
                         
-                        # Dedup
+                        # Dedup — check both in-memory set and DB
                         _p29cl_key = "p29cl_{}_{}".format(_p29cl_asset, window_ts)
                         if _p29cl_key in _p29cl_traded:
                             continue
+                        # Also check DB to prevent cross-restart duplicates
+                        try:
+                            _dedup_db = get_db()
+                            _dedup_rows = _dedup_db.run("SELECT id FROM p29cl_trades WHERE market_id=:mid", mid=_p29cl_key)
+                            _dedup_db.close()
+                            if _dedup_rows:
+                                _p29cl_traded.add(_p29cl_key)
+                                continue
+                        except: pass
                         
                         # Calculate stake with phase-aware multiplier
                         _p29cl_base_stake = _p29cl_calc_stake(_p29cl_state["balance"])
@@ -1418,6 +1436,7 @@ def _bot2_sniper_thread():
                         _p29cl_state["balance"] = round(_p29cl_state["balance"] - _p29cl_stake, 2)
                         _p29cl_state["trades_today"] += 1
                         _p29cl_traded.add(_p29cl_key)
+                        _p29cl_paper_spent += _p29cl_stake
                         if _p29cl_state["balance"] > _p29cl_state["peak_balance"]:
                             _p29cl_state["peak_balance"] = _p29cl_state["balance"]
                         
