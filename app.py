@@ -473,7 +473,24 @@ _p29cl_phase = "RANGE"              # TREND / EXHAUST / RANGE
 _p29cl_last_boundary_dir = None     # "UP" or "DOWN" — direction of last boundary
 _p29cl_last_boundary_all_lose = False  # did ALL assets lose last boundary?
 _p29cl_last_boundary_all_win = False   # did ALL assets win last boundary?
+_p29cl_last_boundary_dominant_dir = None  # "UP" or "DOWN" — majority direction last boundary
 _p29cl_boundary_results = []        # list of (asset, outcome) for current boundary
+
+# ── P2.9CL LIVE trading state ──
+_p29cl_live_state = {
+    "enabled": False,  # DISABLED — waiting for paper validation
+    "balance": 150.0,
+    "peak_balance": 150.0,
+    "starting_balance": 150.0,
+    "floor_balance": 120.0,    # stop loss at $120 (20% drawdown)
+    "base_stake": 2.50,        # flat $2.50
+    "max_stake": 5.00,         # 2.0x cap
+    "max_per_boundary": 20.00, # $20 max exposure per boundary
+    "trades_today": 0,
+    "wins_today": 0,
+    "losses_today": 0,
+}
+_p29cl_live_traded = set()
 
 def _p29cl_momentum_score(asset, chainlink_close, p21_dir, btc_dir):
     """P2.9 Chainlink: P2.1 direction + candle analysis + momentum tiebreaker.
@@ -819,29 +836,17 @@ def _p29cl_calc_dist(asset, chainlink_close):
     
     return prob_pct, zone
 
-def _p29cl_get_multiplier(conf, dist_zone, dist_prob, minute, direction, asset, phase, last_all_lose, last_all_win, last_dir, btc_dir=None):
-    """Stake multiplier v5 — 8 rules + BTC market context.
+def _p29cl_get_multiplier(conf, dist_zone, dist_prob, minute, direction, asset, phase, last_all_lose, last_all_win, last_dir, btc_dir=None, is_majority_flip=False):
+    """Stake multiplier v7 — HARD REDUCES first, then PHASE BOOSTS.
     
-    Key insight: REDUCE_EXTREME_HIGH and T1_DOWN_NEUTRAL only work
-    in their matching market conditions. In opposite conditions they
-    lose money. BTC direction (BUY/SELL) determines market regime.
+    Critical fix: REDUCE checks run BEFORE phase boosts.
+    A FLIP boundary with EXTREME_UP(97) gets 0.4x not 2.0x.
     
-    BOOST:
-    - PHASE_FLIP_STRONG: 2.0x (dir changed + :15/:45, 85% WR)
-    - PHASE_FLIP: 1.5x (dir changed + :00/:30, 85% WR)
-    - PHASE_EXHAUST: 1.5x (3+ assets lost, 63% WR)
-    - T1_DOWN_NEUTRAL: 1.5x (DOWN + NEUTRAL + BTC=SELL, 86% WR)
-    - T1_UP_NEUTRAL: 1.5x (UP + NEUTRAL + BTC=BUY, mirror rule)
-    
-    REDUCE:
-    - REDUCE_NEW_PAIR: 0.4x (DOGE/BNB/HYPE, 32% WR)
-    - REDUCE_ETH_WEAK: 0.4x (ETH + TRANSITION/EXTREME_UP, 18% WR)
-    - REDUCE_30: 0.4x (:30 boundaries, 54% WR)
-    - REDUCE_EXTREME_HIGH: 0.4x (DIST 80+ AND BTC=SELL only)
-    - REDUCE_EXTREME_LOW: 0.4x (DIST 0-20, 0% WR)
-    - REDUCE_HIGH_EXTREME: 0.4x (HIGH conf + non-NEUTRAL, 33-55% WR)
-    
-    NORMAL: 1.0x (everything else, 53-55% WR)
+    CASCADE ORDER:
+    1. HARD REDUCES (asset, dist, boundary) — non-negotiable
+    2. PHASE BOOSTS (FLIP, EXHAUST) — only if no reduce triggered
+    3. T1 BOOSTS (DOWN_NEUTRAL, UP_NEUTRAL)
+    4. NORMAL
     
     Returns: (multiplier, tier_label)
     """
@@ -849,21 +854,9 @@ def _p29cl_get_multiplier(conf, dist_zone, dist_prob, minute, direction, asset, 
     _btc_selling = (btc_dir == "SELL")
     _btc_buying = (btc_dir == "BUY")
     
-    # === PHASE OVERRIDES (highest priority) ===
+    # ═══ STEP 1: HARD REDUCES (always checked first) ═══
     
-    # Direction flip — 85% WR, strongest signal
-    if last_dir and direction != last_dir:
-        if _is_strong:
-            return 2.0, "PHASE_FLIP_STRONG"
-        return 1.5, "PHASE_FLIP"
-    
-    # After 3+ assets all lost — exhaustion recovery
-    if last_all_lose:
-        return 1.5, "PHASE_EXHAUST"
-    
-    # === REDUCE RULES ===
-    
-    # DOGE/BNB/HYPE: unproven, 32% WR
+    # DOGE/BNB/HYPE: unproven, 32-38% WR
     if asset in ("DOGE", "BNB", "HYPE"):
         return 0.4, "REDUCE_NEW_PAIR"
     
@@ -871,20 +864,19 @@ def _p29cl_get_multiplier(conf, dist_zone, dist_prob, minute, direction, asset, 
     if asset == "ETH" and dist_zone in ("TRANSITION", "EXTREME_UP"):
         return 0.4, "REDUCE_ETH_WEAK"
     
-    # :30 boundary — 54% WR, pool protection
+    # :30 boundary — 50% WR
     if minute == 30:
         return 0.4, "REDUCE_30"
     
-    # DIST 80+ — context dependent
-    # In dump (BTC=SELL): exhaustion, 47% WR → reduce
-    # In pump (BTC=BUY): confirmation, 64% WR → normal
-    if dist_prob >= 80:
-        if _btc_selling:
-            return 0.4, "REDUCE_EXTREME_HIGH"
-        else:
-            return 1.0, "NORMAL"
+    # DIST 85+ with HIGH/MEDIUM — unconditional exhaustion
+    if dist_prob >= 85 and conf in ("HIGH", "MEDIUM"):
+        return 0.4, "REDUCE_EXTREME_85"
     
-    # DIST 0-20 — move already done, 0% WR
+    # DIST 80+ in dump
+    if dist_prob >= 80 and _btc_selling:
+        return 0.4, "REDUCE_EXTREME_HIGH"
+    
+    # DIST 0-20 — move already done
     if dist_prob <= 20:
         return 0.4, "REDUCE_EXTREME_LOW"
     
@@ -892,23 +884,35 @@ def _p29cl_get_multiplier(conf, dist_zone, dist_prob, minute, direction, asset, 
     if conf == "HIGH" and dist_zone != "NEUTRAL":
         return 0.4, "REDUCE_HIGH_EXTREME"
     
-    # === BOOST RULES (market-context aware) ===
+    # Counter-trend: betting against BTC in NEUTRAL — 29% WR
+    if dist_zone == "NEUTRAL" and direction == "DOWN" and _btc_buying:
+        return 0.4, "REDUCE_COUNTER_TREND"
+    if dist_zone == "NEUTRAL" and direction == "UP" and _btc_selling:
+        return 0.4, "REDUCE_COUNTER_TREND"
     
-    # DOWN + NEUTRAL + BTC selling — 86% WR, confirmed dump edge
+    # ═══ STEP 2: PHASE BOOSTS (only reached if no reduce triggered) ═══
+    
+    # Majority direction flip — 67-69% WR
+    if is_majority_flip and last_dir and direction != last_dir:
+        if _is_strong:
+            return 2.0, "PHASE_FLIP_STRONG"
+        return 1.5, "PHASE_FLIP"
+    
+    # After 3+ assets all lost — exhaustion recovery, 63% WR
+    if last_all_lose:
+        return 1.5, "PHASE_EXHAUST"
+    
+    # ═══ STEP 3: T1 BOOSTS ═══
+    
+    # DOWN + NEUTRAL + BTC selling — 81% WR
     if direction == "DOWN" and dist_zone == "NEUTRAL" and _btc_selling:
         return 1.5, "T1_DOWN_NEUTRAL"
     
-    # UP + NEUTRAL + BTC buying — mirror rule, pump edge
+    # UP + NEUTRAL + BTC buying — 59% WR
     if direction == "UP" and dist_zone == "NEUTRAL" and _btc_buying:
         return 1.5, "T1_UP_NEUTRAL"
     
-    # DOWN in UP market or UP in DOWN market with NEUTRAL — fighting trend
-    if dist_zone == "NEUTRAL" and direction == "DOWN" and _btc_buying:
-        return 0.8, "REDUCE_COUNTER_TREND"
-    if dist_zone == "NEUTRAL" and direction == "UP" and _btc_selling:
-        return 0.8, "REDUCE_COUNTER_TREND"
-    
-    # === EVERYTHING ELSE ===
+    # ═══ STEP 4: EVERYTHING ELSE ═══
     return 1.0, "NORMAL"
 
 
@@ -1336,10 +1340,17 @@ def _bot2_sniper_thread():
                 
                 # Log phase state
                 _p29cl_bnd_minute = datetime.now(timezone.utc).minute
-                print("P29CL PHASE: {} | last_dir={} all_lose={} all_win={} | :{:02d}".format(
-                    _p29cl_phase, _p29cl_last_boundary_dir or "NONE",
-                    _p29cl_last_boundary_all_lose, _p29cl_last_boundary_all_win,
-                    _p29cl_bnd_minute))
+                
+                # Detect majority flip: compare current BTC direction to last boundary's dominant direction
+                _p29cl_current_dominant = "UP" if _p29cl_btc_dir == "BUY" else "DOWN" if _p29cl_btc_dir == "SELL" else None
+                _p29cl_is_majority_flip = False
+                if _p29cl_last_boundary_dominant_dir and _p29cl_current_dominant:
+                    _p29cl_is_majority_flip = (_p29cl_current_dominant != _p29cl_last_boundary_dominant_dir)
+                
+                print("P29CL PHASE: {} | last_dom={} curr_dom={} flip={} all_lose={} | :{:02d}".format(
+                    _p29cl_phase, _p29cl_last_boundary_dominant_dir or "NONE",
+                    _p29cl_current_dominant or "NONE", _p29cl_is_majority_flip,
+                    _p29cl_last_boundary_all_lose, _p29cl_bnd_minute))
                 
                 for _p29cl_asset in P29CL_ASSETS:
                     try:
@@ -1387,7 +1398,7 @@ def _bot2_sniper_thread():
                             _p29cl_bnd_minute, _p29cl_dir, _p29cl_asset,
                             _p29cl_phase, _p29cl_last_boundary_all_lose,
                             _p29cl_last_boundary_all_win, _p29cl_last_boundary_dir,
-                            btc_dir=_p29cl_btc_dir)
+                            btc_dir=_p29cl_btc_dir, is_majority_flip=_p29cl_is_majority_flip)
                         
                         _p29cl_stake = round(_p29cl_base_stake * _p29cl_mult, 2)
                         _p29cl_stake = max(2.50, _p29cl_stake)  # Polymarket minimum
@@ -1414,7 +1425,8 @@ def _bot2_sniper_thread():
                         # Track for phase update
                         _p29cl_boundary_trades.append({
                             "asset": _p29cl_asset, "key": _p29cl_key,
-                            "dir": _p29cl_dir, "stake": _p29cl_stake
+                            "dir": _p29cl_dir, "stake": _p29cl_stake,
+                            "conf": _p29cl_conf,
                         })
                         
                         # Save to DB
@@ -1466,6 +1478,147 @@ def _bot2_sniper_thread():
                         len(_p29cl_candle_prefetch), len(_chainlink_prices)))
             except Exception as _p29cl_err:
                 print("P29CL error: {}".format(_p29cl_err))
+
+            # ── P2.9CL LIVE: Real orders using same signals as paper ──
+            try:
+                if _p29cl_live_state["enabled"] and _p29cl_boundary_trades:
+                    _p29l_count = 0
+                    _p29l_boundary_spent = 0.0
+                    
+                    # Check stop loss
+                    if _p29cl_live_state["balance"] <= _p29cl_live_state["floor_balance"]:
+                        _p29cl_live_state["enabled"] = False
+                        print("P29CL LIVE STOPPED: balance ${:.2f} hit floor ${:.2f}".format(
+                            _p29cl_live_state["balance"], _p29cl_live_state["floor_balance"]))
+                    else:
+                        for _p29l_t in _p29cl_boundary_trades:
+                            try:
+                                _p29l_asset = _p29l_t["asset"]
+                                _p29l_dir = _p29l_t["dir"]
+                                _p29l_key = "p29cl_live_{}_{}".format(_p29l_asset, window_ts)
+                                
+                                if _p29l_key in _p29cl_live_traded:
+                                    continue
+                                
+                                # Only trade core 4 live — DOGE/BNB/HYPE paper only
+                                if _p29l_asset not in ("BTC", "ETH", "SOL", "XRP"):
+                                    continue
+                                
+                                # Get token info
+                                _p29l_entry = _p29cl_token_map.get(_p29l_asset, {})
+                                if not _p29l_entry:
+                                    _p29l_entry = token_map.get(_p29l_asset, {})
+                                _p29l_token = _p29l_entry.get("up_token" if _p29l_dir == "UP" else "down_token", "")
+                                if not _p29l_token:
+                                    continue
+                                
+                                # Calculate live stake (flat base + multiplier)
+                                _p29l_base = _p29cl_live_state["base_stake"]
+                                
+                                # Reuse the same multiplier that paper calculated
+                                _p29l_dist_prob, _p29l_dist_zone = _p29cl_calc_dist(_p29l_asset, _chainlink_prices.get(_p29l_asset, 0))
+                                _p29l_conf = _p29l_t.get("conf", "MEDIUM")
+                                _p29l_mult, _p29l_tier = _p29cl_get_multiplier(
+                                    _p29l_conf, _p29l_dist_zone, _p29l_dist_prob,
+                                    _p29cl_bnd_minute, _p29l_dir, _p29l_asset,
+                                    _p29cl_phase, _p29cl_last_boundary_all_lose,
+                                    _p29cl_last_boundary_all_win, _p29cl_last_boundary_dir,
+                                    btc_dir=_p29cl_btc_dir, is_majority_flip=_p29cl_is_majority_flip)
+                                
+                                _p29l_stake = round(_p29l_base * _p29l_mult, 2)
+                                _p29l_stake = max(2.50, _p29l_stake)
+                                _p29l_stake = min(_p29l_stake, _p29cl_live_state["max_stake"])
+                                
+                                # Per-boundary cap
+                                if _p29l_boundary_spent + _p29l_stake > _p29cl_live_state["max_per_boundary"]:
+                                    _p29l_stake = max(2.50, round(_p29cl_live_state["max_per_boundary"] - _p29l_boundary_spent, 2))
+                                    if _p29l_stake < 2.50:
+                                        continue
+                                
+                                # Balance check
+                                if _p29l_stake > _p29cl_live_state["balance"] - _p29cl_live_state["floor_balance"]:
+                                    continue
+                                
+                                # Place real GTC order
+                                _p29l_oid = None
+                                _p29l_filled = False
+                                try:
+                                    _p29l_price = 0.50
+                                    _p29l_shares = round(_p29l_stake / _p29l_price, 4)
+                                    _p29l_args = OrderArgs(
+                                        token_id=str(_p29l_token),
+                                        price=_p29l_price,
+                                        size=_p29l_shares,
+                                        side=BUY,
+                                    )
+                                    _p29l_signed = client.create_order(_p29l_args)
+                                    _p29l_resp = client.post_order(_p29l_signed, OrderType.GTC)
+                                    if _p29l_resp:
+                                        _p29l_oid = _p29l_resp.get("orderID") or _p29l_resp.get("id") or None
+                                        _p29l_status = (_p29l_resp.get("status") or "").upper()
+                                        _p29l_matched = float(_p29l_resp.get("sizeMatched") or 0)
+                                        _p29l_filled = _p29l_status in ("MATCHED", "FILLED") or _p29l_matched > 0
+                                except Exception as _p29l_oe:
+                                    print("P29CL LIVE order error {}: {}".format(_p29l_asset, _p29l_oe))
+                                
+                                # Update balance
+                                _p29cl_live_state["balance"] = round(_p29cl_live_state["balance"] - _p29l_stake, 2)
+                                _p29cl_live_state["trades_today"] += 1
+                                _p29cl_live_traded.add(_p29l_key)
+                                _p29l_boundary_spent += _p29l_stake
+                                if _p29cl_live_state["balance"] > _p29cl_live_state["peak_balance"]:
+                                    _p29cl_live_state["peak_balance"] = _p29cl_live_state["balance"]
+                                
+                                # Save to DB
+                                try:
+                                    _p29l_db = get_db()
+                                    _p29l_db.run("""INSERT INTO p29cl_live_trades
+                                        (market_id, title, asset, bet_side, stake, fill_price,
+                                         pool_after, indicators, confidence, momentum_score,
+                                         dist_prob, dist_zone, tier, multiplier,
+                                         order_id, token_id, condition_id, slug, filled,
+                                         status, outcome, fired_at)
+                                        VALUES (:mid, :ttl, :ast, :bs, :stk, 0.50,
+                                                :pa, :ind, :conf, :ms,
+                                                :dp, :dz, :tier, :mult,
+                                                :oid, :tid, :cid, :slg, :fld,
+                                                'Pending', 'PENDING', :fa)""",
+                                        mid=_p29l_key,
+                                        ttl="P29CL LIVE {} {} 15M".format(_p29l_asset, _p29l_dir),
+                                        ast=_p29l_asset, bs=_p29l_dir, stk=_p29l_stake,
+                                        pa=_p29cl_live_state["balance"],
+                                        ind="[{}] {} | DIST={}({}) | {} | PHASE={}".format(
+                                            _p29l_conf, _p29l_tier, _p29l_dist_zone, _p29l_dist_prob,
+                                            _p29l_dir, _p29cl_phase),
+                                        conf=_p29l_conf, ms=0,
+                                        dp=_p29l_dist_prob, dz=_p29l_dist_zone,
+                                        tier=_p29l_tier, mult=_p29l_mult,
+                                        oid=str(_p29l_oid) if _p29l_oid else "",
+                                        tid=_p29l_token,
+                                        cid=_p29l_entry.get("condition_id", ""),
+                                        slg=_p29l_entry.get("slug", ""),
+                                        fld=_p29l_filled,
+                                        fa=datetime.now(timezone.utc).isoformat())
+                                    _p29l_db.close()
+                                except Exception as _p29l_dbe:
+                                    print("P29CL LIVE DB error {}: {}".format(_p29l_asset, _p29l_dbe))
+                                
+                                _p29l_count += 1
+                                print("P29CL LIVE: {} {} ${:.2f} {}({:.1f}x) oid={} | pool=${:.2f}".format(
+                                    _p29l_dir, _p29l_asset, _p29l_stake,
+                                    _p29l_tier, _p29l_mult,
+                                    str(_p29l_oid)[:12] if _p29l_oid else "NONE",
+                                    _p29cl_live_state["balance"]))
+                                
+                            except Exception as _p29l_ae:
+                                print("P29CL LIVE error {}: {}".format(_p29l_asset, _p29l_ae))
+                        
+                        if _p29l_count > 0:
+                            _save_bot_balance("p29cl_live", _p29cl_live_state)
+                            print("P29CL LIVE: {} orders placed | ${:.2f} spent | pool=${:.2f}".format(
+                                _p29l_count, _p29l_boundary_spent, _p29cl_live_state["balance"]))
+            except Exception as _p29l_err:
+                print("P29CL LIVE error: {}".format(_p29l_err))
 
             _time.sleep(60)  # Wait before next cycle
             
@@ -3009,27 +3162,10 @@ def _sniper_thread():
                     _fa4_dir, _fa4_asset, _fa4_ind[:60]))
                 
                 try:
-                    _fa4_args = OrderArgs(
-                        token_id=str(_fa4_token),
-                        price=_fa4_price,
-                        size=_fa4_shares,
-                        side=BUY,
-                    )
-                    _fa4_signed = client.create_order(_fa4_args)
-                    _fa4_resp = client.post_order(_fa4_signed, OrderType.GTC)
+                    # A4 PAUSED — paper mode only, P2.9CL Live replaces it
                     _fa4_oid = None
                     _fa4_immediately_filled = False
-                    if _fa4_resp:
-                        _fa4_oid = _fa4_resp.get("orderID") or _fa4_resp.get("id") or None
-                        _fa4_status = (_fa4_resp.get("status") or "").upper()
-                        _fa4_matched = float(_fa4_resp.get("sizeMatched") or _fa4_resp.get("filledAmount") or 0)
-                        _fa4_immediately_filled = _fa4_status in ("MATCHED", "FILLED") or _fa4_matched > 0
-                        if _fa4_oid:
-                            print("A4 ORDER: {} {} oid={} status={} matched={} filled={}".format(
-                                _fa4_asset, _fa4_dir, str(_fa4_oid)[:12], _fa4_status, _fa4_matched, _fa4_immediately_filled))
-                        else:
-                            print("A4 ORDER REJECTED: {} {} resp={}".format(
-                                _fa4_asset, _fa4_dir, str(_fa4_resp)[:100]))
+                    print("A4 PAPER: {} {} (live orders paused)".format(_fa4_dir, _fa4_asset))
                     
                     fired_results.append({
                         "asset": _fa4_asset, "direction": _fa4_dir,
@@ -5379,7 +5515,21 @@ def init_db():
     except:
         pass
     conn.run("""
-        CREATE TABLE IF NOT EXISTS poly_alpha4_trades (
+        CREATE TABLE IF NOT EXISTS p29cl_live_trades (
+            id SERIAL PRIMARY KEY,
+            market_id TEXT, title TEXT, asset TEXT,
+            bet_side TEXT, stake REAL, fill_price REAL DEFAULT 0.50,
+            pool_after REAL, payout REAL, indicators TEXT,
+            confidence TEXT, momentum_score INTEGER,
+            dist_prob INTEGER DEFAULT 50, dist_zone TEXT DEFAULT 'NEUTRAL',
+            tier TEXT, multiplier REAL DEFAULT 1.0,
+            order_id TEXT, token_id TEXT, condition_id TEXT, slug TEXT,
+            filled BOOLEAN DEFAULT FALSE,
+            status TEXT DEFAULT 'Pending', outcome TEXT DEFAULT 'PENDING',
+            fired_at TEXT, resolved_at TEXT
+        )
+    """)
+    conn.run("""
             id SERIAL PRIMARY KEY,
             market_id TEXT, title TEXT, asset TEXT, timeframe TEXT,
             bet_side TEXT, stake REAL, fill_price REAL,
@@ -20077,6 +20227,16 @@ if SIGNALS_DB_URL:
         _p29cl_state["peak_balance"] = _saved_p29cl.get("peak_balance", _saved_p29cl["balance"])
         print("P29CL: restored ${:.2f} from DB".format(_p29cl_state["balance"]))
     _save_bot_balance("p29cl", _p29cl_state)
+    
+    # ── P2.9CL LIVE init ──
+    _saved_p29cl_live = _saved_balances.get("p29cl_live", {})
+    if _saved_p29cl_live and _saved_p29cl_live.get("balance", 0) > 0:
+        _p29cl_live_state["balance"] = _saved_p29cl_live["balance"]
+        _p29cl_live_state["peak_balance"] = _saved_p29cl_live.get("peak_balance", _saved_p29cl_live["balance"])
+        print("P29CL LIVE: restored ${:.2f} from DB".format(_p29cl_live_state["balance"]))
+    _save_bot_balance("p29cl_live", _p29cl_live_state)
+    print("P29CL LIVE: ${:.2f} pool | $2.50 flat | $5 max | $20/bnd cap | LIVE".format(
+        _p29cl_live_state["balance"]))
     threading.Thread(target=_bot2_sniper_thread, daemon=True).start()
     print("BOT2 SNIPER thread launched")
     
@@ -22527,6 +22687,11 @@ def _resolve_p29cl_trades():
                             _p29cl_last_boundary_all_lose, _p29cl_last_boundary_all_win))
                         _p29cl_last_boundary_dir = _bnd_dir
                         
+                        # Track dominant direction for majority flip detection
+                        _bnd_up_count = sum(1 for t in _bnd_trades if t.get("bet_side") == "UP")
+                        _bnd_down_count = _bnd_total - _bnd_up_count
+                        _p29cl_last_boundary_dominant_dir = "UP" if _bnd_up_count > _bnd_down_count else "DOWN"
+                        
                         # Phase transitions
                         if _p29cl_last_boundary_all_lose:
                             _p29cl_phase = "EXHAUST"
@@ -22543,6 +22708,85 @@ def _resolve_p29cl_trades():
         return resolved
     except Exception as e:
         print("P29CL resolve error: {}".format(e)); return 0
+
+def _resolve_p29cl_live_trades():
+    """Resolve P2.9CL LIVE trades — same logic as paper."""
+    try:
+        conn = get_db()
+        rows = conn.run("SELECT * FROM p29cl_live_trades WHERE status='Pending' ORDER BY id")
+        cols = [c['name'] for c in conn.columns]
+        items = [dict(zip(cols, r)) for r in rows]
+        conn.close()
+        if not items: return 0
+        now = datetime.now(timezone.utc)
+        resolved = 0
+        for p in items:
+            try:
+                if not p.get("fired_at"): continue
+                fired = datetime.fromisoformat(str(p["fired_at"]).replace("+00:00","").replace("Z","")[:26])
+                if fired.tzinfo is None: fired = fired.replace(tzinfo=timezone.utc)
+                m15 = (fired.minute // 15) * 15
+                window_start = fired.replace(minute=m15, second=0, microsecond=0)
+                expiry = window_start + timedelta(minutes=15)
+                if now < expiry + timedelta(minutes=2): continue
+                stake = float(p.get("stake") or 2.50)
+                won = None
+                slug = p.get("slug", "")
+                bs = p.get("bet_side", "UP")
+                try:
+                    import requests as req
+                    if slug:
+                        r = req.get("https://gamma-api.polymarket.com/markets/slug/{}".format(slug), timeout=8)
+                        if r.status_code == 200:
+                            md = r.json()
+                            ops = md.get("outcomePrices")
+                            if ops:
+                                if isinstance(ops, str):
+                                    try: ops = json.loads(ops)
+                                    except: ops = None
+                                if isinstance(ops, list) and len(ops) >= 2:
+                                    p0 = float(ops[0]); p1 = float(ops[1])
+                                    _oc = md.get("outcomes")
+                                    if isinstance(_oc, str):
+                                        try: _oc = json.loads(_oc)
+                                        except: _oc = None
+                                    _up_idx = 0
+                                    if isinstance(_oc, list) and len(_oc) >= 2:
+                                        o0 = str(_oc[0]).lower().strip()
+                                        if o0 in ("no", "down", "below"): _up_idx = 1
+                                    if _up_idx == 0:
+                                        if p0 >= 0.95: won = (bs == "UP")
+                                        elif p1 >= 0.95: won = (bs == "DOWN")
+                                    else:
+                                        if p1 >= 0.95: won = (bs == "UP")
+                                        elif p0 >= 0.95: won = (bs == "DOWN")
+                except: pass
+                if won is None:
+                    if now > expiry + timedelta(hours=1): won = False
+                    else: continue
+                fill = float(p.get("fill_price") or 0.50)
+                payout = round(stake / fill, 4) if won else 0
+                c3 = get_db()
+                c3.run("UPDATE p29cl_live_trades SET status=:s,outcome=:o,resolved_at=:r,payout=:p WHERE id=:i",
+                    s="Won" if won else "Lost", o="WIN" if won else "LOSS",
+                    r=now.isoformat(), p=payout, i=p["id"])
+                c3.close()
+                resolved += 1
+                if won:
+                    _p29cl_live_state["balance"] = round(_p29cl_live_state["balance"] + payout, 2)
+                    _p29cl_live_state["wins_today"] += 1
+                else:
+                    _p29cl_live_state["losses_today"] += 1
+                if _p29cl_live_state["balance"] > _p29cl_live_state["peak_balance"]:
+                    _p29cl_live_state["peak_balance"] = _p29cl_live_state["balance"]
+                _pnl = "+${:.2f}".format(payout - stake) if won else "-${:.2f}".format(stake)
+                print("P29CL LIVE #{} {}: {} | pool=${:.2f}".format(p["id"], "WIN" if won else "LOSS", _pnl, _p29cl_live_state["balance"]))
+                _save_bot_balance("p29cl_live", _p29cl_live_state)
+            except Exception as e:
+                print("P29CL LIVE resolve error #{}: {}".format(p.get("id"), e))
+        return resolved
+    except Exception as e:
+        print("P29CL LIVE resolve error: {}".format(e)); return 0
 
 def _poly_scan_loop():
     """Background thread for Polymarket scanning and resolving."""
@@ -22611,6 +22855,12 @@ def _poly_scan_loop():
                 print("P29CL resolved: {}".format(_p29cl_resolved))
         except Exception as e:
             print("P29CL resolve error: {}".format(e))
+        try:
+            _p29cl_live_resolved = _resolve_p29cl_live_trades()
+            if _p29cl_live_resolved:
+                print("P29CL LIVE resolved: {}".format(_p29cl_live_resolved))
+        except Exception as e:
+            print("P29CL LIVE resolve error: {}".format(e))
         try:
             _sv3_resolved = _resolve_sv3_trades()
             if _sv3_resolved:
@@ -23107,8 +23357,8 @@ def p29cl_page():
         for label in ["PHASE_FLIP_STRONG", "PHASE_FLIP", "PHASE_EXHAUST",
                        "T1_DOWN_NEUTRAL", "T1_UP_NEUTRAL",
                        "REDUCE_NEW_PAIR", "REDUCE_ETH_WEAK", "REDUCE_30",
-                       "REDUCE_EXTREME_HIGH", "REDUCE_EXTREME_LOW", "REDUCE_HIGH_EXTREME",
-                       "REDUCE_COUNTER_TREND"]:
+                       "REDUCE_EXTREME_85", "REDUCE_EXTREME_HIGH", "REDUCE_EXTREME_LOW",
+                       "REDUCE_HIGH_EXTREME", "REDUCE_COUNTER_TREND"]:
             if label in ind:
                 tier = label
                 break
@@ -24389,7 +24639,7 @@ def csv_export(table_name):
         "paper26_trades", "paper36_trades", "paper27_trades", "paper37_trades",
         "paper28_trades", "paper29_trades", "paper210_trades",
         "alpha_trades", "poly_alpha3_trades", "limitless_sniper_trades",
-        "poly_trades", "poly_alpha41_trades", "bot2_sniper_trades", "p29cl_trades", "poly_alpha4_trades",
+        "poly_trades", "poly_alpha41_trades", "bot2_sniper_trades", "p29cl_trades", "p29cl_live_trades", "poly_alpha4_trades",
     ]
     if table_name not in allowed:
         return "Table not allowed. Allowed: {}".format(", ".join(allowed)), 400
