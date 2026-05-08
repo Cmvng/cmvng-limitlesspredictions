@@ -453,6 +453,21 @@ _p29cl_traded = set()
 # Pre-fetched 15M candle series (fetched at T-22s, 6 completed candles)
 _p29cl_candle_prefetch = {}  # {"BTC": [(o,h,l,c), (o,h,l,c), ...], ...}
 
+# P2.9CL trades ALL available 15M pairs, not just the sniper 4
+P29CL_ASSETS = ["BTC", "ETH", "SOL", "XRP", "DOGE", "BNB", "HYPE"]
+P29CL_BINANCE_MAP = {
+    "BTC": "BTCUSDT", "ETH": "ETHUSDT", "SOL": "SOLUSDT",
+    "XRP": "XRPUSDT", "DOGE": "DOGEUSDT", "BNB": "BNBUSDT",
+    "HYPE": "HYPEUSDT",
+}
+P29CL_SLUGS = {
+    "BTC": "btc-updown-15m-{}", "ETH": "eth-updown-15m-{}",
+    "SOL": "sol-updown-15m-{}", "XRP": "xrp-updown-15m-{}",
+    "DOGE": "doge-updown-15m-{}", "BNB": "bnb-updown-15m-{}",
+    "HYPE": "hype-updown-15m-{}",
+}
+_p29cl_token_map = {}  # separate token map for P2.9CL extra pairs
+
 def _p29cl_momentum_score(asset, chainlink_close, p21_dir, btc_dir):
     """P2.9 Chainlink: P2.1 direction + candle analysis + momentum tiebreaker.
     
@@ -885,23 +900,40 @@ def _bot2_sniper_thread():
                 except Exception as e:
                     print("BOT2 prefetch error {}: {}".format(asset, e))
             
-            # ── T-22s: P2.9CL — Pre-fetch 15M candles (OHLC for candle analysis) ──
+            # ── T-22s: P2.9CL — Pre-fetch 15M candles for ALL P29CL assets ──
             _15m_boundary_ms = (now_ms // 900000) * 900000  # last completed 15M boundary
-            for asset in SNIPER_ASSETS:
+            for asset in P29CL_ASSETS:
                 try:
-                    symbol = {"BTC": "BTCUSDT", "ETH": "ETHUSDT", "SOL": "SOLUSDT", "XRP": "XRPUSDT"}.get(asset)
+                    symbol = P29CL_BINANCE_MAP.get(asset)
+                    if not symbol: continue
                     r = _req.get("https://api.binance.com/api/v3/klines",
                         params={"symbol": symbol, "interval": "15m", "limit": 8},
                         timeout=3)
                     if r.status_code == 200:
                         klines = r.json()
                         if klines and len(klines) >= 4:
-                            # Store as (open, high, low, close) tuples
-                            # Include the current (incomplete) candle — we'll fix its close with Chainlink
                             ohlc = [(float(k[1]), float(k[2]), float(k[3]), float(k[4])) for k in klines]
                             _p29cl_candle_prefetch[asset] = ohlc
                 except Exception as e:
                     print("P29CL prefetch error {}: {}".format(asset, e))
+            
+            # Also prefetch 1H candles for extra assets (for SMA calculation)
+            for asset in P29CL_ASSETS:
+                if asset in ["BTC", "ETH", "SOL", "XRP"]:
+                    continue  # already done by Bot2 prefetch
+                try:
+                    symbol = P29CL_BINANCE_MAP.get(asset)
+                    if not symbol: continue
+                    r = _req.get("https://api.binance.com/api/v3/klines",
+                        params={"symbol": symbol, "interval": "1h", "limit": 12},
+                        timeout=3)
+                    if r.status_code == 200:
+                        klines = r.json()
+                        if klines and len(klines) >= 9:
+                            closes = [float(k[4]) for k in klines[:-1]]  # exclude current incomplete
+                            _bot2_prefetch[asset] = closes[-9:]  # store last 9 completed closes
+                except Exception as e:
+                    print("P29CL 1H prefetch error {}: {}".format(asset, e))
             
             # ── T-15s: Fetch token IDs from Polymarket ──
             # Calculate next boundary timestamp
@@ -970,7 +1002,44 @@ def _bot2_sniper_thread():
                 except Exception as e:
                     print("BOT2 token fetch error {}: {}".format(asset, e))
             
-            if not token_map:
+            # ── P2.9CL: Fetch tokens for extra pairs (DOGE, BNB, HYPE) ──
+            _p29cl_token_map = dict(token_map)  # start with sniper tokens
+            for asset in P29CL_ASSETS:
+                if asset in token_map:
+                    continue  # already fetched by sniper
+                try:
+                    slug = P29CL_SLUGS.get(asset, "").format(window_ts)
+                    if not slug: continue
+                    r = _req.get("{}/markets/slug/{}".format(GAMMA_API, slug), timeout=8)
+                    if r.status_code == 200:
+                        md = r.json()
+                        tokens = md.get("clobTokenIds")
+                        outcomes = md.get("outcomes")
+                        if isinstance(tokens, str):
+                            try: tokens = json.loads(tokens)
+                            except: tokens = None
+                        if isinstance(outcomes, str):
+                            try: outcomes = json.loads(outcomes)
+                            except: outcomes = None
+                        if tokens and isinstance(tokens, list) and len(tokens) >= 2:
+                            up_idx = 0
+                            if isinstance(outcomes, list) and len(outcomes) >= 2:
+                                if str(outcomes[0]).lower().strip() in ("no", "down", "below"):
+                                    up_idx = 1
+                            _p29cl_token_map[asset] = {
+                                "up_token": tokens[up_idx],
+                                "down_token": tokens[1 - up_idx],
+                                "condition_id": md.get("conditionId", ""),
+                                "slug": slug,
+                                "title": md.get("question", slug),
+                            }
+                except Exception as e:
+                    print("P29CL token fetch error {}: {}".format(asset, e))
+            
+            print("P29CL: {} tokens ready ({} extra pairs)".format(
+                len(_p29cl_token_map), len(_p29cl_token_map) - len(token_map)))
+            
+            if not token_map and not _p29cl_token_map:
                 print("BOT2: no markets found for boundary {}".format(window_ts))
                 _time.sleep(max(secs_to_boundary + 5, 5))
                 continue
@@ -1163,7 +1232,7 @@ def _bot2_sniper_thread():
                     _p29cl_btc_sma = sum(_p29cl_btc_closes) / 10.0
                     _p29cl_btc_dir = "SELL" if _p29cl_btc_price < _p29cl_btc_sma else "BUY"
                 
-                for _p29cl_asset in ["BTC", "ETH", "SOL", "XRP"]:
+                for _p29cl_asset in P29CL_ASSETS:
                     try:
                         _p29cl_price = _chainlink_prices.get(_p29cl_asset)
                         if not _p29cl_price:
@@ -1201,7 +1270,7 @@ def _bot2_sniper_thread():
                             continue
                         
                         # Get token info for slug
-                        _p29cl_entry = token_map.get(_p29cl_asset, {})
+                        _p29cl_entry = _p29cl_token_map.get(_p29cl_asset, {})
                         _p29cl_slug = _p29cl_entry.get("slug", "")
                         _p29cl_cid = _p29cl_entry.get("condition_id", "")
                         _p29cl_tid = _p29cl_entry.get("up_token" if _p29cl_dir == "UP" else "down_token", "")
@@ -19925,6 +19994,8 @@ def _rtds_loop():
     pair_map = {
         "btc/usd": "BTC", "eth/usd": "ETH",
         "sol/usd": "SOL", "xrp/usd": "XRP",
+        "doge/usd": "DOGE", "bnb/usd": "BNB",
+        "hype/usd": "HYPE",
     }
     
     _rtds_msg_count = [0]  # mutable counter
