@@ -819,28 +819,35 @@ def _p29cl_calc_dist(asset, chainlink_close):
     
     return prob_pct, zone
 
-def _p29cl_get_multiplier(conf, dist_zone, dist_prob, minute, direction, asset, phase, last_all_lose, last_all_win, last_dir):
-    """Stake multiplier v4 — 8 rules, validated on 288 live trades.
+def _p29cl_get_multiplier(conf, dist_zone, dist_prob, minute, direction, asset, phase, last_all_lose, last_all_win, last_dir, btc_dir=None):
+    """Stake multiplier v5 — 8 rules + BTC market context.
+    
+    Key insight: REDUCE_EXTREME_HIGH and T1_DOWN_NEUTRAL only work
+    in their matching market conditions. In opposite conditions they
+    lose money. BTC direction (BUY/SELL) determines market regime.
     
     BOOST:
-    - PHASE_FLIP_STRONG: 2.0x (85% WR, direction changed + :15/:45)
-    - PHASE_FLIP: 1.5x (85% WR, direction changed + :00/:30)
-    - PHASE_EXHAUST: 1.5x (3+ assets lost, needs more data)
-    - T1_DOWN_NEUTRAL: 1.5x (86% WR, DOWN + NEUTRAL dist)
+    - PHASE_FLIP_STRONG: 2.0x (dir changed + :15/:45, 85% WR)
+    - PHASE_FLIP: 1.5x (dir changed + :00/:30, 85% WR)
+    - PHASE_EXHAUST: 1.5x (3+ assets lost, 63% WR)
+    - T1_DOWN_NEUTRAL: 1.5x (DOWN + NEUTRAL + BTC=SELL, 86% WR)
+    - T1_UP_NEUTRAL: 1.5x (UP + NEUTRAL + BTC=BUY, mirror rule)
     
     REDUCE:
     - REDUCE_NEW_PAIR: 0.4x (DOGE/BNB/HYPE, 32% WR)
     - REDUCE_ETH_WEAK: 0.4x (ETH + TRANSITION/EXTREME_UP, 18% WR)
-    - REDUCE_30: 0.4x (:30 boundaries, 50-54% WR)
-    - REDUCE_EXTREME_HIGH: 0.4x (DIST 80+, 24-35% WR)
+    - REDUCE_30: 0.4x (:30 boundaries, 54% WR)
+    - REDUCE_EXTREME_HIGH: 0.4x (DIST 80+ AND BTC=SELL only)
     - REDUCE_EXTREME_LOW: 0.4x (DIST 0-20, 0% WR)
     - REDUCE_HIGH_EXTREME: 0.4x (HIGH conf + non-NEUTRAL, 33-55% WR)
     
-    NORMAL: 1.0x (everything else, 55% WR)
+    NORMAL: 1.0x (everything else, 53-55% WR)
     
     Returns: (multiplier, tier_label)
     """
     _is_strong = minute in (15, 45)
+    _btc_selling = (btc_dir == "SELL")
+    _btc_buying = (btc_dir == "BUY")
     
     # === PHASE OVERRIDES (highest priority) ===
     
@@ -864,27 +871,42 @@ def _p29cl_get_multiplier(conf, dist_zone, dist_prob, minute, direction, asset, 
     if asset == "ETH" and dist_zone in ("TRANSITION", "EXTREME_UP"):
         return 0.4, "REDUCE_ETH_WEAK"
     
-    # :30 boundary — 50-54% WR, pool protection
+    # :30 boundary — 54% WR, pool protection
     if minute == 30:
         return 0.4, "REDUCE_30"
     
-    # DIST 80+ — chasing exhausted move, 24-35% WR
+    # DIST 80+ — context dependent
+    # In dump (BTC=SELL): exhaustion, 47% WR → reduce
+    # In pump (BTC=BUY): confirmation, 64% WR → normal
     if dist_prob >= 80:
-        return 0.4, "REDUCE_EXTREME_HIGH"
+        if _btc_selling:
+            return 0.4, "REDUCE_EXTREME_HIGH"
+        else:
+            return 1.0, "NORMAL"
     
     # DIST 0-20 — move already done, 0% WR
     if dist_prob <= 20:
         return 0.4, "REDUCE_EXTREME_LOW"
     
-    # HIGH confidence + non-NEUTRAL — exhaustion trap, 33-55% WR
+    # HIGH confidence + non-NEUTRAL — exhaustion trap
     if conf == "HIGH" and dist_zone != "NEUTRAL":
         return 0.4, "REDUCE_HIGH_EXTREME"
     
-    # === BOOST RULE ===
+    # === BOOST RULES (market-context aware) ===
     
-    # DOWN + NEUTRAL — 86% WR, second biggest engine
-    if direction == "DOWN" and dist_zone == "NEUTRAL":
+    # DOWN + NEUTRAL + BTC selling — 86% WR, confirmed dump edge
+    if direction == "DOWN" and dist_zone == "NEUTRAL" and _btc_selling:
         return 1.5, "T1_DOWN_NEUTRAL"
+    
+    # UP + NEUTRAL + BTC buying — mirror rule, pump edge
+    if direction == "UP" and dist_zone == "NEUTRAL" and _btc_buying:
+        return 1.5, "T1_UP_NEUTRAL"
+    
+    # DOWN in UP market or UP in DOWN market with NEUTRAL — fighting trend
+    if dist_zone == "NEUTRAL" and direction == "DOWN" and _btc_buying:
+        return 0.8, "REDUCE_COUNTER_TREND"
+    if dist_zone == "NEUTRAL" and direction == "UP" and _btc_selling:
+        return 0.8, "REDUCE_COUNTER_TREND"
     
     # === EVERYTHING ELSE ===
     return 1.0, "NORMAL"
@@ -1364,7 +1386,8 @@ def _bot2_sniper_thread():
                             _p29cl_conf, _p29cl_dist_zone, _p29cl_dist_prob,
                             _p29cl_bnd_minute, _p29cl_dir, _p29cl_asset,
                             _p29cl_phase, _p29cl_last_boundary_all_lose,
-                            _p29cl_last_boundary_all_win, _p29cl_last_boundary_dir)
+                            _p29cl_last_boundary_all_win, _p29cl_last_boundary_dir,
+                            btc_dir=_p29cl_btc_dir)
                         
                         _p29cl_stake = round(_p29cl_base_stake * _p29cl_mult, 2)
                         _p29cl_stake = max(2.50, _p29cl_stake)  # Polymarket minimum
@@ -23081,9 +23104,11 @@ def p29cl_page():
     for t in resolved:
         ind = str(t.get("indicators", ""))
         tier = "NORMAL"
-        for label in ["PHASE_FLIP_STRONG", "PHASE_FLIP", "PHASE_EXHAUST", "T1_DOWN_NEUTRAL",
+        for label in ["PHASE_FLIP_STRONG", "PHASE_FLIP", "PHASE_EXHAUST",
+                       "T1_DOWN_NEUTRAL", "T1_UP_NEUTRAL",
                        "REDUCE_NEW_PAIR", "REDUCE_ETH_WEAK", "REDUCE_30",
-                       "REDUCE_EXTREME_HIGH", "REDUCE_EXTREME_LOW", "REDUCE_HIGH_EXTREME"]:
+                       "REDUCE_EXTREME_HIGH", "REDUCE_EXTREME_LOW", "REDUCE_HIGH_EXTREME",
+                       "REDUCE_COUNTER_TREND"]:
             if label in ind:
                 tier = label
                 break
