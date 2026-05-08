@@ -478,11 +478,11 @@ _p29cl_boundary_results = []        # list of (asset, outcome) for current bound
 
 # ── P2.9CL LIVE trading state ──
 _p29cl_live_state = {
-    "enabled": False,  # DISABLED — waiting for paper validation
+    "enabled": True,  # LIVE TRADING ACTIVE
     "balance": 150.0,
     "peak_balance": 150.0,
     "starting_balance": 150.0,
-    "floor_balance": 120.0,    # stop loss at $120 (20% drawdown)
+    "floor_balance": 50.0,     # stop loss at $50
     "base_stake": 2.50,        # flat $2.50
     "max_stake": 5.00,         # 2.0x cap
     "max_per_boundary": 20.00, # $20 max exposure per boundary
@@ -1500,8 +1500,8 @@ def _bot2_sniper_thread():
                                 if _p29l_key in _p29cl_live_traded:
                                     continue
                                 
-                                # Only trade core 4 live — DOGE/BNB/HYPE paper only
-                                if _p29l_asset not in ("BTC", "ETH", "SOL", "XRP"):
+                                # All pairs trade live — DOGE/BNB/HYPE protected by REDUCE_NEW_PAIR (0.4x)
+                                if _p29l_asset not in ("BTC", "ETH", "SOL", "XRP", "DOGE", "BNB", "HYPE"):
                                     continue
                                 
                                 # Get token info
@@ -1609,6 +1609,15 @@ def _bot2_sniper_thread():
                                     _p29l_tier, _p29l_mult,
                                     str(_p29l_oid)[:12] if _p29l_oid else "NONE",
                                     _p29cl_live_state["balance"]))
+                                
+                                # Telegram notification
+                                try:
+                                    send_telegram("🧠 <b>P29CL LIVE</b>\n{} {} ${:.2f}\n{} ({:.1f}x)\nDIST={}({})\nPool: ${:.2f}".format(
+                                        _p29l_dir, _p29l_asset, _p29l_stake,
+                                        _p29l_tier, _p29l_mult,
+                                        _p29l_dist_zone, _p29l_dist_prob,
+                                        _p29cl_live_state["balance"]))
+                                except: pass
                                 
                             except Exception as _p29l_ae:
                                 print("P29CL LIVE error {}: {}".format(_p29l_asset, _p29l_ae))
@@ -3215,11 +3224,9 @@ def _sniper_thread():
                     except Exception as _fa4_dbe:
                         print("A4 DB error: {}".format(_fa4_dbe))
                     
-                    # Telegram
+                    # Telegram disabled — A4 is paper only
                     try:
-                        send_telegram("SNIPER A4: {} {} @50c ${:.2f} [{}] | pool=${:.2f}".format(
-                            _fr["direction"], _fr["asset"], _fr["cost"],
-                            _fr["indicators"][:40], _poly_alpha4_state["balance"]))
+                        pass
                     except: pass
                     
                 except Exception as _fr_e:
@@ -3458,10 +3465,7 @@ def _sniper_thread():
 
                                     # Telegram
                                     try:
-                                        send_telegram("A4 WAIT→FIRE: {} {} @{}c ${:.2f} | confirmed {}s | {} | pool=${:.2f}".format(
-                                            _a4w_dir, _a4w_asset, int(_a4w_fill_price * 100),
-                                            _a4w_actual_cost, int(_a4w_age),
-                                            _a4w["sv3_tag"], _poly_alpha4_state["balance"]))
+                                        pass  # A4 telegram disabled
                                     except: pass
 
                                     _save_bot_balance("poly_alpha4", _poly_alpha4_state)
@@ -3982,56 +3986,37 @@ def _resolve_poly_alpha4_trades():
                                 if isinstance(_oc, str):
                                     try: _oc = json.loads(_oc)
                                     except: _oc = None
-                                _up_idx = 0
                                 if isinstance(_oc, list) and len(_oc) >= 2:
+                                    _up_idx = 0
                                     o0 = str(_oc[0]).lower().strip()
-                                    if o0 in ("no", "down", "below"): _up_idx = 1
-                                if _up_idx == 0:
-                                    if p0 >= 0.95: won = (bs == "UP")
-                                    elif p1 >= 0.95: won = (bs == "DOWN")
-                                else:
-                                    if p1 >= 0.95: won = (bs == "UP")
-                                    elif p0 >= 0.95: won = (bs == "DOWN")
+                                    if o0 in ("no", "down", "below"):
+                                        _up_idx = 1
+                                    if _up_idx == 0:
+                                        if p0 >= 0.95: won = (bs == "UP")
+                                        elif p1 >= 0.95: won = (bs == "DOWN")
+                                    else:
+                                        if p1 >= 0.95: won = (bs == "UP")
+                                        elif p0 >= 0.95: won = (bs == "DOWN")
                 except: pass
-
                 if won is None:
                     if now > expiry + timedelta(hours=1): won = False
                     else: continue
-
                 fill = float(p.get("fill_price") or 0.50)
                 payout = round(stake / fill, 4) if won else 0
-                status = "Won" if won else "Lost"
-
-                c4 = get_db()
-                c4.run("UPDATE poly_alpha4_trades SET status=:s,outcome=:o,resolved_at=:r,payout=:p,filled=TRUE WHERE id=:i",
-                       s=status, o="WIN" if won else "LOSS", r=now.isoformat(), p=payout, i=p["id"])
-                c4.close()
+                c3 = get_db()
+                c3.run("UPDATE poly_alpha4_trades SET status=:s,outcome=:o,resolved_at=:r,payout=:p WHERE id=:i",
+                    s="Won" if won else "Lost", o="WIN" if won else "LOSS",
+                    r=now.isoformat(), p=payout, i=p["id"])
+                c3.close()
                 resolved += 1
-
                 if won:
                     _poly_alpha4_state["balance"] = round(_poly_alpha4_state["balance"] + payout, 2)
-                    _poly_alpha4_state["wins_today"] += 1
-                    _poly_alpha4_state["profit_today"] = round(_poly_alpha4_state["profit_today"] + (payout - stake), 2)
-                else:
-                    _poly_alpha4_state["losses_today"] += 1
-                    _poly_alpha4_state["profit_today"] = round(_poly_alpha4_state["profit_today"] - stake, 2)
-
-                if _poly_alpha4_state["balance"] > _poly_alpha4_state["peak_balance"]:
+                if _poly_alpha4_state["balance"] > _poly_alpha4_state.get("peak_balance", 0):
                     _poly_alpha4_state["peak_balance"] = _poly_alpha4_state["balance"]
-                if _poly_alpha4_state["balance"] <= _poly_alpha4_state["floor_balance"]:
-                    _poly_alpha4_state["enabled"] = False
-                    send_telegram("🚨 SNIPER A4 STOPPED — Floor ${:.2f}".format(_poly_alpha4_state["balance"]))
-
                 _pnl = "+${:.2f}".format(payout - stake) if won else "-${:.2f}".format(stake)
-                print("SNIPER A4 #{} {}: ${:.2f} → {} | pool=${:.2f}".format(
-                    p["id"], "WIN" if won else "LOSS", stake, _pnl, _poly_alpha4_state["balance"]))
-                _emoji = "\u2705" if won else "\u274c"
-                send_telegram("{} <b>SNIPER A4</b> {} {}\n${:.2f} → {}\nPool: ${:.2f}".format(
-                    _emoji, p.get("asset","?"), "WIN" if won else "LOSS",
-                    stake, _pnl, _poly_alpha4_state["balance"]))
-                # Save balance to DB immediately after each resolution
+                print("SNIPER A4 #{} {}: {} | pool=${:.2f}".format(
+                    p["id"], "WIN" if won else "LOSS", _pnl, _poly_alpha4_state["balance"]))
                 _save_bot_balance("poly_alpha4", _poly_alpha4_state)
-
             except Exception as e:
                 print("SNIPER A4 resolve error #{}: {}".format(p.get("id"), e))
         return resolved
@@ -21261,11 +21246,7 @@ def run_poly_scan():
                                                                     _a4d_confirm_src,
                                                                     _poly_alpha4_state["balance"]))
                                                                 try:
-                                                                    send_telegram("SNIPER A4 DYN: {} {} @{}c ${:.2f} ({} shares) {} [{}] | pool=${:.2f}".format(
-                                                                        _a4d_scan_dir, asset, int(_a4d_odds),
-                                                                        _a4d_cost, _a4d_shares, _a4d_tier,
-                                                                        _a4d_confirm_src,
-                                                                        _poly_alpha4_state["balance"]))
+                                                                    pass  # A4 telegram disabled
                                                                 except: pass
                                                         except Exception as _a4d_oe:
                                                             print("A4 DYN order error {}: {}".format(asset, _a4d_oe))
@@ -21406,10 +21387,7 @@ def run_poly_scan():
                                                                 _poly_alpha41_state["balance"]))
                                                             
                                                             try:
-                                                                send_telegram("A41: {} {} {} @{}c ${:.2f} {} [{}] pool=${:.2f}".format(
-                                                                    _h41_type, _h41_dir, asset, _h41_gtc_pct,
-                                                                    _h41_cost, _h41_tier,
-                                                                    strat.upper(), _poly_alpha41_state["balance"]))
+                                                                pass  # A4 telegram disabled
                                                             except:
                                                                 pass
                                                     except Exception as _h41_oe:
@@ -22782,6 +22760,11 @@ def _resolve_p29cl_live_trades():
                     _p29cl_live_state["peak_balance"] = _p29cl_live_state["balance"]
                 _pnl = "+${:.2f}".format(payout - stake) if won else "-${:.2f}".format(stake)
                 print("P29CL LIVE #{} {}: {} | pool=${:.2f}".format(p["id"], "WIN" if won else "LOSS", _pnl, _p29cl_live_state["balance"]))
+                try:
+                    _emoji = "✅" if won else "❌"
+                    send_telegram("{} <b>P29CL LIVE</b> #{}\n{} {} {}\nPool: ${:.2f}".format(
+                        _emoji, p["id"], p.get("asset","?"), "WIN" if won else "LOSS", _pnl, _p29cl_live_state["balance"]))
+                except: pass
                 _save_bot_balance("p29cl_live", _p29cl_live_state)
             except Exception as e:
                 print("P29CL LIVE resolve error #{}: {}".format(p.get("id"), e))
@@ -23404,6 +23387,7 @@ a{{color:#00d4aa}}
 </style></head><body>
 <div class="nav">
 <a href="/app/p29cl" class="active">🧠 P2.9CL</a>
+<a href="/app/p29cl-live">🔥 LIVE</a>
 <a href="/app/poly-alpha4">🎯 A4</a>
 <a href="/app/bot2-sniper">🤖 Bot2</a>
 <a href="/app/sniper-v2">📊 SV2</a>
@@ -23429,6 +23413,118 @@ a{{color:#00d4aa}}
 </body></html>""".format(wrc=wrc, bal=_p29cl_state["balance"], wr=wr, total=len(trades),
         pnlc=pnlc, pnl=pnl, pending=len(pending), peak=_p29cl_state["peak_balance"],
         conf_html=conf_html, dist_html=dist_html, tier_html=tier_html, asset_html=asset_html, trade_rows=trade_rows)
+
+
+@app.route("/app/p29cl-live")
+def p29cl_live_page():
+    """P2.9CL LIVE — Real trading dashboard."""
+    try:
+        conn = get_db()
+        rows = conn.run("SELECT * FROM p29cl_live_trades ORDER BY id DESC LIMIT 500")
+        cols = [c['name'] for c in conn.columns]
+        trades = [dict(zip(cols, r)) for r in rows]
+        conn.close()
+    except:
+        trades = []
+    
+    resolved = [t for t in trades if t.get("outcome") in ("WIN", "LOSS")]
+    pending = [t for t in trades if t.get("outcome") == "PENDING"]
+    wins = sum(1 for t in resolved if t["outcome"] == "WIN")
+    wr = round(wins / len(resolved) * 100, 1) if resolved else 0
+    pnl = sum(float(t.get("payout") or 0) - float(t.get("stake") or 0) if t["outcome"] == "WIN" else -float(t.get("stake") or 0) for t in resolved)
+    
+    # By Tier
+    tier_stats = {}
+    for t in resolved:
+        tier = t.get("tier", "NORMAL") or "NORMAL"
+        if tier not in tier_stats: tier_stats[tier] = {"w": 0, "l": 0}
+        if t["outcome"] == "WIN": tier_stats[tier]["w"] += 1
+        else: tier_stats[tier]["l"] += 1
+    tier_html = ""
+    for tier in sorted(tier_stats.keys()):
+        s = tier_stats[tier]; tt = s["w"]+s["l"]
+        if tt == 0: continue
+        twr = round(s["w"]/tt*100,1)
+        tc = "#3fb950" if twr >= 58 else "#f85149" if twr < 50 else "#d29922"
+        tier_html += "<tr><td>{}</td><td>{}W/{}L</td><td style='color:{}'>{:.1f}%</td></tr>".format(tier, s["w"], s["l"], tc, twr)
+    
+    # By Asset
+    asset_stats = {}
+    for t in resolved:
+        a = t.get("asset", "?")
+        if a not in asset_stats: asset_stats[a] = {"w": 0, "l": 0, "pnl": 0}
+        if t["outcome"] == "WIN":
+            asset_stats[a]["w"] += 1
+            asset_stats[a]["pnl"] += float(t.get("payout") or 0) - float(t.get("stake") or 0)
+        else:
+            asset_stats[a]["l"] += 1
+            asset_stats[a]["pnl"] -= float(t.get("stake") or 0)
+    asset_html = ""
+    for a in sorted(asset_stats.keys()):
+        s = asset_stats[a]; tt = s["w"]+s["l"]
+        if tt == 0: continue
+        awr = round(s["w"]/tt*100,1)
+        ac = "#3fb950" if s["pnl"] >= 0 else "#f85149"
+        asset_html += "<tr><td>{}</td><td>{}W/{}L</td><td>{:.1f}%</td><td style='color:{}'>${:+.2f}</td></tr>".format(a, s["w"], s["l"], awr, ac, s["pnl"])
+    
+    # Trade rows
+    trade_rows = ""
+    for t in trades[:100]:
+        o = t.get("outcome", "PENDING")
+        icon = "✅" if o == "WIN" else "❌" if o == "LOSS" else "⏳"
+        pstr = "+${:.2f}".format(float(t.get("payout") or 0) - float(t.get("stake") or 0)) if o == "WIN" else "-${:.2f}".format(float(t.get("stake") or 0)) if o == "LOSS" else ""
+        fired = (t.get("fired_at") or "")[:16].replace("T", " ")
+        tier = t.get("tier", "") or ""
+        mult = t.get("multiplier", 1.0) or 1.0
+        filled = "✓" if t.get("filled") else "○"
+        trade_rows += "<tr><td>{}</td><td>{}</td><td>{}</td><td>${:.2f}</td><td>{}</td><td>{}</td><td style='font-size:11px;color:#58a6ff'>{} ({:.1f}x)</td><td>{}</td></tr>".format(
+            icon, t.get("asset","?"), t.get("bet_side","?"), float(t.get("stake") or 0), fired, filled, tier, float(mult), pstr)
+    
+    wrc = "#3fb950" if wr >= 55 else "#f85149" if wr < 50 else "#d29922"
+    pnlc = "#3fb950" if pnl >= 0 else "#f85149"
+    status = "LIVE" if _p29cl_live_state["enabled"] else "STOPPED"
+    status_color = "#3fb950" if _p29cl_live_state["enabled"] else "#f85149"
+    return """<!DOCTYPE html><html><head><title>P2.9CL LIVE</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>body{{background:#0a0a0a;color:#e0e0e0;font-family:sans-serif;max-width:900px;margin:0 auto;padding:10px}}
+h1{{color:#ff6b35}}h2{{color:#888;font-size:14px}}
+.stats{{display:grid;grid-template-columns:repeat(auto-fit,minmax(100px,1fr));gap:8px;margin:10px 0}}
+.stat{{background:#1a1a2e;padding:12px;border-radius:8px;text-align:center}}
+.stat .val{{font-size:24px;font-weight:700}}.stat .lbl{{font-size:11px;color:#888}}
+table{{width:100%;border-collapse:collapse;font-size:13px;margin:10px 0}}
+th,td{{padding:6px 8px;border-bottom:1px solid #222;text-align:left}}
+th{{background:#1a1a2e;color:#888;font-size:11px}}
+.nav{{display:flex;gap:4px;flex-wrap:wrap;margin:10px 0}}
+.nav a{{padding:6px 12px;background:#1a1a2e;color:#888;text-decoration:none;border-radius:4px;font-size:12px}}
+.nav a.active{{background:#ff6b35;color:#000}}
+a{{color:#ff6b35}}
+</style></head><body>
+<div class="nav">
+<a href="/app/p29cl">🧠 Paper</a>
+<a href="/app/p29cl-live" class="active">🔥 LIVE</a>
+<a href="/app/poly-alpha4">🎯 A4</a>
+<a href="/app/bot2-sniper">🤖 Bot2</a>
+<a href="/">Home</a>
+</div>
+<h1>🔥 P2.9CL LIVE — Real Trading</h1>
+<h2>V7 Cascade · Flat $2.50 · $5 Max · $20/Boundary · <span style="color:{statusc}">{status}</span></h2>
+<div class="stats">
+<div class="stat"><div class="val" style="color:{wrc}">${bal:.2f}</div><div class="lbl">Pool</div></div>
+<div class="stat"><div class="val" style="color:{wrc}">{wr:.1f}%</div><div class="lbl">Win Rate</div></div>
+<div class="stat"><div class="val">{total}</div><div class="lbl">Trades</div></div>
+<div class="stat"><div class="val" style="color:{pnlc}">${pnl:+.2f}</div><div class="lbl">P&L</div></div>
+<div class="stat"><div class="val">{pending}</div><div class="lbl">Pending</div></div>
+<div class="stat"><div class="val">${peak:.2f}</div><div class="lbl">Peak</div></div>
+</div>
+<h2>By Tier</h2><table><tr><th>Tier</th><th>Record</th><th>WR</th></tr>{tier_html}</table>
+<h2>By Asset</h2><table><tr><th>Asset</th><th>Record</th><th>WR</th><th>P&L</th></tr>{asset_html}</table>
+<h2>Trades</h2><table><tr><th></th><th>Asset</th><th>Side</th><th>Stake</th><th>Time</th><th>Fill</th><th>Tier</th><th>P&L</th></tr>{trade_rows}</table>
+<p style="color:#444;font-size:11px">P2.9CL LIVE · V7 Cascade · $2.50 base · $50 stop loss · Auto-refresh 60s</p>
+<script>setTimeout(()=>location.reload(),60000)</script>
+</body></html>""".format(wrc=wrc, bal=_p29cl_live_state["balance"], wr=wr, total=len(trades),
+        pnlc=pnlc, pnl=pnl, pending=len(pending), peak=_p29cl_live_state["peak_balance"],
+        tier_html=tier_html, asset_html=asset_html, trade_rows=trade_rows,
+        statusc=status_color, status=status)
 
 
 def poly_alpha3_page():
