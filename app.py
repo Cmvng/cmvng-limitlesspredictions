@@ -24092,7 +24092,7 @@ def csv_export(table_name):
         "paper26_trades", "paper36_trades", "paper27_trades", "paper37_trades",
         "paper28_trades", "paper29_trades", "paper210_trades",
         "alpha_trades", "poly_alpha3_trades", "limitless_sniper_trades",
-        "poly_trades", "poly_alpha41_trades", "bot2_sniper_trades", "p29cl_trades",
+        "poly_trades", "poly_alpha41_trades", "bot2_sniper_trades", "p29cl_trades", "poly_alpha4_trades",
     ]
     if table_name not in allowed:
         return "Table not allowed. Allowed: {}".format(", ".join(allowed)), 400
