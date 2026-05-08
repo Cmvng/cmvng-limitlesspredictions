@@ -812,6 +812,62 @@ def _p29cl_calc_dist(asset, chainlink_close):
     
     return prob_pct, zone
 
+def _p29cl_get_multiplier(conf, dist_zone, dist_prob, minute):
+    """Stake multiplier based on live P2.9CL data (94 trades).
+    
+    Proven patterns:
+    - NEUTRAL(40-60) = 66.7% WR → full or boosted stake
+    - LOW + NEUTRAL = 72.7% WR → 1.5x
+    - EXTREME zones = 33-36% WR → 0.4x
+    - :30 boundary = 40.7% WR → 0.4x
+    - HIGH + non-NEUTRAL = 38.5% WR → 0.4x
+    - 60-70% DIST dead zone = 37.5% WR → 0.4x
+    
+    Returns: (multiplier, tier_label)
+    """
+    # :30 boundary penalty — 40.7% WR, worst boundary
+    if minute == 30:
+        return 0.4, "REDUCE_30"
+    
+    # EXTREME_UP with high DIST prob — 80+ is 28.6% WR
+    if dist_prob >= 80:
+        return 0.4, "REDUCE_EXTREME_HIGH"
+    
+    # EXTREME_DOWN with low DIST prob — 0-20 is 0-0% WR
+    if dist_prob <= 20:
+        return 0.4, "REDUCE_EXTREME_LOW"
+    
+    # Dead zone: 60-70% DIST — 37.5% WR
+    if 60 <= dist_prob <= 70:
+        return 0.4, "REDUCE_DEAD_ZONE"
+    
+    # HIGH confidence + non-NEUTRAL — exhaustion trap
+    if conf == "HIGH" and dist_zone != "NEUTRAL":
+        return 0.4, "REDUCE_HIGH_EXTREME"
+    
+    # LOW + NEUTRAL — the golden combo, 72.7% WR
+    if conf == "LOW" and dist_zone == "NEUTRAL":
+        return 1.5, "T1_LOW_NEUTRAL"
+    
+    # MEDIUM + NEUTRAL — solid 60% WR
+    if conf == "MEDIUM" and dist_zone == "NEUTRAL":
+        return 1.2, "T1_MED_NEUTRAL"
+    
+    # HIGH + NEUTRAL — only 1 trade but strong candle in moderate zone
+    if conf == "HIGH" and dist_zone == "NEUTRAL":
+        return 1.0, "NORMAL_HIGH_NEUTRAL"
+    
+    # MEDIUM + EXTREME_UP (57.1% WR) — decent
+    if conf == "MEDIUM" and dist_zone == "EXTREME_UP":
+        return 0.8, "NORMAL_MED_EXTREME"
+    
+    # TRANSITION zone default — 48.8% WR
+    if dist_zone == "TRANSITION":
+        return 0.6, "REDUCE_TRANSITION"
+    
+    # Everything else
+    return 1.0, "NORMAL"
+
 def _bot2_sniper_calc_direction(asset, chainlink_close):
     """Bot2 strategy: SMA10 on 1H + BTC trend agree.
     Uses 9 pre-fetched completed candles + Chainlink close as 10th.
@@ -1264,9 +1320,22 @@ def _bot2_sniper_thread():
                         if _p29cl_key in _p29cl_traded:
                             continue
                         
-                        # Calculate stake (compounding)
-                        _p29cl_stake = _p29cl_calc_stake(_p29cl_state["balance"])
-                        if _p29cl_stake <= 0 or _p29cl_stake > _p29cl_state["balance"]:
+                        # Calculate stake with multiplier
+                        _p29cl_base_stake = _p29cl_calc_stake(_p29cl_state["balance"])
+                        if _p29cl_base_stake <= 0:
+                            continue
+                        
+                        _p29cl_mult, _p29cl_tier = _p29cl_get_multiplier(
+                            _p29cl_conf, _p29cl_dist_zone, _p29cl_dist_prob,
+                            datetime.now(timezone.utc).minute)
+                        
+                        _p29cl_stake = round(_p29cl_base_stake * _p29cl_mult, 2)
+                        _p29cl_stake = max(2.50, _p29cl_stake)  # Polymarket minimum
+                        if _p29cl_stake > _p29cl_state["balance"] * 0.15:
+                            _p29cl_stake = round(_p29cl_state["balance"] * 0.10, 2)
+                        if _p29cl_stake > _p29cl_state["balance"] - _p29cl_state["floor_balance"]:
+                            _p29cl_stake = max(2.50, round(_p29cl_state["balance"] - _p29cl_state["floor_balance"], 2))
+                        if _p29cl_stake < 2.50 or _p29cl_stake > _p29cl_state["balance"]:
                             continue
                         
                         # Get token info for slug
@@ -1300,9 +1369,10 @@ def _bot2_sniper_thread():
                                 ttl="P29CL {} {} 15M".format(_p29cl_asset, _p29cl_dir),
                                 ast=_p29cl_asset, bs=_p29cl_dir, stk=_p29cl_stake,
                                 pa=_p29cl_state["balance"],
-                                ind="[{}] {} | P21={} | BTC={} | DIST={}({})".format(
+                                ind="[{}] {} | P21={} | BTC={} | DIST={}({}) | {}".format(
                                     _p29cl_conf, _p29cl_tag, _p29cl_p21_dir or "NONE",
-                                    _p29cl_btc_dir or "NONE", _p29cl_dist_zone, _p29cl_dist_prob),
+                                    _p29cl_btc_dir or "NONE", _p29cl_dist_zone, _p29cl_dist_prob,
+                                    _p29cl_tier),
                                 conf=_p29cl_conf, ms=_p29cl_score,
                                 dp=_p29cl_dist_prob, dz=_p29cl_dist_zone,
                                 slg=_p29cl_slug, cid=_p29cl_cid, tid=_p29cl_tid,
@@ -1312,9 +1382,10 @@ def _bot2_sniper_thread():
                             print("P29CL DB error {}: {}".format(_p29cl_asset, _p29cl_dbe))
                         
                         _p29cl_count += 1
-                        print("P29CL: {} {} S{} [{}] ${:.2f} DIST={}({}) | pool=${:.2f}".format(
+                        print("P29CL: {} {} S{} [{}] ${:.2f} DIST={}({}) {}({:.1f}x) | pool=${:.2f}".format(
                             _p29cl_dir, _p29cl_asset, _p29cl_score, _p29cl_conf,
                             _p29cl_stake, _p29cl_dist_zone, _p29cl_dist_prob,
+                            _p29cl_tier, _p29cl_mult,
                             _p29cl_state["balance"]))
                         
                     except Exception as _p29cl_ae:
@@ -22898,6 +22969,28 @@ def p29cl_page():
         dzwr = round(s["w"]/tt*100,1)
         dist_html += "<tr><td>{}</td><td>{}W/{}L</td><td>{:.1f}%</td></tr>".format(dz, s["w"], s["l"], dzwr)
     
+    # By tier (from indicators)
+    tier_stats = {}
+    for t in resolved:
+        ind = str(t.get("indicators", ""))
+        tier = "NORMAL"
+        for label in ["T1_LOW_NEUTRAL", "T1_MED_NEUTRAL", "REDUCE_30", "REDUCE_EXTREME_HIGH", 
+                       "REDUCE_EXTREME_LOW", "REDUCE_DEAD_ZONE", "REDUCE_HIGH_EXTREME",
+                       "REDUCE_TRANSITION", "REDUCE_WEAK", "NORMAL_HIGH_NEUTRAL", "NORMAL_MED_EXTREME"]:
+            if label in ind:
+                tier = label
+                break
+        if tier not in tier_stats: tier_stats[tier] = {"w": 0, "l": 0}
+        if t["outcome"] == "WIN": tier_stats[tier]["w"] += 1
+        else: tier_stats[tier]["l"] += 1
+    tier_html = ""
+    for tier in sorted(tier_stats.keys()):
+        s = tier_stats[tier]; tt = s["w"]+s["l"]
+        if tt == 0: continue
+        twr = round(s["w"]/tt*100,1)
+        tc = "#3fb950" if twr >= 58 else "#f85149" if twr < 50 else "#d29922"
+        tier_html += "<tr><td>{}</td><td>{}W/{}L</td><td style='color:{}'>{:.1f}%</td></tr>".format(tier, s["w"], s["l"], tc, twr)
+    
     trade_rows = ""
     for t in trades[:100]:
         o = t.get("outcome", "PENDING")
@@ -22945,13 +23038,14 @@ a{{color:#00d4aa}}
 </div>
 <h2>By Confidence</h2><table><tr><th>Level</th><th>Record</th><th>WR</th></tr>{conf_html}</table>
 <h2>By DIST Zone</h2><table><tr><th>Zone</th><th>Record</th><th>WR</th></tr>{dist_html}</table>
+<h2>By Tier</h2><table><tr><th>Tier</th><th>Record</th><th>WR</th></tr>{tier_html}</table>
 <h2>By Asset</h2><table><tr><th>Asset</th><th>Record</th><th>WR</th><th>P&L</th></tr>{asset_html}</table>
 <h2>Trades</h2><table><tr><th></th><th>Asset</th><th>Side</th><th>Stake</th><th>Time</th><th>Indicators</th><th>DIST</th><th>P&L</th></tr>{trade_rows}</table>
 <p style="color:#444;font-size:11px">P2.9 Chainlink · Momentum scoring · DIST tracking · Paper · Auto-refresh 60s</p>
 <script>setTimeout(()=>location.reload(),60000)</script>
 </body></html>""".format(wrc=wrc, bal=_p29cl_state["balance"], wr=wr, total=len(trades),
         pnlc=pnlc, pnl=pnl, pending=len(pending), peak=_p29cl_state["peak_balance"],
-        conf_html=conf_html, dist_html=dist_html, asset_html=asset_html, trade_rows=trade_rows)
+        conf_html=conf_html, dist_html=dist_html, tier_html=tier_html, asset_html=asset_html, trade_rows=trade_rows)
 
 
 def poly_alpha3_page():
