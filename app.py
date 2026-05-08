@@ -820,22 +820,23 @@ def _p29cl_calc_dist(asset, chainlink_close):
     return prob_pct, zone
 
 def _p29cl_get_multiplier(conf, dist_zone, dist_prob, minute, direction, asset, phase, last_all_lose, last_all_win, last_dir):
-    """Stake multiplier v3 — phase-aware + validated corrections.
+    """Stake multiplier v4 — 8 rules, validated on 288 live trades.
     
-    PHASE RULES:
-    - FLIP (direction changed): 2.0x on STRONG(:15/:45), 1.5x on WEAK(:00/:30) — 85% WR
-    - EXHAUST (3+ assets lost): 1.5x — ~60% WR historically
-    - CAUTIOUS removed — 50.8% WR not a real signal
+    BOOST:
+    - PHASE_FLIP_STRONG: 2.0x (85% WR, direction changed + :15/:45)
+    - PHASE_FLIP: 1.5x (85% WR, direction changed + :00/:30)
+    - PHASE_EXHAUST: 1.5x (3+ assets lost, needs more data)
+    - T1_DOWN_NEUTRAL: 1.5x (86% WR, DOWN + NEUTRAL dist)
     
-    DIST RULES:
-    - DOWN+NEUTRAL: 1.5x (90.9% WR on DOWN side in NEUTRAL)
-    - LOW+NEUTRAL on STRONG period: 1.2x (66.7% WR)
-    - EXTREME/TRANSITION/dead zone: 0.4-0.6x
-    - :30 boundary: 0.4x (37% WR)
+    REDUCE:
+    - REDUCE_NEW_PAIR: 0.4x (DOGE/BNB/HYPE, 32% WR)
+    - REDUCE_ETH_WEAK: 0.4x (ETH + TRANSITION/EXTREME_UP, 18% WR)
+    - REDUCE_30: 0.4x (:30 boundaries, 50-54% WR)
+    - REDUCE_EXTREME_HIGH: 0.4x (DIST 80+, 24-35% WR)
+    - REDUCE_EXTREME_LOW: 0.4x (DIST 0-20, 0% WR)
+    - REDUCE_HIGH_EXTREME: 0.4x (HIGH conf + non-NEUTRAL, 33-55% WR)
     
-    ASSET RULES:
-    - DOGE/BNB/HYPE: 0.4x until proven
-    - ETH+TRANSITION/EXTREME_UP: 0.4x (14-27% WR)
+    NORMAL: 1.0x (everything else, 55% WR)
     
     Returns: (multiplier, tier_label)
     """
@@ -850,73 +851,42 @@ def _p29cl_get_multiplier(conf, dist_zone, dist_prob, minute, direction, asset, 
         return 1.5, "PHASE_FLIP"
     
     # After 3+ assets all lost — exhaustion recovery
-    # (last_all_lose only True when 3+ assets lost, checked in resolution)
     if last_all_lose:
         return 1.5, "PHASE_EXHAUST"
     
-    # CAUTIOUS removed — 50.8% WR not a real signal
+    # === REDUCE RULES ===
     
-    # === NO DIST DATA — minimum stake (17-35% WR) ===
-    if dist_zone not in ("EXTREME_DOWN", "TRANSITION", "NEUTRAL", "EXTREME_UP"):
-        return 0.4, "REDUCE_NO_DIST"
-    
-    # === ASSET PENALTIES (second priority) ===
-    
-    # DOGE/BNB/HYPE: unproven pairs, force minimum
+    # DOGE/BNB/HYPE: unproven, 32% WR
     if asset in ("DOGE", "BNB", "HYPE"):
         return 0.4, "REDUCE_NEW_PAIR"
     
-    # ETH in TRANSITION or EXTREME_UP — 14-27% WR
+    # ETH in TRANSITION or EXTREME_UP — 18% WR
     if asset == "ETH" and dist_zone in ("TRANSITION", "EXTREME_UP"):
         return 0.4, "REDUCE_ETH_WEAK"
     
-    # === BOUNDARY MINUTE (third priority) ===
-    
-    # :30 boundary — 37% WR, worst boundary
+    # :30 boundary — 50-54% WR, pool protection
     if minute == 30:
         return 0.4, "REDUCE_30"
     
-    # :00 boundary — also weaker
-    if minute == 0:
-        return 0.6, "REDUCE_00"
-    
-    # === DIST ZONE RULES ===
-    
-    # Dead zone: 60-70% DIST — 38.9% WR
-    if 60 <= dist_prob <= 70:
-        return 0.4, "REDUCE_DEAD_ZONE"
-    
-    # EXTREME_UP with high DIST prob — 80+ chasing
+    # DIST 80+ — chasing exhausted move, 24-35% WR
     if dist_prob >= 80:
         return 0.4, "REDUCE_EXTREME_HIGH"
     
-    # EXTREME_DOWN with very low DIST — 0-20 exhaustion
+    # DIST 0-20 — move already done, 0% WR
     if dist_prob <= 20:
         return 0.4, "REDUCE_EXTREME_LOW"
     
-    # HIGH confidence + non-NEUTRAL — exhaustion trap
+    # HIGH confidence + non-NEUTRAL — exhaustion trap, 33-55% WR
     if conf == "HIGH" and dist_zone != "NEUTRAL":
         return 0.4, "REDUCE_HIGH_EXTREME"
     
-    # MEDIUM conf + non-NEUTRAL — 36% WR, draining NORMAL tier
-    if conf == "MEDIUM" and dist_zone != "NEUTRAL":
-        return 0.6, "REDUCE_MED_NONNEUTRAL"
+    # === BOOST RULE ===
     
-    # === THE GOOD SETUPS (only :15/:45 reach here) ===
-    
-    # DOWN + NEUTRAL — 69.2% WR (90.9% on DOWN side in NEUTRAL)
+    # DOWN + NEUTRAL — 86% WR, second biggest engine
     if direction == "DOWN" and dist_zone == "NEUTRAL":
         return 1.5, "T1_DOWN_NEUTRAL"
     
-    # LOW confidence + NEUTRAL + STRONG period — 66.7% WR
-    if conf == "LOW" and dist_zone == "NEUTRAL" and _is_strong:
-        return 1.2, "T1_LOW_NEUTRAL"
-    
-    # TRANSITION zone — 48.4% WR
-    if dist_zone == "TRANSITION":
-        return 0.6, "REDUCE_TRANSITION"
-    
-    # Everything else
+    # === EVERYTHING ELSE ===
     return 1.0, "NORMAL"
 
 
@@ -23112,10 +23082,8 @@ def p29cl_page():
         ind = str(t.get("indicators", ""))
         tier = "NORMAL"
         for label in ["PHASE_FLIP_STRONG", "PHASE_FLIP", "PHASE_EXHAUST", "T1_DOWN_NEUTRAL",
-                       "T1_LOW_NEUTRAL", "REDUCE_NO_DIST", "REDUCE_30", "REDUCE_00",
-                       "REDUCE_EXTREME_HIGH", "REDUCE_EXTREME_LOW", "REDUCE_DEAD_ZONE",
-                       "REDUCE_HIGH_EXTREME", "REDUCE_MED_NONNEUTRAL", "REDUCE_TRANSITION",
-                       "REDUCE_NEW_PAIR", "REDUCE_ETH_WEAK"]:
+                       "REDUCE_NEW_PAIR", "REDUCE_ETH_WEAK", "REDUCE_30",
+                       "REDUCE_EXTREME_HIGH", "REDUCE_EXTREME_LOW", "REDUCE_HIGH_EXTREME"]:
             if label in ind:
                 tier = label
                 break
