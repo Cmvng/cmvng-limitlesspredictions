@@ -856,6 +856,10 @@ def _p29cl_get_multiplier(conf, dist_zone, dist_prob, minute, direction, asset, 
     
     # CAUTIOUS removed — 50.8% WR not a real signal
     
+    # === NO DIST DATA — minimum stake (17-35% WR) ===
+    if dist_zone not in ("EXTREME_DOWN", "TRANSITION", "NEUTRAL", "EXTREME_UP"):
+        return 0.4, "REDUCE_NO_DIST"
+    
     # === ASSET PENALTIES (second priority) ===
     
     # DOGE/BNB/HYPE: unproven pairs, force minimum
@@ -893,6 +897,10 @@ def _p29cl_get_multiplier(conf, dist_zone, dist_prob, minute, direction, asset, 
     # HIGH confidence + non-NEUTRAL — exhaustion trap
     if conf == "HIGH" and dist_zone != "NEUTRAL":
         return 0.4, "REDUCE_HIGH_EXTREME"
+    
+    # MEDIUM conf + non-NEUTRAL — 36% WR, draining NORMAL tier
+    if conf == "MEDIUM" and dist_zone != "NEUTRAL":
+        return 0.6, "REDUCE_MED_NONNEUTRAL"
     
     # === THE GOOD SETUPS (only :15/:45 reach here) ===
     
@@ -22519,6 +22527,11 @@ def _resolve_p29cl_trades():
                         
                         _p29cl_last_boundary_all_lose = (_bnd_wins == 0 and _bnd_total >= 3)
                         _p29cl_last_boundary_all_win = (_bnd_wins == _bnd_total and _bnd_total >= 3)
+                        
+                        # Log phase detail
+                        print("P29CL PHASE CHECK: bnd={} fired={} won={} all_lose={} all_win={}".format(
+                            _latest_bnd, _bnd_total, _bnd_wins,
+                            _p29cl_last_boundary_all_lose, _p29cl_last_boundary_all_win))
                         _p29cl_last_boundary_dir = _bnd_dir
                         
                         # Phase transitions
@@ -23099,9 +23112,10 @@ def p29cl_page():
         ind = str(t.get("indicators", ""))
         tier = "NORMAL"
         for label in ["PHASE_FLIP_STRONG", "PHASE_FLIP", "PHASE_EXHAUST", "T1_DOWN_NEUTRAL",
-                       "T1_LOW_NEUTRAL", "REDUCE_30", "REDUCE_00", "REDUCE_EXTREME_HIGH", 
-                       "REDUCE_EXTREME_LOW", "REDUCE_DEAD_ZONE", "REDUCE_HIGH_EXTREME",
-                       "REDUCE_TRANSITION", "REDUCE_NEW_PAIR", "REDUCE_ETH_WEAK"]:
+                       "T1_LOW_NEUTRAL", "REDUCE_NO_DIST", "REDUCE_30", "REDUCE_00",
+                       "REDUCE_EXTREME_HIGH", "REDUCE_EXTREME_LOW", "REDUCE_DEAD_ZONE",
+                       "REDUCE_HIGH_EXTREME", "REDUCE_MED_NONNEUTRAL", "REDUCE_TRANSITION",
+                       "REDUCE_NEW_PAIR", "REDUCE_ETH_WEAK"]:
             if label in ind:
                 tier = label
                 break
