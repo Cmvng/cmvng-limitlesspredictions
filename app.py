@@ -468,6 +468,13 @@ P29CL_SLUGS = {
 }
 _p29cl_token_map = {}  # separate token map for P2.9CL extra pairs
 
+# ── Phase detector state (persists across boundaries) ──
+_p29cl_phase = "RANGE"              # TREND / EXHAUST / RANGE
+_p29cl_last_boundary_dir = None     # "UP" or "DOWN" — direction of last boundary
+_p29cl_last_boundary_all_lose = False  # did ALL assets lose last boundary?
+_p29cl_last_boundary_all_win = False   # did ALL assets win last boundary?
+_p29cl_boundary_results = []        # list of (asset, outcome) for current boundary
+
 def _p29cl_momentum_score(asset, chainlink_close, p21_dir, btc_dir):
     """P2.9 Chainlink: P2.1 direction + candle analysis + momentum tiebreaker.
     
@@ -812,56 +819,101 @@ def _p29cl_calc_dist(asset, chainlink_close):
     
     return prob_pct, zone
 
-def _p29cl_get_multiplier(conf, dist_zone, dist_prob, minute):
-    """Stake multiplier based on live P2.9CL data (94 trades).
+def _p29cl_get_multiplier(conf, dist_zone, dist_prob, minute, direction, asset, phase, last_all_lose, last_all_win, last_dir):
+    """Stake multiplier based on 288 live P2.9CL trades + phase detection.
     
-    Proven patterns:
-    - NEUTRAL(40-60) = 66.7% WR → full or boosted stake
-    - LOW + NEUTRAL = 72.7% WR → 1.5x
-    - EXTREME zones = 33-36% WR → 0.4x
-    - :30 boundary = 40.7% WR → 0.4x
-    - HIGH + non-NEUTRAL = 38.5% WR → 0.4x
-    - 60-70% DIST dead zone = 37.5% WR → 0.4x
+    PHASE RULES (override everything):
+    - EXHAUST (after all-lose): 1.5x — 59% WR proven
+    - Direction flip: 1.5x — 85% WR proven (strongest signal)
+    - After all-win: 0.4x — 41% WR mean reversion
+    
+    DIST RULES:
+    - NEUTRAL(40-60) = best zone, 57% WR → 1.0x base
+    - DOWN+NEUTRAL = 69.2% WR → 1.5x (the real T1)
+    - EXTREME zones = exhaustion → 0.4x
+    - TRANSITION = dead zone → 0.6x
+    - :30 boundary = 37% WR → 0.4x
+    - Dead zone 60-70% DIST = 38.9% → 0.4x
+    
+    ASSET RULES:
+    - DOGE/BNB: force 0.4x until proven (35-43% WR)
+    - ETH+TRANSITION/EXTREME_UP: 0.4x (14-27% WR)
+    
+    CONFIDENCE RULES:
+    - HIGH+STRONG+EXTREME: 0.4x (exhaustion trap)
+    - HIGH+NEUTRAL: 1.0x (candle strong but room to run)
+    - LOW/MED+NEUTRAL: standard or boost
     
     Returns: (multiplier, tier_label)
     """
-    # :30 boundary penalty — 40.7% WR, worst boundary
+    
+    # ═══ PHASE OVERRIDES (highest priority) ═══
+    
+    # Direction flip — 85% WR, the strongest signal
+    if last_dir and direction != last_dir:
+        return 1.5, "PHASE_FLIP"
+    
+    # After all-lose — 59% WR, exhaustion recovery
+    if last_all_lose:
+        return 1.5, "PHASE_EXHAUST"
+    
+    # After all-win — 41% WR, mean reversion danger
+    if last_all_win:
+        return 0.4, "PHASE_CAUTIOUS"
+    
+    # ═══ ASSET PENALTIES (second priority) ═══
+    
+    # DOGE/BNB: unproven pairs, force minimum
+    if asset in ("DOGE", "BNB", "HYPE"):
+        return 0.4, "REDUCE_NEW_PAIR"
+    
+    # ETH in TRANSITION or EXTREME_UP — 14-27% WR
+    if asset == "ETH" and dist_zone in ("TRANSITION", "EXTREME_UP"):
+        return 0.4, "REDUCE_ETH_WEAK"
+    
+    # ═══ BOUNDARY MINUTE (third priority) ═══
+    
+    # :30 boundary — 37% WR, worst boundary
     if minute == 30:
         return 0.4, "REDUCE_30"
     
-    # EXTREME_UP with high DIST prob — 80+ is 28.6% WR
+    # ═══ DIST ZONE RULES ═══
+    
+    # Dead zone: 60-70% DIST — 38.9% WR
+    if 60 <= dist_prob <= 70:
+        return 0.4, "REDUCE_DEAD_ZONE"
+    
+    # EXTREME_UP with high DIST prob — 80+ chasing
     if dist_prob >= 80:
         return 0.4, "REDUCE_EXTREME_HIGH"
     
-    # EXTREME_DOWN with low DIST prob — 0-20 is 0-0% WR
+    # EXTREME_DOWN with very low DIST — 0-20 exhaustion
     if dist_prob <= 20:
         return 0.4, "REDUCE_EXTREME_LOW"
-    
-    # Dead zone: 60-70% DIST — 37.5% WR
-    if 60 <= dist_prob <= 70:
-        return 0.4, "REDUCE_DEAD_ZONE"
     
     # HIGH confidence + non-NEUTRAL — exhaustion trap
     if conf == "HIGH" and dist_zone != "NEUTRAL":
         return 0.4, "REDUCE_HIGH_EXTREME"
     
-    # LOW + NEUTRAL — the golden combo, 72.7% WR
+    # ═══ THE GOOD SETUPS ═══
+    
+    # DOWN + NEUTRAL — 69.2% WR, the real gold
+    if direction == "DOWN" and dist_zone == "NEUTRAL":
+        return 1.5, "T1_DOWN_NEUTRAL"
+    
+    # LOW confidence + NEUTRAL — 57.9% WR
     if conf == "LOW" and dist_zone == "NEUTRAL":
-        return 1.5, "T1_LOW_NEUTRAL"
+        return 1.2, "T1_LOW_NEUTRAL"
     
-    # MEDIUM + NEUTRAL — solid 60% WR
-    if conf == "MEDIUM" and dist_zone == "NEUTRAL":
-        return 1.2, "T1_MED_NEUTRAL"
-    
-    # HIGH + NEUTRAL — only 1 trade but strong candle in moderate zone
+    # HIGH + NEUTRAL — 100% WR (small sample but strong candle + room)
     if conf == "HIGH" and dist_zone == "NEUTRAL":
-        return 1.0, "NORMAL_HIGH_NEUTRAL"
+        return 1.0, "NORMAL"
     
-    # MEDIUM + EXTREME_UP (57.1% WR) — decent
-    if conf == "MEDIUM" and dist_zone == "EXTREME_UP":
-        return 0.8, "NORMAL_MED_EXTREME"
+    # MEDIUM + NEUTRAL — 51.6% WR, standard (was T1, demoted)
+    if conf == "MEDIUM" and dist_zone == "NEUTRAL":
+        return 1.0, "NORMAL"
     
-    # TRANSITION zone default — 48.8% WR
+    # TRANSITION zone — 48.4% WR
     if dist_zone == "TRANSITION":
         return 0.6, "REDUCE_TRANSITION"
     
@@ -1271,13 +1323,15 @@ def _bot2_sniper_thread():
                 print("BOT2 STOPPED: balance ${:.2f} hit floor".format(_bot2_sniper_state["balance"]))
                 send_telegram("🛑 BOT2 SNIPER STOPPED — balance ${:.2f}".format(_bot2_sniper_state["balance"]))
             
-    # ── P2.9CL: Momentum-based paper trades at T+0.5s ──
+    # ── P2.9CL: Phase-aware momentum engine at T+0.5s ──
             try:
                 if not _p29cl_state["enabled"]:
                     continue
                 
                 _p29cl_now = datetime.now(timezone.utc).isoformat()
                 _p29cl_count = 0
+                _p29cl_boundary_trades = []  # track this boundary for phase update
+                _p29cl_boundary_dir = None   # main direction this boundary
                 
                 # Get BTC direction for P2.1 and BTC trend
                 _p29cl_btc_price = _chainlink_prices.get("BTC")
@@ -1287,6 +1341,13 @@ def _bot2_sniper_thread():
                     _p29cl_btc_closes = _p29cl_btc_prefetch[-9:] + [_p29cl_btc_price]
                     _p29cl_btc_sma = sum(_p29cl_btc_closes) / 10.0
                     _p29cl_btc_dir = "SELL" if _p29cl_btc_price < _p29cl_btc_sma else "BUY"
+                
+                # Log phase state
+                _p29cl_bnd_minute = datetime.now(timezone.utc).minute
+                print("P29CL PHASE: {} | last_dir={} all_lose={} all_win={} | :{:02d}".format(
+                    _p29cl_phase, _p29cl_last_boundary_dir or "NONE",
+                    _p29cl_last_boundary_all_lose, _p29cl_last_boundary_all_win,
+                    _p29cl_bnd_minute))
                 
                 for _p29cl_asset in P29CL_ASSETS:
                     try:
@@ -1312,7 +1373,11 @@ def _bot2_sniper_thread():
                         if not _p29cl_dir:
                             continue
                         
-                        # Calculate DIST_PROB (tracking data)
+                        # Track main direction for phase detection
+                        if not _p29cl_boundary_dir:
+                            _p29cl_boundary_dir = _p29cl_dir
+                        
+                        # Calculate DIST_PROB
                         _p29cl_dist_prob, _p29cl_dist_zone = _p29cl_calc_dist(_p29cl_asset, _p29cl_price)
                         
                         # Dedup
@@ -1320,14 +1385,16 @@ def _bot2_sniper_thread():
                         if _p29cl_key in _p29cl_traded:
                             continue
                         
-                        # Calculate stake with multiplier
+                        # Calculate stake with phase-aware multiplier
                         _p29cl_base_stake = _p29cl_calc_stake(_p29cl_state["balance"])
                         if _p29cl_base_stake <= 0:
                             continue
                         
                         _p29cl_mult, _p29cl_tier = _p29cl_get_multiplier(
                             _p29cl_conf, _p29cl_dist_zone, _p29cl_dist_prob,
-                            datetime.now(timezone.utc).minute)
+                            _p29cl_bnd_minute, _p29cl_dir, _p29cl_asset,
+                            _p29cl_phase, _p29cl_last_boundary_all_lose,
+                            _p29cl_last_boundary_all_win, _p29cl_last_boundary_dir)
                         
                         _p29cl_stake = round(_p29cl_base_stake * _p29cl_mult, 2)
                         _p29cl_stake = max(2.50, _p29cl_stake)  # Polymarket minimum
@@ -1351,6 +1418,12 @@ def _bot2_sniper_thread():
                         if _p29cl_state["balance"] > _p29cl_state["peak_balance"]:
                             _p29cl_state["peak_balance"] = _p29cl_state["balance"]
                         
+                        # Track for phase update
+                        _p29cl_boundary_trades.append({
+                            "asset": _p29cl_asset, "key": _p29cl_key,
+                            "dir": _p29cl_dir, "stake": _p29cl_stake
+                        })
+                        
                         # Save to DB
                         try:
                             _p29cl_db = get_db()
@@ -1369,10 +1442,10 @@ def _bot2_sniper_thread():
                                 ttl="P29CL {} {} 15M".format(_p29cl_asset, _p29cl_dir),
                                 ast=_p29cl_asset, bs=_p29cl_dir, stk=_p29cl_stake,
                                 pa=_p29cl_state["balance"],
-                                ind="[{}] {} | P21={} | BTC={} | DIST={}({}) | {}".format(
+                                ind="[{}] {} | P21={} | BTC={} | DIST={}({}) | {} | PHASE={}".format(
                                     _p29cl_conf, _p29cl_tag, _p29cl_p21_dir or "NONE",
                                     _p29cl_btc_dir or "NONE", _p29cl_dist_zone, _p29cl_dist_prob,
-                                    _p29cl_tier),
+                                    _p29cl_tier, _p29cl_phase),
                                 conf=_p29cl_conf, ms=_p29cl_score,
                                 dp=_p29cl_dist_prob, dz=_p29cl_dist_zone,
                                 slg=_p29cl_slug, cid=_p29cl_cid, tid=_p29cl_tid,
@@ -1393,7 +1466,8 @@ def _bot2_sniper_thread():
                 
                 if _p29cl_count > 0:
                     _save_bot_balance("p29cl", _p29cl_state)
-                    print("P29CL: {} paper trades | pool=${:.2f}".format(_p29cl_count, _p29cl_state["balance"]))
+                    print("P29CL: {} paper trades | phase={} | pool=${:.2f}".format(
+                        _p29cl_count, _p29cl_phase, _p29cl_state["balance"]))
                 else:
                     print("P29CL: 0 trades (no momentum signal) | candles={} chainlink={}".format(
                         len(_p29cl_candle_prefetch), len(_chainlink_prices)))
@@ -22421,6 +22495,53 @@ def _resolve_p29cl_trades():
                 _save_bot_balance("p29cl", _p29cl_state)
             except Exception as e:
                 print("P29CL resolve error #{}: {}".format(p.get("id"), e))
+        
+        # ── Phase update: check boundary-level outcomes ──
+        if resolved > 0:
+            try:
+                global _p29cl_phase, _p29cl_last_boundary_dir
+                global _p29cl_last_boundary_all_lose, _p29cl_last_boundary_all_win
+                
+                # Get the most recently resolved boundary's trades
+                _phase_conn = get_db()
+                _phase_rows = _phase_conn.run("""SELECT bet_side, outcome, fired_at 
+                    FROM p29cl_trades WHERE outcome IN ('WIN','LOSS') 
+                    ORDER BY id DESC LIMIT 30""")
+                _phase_cols = [c['name'] for c in _phase_conn.columns]
+                _phase_items = [dict(zip(_phase_cols, r)) for r in _phase_rows]
+                _phase_conn.close()
+                
+                if _phase_items:
+                    # Group by boundary (fired_at[:16])
+                    _latest_bnd = str(_phase_items[0].get("fired_at", ""))[:16]
+                    _bnd_trades = [t for t in _phase_items if str(t.get("fired_at",""))[:16] == _latest_bnd]
+                    
+                    if len(_bnd_trades) >= 2:
+                        _bnd_wins = sum(1 for t in _bnd_trades if t["outcome"] == "WIN")
+                        _bnd_total = len(_bnd_trades)
+                        _bnd_dir = _bnd_trades[0].get("bet_side", "")
+                        
+                        _prev_all_lose = _p29cl_last_boundary_all_lose
+                        _prev_all_win = _p29cl_last_boundary_all_win
+                        _prev_dir = _p29cl_last_boundary_dir
+                        
+                        _p29cl_last_boundary_all_lose = (_bnd_wins == 0)
+                        _p29cl_last_boundary_all_win = (_bnd_wins == _bnd_total)
+                        _p29cl_last_boundary_dir = _bnd_dir
+                        
+                        # Phase transitions
+                        if _p29cl_last_boundary_all_lose:
+                            _p29cl_phase = "EXHAUST"
+                            print("P29CL PHASE → EXHAUST (all {} lost at {})".format(_bnd_total, _latest_bnd))
+                        elif _p29cl_last_boundary_all_win:
+                            _p29cl_phase = "CAUTIOUS"
+                            print("P29CL PHASE → CAUTIOUS (all {} won at {})".format(_bnd_total, _latest_bnd))
+                        else:
+                            _p29cl_phase = "RANGE"
+                            print("P29CL PHASE → RANGE ({}/{} won at {})".format(_bnd_wins, _bnd_total, _latest_bnd))
+            except Exception as _pe:
+                print("P29CL phase update error: {}".format(_pe))
+        
         return resolved
     except Exception as e:
         print("P29CL resolve error: {}".format(e)); return 0
@@ -22985,9 +23106,10 @@ def p29cl_page():
     for t in resolved:
         ind = str(t.get("indicators", ""))
         tier = "NORMAL"
-        for label in ["T1_LOW_NEUTRAL", "T1_MED_NEUTRAL", "REDUCE_30", "REDUCE_EXTREME_HIGH", 
+        for label in ["PHASE_FLIP", "PHASE_EXHAUST", "PHASE_CAUTIOUS", "T1_DOWN_NEUTRAL",
+                       "T1_LOW_NEUTRAL", "REDUCE_30", "REDUCE_EXTREME_HIGH", 
                        "REDUCE_EXTREME_LOW", "REDUCE_DEAD_ZONE", "REDUCE_HIGH_EXTREME",
-                       "REDUCE_TRANSITION", "REDUCE_WEAK", "NORMAL_HIGH_NEUTRAL", "NORMAL_MED_EXTREME"]:
+                       "REDUCE_TRANSITION", "REDUCE_NEW_PAIR", "REDUCE_ETH_WEAK"]:
             if label in ind:
                 tier = label
                 break
