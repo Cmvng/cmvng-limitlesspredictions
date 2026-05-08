@@ -22930,7 +22930,7 @@ def p29cl_page():
     """P2.9 Chainlink — Momentum paper bot dashboard."""
     try:
         conn = get_db()
-        rows = conn.run("SELECT * FROM p29cl_trades ORDER BY id DESC LIMIT 200")
+        rows = conn.run("SELECT * FROM p29cl_trades ORDER BY id DESC LIMIT 500")
         cols = [c['name'] for c in conn.columns]
         trades = [dict(zip(cols, r)) for r in rows]
         conn.close()
