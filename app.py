@@ -1543,16 +1543,17 @@ def _bot2_sniper_thread():
                                 _p29l_oid = None
                                 _p29l_filled = False
                                 try:
+                                    from py_clob_client_v2 import Side as _P29LSide, OrderArgs as _P29LArgs, OrderType as _P29LOT
                                     _p29l_price = 0.50
                                     _p29l_shares = round(_p29l_stake / _p29l_price, 4)
-                                    _p29l_args = OrderArgs(
+                                    _p29l_args = _P29LArgs(
                                         token_id=str(_p29l_token),
                                         price=_p29l_price,
                                         size=_p29l_shares,
-                                        side=BUY,
+                                        side=_P29LSide.BUY,
                                     )
                                     _p29l_signed = client.create_order(_p29l_args)
-                                    _p29l_resp = client.post_order(_p29l_signed, OrderType.GTC)
+                                    _p29l_resp = client.post_order(_p29l_signed, _P29LOT.GTC)
                                     if _p29l_resp:
                                         _p29l_oid = _p29l_resp.get("orderID") or _p29l_resp.get("id") or None
                                         _p29l_status = (_p29l_resp.get("status") or "").upper()
