@@ -766,10 +766,10 @@ def _p29cl_momentum_score(asset, chainlink_close, p21_dir, btc_dir):
     return direction, confidence, m_score, full_tag
 
 def _p29cl_calc_stake(balance):
-    """Compounding stake: 5% of pool, min $2.50, max $8."""
+    """Compounding stake: 5% of pool, min $2.50, max $4 (capped to match live)."""
     stake = round(balance * 0.05, 2)
     stake = max(stake, 2.50)
-    stake = min(stake, 8.00)
+    stake = min(stake, 4.00)  # capped at $4 — prevents $8-11 single-trade losses
     if stake > balance * 0.15:
         return 0
     return stake
@@ -860,9 +860,11 @@ def _p29cl_get_multiplier(conf, dist_zone, dist_prob, minute, direction, asset, 
     if asset in ("DOGE", "BNB", "HYPE"):
         return 0.4, "REDUCE_NEW_PAIR"
     
-    # ETH in TRANSITION or EXTREME_UP — 18% WR
-    if asset == "ETH" and dist_zone in ("TRANSITION", "EXTREME_UP"):
-        return 0.4, "REDUCE_ETH_WEAK"
+    # ETH underperforms across all zones — cap at 0.6x
+    if asset == "ETH":
+        if dist_zone in ("TRANSITION", "EXTREME_UP"):
+            return 0.4, "REDUCE_ETH_WEAK"
+        return 0.6, "REDUCE_ETH_ALL"
     
     # :30 boundary — 50% WR
     if minute == 30:
@@ -1544,6 +1546,10 @@ def _bot2_sniper_thread():
                                 _p29l_filled = False
                                 try:
                                     from py_clob_client_v2 import Side as _P29LSide, OrderArgs as _P29LArgs, OrderType as _P29LOT
+                                    _p29l_client = _get_poly_client()
+                                    if not _p29l_client:
+                                        print("P29CL LIVE: no client for {}".format(_p29l_asset))
+                                        continue
                                     _p29l_price = 0.50
                                     _p29l_shares = round(_p29l_stake / _p29l_price, 4)
                                     _p29l_args = _P29LArgs(
@@ -1552,8 +1558,8 @@ def _bot2_sniper_thread():
                                         size=_p29l_shares,
                                         side=_P29LSide.BUY,
                                     )
-                                    _p29l_signed = client.create_order(_p29l_args)
-                                    _p29l_resp = client.post_order(_p29l_signed, _P29LOT.GTC)
+                                    _p29l_signed = _p29l_client.create_order(_p29l_args)
+                                    _p29l_resp = _p29l_client.post_order(_p29l_signed, _P29LOT.GTC)
                                     if _p29l_resp:
                                         _p29l_oid = _p29l_resp.get("orderID") or _p29l_resp.get("id") or None
                                         _p29l_status = (_p29l_resp.get("status") or "").upper()
@@ -23341,7 +23347,7 @@ def p29cl_page():
         tier = "NORMAL"
         for label in ["PHASE_FLIP_STRONG", "PHASE_FLIP", "PHASE_EXHAUST",
                        "T1_DOWN_NEUTRAL", "T1_UP_NEUTRAL",
-                       "REDUCE_NEW_PAIR", "REDUCE_ETH_WEAK", "REDUCE_30",
+                       "REDUCE_NEW_PAIR", "REDUCE_ETH_WEAK", "REDUCE_ETH_ALL", "REDUCE_30",
                        "REDUCE_EXTREME_85", "REDUCE_EXTREME_HIGH", "REDUCE_EXTREME_LOW",
                        "REDUCE_HIGH_EXTREME", "REDUCE_COUNTER_TREND"]:
             if label in ind:
