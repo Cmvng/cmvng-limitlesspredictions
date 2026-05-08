@@ -820,50 +820,45 @@ def _p29cl_calc_dist(asset, chainlink_close):
     return prob_pct, zone
 
 def _p29cl_get_multiplier(conf, dist_zone, dist_prob, minute, direction, asset, phase, last_all_lose, last_all_win, last_dir):
-    """Stake multiplier based on 288 live P2.9CL trades + phase detection.
+    """Stake multiplier v3 — phase-aware + validated corrections.
     
-    PHASE RULES (override everything):
-    - EXHAUST (after all-lose): 1.5x — 59% WR proven
-    - Direction flip: 1.5x — 85% WR proven (strongest signal)
-    - After all-win: 0.4x — 41% WR mean reversion
+    PHASE RULES:
+    - FLIP (direction changed): 2.0x on STRONG(:15/:45), 1.5x on WEAK(:00/:30) — 85% WR
+    - EXHAUST (3+ assets lost): 1.5x — ~60% WR historically
+    - CAUTIOUS removed — 50.8% WR not a real signal
     
     DIST RULES:
-    - NEUTRAL(40-60) = best zone, 57% WR → 1.0x base
-    - DOWN+NEUTRAL = 69.2% WR → 1.5x (the real T1)
-    - EXTREME zones = exhaustion → 0.4x
-    - TRANSITION = dead zone → 0.6x
-    - :30 boundary = 37% WR → 0.4x
-    - Dead zone 60-70% DIST = 38.9% → 0.4x
+    - DOWN+NEUTRAL: 1.5x (90.9% WR on DOWN side in NEUTRAL)
+    - LOW+NEUTRAL on STRONG period: 1.2x (66.7% WR)
+    - EXTREME/TRANSITION/dead zone: 0.4-0.6x
+    - :30 boundary: 0.4x (37% WR)
     
     ASSET RULES:
-    - DOGE/BNB: force 0.4x until proven (35-43% WR)
+    - DOGE/BNB/HYPE: 0.4x until proven
     - ETH+TRANSITION/EXTREME_UP: 0.4x (14-27% WR)
-    
-    CONFIDENCE RULES:
-    - HIGH+STRONG+EXTREME: 0.4x (exhaustion trap)
-    - HIGH+NEUTRAL: 1.0x (candle strong but room to run)
-    - LOW/MED+NEUTRAL: standard or boost
     
     Returns: (multiplier, tier_label)
     """
+    _is_strong = minute in (15, 45)
     
-    # ═══ PHASE OVERRIDES (highest priority) ═══
+    # === PHASE OVERRIDES (highest priority) ===
     
-    # Direction flip — 85% WR, the strongest signal
+    # Direction flip — 85% WR, strongest signal
     if last_dir and direction != last_dir:
+        if _is_strong:
+            return 2.0, "PHASE_FLIP_STRONG"
         return 1.5, "PHASE_FLIP"
     
-    # After all-lose — 59% WR, exhaustion recovery
+    # After 3+ assets all lost — exhaustion recovery
+    # (last_all_lose only True when 3+ assets lost, checked in resolution)
     if last_all_lose:
         return 1.5, "PHASE_EXHAUST"
     
-    # After all-win — 41% WR, mean reversion danger
-    if last_all_win:
-        return 0.4, "PHASE_CAUTIOUS"
+    # CAUTIOUS removed — 50.8% WR not a real signal
     
-    # ═══ ASSET PENALTIES (second priority) ═══
+    # === ASSET PENALTIES (second priority) ===
     
-    # DOGE/BNB: unproven pairs, force minimum
+    # DOGE/BNB/HYPE: unproven pairs, force minimum
     if asset in ("DOGE", "BNB", "HYPE"):
         return 0.4, "REDUCE_NEW_PAIR"
     
@@ -871,13 +866,17 @@ def _p29cl_get_multiplier(conf, dist_zone, dist_prob, minute, direction, asset, 
     if asset == "ETH" and dist_zone in ("TRANSITION", "EXTREME_UP"):
         return 0.4, "REDUCE_ETH_WEAK"
     
-    # ═══ BOUNDARY MINUTE (third priority) ═══
+    # === BOUNDARY MINUTE (third priority) ===
     
     # :30 boundary — 37% WR, worst boundary
     if minute == 30:
         return 0.4, "REDUCE_30"
     
-    # ═══ DIST ZONE RULES ═══
+    # :00 boundary — also weaker
+    if minute == 0:
+        return 0.6, "REDUCE_00"
+    
+    # === DIST ZONE RULES ===
     
     # Dead zone: 60-70% DIST — 38.9% WR
     if 60 <= dist_prob <= 70:
@@ -895,23 +894,15 @@ def _p29cl_get_multiplier(conf, dist_zone, dist_prob, minute, direction, asset, 
     if conf == "HIGH" and dist_zone != "NEUTRAL":
         return 0.4, "REDUCE_HIGH_EXTREME"
     
-    # ═══ THE GOOD SETUPS ═══
+    # === THE GOOD SETUPS (only :15/:45 reach here) ===
     
-    # DOWN + NEUTRAL — 69.2% WR, the real gold
+    # DOWN + NEUTRAL — 69.2% WR (90.9% on DOWN side in NEUTRAL)
     if direction == "DOWN" and dist_zone == "NEUTRAL":
         return 1.5, "T1_DOWN_NEUTRAL"
     
-    # LOW confidence + NEUTRAL — 57.9% WR
-    if conf == "LOW" and dist_zone == "NEUTRAL":
+    # LOW confidence + NEUTRAL + STRONG period — 66.7% WR
+    if conf == "LOW" and dist_zone == "NEUTRAL" and _is_strong:
         return 1.2, "T1_LOW_NEUTRAL"
-    
-    # HIGH + NEUTRAL — 100% WR (small sample but strong candle + room)
-    if conf == "HIGH" and dist_zone == "NEUTRAL":
-        return 1.0, "NORMAL"
-    
-    # MEDIUM + NEUTRAL — 51.6% WR, standard (was T1, demoted)
-    if conf == "MEDIUM" and dist_zone == "NEUTRAL":
-        return 1.0, "NORMAL"
     
     # TRANSITION zone — 48.4% WR
     if dist_zone == "TRANSITION":
@@ -919,6 +910,7 @@ def _p29cl_get_multiplier(conf, dist_zone, dist_prob, minute, direction, asset, 
     
     # Everything else
     return 1.0, "NORMAL"
+
 
 def _bot2_sniper_calc_direction(asset, chainlink_close):
     """Bot2 strategy: SMA10 on 1H + BTC trend agree.
@@ -22525,8 +22517,8 @@ def _resolve_p29cl_trades():
                         _prev_all_win = _p29cl_last_boundary_all_win
                         _prev_dir = _p29cl_last_boundary_dir
                         
-                        _p29cl_last_boundary_all_lose = (_bnd_wins == 0)
-                        _p29cl_last_boundary_all_win = (_bnd_wins == _bnd_total)
+                        _p29cl_last_boundary_all_lose = (_bnd_wins == 0 and _bnd_total >= 3)
+                        _p29cl_last_boundary_all_win = (_bnd_wins == _bnd_total and _bnd_total >= 3)
                         _p29cl_last_boundary_dir = _bnd_dir
                         
                         # Phase transitions
@@ -23106,8 +23098,8 @@ def p29cl_page():
     for t in resolved:
         ind = str(t.get("indicators", ""))
         tier = "NORMAL"
-        for label in ["PHASE_FLIP", "PHASE_EXHAUST", "PHASE_CAUTIOUS", "T1_DOWN_NEUTRAL",
-                       "T1_LOW_NEUTRAL", "REDUCE_30", "REDUCE_EXTREME_HIGH", 
+        for label in ["PHASE_FLIP_STRONG", "PHASE_FLIP", "PHASE_EXHAUST", "T1_DOWN_NEUTRAL",
+                       "T1_LOW_NEUTRAL", "REDUCE_30", "REDUCE_00", "REDUCE_EXTREME_HIGH", 
                        "REDUCE_EXTREME_LOW", "REDUCE_DEAD_ZONE", "REDUCE_HIGH_EXTREME",
                        "REDUCE_TRANSITION", "REDUCE_NEW_PAIR", "REDUCE_ETH_WEAK"]:
             if label in ind:
