@@ -861,8 +861,13 @@ def _p29cl_get_multiplier(conf, dist_zone, dist_prob, minute, direction, asset, 
     if consecutive_all_lose >= 2:
         return 0.4, "REDUCE_DUMP_CONFIRMED"
     
-    # Momentum engine flagged exhaustion — signal contradicting itself
-    if ("EXHAUST" in _tag_upper or "DOJI" in _tag_upper) and conf == "LOW":
+    # DOJI at any confidence — 45.9% WR confirmed across P2.9 (111 trades)
+    # Market indecisive, betting on a coin flip
+    if "DOJI" in _tag_upper:
+        return 0.4, "REDUCE_DOJI"
+    
+    # Momentum engine flagged exhaustion
+    if "EXHAUST" in _tag_upper and conf == "LOW":
         return 0.4, "REDUCE_EXHAUSTION"
     
     # MODERATE_RED_CONFIRMS + MEDIUM conf — 28% WR on 25 trades (p=0.010)
@@ -883,6 +888,11 @@ def _p29cl_get_multiplier(conf, dist_zone, dist_prob, minute, direction, asset, 
     if ("STRONG_STRONG_GREEN_CONFIRMS" in _tag_upper or 
         "STRONG_MODERATE_GREEN_CONFIRMS" in _tag_upper) and dist_zone == "EXTREME_UP":
         return 0.4, "REDUCE_STRONG_GREEN_EXTREME"
+    
+    # STRONG candle but price already moving against bet direction
+    # eff_prob < 48 means price hasn't confirmed — 48% WR across P2.9 (304 trades)
+    if "STRONG" in _tag_upper and _eff_prob < 48:
+        return 0.4, "REDUCE_STRONG_OPPOSES"
     
     # DOGE/BNB/HYPE: unproven, 32-38% WR
     if asset in ("DOGE", "BNB", "HYPE"):
@@ -931,15 +941,21 @@ def _p29cl_get_multiplier(conf, dist_zone, dist_prob, minute, direction, asset, 
     if last_all_lose:
         return 1.5, "PHASE_EXHAUST"
     
-    # ═══ STEP 3: T1 BOOSTS ═══
+    # ═══ STEP 3: T1 BOOSTS (with price confirmation gate) ═══
     
     # DOWN + NEUTRAL + BTC selling — 81% WR
+    # Only boost if eff_prob > 50 (price has started moving DOWN)
     if direction == "DOWN" and dist_zone == "NEUTRAL" and _btc_selling:
-        return 1.5, "T1_DOWN_NEUTRAL"
+        if _eff_prob > 50:
+            return 1.5, "T1_DOWN_NEUTRAL"
+        return 1.0, "NORMAL"  # price hasn't confirmed yet
     
     # UP + NEUTRAL + BTC buying — 59% WR
+    # Only boost if eff_prob > 50 (price has started moving UP)
     if direction == "UP" and dist_zone == "NEUTRAL" and _btc_buying:
-        return 1.5, "T1_UP_NEUTRAL"
+        if _eff_prob > 50:
+            return 1.5, "T1_UP_NEUTRAL"
+        return 1.0, "NORMAL"  # price hasn't confirmed yet
     
     # ═══ STEP 4: EVERYTHING ELSE ═══
     return 1.0, "NORMAL"
@@ -1648,6 +1664,7 @@ def _bot2_sniper_thread():
                                 # Skip confirmed losers — paper only for data
                                 _LIVE_SKIP_TIERS = {
                                     "REDUCE_DUMP_CONFIRMED", # 2+ consecutive all-lose
+                                    "REDUCE_DOJI",           # DOJI at any conf — 45.9% WR
                                     "REDUCE_NEW_PAIR",       # 41% WR — DOGE/BNB/HYPE
                                     "REDUCE_ETH_WEAK",       # 30% WR — ETH TRANSITION/EXTREME_UP
                                     "REDUCE_EXTREME_LOW",    # 0% WR — DIST 0-20
@@ -1658,6 +1675,7 @@ def _bot2_sniper_thread():
                                     "REDUCE_MODERATE_RED",   # 28% WR — confirmed loser
                                     "REDUCE_SHOOTING_STAR",  # 37% WR — M2+ losing pattern
                                     "REDUCE_STRONG_GREEN_EXTREME",  # 44% WR — strong green in EXTREME_UP
+                                    "REDUCE_STRONG_OPPOSES", # 48% WR — strong candle but price opposing
                                 }
                                 if _p29l_tier in _LIVE_SKIP_TIERS:
                                     print("P29CL LIVE SKIP: {} {} tier={} (paper only)".format(
@@ -23486,9 +23504,9 @@ def p29cl_page():
         tier = "NORMAL"
         for label in ["PHASE_FLIP_STRONG", "PHASE_FLIP", "PHASE_EXHAUST",
                        "T1_DOWN_NEUTRAL", "T1_UP_NEUTRAL",
-                       "REDUCE_DUMP_CONFIRMED",
+                       "REDUCE_DUMP_CONFIRMED", "REDUCE_DOJI",
                        "REDUCE_EXHAUSTION", "REDUCE_MODERATE_RED", "REDUCE_SHOOTING_STAR",
-                       "REDUCE_STRONG_GREEN_EXTREME",
+                       "REDUCE_STRONG_GREEN_EXTREME", "REDUCE_STRONG_OPPOSES",
                        "REDUCE_NEW_PAIR", "REDUCE_ETH_WEAK", "REDUCE_30",
                        "REDUCE_EXTREME_85", "REDUCE_EXTREME_HIGH", "REDUCE_EXTREME_LOW",
                        "REDUCE_HIGH_EXTREME", "REDUCE_COUNTER_TREND"]:
