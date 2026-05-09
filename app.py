@@ -857,11 +857,9 @@ def _p29cl_get_multiplier(conf, dist_zone, dist_prob, minute, direction, asset, 
     if asset in ("DOGE", "BNB", "HYPE"):
         return 0.4, "REDUCE_NEW_PAIR"
     
-    # ETH underperforms across all zones — cap at 0.6x
-    if asset == "ETH":
-        if dist_zone in ("TRANSITION", "EXTREME_UP"):
-            return 0.4, "REDUCE_ETH_WEAK"
-        return 0.6, "REDUCE_ETH_ALL"
+    # ETH in TRANSITION or EXTREME_UP — 20-30% WR confirmed
+    if asset == "ETH" and dist_zone in ("TRANSITION", "EXTREME_UP"):
+        return 0.4, "REDUCE_ETH_WEAK"
     
     # :30 boundary — 50% WR
     if minute == 30:
