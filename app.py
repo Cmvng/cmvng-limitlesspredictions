@@ -1110,6 +1110,7 @@ def _bot2_sniper_thread():
                     print("BOT2 token fetch error {}: {}".format(asset, e))
             
             # ── P2.9CL: Fetch tokens for extra pairs (DOGE, BNB, HYPE) ──
+            global _p29cl_token_map
             _p29cl_token_map = dict(token_map)  # start with sniper tokens
             for asset in P29CL_ASSETS:
                 if asset in token_map:
@@ -6889,12 +6890,6 @@ def _sign_order(order_data, verifying_contract):
         return None
     except Exception as e:
         print("Signing error: {}".format(e))
-        return None
-        return signed.signature.hex()
-    except Exception as e:
-        print("Signing error: {}".format(e))
-        import traceback
-        traceback.print_exc()
         return None
 
 def _is_safe_trading_window():
