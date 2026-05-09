@@ -474,6 +474,7 @@ _p29cl_phase = "RANGE"              # TREND / EXHAUST / RANGE
 _p29cl_last_boundary_dir = None     # "UP" or "DOWN" — direction of last boundary
 _p29cl_last_boundary_all_lose = False  # did ALL assets lose last boundary?
 _p29cl_last_boundary_all_win = False   # did ALL assets win last boundary?
+_p29cl_consecutive_all_lose = 0        # count of consecutive all-lose boundaries (for DUMP_CONFIRMED)
 _p29cl_last_boundary_dominant_dir = None  # "UP" or "DOWN" — majority direction last boundary
 _p29cl_boundary_results = []        # list of (asset, outcome) for current boundary
 
@@ -837,10 +838,10 @@ def _p29cl_calc_dist(asset, chainlink_close):
     
     return prob_pct, zone
 
-def _p29cl_get_multiplier(conf, dist_zone, dist_prob, minute, direction, asset, phase, last_all_lose, last_all_win, last_dir, btc_dir=None, is_majority_flip=False, momentum_tag=""):
+def _p29cl_get_multiplier(conf, dist_zone, dist_prob, minute, direction, asset, phase, last_all_lose, last_all_win, last_dir, btc_dir=None, is_majority_flip=False, momentum_tag="", consecutive_all_lose=0):
     """Stake multiplier v7.1 — hard reduces first, then phase boosts.
     
-    Added: REDUCE_EXHAUSTION when momentum engine flags exhaustion/doji.
+    Added: DUMP_CONFIRMED when 2+ consecutive all-lose boundaries.
     """
     _is_strong = minute in (15, 45)
     _btc_selling = (btc_dir == "SELL")
@@ -853,6 +854,12 @@ def _p29cl_get_multiplier(conf, dist_zone, dist_prob, minute, direction, asset, 
     _eff_prob = dist_prob if direction == "UP" else (100 - dist_prob)
     
     # ═══ STEP 1: HARD REDUCES (always checked first) ═══
+    
+    # DUMP_CONFIRMED: 2+ consecutive all-lose boundaries
+    # When 4+ assets all lost for 2+ boundaries in a row, the market is in a genuine dump
+    # Reduce all trades in the SAME direction as the dump to 0.4x
+    if consecutive_all_lose >= 2:
+        return 0.4, "REDUCE_DUMP_CONFIRMED"
     
     # Momentum engine flagged exhaustion — signal contradicting itself
     if ("EXHAUST" in _tag_upper or "DOJI" in _tag_upper) and conf == "LOW":
@@ -1376,10 +1383,11 @@ def _bot2_sniper_thread():
                 if _p29cl_last_boundary_dominant_dir and _p29cl_current_dominant:
                     _p29cl_is_majority_flip = (_p29cl_current_dominant != _p29cl_last_boundary_dominant_dir)
                 
-                print("P29CL PHASE: {} | last_dom={} curr_dom={} flip={} all_lose={} | :{:02d}".format(
+                print("P29CL PHASE: {} | last_dom={} curr_dom={} flip={} all_lose={} consec={} | :{:02d}".format(
                     _p29cl_phase, _p29cl_last_boundary_dominant_dir or "NONE",
                     _p29cl_current_dominant or "NONE", _p29cl_is_majority_flip,
-                    _p29cl_last_boundary_all_lose, _p29cl_bnd_minute))
+                    _p29cl_last_boundary_all_lose, _p29cl_consecutive_all_lose,
+                    _p29cl_bnd_minute))
                 
                 for _p29cl_asset in P29CL_ASSETS:
                     if _p29cl_skip_boundary:
@@ -1439,7 +1447,7 @@ def _bot2_sniper_thread():
                             _p29cl_phase, _p29cl_last_boundary_all_lose,
                             _p29cl_last_boundary_all_win, _p29cl_last_boundary_dir,
                             btc_dir=_p29cl_btc_dir, is_majority_flip=_p29cl_is_majority_flip,
-                            momentum_tag=_p29cl_tag)
+                            momentum_tag=_p29cl_tag, consecutive_all_lose=_p29cl_consecutive_all_lose)
                         
                         _p29cl_stake = round(_p29cl_base_stake * _p29cl_mult, 2)
                         _p29cl_stake = max(2.50, _p29cl_stake)  # Polymarket minimum
@@ -1567,10 +1575,11 @@ def _bot2_sniper_thread():
                                     _p29cl_phase, _p29cl_last_boundary_all_lose,
                                     _p29cl_last_boundary_all_win, _p29cl_last_boundary_dir,
                                     btc_dir=_p29cl_btc_dir, is_majority_flip=_p29cl_is_majority_flip,
-                                    momentum_tag=_p29l_tag)
+                                    momentum_tag=_p29l_tag, consecutive_all_lose=_p29cl_consecutive_all_lose)
                                 
                                 # Skip confirmed losers — paper only for data
                                 _LIVE_SKIP_TIERS = {
+                                    "REDUCE_DUMP_CONFIRMED", # 2+ consecutive all-lose
                                     "REDUCE_NEW_PAIR",       # 41% WR — DOGE/BNB/HYPE
                                     "REDUCE_ETH_WEAK",       # 30% WR — ETH TRANSITION/EXTREME_UP
                                     "REDUCE_EXTREME_LOW",    # 0% WR — DIST 0-20
@@ -22694,6 +22703,7 @@ def _resolve_p29cl_trades():
             try:
                 global _p29cl_phase, _p29cl_last_boundary_dir
                 global _p29cl_last_boundary_all_lose, _p29cl_last_boundary_all_win
+                global _p29cl_consecutive_all_lose
                 
                 # Get the most recently resolved boundary's trades
                 _phase_conn = get_db()
@@ -22721,10 +22731,17 @@ def _resolve_p29cl_trades():
                         _p29cl_last_boundary_all_lose = (_bnd_wins == 0 and _bnd_total >= 3)
                         _p29cl_last_boundary_all_win = (_bnd_wins == _bnd_total and _bnd_total >= 3)
                         
+                        # Track consecutive all-lose for DUMP_CONFIRMED
+                        if _p29cl_last_boundary_all_lose:
+                            _p29cl_consecutive_all_lose += 1
+                        else:
+                            _p29cl_consecutive_all_lose = 0
+                        
                         # Log phase detail
-                        print("P29CL PHASE CHECK: bnd={} fired={} won={} all_lose={} all_win={}".format(
+                        print("P29CL PHASE CHECK: bnd={} fired={} won={} all_lose={} all_win={} consec_lose={}".format(
                             _latest_bnd, _bnd_total, _bnd_wins,
-                            _p29cl_last_boundary_all_lose, _p29cl_last_boundary_all_win))
+                            _p29cl_last_boundary_all_lose, _p29cl_last_boundary_all_win,
+                            _p29cl_consecutive_all_lose))
                         _p29cl_last_boundary_dir = _bnd_dir
                         
                         # Track dominant direction for majority flip detection
@@ -23401,6 +23418,7 @@ def p29cl_page():
         tier = "NORMAL"
         for label in ["PHASE_FLIP_STRONG", "PHASE_FLIP", "PHASE_EXHAUST",
                        "T1_DOWN_NEUTRAL", "T1_UP_NEUTRAL",
+                       "REDUCE_DUMP_CONFIRMED",
                        "REDUCE_EXHAUSTION", "REDUCE_MODERATE_RED", "REDUCE_SHOOTING_STAR",
                        "REDUCE_STRONG_GREEN_EXTREME",
                        "REDUCE_NEW_PAIR", "REDUCE_ETH_WEAK", "REDUCE_30",
