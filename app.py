@@ -847,6 +847,11 @@ def _p29cl_get_multiplier(conf, dist_zone, dist_prob, minute, direction, asset, 
     _btc_buying = (btc_dir == "BUY")
     _tag_upper = str(momentum_tag).upper()
     
+    # Effective probability: for UP bets, eff_prob = dist_prob
+    # For DOWN bets, eff_prob = 100 - dist_prob (mirrored)
+    # This ensures EXTREME_DOWN(7%) on a DOWN bet → eff_prob=93 (exhausted)
+    _eff_prob = dist_prob if direction == "UP" else (100 - dist_prob)
+    
     # ═══ STEP 1: HARD REDUCES (always checked first) ═══
     
     # Momentum engine flagged exhaustion — signal contradicting itself
@@ -865,16 +870,17 @@ def _p29cl_get_multiplier(conf, dist_zone, dist_prob, minute, direction, asset, 
     if minute == 30:
         return 0.4, "REDUCE_30"
     
-    # DIST 85+ with HIGH/MEDIUM — unconditional exhaustion
-    if dist_prob >= 85 and conf in ("HIGH", "MEDIUM"):
+    # Effective prob 85+ with HIGH/MEDIUM — unconditional exhaustion
+    # Catches both UP+EXTREME_UP(85+) AND DOWN+EXTREME_DOWN(15-)
+    if _eff_prob >= 85 and conf in ("HIGH", "MEDIUM"):
         return 0.4, "REDUCE_EXTREME_85"
     
-    # DIST 80+ in dump
-    if dist_prob >= 80 and _btc_selling:
+    # Effective prob 80+ in dump
+    if _eff_prob >= 80 and _btc_selling:
         return 0.4, "REDUCE_EXTREME_HIGH"
     
-    # DIST 0-20 — move already done
-    if dist_prob <= 20:
+    # Effective prob 0-20 — move barely started or wrong direction
+    if _eff_prob <= 20:
         return 0.4, "REDUCE_EXTREME_LOW"
     
     # HIGH confidence + non-NEUTRAL — exhaustion trap
