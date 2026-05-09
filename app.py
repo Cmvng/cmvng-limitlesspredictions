@@ -858,6 +858,25 @@ def _p29cl_get_multiplier(conf, dist_zone, dist_prob, minute, direction, asset, 
     if ("EXHAUST" in _tag_upper or "DOJI" in _tag_upper) and conf == "LOW":
         return 0.4, "REDUCE_EXHAUSTION"
     
+    # MODERATE_RED_CONFIRMS + MEDIUM conf — 28% WR on 25 trades (p=0.010)
+    # Important: STRONG_MODERATE_RED_CONFIRMS (52% WR) must NOT match
+    if "MODERATE_RED_CONFIRMS" in _tag_upper and "STRONG_MODERATE" not in _tag_upper and conf == "MEDIUM":
+        return 0.4, "REDUCE_MODERATE_RED"
+    
+    # WEAK_SHOOTING_STAR with M2+ — 37% WR losing pattern
+    # M0 (69% WR) and M1 are NOT losers — only M2, M3, M4+
+    if ("WEAK_SHOOTING_STAR_M2" in _tag_upper or 
+        "WEAK_SHOOTING_STAR_M3" in _tag_upper or 
+        "WEAK_SHOOTING_STAR_M4" in _tag_upper or
+        "WEAK_SHOOTING_STAR_M5" in _tag_upper):
+        return 0.4, "REDUCE_SHOOTING_STAR"
+    
+    # STRONG_GREEN in EXTREME_UP — 44% WR on 86 trades
+    # Only in EXTREME_UP — TRANSITION at 65% WR should not be reduced
+    if ("STRONG_STRONG_GREEN_CONFIRMS" in _tag_upper or 
+        "STRONG_MODERATE_GREEN_CONFIRMS" in _tag_upper) and dist_zone == "EXTREME_UP":
+        return 0.4, "REDUCE_STRONG_GREEN_EXTREME"
+    
     # DOGE/BNB/HYPE: unproven, 32-38% WR
     if asset in ("DOGE", "BNB", "HYPE"):
         return 0.4, "REDUCE_NEW_PAIR"
@@ -1554,12 +1573,14 @@ def _bot2_sniper_thread():
                                 _LIVE_SKIP_TIERS = {
                                     "REDUCE_NEW_PAIR",       # 41% WR — DOGE/BNB/HYPE
                                     "REDUCE_ETH_WEAK",       # 30% WR — ETH TRANSITION/EXTREME_UP
-                                    "REDUCE_ETH_ALL",        # ETH all zones
                                     "REDUCE_EXTREME_LOW",    # 0% WR — DIST 0-20
                                     "REDUCE_COUNTER_TREND",  # 29% WR — fighting BTC
                                     "REDUCE_EXHAUSTION",     # new, no validation
                                     "REDUCE_30",             # 53% WR — thin edge
                                     "REDUCE_EXTREME_85",     # 52% WR — unproven
+                                    "REDUCE_MODERATE_RED",   # 28% WR — confirmed loser
+                                    "REDUCE_SHOOTING_STAR",  # 37% WR — M2+ losing pattern
+                                    "REDUCE_STRONG_GREEN_EXTREME",  # 44% WR — strong green in EXTREME_UP
                                 }
                                 if _p29l_tier in _LIVE_SKIP_TIERS:
                                     print("P29CL LIVE SKIP: {} {} tier={} (paper only)".format(
@@ -23380,8 +23401,9 @@ def p29cl_page():
         tier = "NORMAL"
         for label in ["PHASE_FLIP_STRONG", "PHASE_FLIP", "PHASE_EXHAUST",
                        "T1_DOWN_NEUTRAL", "T1_UP_NEUTRAL",
-                       "REDUCE_EXHAUSTION", "REDUCE_NEW_PAIR", "REDUCE_ETH_WEAK",
-                       "REDUCE_ETH_ALL", "REDUCE_30",
+                       "REDUCE_EXHAUSTION", "REDUCE_MODERATE_RED", "REDUCE_SHOOTING_STAR",
+                       "REDUCE_STRONG_GREEN_EXTREME",
+                       "REDUCE_NEW_PAIR", "REDUCE_ETH_WEAK", "REDUCE_30",
                        "REDUCE_EXTREME_85", "REDUCE_EXTREME_HIGH", "REDUCE_EXTREME_LOW",
                        "REDUCE_HIGH_EXTREME", "REDUCE_COUNTER_TREND"]:
             if label in ind:
