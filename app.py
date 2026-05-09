@@ -23322,7 +23322,7 @@ def p29cl_page():
     """P2.9 Chainlink — Momentum paper bot dashboard."""
     try:
         conn = get_db()
-        rows = conn.run("SELECT * FROM p29cl_trades ORDER BY id DESC LIMIT 500")
+        rows = conn.run("SELECT * FROM p29cl_trades ORDER BY id DESC LIMIT 1000")
         cols = [c['name'] for c in conn.columns]
         trades = [dict(zip(cols, r)) for r in rows]
         conn.close()
@@ -24771,7 +24771,9 @@ def csv_export(table_name):
     Usage: /csv/paper23_trades, /csv/alpha_trades, /csv/poly_alpha3_trades, etc.
     """
     allowed = [
+        "paper_trades", "paper3_trades", "paper4_trades", "paper5_trades",
         "paper21_trades", "paper22_trades", "paper23_trades", "paper33_trades",
+        "paper31_trades", "paper32_trades", "paper51_trades",
         "paper24_trades", "paper34_trades", "paper25_trades", "paper35_trades",
         "paper26_trades", "paper36_trades", "paper27_trades", "paper37_trades",
         "paper28_trades", "paper29_trades", "paper210_trades",
