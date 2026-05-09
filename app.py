@@ -1383,38 +1383,66 @@ def _bot2_sniper_thread():
                 if _p29cl_last_boundary_dominant_dir and _p29cl_current_dominant:
                     _p29cl_is_majority_flip = (_p29cl_current_dominant != _p29cl_last_boundary_dominant_dir)
                 
-                # EXHAUST timing fix: query DB directly for previous boundary outcomes
-                # This bypasses the resolution timing gap — checks at T+0.5s what happened last boundary
+                # EXHAUST timing fix: query DB for N-2 boundary outcomes (30 min ago)
+                # N-1 boundary may still be PENDING at T+0.5s, N-2 is guaranteed resolved
                 try:
                     _exhaust_db = get_db()
                     _exhaust_rows = _exhaust_db.run("""SELECT bet_side, outcome, fired_at 
                         FROM p29cl_trades WHERE outcome IN ('WIN','LOSS') 
-                        ORDER BY id DESC LIMIT 20""")
+                        ORDER BY id DESC LIMIT 30""")
                     _exhaust_cols = [c['name'] for c in _exhaust_db.columns]
                     _exhaust_items = [dict(zip(_exhaust_cols, r)) for r in _exhaust_rows]
                     _exhaust_db.close()
                     
                     if _exhaust_items:
-                        _exhaust_latest_bnd = str(_exhaust_items[0].get("fired_at", ""))[:16]
-                        _exhaust_bnd_trades = [t for t in _exhaust_items if str(t.get("fired_at",""))[:16] == _exhaust_latest_bnd]
-                        if len(_exhaust_bnd_trades) >= 3:
-                            _exhaust_wins = sum(1 for t in _exhaust_bnd_trades if t["outcome"] == "WIN")
-                            _exhaust_total = len(_exhaust_bnd_trades)
-                            if _exhaust_wins == 0:
-                                _p29cl_last_boundary_all_lose = True
-                                _p29cl_consecutive_all_lose += 1
-                                _p29cl_phase = "EXHAUST"
-                                # Track dominant direction from resolved trades
-                                _exhaust_up = sum(1 for t in _exhaust_bnd_trades if t.get("bet_side") == "UP")
-                                _p29cl_last_boundary_dominant_dir = "UP" if _exhaust_up > _exhaust_total / 2 else "DOWN"
-                                _p29cl_is_majority_flip = (_p29cl_current_dominant != _p29cl_last_boundary_dominant_dir) if _p29cl_current_dominant else False
-                                print("P29CL EXHAUST PRE-CHECK: all {} lost at {} → EXHAUST active".format(
-                                    _exhaust_total, _exhaust_latest_bnd))
-                            elif _exhaust_wins == _exhaust_total:
-                                _p29cl_last_boundary_all_win = True
-                                _p29cl_consecutive_all_lose = 0
+                        # Get the two most recent resolved boundaries
+                        _exhaust_bnds = {}
+                        for t in _exhaust_items:
+                            bnd = str(t.get("fired_at", ""))[:16]
+                            if bnd not in _exhaust_bnds:
+                                _exhaust_bnds[bnd] = []
+                            _exhaust_bnds[bnd].append(t)
+                        
+                        _exhaust_sorted = sorted(_exhaust_bnds.keys(), reverse=True)
+                        
+                        # Check the last 2 resolved boundaries for consecutive all-lose
+                        _consec_lose = 0
+                        _last_bnd_dir = None
+                        for _eb in _exhaust_sorted[:3]:
+                            _eb_trades = _exhaust_bnds[_eb]
+                            if len(_eb_trades) < 3:
+                                break
+                            _eb_wins = sum(1 for t in _eb_trades if t["outcome"] == "WIN")
+                            _eb_total = len(_eb_trades)
+                            if _eb_wins == 0:
+                                _consec_lose += 1
+                                if not _last_bnd_dir:
+                                    _eb_up = sum(1 for t in _eb_trades if t.get("bet_side") == "UP")
+                                    _last_bnd_dir = "UP" if _eb_up > _eb_total / 2 else "DOWN"
                             else:
-                                _p29cl_consecutive_all_lose = 0
+                                break
+                        
+                        if _consec_lose >= 1:
+                            _p29cl_last_boundary_all_lose = True
+                            _p29cl_consecutive_all_lose = _consec_lose
+                            _p29cl_phase = "EXHAUST"
+                            if _last_bnd_dir:
+                                _p29cl_last_boundary_dominant_dir = _last_bnd_dir
+                                _p29cl_is_majority_flip = (_p29cl_current_dominant != _last_bnd_dir) if _p29cl_current_dominant else False
+                            print("P29CL EXHAUST PRE-CHECK: {} consecutive all-lose | last_dir={} → EXHAUST active".format(
+                                _consec_lose, _last_bnd_dir))
+                        else:
+                            # Check if last boundary was all-win
+                            if _exhaust_sorted:
+                                _last_bnd = _exhaust_bnds[_exhaust_sorted[0]]
+                                if len(_last_bnd) >= 3:
+                                    _lw = sum(1 for t in _last_bnd if t["outcome"] == "WIN")
+                                    if _lw == len(_last_bnd):
+                                        _p29cl_last_boundary_all_win = True
+                                    _p29cl_consecutive_all_lose = 0
+                                    _eb_up = sum(1 for t in _last_bnd if t.get("bet_side") == "UP")
+                                    _p29cl_last_boundary_dominant_dir = "UP" if _eb_up > len(_last_bnd) / 2 else "DOWN"
+                                    _p29cl_is_majority_flip = (_p29cl_current_dominant != _p29cl_last_boundary_dominant_dir) if _p29cl_current_dominant else False
                 except Exception as _exhaust_err:
                     print("P29CL EXHAUST pre-check error: {}".format(_exhaust_err))
                 
