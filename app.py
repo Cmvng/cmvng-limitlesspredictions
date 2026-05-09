@@ -890,11 +890,6 @@ def _p29cl_get_multiplier(conf, dist_zone, dist_prob, minute, direction, asset, 
         "STRONG_MODERATE_GREEN_CONFIRMS" in _tag_upper) and dist_zone == "EXTREME_UP":
         return 0.4, "REDUCE_STRONG_GREEN_EXTREME"
     
-    # STRONG candle but price already moving against bet direction
-    # eff_prob < 48 means price hasn't confirmed — 48% WR across P2.9 (304 trades)
-    if "STRONG" in _tag_upper and _eff_prob < 48:
-        return 0.4, "REDUCE_STRONG_OPPOSES"
-    
     # DOGE/BNB/HYPE: unproven, 32-38% WR
     if asset in ("DOGE", "BNB", "HYPE"):
         return 0.4, "REDUCE_NEW_PAIR"
@@ -1670,7 +1665,6 @@ def _bot2_sniper_thread():
                                     "REDUCE_MODERATE_RED",   # 28% WR — confirmed loser
                                     "REDUCE_SHOOTING_STAR",  # 37% WR — M2+ losing pattern
                                     "REDUCE_STRONG_GREEN_EXTREME",  # 44% WR — strong green in EXTREME_UP
-                                    "REDUCE_STRONG_OPPOSES", # 48% WR — strong candle but price opposing
                                 }
                                 if _p29l_tier in _LIVE_SKIP_TIERS:
                                     print("P29CL LIVE SKIP: {} {} tier={} (paper only)".format(
@@ -23501,7 +23495,7 @@ def p29cl_page():
                        "T1_DOWN_NEUTRAL", "T1_UP_NEUTRAL",
                        "REDUCE_DUMP_CONFIRMED", "REDUCE_DOJI",
                        "REDUCE_EXHAUSTION", "REDUCE_MODERATE_RED", "REDUCE_SHOOTING_STAR",
-                       "REDUCE_STRONG_GREEN_EXTREME", "REDUCE_STRONG_OPPOSES",
+                       "REDUCE_STRONG_GREEN_EXTREME",
                        "REDUCE_NEW_PAIR", "REDUCE_ETH_WEAK", "REDUCE_30",
                        "REDUCE_EXTREME_85", "REDUCE_EXTREME_HIGH", "REDUCE_EXTREME_LOW",
                        "REDUCE_HIGH_EXTREME", "REDUCE_COUNTER_TREND"]:
