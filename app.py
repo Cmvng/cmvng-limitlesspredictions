@@ -861,10 +861,11 @@ def _p29cl_get_multiplier(conf, dist_zone, dist_prob, minute, direction, asset, 
     if consecutive_all_lose >= 2:
         return 0.4, "REDUCE_DUMP_CONFIRMED"
     
-    # DOJI at any confidence — 45.9% WR confirmed across P2.9 (111 trades)
-    # Market indecisive, betting on a coin flip
-    if "DOJI" in _tag_upper:
-        return 0.4, "REDUCE_DOJI"
+    # DOJI (exact tag only) — 20% WR on 5 trades
+    # DOJI_CONFIRMS (67% WR) must NOT be caught — different signal
+    if _tag_upper.endswith("_DOJI") or _tag_upper.endswith("|DOJI") or _tag_upper == "DOJI" or "P21_ONLY_DOJI" in _tag_upper or "DOJI+MOMENTUM" in _tag_upper:
+        if "CONFIRMS" not in _tag_upper:
+            return 0.4, "REDUCE_DOJI"
     
     # Momentum engine flagged exhaustion
     if "EXHAUST" in _tag_upper and conf == "LOW":
@@ -941,21 +942,15 @@ def _p29cl_get_multiplier(conf, dist_zone, dist_prob, minute, direction, asset, 
     if last_all_lose:
         return 1.5, "PHASE_EXHAUST"
     
-    # ═══ STEP 3: T1 BOOSTS (with price confirmation gate) ═══
+    # ═══ STEP 3: T1 BOOSTS ═══
     
     # DOWN + NEUTRAL + BTC selling — 81% WR
-    # Only boost if eff_prob > 50 (price has started moving DOWN)
     if direction == "DOWN" and dist_zone == "NEUTRAL" and _btc_selling:
-        if _eff_prob > 50:
-            return 1.5, "T1_DOWN_NEUTRAL"
-        return 1.0, "NORMAL"  # price hasn't confirmed yet
+        return 1.5, "T1_DOWN_NEUTRAL"
     
     # UP + NEUTRAL + BTC buying — 59% WR
-    # Only boost if eff_prob > 50 (price has started moving UP)
     if direction == "UP" and dist_zone == "NEUTRAL" and _btc_buying:
-        if _eff_prob > 50:
-            return 1.5, "T1_UP_NEUTRAL"
-        return 1.0, "NORMAL"  # price hasn't confirmed yet
+        return 1.5, "T1_UP_NEUTRAL"
     
     # ═══ STEP 4: EVERYTHING ELSE ═══
     return 1.0, "NORMAL"
