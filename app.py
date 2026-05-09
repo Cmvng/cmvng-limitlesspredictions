@@ -1365,6 +1365,11 @@ def _bot2_sniper_thread():
                 _p29cl_boundary_trades = []
                 _p29cl_boundary_dir = None
                 
+                # Ensure phase state variables are read from global scope
+                global _p29cl_last_boundary_dominant_dir, _p29cl_is_majority_flip
+                global _p29cl_last_boundary_all_lose, _p29cl_last_boundary_all_win
+                global _p29cl_consecutive_all_lose, _p29cl_phase
+                
                 # Get BTC direction for P2.1 and BTC trend
                 _p29cl_btc_price = _chainlink_prices.get("BTC")
                 _p29cl_btc_prefetch = _bot2_prefetch.get("BTC")
