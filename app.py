@@ -1540,11 +1540,11 @@ def _bot2_sniper_thread():
                         else: _cs_ptb_pos = "BELOW_LOW"
                         
                         # SCORING
-                        # A. Macro structure
-                        if _cs_macro == "BULLISH": _cs_score -= 2; _cs_tags.append("MACRO_BULL")
-                        elif _cs_macro == "BEARISH": _cs_score += 2; _cs_tags.append("MACRO_BEAR")
-                        elif _cs_macro == "LEAN_BULL": _cs_score -= 1; _cs_tags.append("LEAN_BULL")
-                        elif _cs_macro == "LEAN_BEAR": _cs_score += 1; _cs_tags.append("LEAN_BEAR")
+                        # A. Macro structure (HEAVY — 20 candles outweigh 2 candles)
+                        if _cs_macro == "BULLISH": _cs_score -= 3; _cs_tags.append("MACRO_BULL")
+                        elif _cs_macro == "BEARISH": _cs_score += 3; _cs_tags.append("MACRO_BEAR")
+                        elif _cs_macro == "LEAN_BULL": _cs_score -= 2; _cs_tags.append("LEAN_BULL")
+                        elif _cs_macro == "LEAN_BEAR": _cs_score += 2; _cs_tags.append("LEAN_BEAR")
                         elif _cs_macro == "RANGING": _cs_tags.append("MACRO_RANGE")
                         
                         # B. Recent trend
@@ -1590,11 +1590,22 @@ def _bot2_sniper_thread():
                             if _c1_uwick > 50 and _cs_ptb_pct >= 50: _cs_score += 2; _cs_tags.append("WICK_REJECT")
                             elif _c1_lwick > 50 and _cs_ptb_pct <= 50: _cs_score -= 2; _cs_tags.append("WICK_SUPPORT")
                         
-                        # D. Indicators
-                        if _p29cl_asset_sma_dir == "BUY": _cs_score -= 1; _cs_tags.append("SMA_BUY")
-                        elif _p29cl_asset_sma_dir == "SELL": _cs_score += 1; _cs_tags.append("SMA_SELL")
-                        if _p29cl_btc_dir == "BUY": _cs_score -= 0.5
-                        elif _p29cl_btc_dir == "SELL": _cs_score += 0.5
+                        # D. Indicators (MEANINGFUL — confirms or warns against candle story)
+                        if _p29cl_asset_sma_dir == "BUY": _cs_score -= 2; _cs_tags.append("SMA_BUY")
+                        elif _p29cl_asset_sma_dir == "SELL": _cs_score += 2; _cs_tags.append("SMA_SELL")
+                        if _p29cl_btc_dir == "BUY": _cs_score -= 1
+                        elif _p29cl_btc_dir == "SELL": _cs_score += 1
+                        
+                        # E. DIST exhaustion — move already happened, don't chase
+                        _p29cl_dist_prob, _p29cl_dist_zone = _p29cl_calc_dist(_p29cl_asset, _p29cl_price)
+                        _cs_eff_prob = _p29cl_dist_prob if _cs_score < 0 else (100 - _p29cl_dist_prob)
+                        if _cs_eff_prob >= 85:
+                            # Extreme — price already moved 85%+ in this direction
+                            if _cs_score < 0: _cs_score += 5; _cs_tags.append("EXTREME_UP_DONE")
+                            else: _cs_score -= 5; _cs_tags.append("EXTREME_DN_DONE")
+                        elif _cs_eff_prob >= 75:
+                            if _cs_score < 0: _cs_score += 2; _cs_tags.append("HIGH_DIST")
+                            else: _cs_score -= 2; _cs_tags.append("HIGH_DIST")
                         
                         # DECISION
                         if abs(_cs_score) == 0:
@@ -1618,9 +1629,6 @@ def _bot2_sniper_thread():
                         # Track main direction for phase detection
                         if not _p29cl_boundary_dir:
                             _p29cl_boundary_dir = _p29cl_dir
-                        
-                        # Calculate DIST_PROB
-                        _p29cl_dist_prob, _p29cl_dist_zone = _p29cl_calc_dist(_p29cl_asset, _p29cl_price)
                         
                         # Dedup — check both in-memory set and DB
                         _p29cl_key = "p29cl_{}_{}".format(_p29cl_asset, window_ts)
