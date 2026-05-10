@@ -1815,204 +1815,220 @@ def _bot2_sniper_thread():
                         _ind_score = 0
                         _dist_score = 0
                         
-                        # A. Macro structure (max ±3)
-                        if _cs_macro == "BULLISH": _macro_score = -3; _cs_tags.append("MACRO_BULL")
-                        elif _cs_macro == "BEARISH": _macro_score = 3; _cs_tags.append("MACRO_BEAR")
-                        elif _cs_macro == "LEAN_BULL": _macro_score = -2; _cs_tags.append("LEAN_BULL")
-                        elif _cs_macro == "LEAN_BEAR": _macro_score = 2; _cs_tags.append("LEAN_BEAR")
+
+                        # ══ SEASONED TRADER SCORING v5 ══
+                        # Current action > Historical context
+                        # Historical max: ±5.5 | Current max: ±10
+                        
+                        # Detect reversal pattern first
+                        _rejection_at_high = (_c1_uwick > 40 and _c2_green and _c1_cpct < 60)
+                        _rejection_at_low = (_c1_lwick > 40 and _c2_red and _c1_cpct > 40)
+                        _recent_rejection_high = None
+                        _recent_rejection_low = None
+                        for _rj_c in _cs_all[-5:]:
+                            _rj_range = _rj_c[1] - _rj_c[2] if _rj_c[1] > _rj_c[2] else 0.0001
+                            _rj_uwick = (_rj_c[1] - max(_rj_c[0], _rj_c[3])) / _rj_range * 100
+                            _rj_lwick = (min(_rj_c[0], _rj_c[3]) - _rj_c[2]) / _rj_range * 100
+                            if _rj_uwick > 40:
+                                if not _recent_rejection_high or _rj_c[1] > _recent_rejection_high:
+                                    _recent_rejection_high = _rj_c[1]
+                            if _rj_lwick > 40:
+                                if not _recent_rejection_low or _rj_c[2] < _recent_rejection_low:
+                                    _recent_rejection_low = _rj_c[2]
+                        _clear_bearish_reversal = (_rejection_at_high or _bearish_bos) and _c1_red
+                        _clear_bullish_reversal = (_rejection_at_low or _bullish_bos) and _c1_green
+                        _avg_range_5 = sum(c[1] - c[2] for c in _cs_all[-5:]) / min(5, len(_cs_all))
+                        _big_move_recent = any((c[1] - c[2]) > _avg_range_5 * 2 for c in _cs_all[-3:])
+                        _momentum_dying = False
+                        if len(_cs_all) >= 3:
+                            _last3_bodies = [abs(c[3] - c[0]) for c in _cs_all[-3:]]
+                            _last3_same_dir = all(c[3] > c[0] for c in _cs_all[-3:]) or all(c[3] < c[0] for c in _cs_all[-3:])
+                            if _last3_same_dir and len(_last3_bodies) == 3 and _last3_bodies[2] < _last3_bodies[1] < _last3_bodies[0]:
+                                _momentum_dying = True
+                        
+                        # A. Macro (REDUCED: max ±2)
+                        _macro_score = 0
+                        if _cs_macro == "BULLISH": _macro_score = -2; _cs_tags.append("MACRO_BULL")
+                        elif _cs_macro == "BEARISH": _macro_score = 2; _cs_tags.append("MACRO_BEAR")
+                        elif _cs_macro == "LEAN_BULL": _macro_score = -1; _cs_tags.append("LEAN_BULL")
+                        elif _cs_macro == "LEAN_BEAR": _macro_score = 1; _cs_tags.append("LEAN_BEAR")
                         elif _cs_macro == "RANGING": _cs_tags.append("MACRO_RANGE")
                         
-                        # B. Recent trend (max ±3, scaled by trend strength)
+                        # B. Recent trend (INCREASED: max ±4)
+                        _trend_score = 0
                         if _trend_down and _closes_falling:
-                            _trend_score = 3 if _trend_is_strong else 1
+                            _trend_score = 4 if _trend_is_strong else 2
                             _cs_tags.append("TREND_DN" if _trend_is_strong else "DRIFT_DN")
                         elif _trend_down:
-                            _trend_score = 2 if _trend_is_strong else 1; _cs_tags.append("2RED")
+                            _trend_score = 3 if _trend_is_strong else 1; _cs_tags.append("2RED")
                         if _trend_up and _closes_rising:
-                            _trend_score = -3 if _trend_is_strong else -1
+                            _trend_score = -4 if _trend_is_strong else -2
                             _cs_tags.append("TREND_UP" if _trend_is_strong else "DRIFT_UP")
                         elif _trend_up:
-                            _trend_score = -2 if _trend_is_strong else -1; _cs_tags.append("2GREEN")
-                        # Exhaustion
+                            _trend_score = -3 if _trend_is_strong else -1; _cs_tags.append("2GREEN")
                         if _strong_trend_down and _bodies_shrinking: _trend_score -= 2; _cs_tags.append("DN_EXHAUST")
                         if _strong_trend_up and _bodies_shrinking: _trend_score += 2; _cs_tags.append("UP_EXHAUST")
-                        # BOS / COC
                         if _bullish_bos: _trend_score -= 3; _cs_tags.append("BOS_BULL")
                         elif _bearish_bos: _trend_score += 3; _cs_tags.append("BOS_BEAR")
                         if _bullish_coc: _trend_score -= 2; _cs_tags.append("COC_BULL")
                         elif _bearish_coc: _trend_score += 2; _cs_tags.append("COC_BEAR")
-                        
-                        # P2.9 FINDING 1: Strong green candle = move ALREADY DONE (48.6% WR on 1081 trades)
-                        # A genuine strong green candle means buyers pushed hard last candle
-                        # PTB now sits near the high — betting UP is chasing
-                        # Strong red = same logic for DOWN
                         if _c1_genuine_green and _c1_cpct > 70 and _c1_body_ratio > 0.5:
-                            _trend_score += 2; _cs_tags.append("STRONG_GREEN_DONE")  # pushes toward DOWN
+                            _trend_score += 2; _cs_tags.append("STRONG_GREEN_DONE")
                         if _c1_genuine_red and _c1_cpct < 30 and _c1_body_ratio > 0.5:
-                            _trend_score -= 2; _cs_tags.append("STRONG_RED_DONE")  # pushes toward UP
-                        
-                        # P2.9 FINDING 2: Pullback trap = BEST continuation signal (54.3% WR, 1093 trades)
-                        # Previous candle pulled back slightly but didn't break structure
-                        # = sellers tried and failed = continuation UP
-                        # Detect: last candle RED but close still above candle-2's low (didn't break down)
+                            _trend_score -= 2; _cs_tags.append("STRONG_RED_DONE")
                         _is_pullback_trap = _c1_red and not _c1_genuine_red and _c1_c > _c2_l
                         _is_bounce_trap = _c1_green and not _c1_genuine_green and _c1_c < _c2_h
-                        if _is_pullback_trap and not _trend_down:
-                            _trend_score -= 1; _cs_tags.append("PULLBACK_TRAP")  # favors UP continuation
-                        if _is_bounce_trap and not _trend_up:
-                            _trend_score += 1; _cs_tags.append("BOUNCE_TRAP")  # favors DOWN continuation
+                        if _is_pullback_trap and not _trend_down: _trend_score -= 2; _cs_tags.append("PULLBACK_TRAP")
+                        if _is_bounce_trap and not _trend_up: _trend_score += 2; _cs_tags.append("BOUNCE_TRAP")
+                        if _rejection_at_high: _trend_score += 3; _cs_tags.append("REJECTION_HIGH")
+                        elif _rejection_at_low: _trend_score -= 3; _cs_tags.append("REJECTION_LOW")
+                        if _momentum_dying:
+                            if _trend_score < 0: _trend_score += 2; _cs_tags.append("MOM_DYING")
+                            elif _trend_score > 0: _trend_score -= 2; _cs_tags.append("MOM_DYING")
+                        _trend_score = max(-4, min(4, _trend_score))
                         
-                        _trend_score = max(-3, min(3, _trend_score))  # CAP at ±3
-                        
-                        # C. PTB vs structure (max ±3)
+                        # C. PTB vs structure (INCREASED: max ±4)
+                        _ptb_score = 0
                         _ptb_at_support = any(abs(_cs_ptb - s) < _cs_zone_thresh for s in _cs_support_levels)
                         _ptb_at_resist = any(abs(_cs_ptb - r) < _cs_zone_thresh for r in _cs_resist_levels)
                         if _ptb_at_support: _ptb_score -= 2; _cs_tags.append("PTB_SUPPORT")
                         if _ptb_at_resist: _ptb_score += 2; _cs_tags.append("PTB_RESIST")
-                        
+                        if _recent_rejection_high and _cs_ptb > 0:
+                            _dist_to_rj = abs(_cs_ptb - _recent_rejection_high) / _c1_range if _c1_range > 0 else 999
+                            if _dist_to_rj < 1.5: _ptb_score += 3; _cs_tags.append("PTB_AT_REJECT_WICK")
+                        if _recent_rejection_low and _cs_ptb > 0:
+                            _dist_to_df = abs(_cs_ptb - _recent_rejection_low) / _c1_range if _c1_range > 0 else 999
+                            if _dist_to_df < 1.5: _ptb_score -= 3; _cs_tags.append("PTB_AT_DEFEND_WICK")
                         if _trend_down and _closes_falling:
                             if _cs_ptb_pct >= 60: _ptb_score += 2; _cs_tags.append("PTB_HIGH_SELL")
-                            elif _cs_ptb_pct <= 20:
-                                # FIX 5: Only bounce if candle showed buyer defense
-                                if _c1_lwick > 30 or _c1_cpct > 30:
-                                    _ptb_score -= 2; _cs_tags.append("PTB_BOUNCE")
-                                # else: no bounce signal — sellers carried through
+                            elif _cs_ptb_pct <= 20 and (_c1_lwick > 30 or _c1_cpct > 30): _ptb_score -= 2; _cs_tags.append("PTB_BOUNCE")
                         elif _trend_up and _closes_rising:
                             if _cs_ptb_pct <= 40: _ptb_score -= 2; _cs_tags.append("PTB_LOW_BUY")
-                            elif _cs_ptb_pct >= 80:
-                                if _c1_uwick > 30 or _c1_cpct < 70:
-                                    _ptb_score += 2; _cs_tags.append("PTB_REJECT")
+                            elif _cs_ptb_pct >= 80 and (_c1_uwick > 30 or _c1_cpct < 70): _ptb_score += 2; _cs_tags.append("PTB_REJECT")
                         elif _is_ranging or _cs_macro == "RANGING":
                             if _cs_ptb_pos == "BELOW_LOW": _ptb_score -= 3; _cs_tags.append("RNG_PTB_LOW")
                             elif _cs_ptb_pos == "ABOVE_HIGH": _ptb_score += 3; _cs_tags.append("RNG_PTB_HIGH")
                             elif _cs_ptb_pct <= 25: _ptb_score -= 2; _cs_tags.append("RNG_LOW")
                             elif _cs_ptb_pct >= 75: _ptb_score += 2; _cs_tags.append("RNG_HIGH")
                         else:
-                            # FIX 5: PTB below low only UP if candle showed defense
                             if _cs_ptb_pos == "BELOW_LOW":
-                                if _c1_cpct > 30 or _c1_lwick > 30:
-                                    _ptb_score -= 2; _cs_tags.append("PTB_BELOW_DEF")
-                                else:
-                                    _cs_tags.append("PTB_BELOW_NO_DEF")  # no score — sellers carried through
-                            elif _cs_ptb_pos == "ABOVE_HIGH": _ptb_score += 2; _cs_tags.append("PTB_ABOVE")
-                            elif _cs_ptb_pct <= 30: _ptb_score -= 1; _cs_tags.append("PTB_LOW")
-                            elif _cs_ptb_pct >= 70: _ptb_score += 1; _cs_tags.append("PTB_HIGH")
-                        
+                                if _c1_cpct > 30 or _c1_lwick > 30: _ptb_score -= 3; _cs_tags.append("PTB_BELOW_DEF")
+                                else: _cs_tags.append("PTB_BELOW_NO_DEF")
+                            elif _cs_ptb_pos == "ABOVE_HIGH": _ptb_score += 3; _cs_tags.append("PTB_ABOVE")
+                            elif _cs_ptb_pct <= 25: _ptb_score -= 2; _cs_tags.append("PTB_LOW")
+                            elif _cs_ptb_pct >= 75: _ptb_score += 2; _cs_tags.append("PTB_HIGH")
                         if not _strong_trend_down and not _strong_trend_up:
                             if _c1_uwick > 50 and _cs_ptb_pct >= 50: _ptb_score += 2; _cs_tags.append("WICK_REJECT")
                             elif _c1_lwick > 50 and _cs_ptb_pct <= 50: _ptb_score -= 2; _cs_tags.append("WICK_SUPPORT")
-                        
-                        # PTB near 1H key levels — invisible on 15M chart
                         if _1h_rejection_level and _1h_rejection_level > 0:
-                            _ptb_dist_to_reject = abs(_cs_ptb - _1h_rejection_level) / _c1_range if _c1_range > 0 else 999
-                            if _ptb_dist_to_reject < 2:  # PTB within 2 candle ranges of 1H rejection
-                                if _cs_ptb <= _1h_rejection_level:
-                                    _ptb_score += 1; _cs_tags.append("PTB_NEAR_1H_REJECT")
+                            if abs(_cs_ptb - _1h_rejection_level) / _c1_range < 2 if _c1_range > 0 else False:
+                                if _cs_ptb <= _1h_rejection_level: _ptb_score += 2; _cs_tags.append("PTB_NEAR_1H_REJECT")
                         if _1h_defense_level and _1h_defense_level > 0:
-                            _ptb_dist_to_defend = abs(_cs_ptb - _1h_defense_level) / _c1_range if _c1_range > 0 else 999
-                            if _ptb_dist_to_defend < 2:
-                                if _cs_ptb >= _1h_defense_level:
-                                    _ptb_score -= 1; _cs_tags.append("PTB_NEAR_1H_DEFEND")
+                            if abs(_cs_ptb - _1h_defense_level) / _c1_range < 2 if _c1_range > 0 else False:
+                                if _cs_ptb >= _1h_defense_level: _ptb_score -= 2; _cs_tags.append("PTB_NEAR_1H_DEFEND")
+                        if _1h_volatility == "HIGH" and abs(_ptb_score) >= 3:
+                            _ptb_score = int(_ptb_score * 0.7); _cs_tags.append("1H_VOL_REDUCE")
+                        _ptb_score = max(-4, min(4, _ptb_score))
                         
-                        # High 1H volatility = 15M PTB position less reliable
-                        if _1h_volatility == "HIGH" and abs(_ptb_score) >= 2:
-                            _ptb_score = int(_ptb_score * 0.7)
-                            _cs_tags.append("1H_VOL_REDUCE")
+                        # D. Indicators (REDUCED: max ±1.5)
+                        _ind_score = 0
+                        if _p29cl_asset_sma_dir == "BUY": _ind_score -= 1; _cs_tags.append("SMA_BUY")
+                        elif _p29cl_asset_sma_dir == "SELL": _ind_score += 1; _cs_tags.append("SMA_SELL")
+                        if _p29cl_btc_dir == "BUY": _ind_score -= 0.5
+                        elif _p29cl_btc_dir == "SELL": _ind_score += 0.5
                         
-                        _ptb_score = max(-3, min(3, _ptb_score))  # CAP at ±3
+                        # REVERSAL OVERRIDE — neutralize historical when reversal is clear
+                        if _clear_bearish_reversal and _macro_score < 0:
+                            _macro_score = 0; _1h_bias = min(_1h_bias + 2, 0); _ind_score = 0
+                            _cs_tags.append("REV_OVERRIDE_DN")
+                        elif _clear_bullish_reversal and _macro_score > 0:
+                            _macro_score = 0; _1h_bias = max(_1h_bias - 2, 0); _ind_score = 0
+                            _cs_tags.append("REV_OVERRIDE_UP")
                         
-                        # D. Indicators (max ±2)
-                        if _p29cl_asset_sma_dir == "BUY": _ind_score -= 2; _cs_tags.append("SMA_BUY")
-                        elif _p29cl_asset_sma_dir == "SELL": _ind_score += 2; _cs_tags.append("SMA_SELL")
-                        if _p29cl_btc_dir == "BUY": _ind_score -= 1
-                        elif _p29cl_btc_dir == "SELL": _ind_score += 1
-                        _ind_score = max(-2, min(2, _ind_score))  # CAP at ±2
+                        # POST-BIG-MOVE CAUTION
+                        if _big_move_recent:
+                            _macro_score = int(_macro_score * 0.6)
+                            _trend_score = int(_trend_score * 0.6)
+                            _ptb_score = int(_ptb_score * 0.6)
+                            _1h_bias = int(_1h_bias * 0.6)
+                            _cs_tags.append("POST_BIG_MOVE")
                         
-                        # E. DIST exhaustion — context-aware, respects breakouts below 90%
+                        # E. DIST exhaustion
+                        _dist_score = 0
                         _p29cl_dist_prob, _p29cl_dist_zone = _p29cl_calc_dist(_p29cl_asset, _p29cl_price)
                         _cs_preliminary_dir = "UP" if (_macro_score + _trend_score + _ptb_score + _ind_score + _1h_bias) < 0 else "DOWN"
                         _cs_eff_prob = _p29cl_dist_prob if _cs_preliminary_dir == "UP" else (100 - _p29cl_dist_prob)
-                        
-                        # Detect breakout vs exhaustion
                         _is_breakout_up = _bullish_bos or _bullish_coc or (_trend_up and _bodies_growing and _c1_genuine_green)
                         _is_breakout_down = _bearish_bos or _bearish_coc or (_trend_down and _bodies_growing and _c1_genuine_red)
                         _is_breakout = (_is_breakout_up and _cs_preliminary_dir == "UP") or (_is_breakout_down and _cs_preliminary_dir == "DOWN")
                         _1h_confirms_breakout = (_is_breakout_up and _1h_bias < 0) or (_is_breakout_down and _1h_bias > 0)
-                        
                         if _cs_eff_prob >= 90:
-                            # 90%+ = fill is terrible regardless of breakout. ALWAYS override.
                             _pre_dist_total = _macro_score + _trend_score + _ptb_score + _ind_score + _1h_bias
                             if _cs_preliminary_dir == "UP":
-                                _dist_score = -_pre_dist_total + 1
-                                _cs_tags.append("EXTREME_UP_OVERRIDE")
+                                _dist_score = -_pre_dist_total + 1; _cs_tags.append("EXTREME_UP_OVERRIDE")
                             else:
-                                _dist_score = -_pre_dist_total - 1
-                                _cs_tags.append("EXTREME_DN_OVERRIDE")
+                                _dist_score = -_pre_dist_total - 1; _cs_tags.append("EXTREME_DN_OVERRIDE")
                         elif _cs_eff_prob >= 80:
-                            # 80-90%: check for breakout — if genuine, reduce counter
                             if _is_breakout and _1h_confirms_breakout:
-                                _dist_score = 1 if _cs_preliminary_dir == "UP" else -1
-                                _cs_tags.append("HIGH_DIST_BREAKOUT")
+                                _dist_score = 1 if _cs_preliminary_dir == "UP" else -1; _cs_tags.append("HIGH_DIST_BREAKOUT")
                             elif _is_breakout:
-                                _dist_score = 2 if _cs_preliminary_dir == "UP" else -2
-                                _cs_tags.append("HIGH_DIST_BRK_WEAK")
+                                _dist_score = 2 if _cs_preliminary_dir == "UP" else -2; _cs_tags.append("HIGH_DIST_BRK_WEAK")
                             elif _cs_preliminary_dir == "UP" and _c1_uwick < 30:
-                                _dist_score = 5; _cs_tags.append("EXTREME_UP_DONE")
+                                _dist_score = 4; _cs_tags.append("EXTREME_UP_DONE")
                             elif _cs_preliminary_dir == "DOWN" and _c1_lwick < 30:
-                                _dist_score = -5; _cs_tags.append("EXTREME_DN_DONE")
+                                _dist_score = -4; _cs_tags.append("EXTREME_DN_DONE")
                             else:
-                                if _cs_preliminary_dir == "UP": _dist_score = 3; _cs_tags.append("EXTREME_UP_DEF")
-                                else: _dist_score = -3; _cs_tags.append("EXTREME_DN_DEF")
+                                if _cs_preliminary_dir == "UP": _dist_score = 2; _cs_tags.append("EXTREME_UP_DEF")
+                                else: _dist_score = -2; _cs_tags.append("EXTREME_DN_DEF")
                         elif _cs_eff_prob >= 70:
-                            if _cs_preliminary_dir == "UP": _dist_score = 2; _cs_tags.append("HIGH_DIST")
-                            else: _dist_score = -2; _cs_tags.append("HIGH_DIST")
+                            if _cs_preliminary_dir == "UP": _dist_score = 1; _cs_tags.append("HIGH_DIST")
+                            else: _dist_score = -1; _cs_tags.append("HIGH_DIST")
                         
-                        # F. DOJI penalty (47.6% WR across 5759 P2.9 trades — consistent loser)
+                        # F. DOJI penalty
                         _doji_score = 0
-                        if _c1_body_ratio < 0.15:  # very small body = true doji
-                            # Push score toward zero — doji means indecision
-                            _doji_score = 1 if _cs_score < 0 else -1 if _cs_score > 0 else 0
+                        if _c1_body_ratio < 0.15:
+                            _doji_score = 1 if (_macro_score + _trend_score) < 0 else -1 if (_macro_score + _trend_score) > 0 else 0
                             _cs_tags.append("DOJI_WEAK")
                         
-                        # G. Session timing — REMOVED (P2.9 data doesn't transfer to P2.9CL timing)
+                        # G. Session — REMOVED
                         _session_score = 0
                         
-                        # H. Recovery signal (66-80% WR after all-lose in P2.9)
+                        # H. Recovery
                         _recovery_score = 0
                         if _p29cl_last_boundary_all_lose:
-                            _recovery_score = -1 if _cs_score < 0 else 1 if _cs_score > 0 else 0
-                            _cs_tags.append("RECOVERY")  # boost whatever direction the engine chose
+                            _recovery_score = -1 if (_macro_score + _trend_score) < 0 else 1 if (_macro_score + _trend_score) > 0 else 0
+                            _cs_tags.append("RECOVERY")
                         
-                        # ══ COMBINE ALL SCORES ══
+                        # COMBINE
                         _cs_score = _macro_score + _trend_score + _ptb_score + _ind_score + _dist_score + _doji_score + _session_score + _recovery_score + _1h_bias
-                        
-                        # FIX 3: Cap total score — very high = overconfident = priced in
                         _cs_score = max(-10, min(10, _cs_score))
                         
-                        # DECISION
-                        if abs(_cs_score) == 0:
-                            print("P29CL SKIP: {} score=0 ptb={}% {} {}".format(_p29cl_asset, _cs_ptb_pct, _cs_macro, "+".join(_cs_tags[:3])))
-                            continue
-                        _p29cl_dir = "UP" if _cs_score < 0 else "DOWN"
-                        
-                        # FIX 3: Confidence — HIGH only for moderate scores, not extreme
+                        # CONFIDENCE
                         _abs = abs(_cs_score)
-                        if 5 <= _abs <= 7: _p29cl_conf = "HIGH"
-                        elif _abs >= 8: _p29cl_conf = "MEDIUM"  # overconfident → treat as medium
-                        elif _abs >= 3: _p29cl_conf = "MEDIUM"
+                        if _momentum_dying or _big_move_recent:
+                            _p29cl_conf = "MEDIUM" if _abs >= 3 else "LOW"
+                        elif 4 <= _abs <= 6: _p29cl_conf = "HIGH"
+                        elif _abs >= 7: _p29cl_conf = "MEDIUM"
+                        elif _abs >= 2: _p29cl_conf = "MEDIUM"
                         else: _p29cl_conf = "LOW"
                         
+                        # DECISION
+                        if _cs_score == 0:
+                            print("P29CL SKIP: {} score=0 ptb={}% {} {}".format(_p29cl_asset, _cs_ptb_pct, _cs_macro, "+".join(_cs_tags[:4])))
+                            continue
+                        _p29cl_dir = "UP" if _cs_score < 0 else "DOWN"
                         _cs_candle_desc = "G" if _c1_green else "R" if _c1_red else "D"
-                        if _c1_indecisive: _cs_candle_desc += "i"  # mark indecisive
+                        if _c1_indecisive: _cs_candle_desc += "i"
                         _cs_trend = "3R" if _strong_trend_down else "2R" if _trend_down else "3G" if _strong_trend_up else "2G" if _trend_up else "RNG" if _is_ranging else "MIX"
                         _p29cl_tag = "CS_{}_{}_{}_{}_{}_S{}".format(_p29cl_dir, _cs_candle_desc, _cs_trend, _cs_macro, _cs_ptb_pos, int(_cs_score))
                         _p29cl_score = _cs_score
                         _cs_cpct = _c1_cpct
                         _cs_uwick = _c1_uwick
                         if _p29cl_p21_dir and _p29cl_p21_dir != _p29cl_dir:
-                            print("P29CL OVERRIDE: {} P2.1={} > CS={} score={} macro={} trend={} ptb={}% {}".format(_p29cl_asset, _p29cl_p21_dir, _p29cl_dir, int(_cs_score), _cs_macro, _cs_trend, _cs_ptb_pct, "+".join(_cs_tags[:5])))
+                            print("P29CL OVERRIDE: {} P2.1={} > CS={} score={} macro={} trend={} ptb={}% {}".format(_p29cl_asset, _p29cl_p21_dir, _p29cl_dir, int(_cs_score), _cs_macro, _cs_trend, _cs_ptb_pct, "+".join(_cs_tags[:6])))
                         elif not _p29cl_p21_dir:
-                            print("P29CL INDEPENDENT: {} CS={} score={} macro={} trend={} ptb={}% {}".format(_p29cl_asset, _p29cl_dir, int(_cs_score), _cs_macro, _cs_trend, _cs_ptb_pct, "+".join(_cs_tags[:5])))
+                            print("P29CL INDEPENDENT: {} CS={} score={} macro={} trend={} ptb={}% {}".format(_p29cl_asset, _p29cl_dir, int(_cs_score), _cs_macro, _cs_trend, _cs_ptb_pct, "+".join(_cs_tags[:6])))
+
 
                         
                         # Track main direction for phase detection
@@ -2048,6 +2064,17 @@ def _bot2_sniper_thread():
                         
                         _p29cl_stake = round(_p29cl_base_stake * _p29cl_mult, 2)
                         _p29cl_stake = max(2.50, _p29cl_stake)  # Polymarket minimum
+                        
+                        # SEASONED TRADER: cap stake when signals conflict
+                        if _momentum_dying and _p29cl_stake > 2.50:
+                            _p29cl_stake = 2.50; _cs_tags.append("STAKE_CAP_MOM")
+                        if _1h_momentum == "DEAD" and _p29cl_stake > 2.50:
+                            _p29cl_stake = 2.50; _cs_tags.append("STAKE_CAP_1H_DEAD")
+                        if _big_move_recent and _p29cl_stake > 2.50:
+                            _p29cl_stake = 2.50; _cs_tags.append("STAKE_CAP_BIG_MOVE")
+                        if "PTB_RESIST" in _cs_tags and _p29cl_dir == "UP" and _p29cl_stake > 2.50:
+                            _p29cl_stake = 2.50; _cs_tags.append("STAKE_CAP_RESIST")
+                        
                         if _p29cl_stake > _p29cl_state["balance"] * 0.15:
                             _p29cl_stake = round(_p29cl_state["balance"] * 0.10, 2)
                         if _p29cl_stake > _p29cl_state["balance"] - _p29cl_state["floor_balance"]:
