@@ -1007,7 +1007,7 @@ def _bot2_sniper_thread():
                     symbol = P29CL_BINANCE_MAP.get(asset)
                     if not symbol: continue
                     r = _req.get("https://api.binance.com/api/v3/klines",
-                        params={"symbol": symbol, "interval": "15m", "limit": 8},
+                        params={"symbol": symbol, "interval": "15m", "limit": 25},
                         timeout=3)
                     if r.status_code == 200:
                         klines = r.json()
@@ -1447,158 +1447,173 @@ def _bot2_sniper_thread():
                             else:
                                 _p29cl_sma_agree = "DIVERGE"
                         
+                        
                         # ══════════════════════════════════════════════════
-                        # PTB-RELATIVE CANDLE STRUCTURE DIRECTION ENGINE v1
+                        # SELF-THINKING CANDLE STRUCTURE ENGINE v3
+                        # Step 1: Market structure from 20 candles
+                        # Step 2: Recent action (BOS/COC/exhaustion)
+                        # Step 3: Indicators confirm or contradict
+                        # Step 4: PTB position — final decision
                         # ══════════════════════════════════════════════════
-                        # Core question: will price close ABOVE or BELOW the PTB?
-                        # Based on where PTB sits relative to previous candle structure
                         
                         _p29cl_prev_candles = _p29cl_candle_prefetch.get(_p29cl_asset)
-                        if not _p29cl_prev_candles or len(_p29cl_prev_candles) < 3:
+                        if not _p29cl_prev_candles or len(_p29cl_prev_candles) < 5:
                             continue
                         
-                        # Settle last candle with Chainlink close
                         _cs_settled = list(_p29cl_prev_candles)
                         _cs_last = _cs_settled[-1]
-                        _cs_settled[-1] = (
-                            _cs_last[0],
-                            max(_cs_last[1], _p29cl_price),
-                            min(_cs_last[2], _p29cl_price),
-                            _p29cl_price
-                        )
-                        _cs_recent = _cs_settled[-5:] if len(_cs_settled) >= 5 else _cs_settled
-                        
-                        # ── Read previous candle (just-closed) ──
-                        _cs_prev = _cs_recent[-1]
-                        _cs_o, _cs_h, _cs_l, _cs_c = _cs_prev
-                        _cs_range = _cs_h - _cs_l if _cs_h > _cs_l else 0.0001
-                        _cs_body = abs(_cs_c - _cs_o)
-                        _cs_body_ratio = _cs_body / _cs_range
-                        _cs_is_green = _cs_c > _cs_o
-                        _cs_is_red = _cs_c < _cs_o
-                        _cs_cpct = int((_cs_c - _cs_l) / _cs_range * 100)
-                        _cs_uwick = int((_cs_h - max(_cs_o, _cs_c)) / _cs_range * 100)
-                        _cs_lwick = int((min(_cs_o, _cs_c) - _cs_l) / _cs_range * 100)
-                        
-                        # ── Read candles 2 and 3 back for context ──
-                        _cs_prev2 = _cs_recent[-2] if len(_cs_recent) >= 2 else _cs_prev
-                        _cs_prev3 = _cs_recent[-3] if len(_cs_recent) >= 3 else _cs_prev2
-                        _cs_dirs = []
-                        for _cc in _cs_recent[-3:]:
-                            _cs_dirs.append("G" if _cc[3] > _cc[0] else "R" if _cc[3] < _cc[0] else "F")
-                        _cs_all_green = all(d == "G" for d in _cs_dirs)
-                        _cs_all_red = all(d == "R" for d in _cs_dirs)
-                        
-                        # ── PTB position relative to previous candle ──
-                        _cs_ptb = _p29cl_price  # at T+0.5s, Chainlink price ≈ PTB
-                        _cs_ptb_pct = max(0, min(100, int((_cs_ptb - _cs_l) / _cs_range * 100)))
-                        
-                        if _cs_ptb > _cs_h:
-                            _cs_ptb_pos = "ABOVE_HIGH"
-                        elif _cs_ptb > max(_cs_o, _cs_c):
-                            _cs_ptb_pos = "ABOVE_CLOSE" if _cs_is_green else "ABOVE_OPEN"
-                        elif _cs_ptb > min(_cs_o, _cs_c):
-                            _cs_ptb_pos = "MID_BODY"
-                        elif _cs_ptb > _cs_l:
-                            _cs_ptb_pos = "BELOW_CLOSE" if _cs_is_red else "BELOW_OPEN"
-                        else:
-                            _cs_ptb_pos = "BELOW_LOW"
-                        
-                        # ── SCORE: negative = UP, positive = DOWN ──
+                        _cs_settled[-1] = (_cs_last[0], max(_cs_last[1], _p29cl_price), min(_cs_last[2], _p29cl_price), _p29cl_price)
+                        _cs_all = _cs_settled
                         _cs_score = 0
                         _cs_tags = []
                         
-                        # Rule 1: PTB position is primary signal
-                        if _cs_ptb_pos == "BELOW_LOW":
-                            _cs_score -= 4; _cs_tags.append("PTB_BELOW_LOW")
-                        elif _cs_ptb_pos == "ABOVE_HIGH":
-                            _cs_score += 4; _cs_tags.append("PTB_ABOVE_HIGH")
-                        elif _cs_ptb_pct <= 25:
-                            _cs_score -= 3; _cs_tags.append("PTB_LOW25")
-                        elif _cs_ptb_pct >= 75:
-                            _cs_score += 3; _cs_tags.append("PTB_HIGH75")
-                        elif _cs_ptb_pct < 50:
-                            _cs_score -= 1; _cs_tags.append("PTB_LOWER")
-                        elif _cs_ptb_pct > 50:
-                            _cs_score += 1; _cs_tags.append("PTB_UPPER")
+                        # STEP 1: MARKET STRUCTURE (10-20 candles)
+                        _cs_all_highs = [c[1] for c in _cs_all]
+                        _cs_all_lows = [c[2] for c in _cs_all]
+                        _cs_overall_high = max(_cs_all_highs)
+                        _cs_overall_low = min(_cs_all_lows)
+                        _cs_overall_range = _cs_overall_high - _cs_overall_low if _cs_overall_high > _cs_overall_low else 0.0001
+                        _cs_zone_thresh = _cs_overall_range * 0.03
+                        _cs_support_levels = []
+                        _cs_resist_levels = []
+                        for lv in _cs_all_lows:
+                            if sum(1 for l in _cs_all_lows if abs(l - lv) < _cs_zone_thresh) >= 2:
+                                if not any(abs(s - lv) < _cs_zone_thresh for s in _cs_support_levels):
+                                    _cs_support_levels.append(lv)
+                        for hv in _cs_all_highs:
+                            if sum(1 for h in _cs_all_highs if abs(h - hv) < _cs_zone_thresh) >= 2:
+                                if not any(abs(r - hv) < _cs_zone_thresh for r in _cs_resist_levels):
+                                    _cs_resist_levels.append(hv)
                         
-                        # Rule 2: Candle color + PTB relationship
-                        if _cs_is_green:
-                            if _cs_ptb_pct <= 30:
-                                _cs_score -= 2; _cs_tags.append("GREEN_PTB_LOW")
-                            elif _cs_ptb_pct >= 70:
-                                _cs_score += 2; _cs_tags.append("GREEN_PTB_HIGH")
-                        elif _cs_is_red:
-                            if _cs_ptb_pct >= 70:
-                                _cs_score += 2; _cs_tags.append("RED_PTB_HIGH")
-                            elif _cs_ptb_pct <= 30:
-                                _cs_score -= 2; _cs_tags.append("RED_PTB_LOW")
+                        _cs_lookback = min(len(_cs_all), 20)
+                        _cs_first_close = _cs_all[-_cs_lookback][3]
+                        _cs_last_close = _cs_all[-1][3]
+                        _cs_macro_move = (_cs_last_close - _cs_first_close) / _cs_first_close * 100 if _cs_first_close > 0 else 0
+                        _cs_green_count = sum(1 for c in _cs_all[-_cs_lookback:] if c[3] > c[0])
+                        _cs_green_pct = _cs_green_count / _cs_lookback * 100
+                        _cs_hh = sum(1 for i in range(1, min(10, len(_cs_all))) if _cs_all[-i][1] > _cs_all[-i-1][1])
+                        _cs_ll = sum(1 for i in range(1, min(10, len(_cs_all))) if _cs_all[-i][2] < _cs_all[-i-1][2])
                         
-                        # Rule 3: Wick analysis relative to PTB
-                        if _cs_uwick > 40:
-                            if _cs_ptb_pct >= 60:
-                                _cs_score += 3; _cs_tags.append("REJECT_ABOVE_PTB")
-                            else:
-                                _cs_score -= 1; _cs_tags.append("REJECT_FAR_ABOVE")
-                        if _cs_lwick > 40:
-                            if _cs_ptb_pct <= 40:
-                                _cs_score -= 3; _cs_tags.append("SUPPORT_AT_PTB")
-                            else:
-                                _cs_score += 1; _cs_tags.append("SUPPORT_FAR_BELOW")
+                        _cs_macro = "NEUTRAL"
+                        if _cs_macro_move > 0.3 and _cs_green_pct >= 55 and _cs_hh >= 4: _cs_macro = "BULLISH"
+                        elif _cs_macro_move < -0.3 and _cs_green_pct <= 45 and _cs_ll >= 4: _cs_macro = "BEARISH"
+                        elif abs(_cs_macro_move) < 0.15: _cs_macro = "RANGING"
+                        elif _cs_macro_move > 0.1: _cs_macro = "LEAN_BULL"
+                        elif _cs_macro_move < -0.1: _cs_macro = "LEAN_BEAR"
                         
-                        # Rule 4: Multi-candle trend context
-                        if _cs_all_green and _cs_ptb_pct <= 40:
-                            _cs_score -= 2; _cs_tags.append("UPTREND_LOW")
-                        elif _cs_all_green and _cs_ptb_pct >= 70:
-                            _cs_score += 1; _cs_tags.append("UPTREND_EXHAUST")
-                        if _cs_all_red and _cs_ptb_pct >= 60:
-                            _cs_score += 2; _cs_tags.append("DOWNTREND_HIGH")
-                        elif _cs_all_red and _cs_ptb_pct <= 30:
-                            _cs_score -= 1; _cs_tags.append("DOWNTREND_BOUNCE")
+                        # STEP 2: RECENT ACTION (last 2-3 candles)
+                        _c1 = _cs_all[-1]
+                        _c2 = _cs_all[-2] if len(_cs_all) >= 2 else _c1
+                        _c3 = _cs_all[-3] if len(_cs_all) >= 3 else _c2
+                        _c1_o, _c1_h, _c1_l, _c1_c = _c1
+                        _c1_range = _c1_h - _c1_l if _c1_h > _c1_l else 0.0001
+                        _c1_body = abs(_c1_c - _c1_o)
+                        _c1_green = _c1_c > _c1_o
+                        _c1_red = _c1_c < _c1_o
+                        _c1_cpct = int((_c1_c - _c1_l) / _c1_range * 100)
+                        _c1_uwick = int((_c1_h - max(_c1_o, _c1_c)) / _c1_range * 100)
+                        _c1_lwick = int((min(_c1_o, _c1_c) - _c1_l) / _c1_range * 100)
+                        _c2_o, _c2_h, _c2_l, _c2_c = _c2
+                        _c2_green = _c2_c > _c2_o; _c2_red = _c2_c < _c2_o
+                        _c3_green = _c3[3] > _c3[0]; _c3_red = _c3[3] < _c3[0]
                         
-                        # Rule 5: Asset SMA as secondary (light weight)
-                        if _p29cl_asset_sma_dir == "BUY":
-                            _cs_score -= 1; _cs_tags.append("SMA_BUY")
-                        elif _p29cl_asset_sma_dir == "SELL":
-                            _cs_score += 1; _cs_tags.append("SMA_SELL")
+                        _trend_down = _c1_red and _c2_red
+                        _trend_up = _c1_green and _c2_green
+                        _strong_trend_down = _trend_down and _c3_red
+                        _strong_trend_up = _trend_up and _c3_green
+                        _closes_falling = _c1_c < _c2_c and _c2_c < _c3[3]
+                        _closes_rising = _c1_c > _c2_c and _c2_c > _c3[3]
+                        _bodies_growing = _c1_body > abs(_c2_c - _c2_o) * 1.2
+                        _bodies_shrinking = _c1_body < abs(_c2_c - _c2_o) * 0.8
+                        _bullish_bos = _c1_green and _c1_c > _c2_h
+                        _bearish_bos = _c1_red and _c1_c < _c2_l
+                        _bullish_coc = _c2_red and _c3_red and _c1_green
+                        _bearish_coc = _c2_green and _c3_green and _c1_red
+                        _is_ranging = (max(_c1_h, _c2_h, _c3[1]) - min(_c1_l, _c2_l, _c3[2])) < _c1_range * 2.5 and not _trend_down and not _trend_up
                         
-                        # BTC direction as very light signal
-                        if _p29cl_btc_dir == "BUY":
-                            _cs_score -= 0.5
-                        elif _p29cl_btc_dir == "SELL":
-                            _cs_score += 0.5
+                        _cs_ptb = _p29cl_price
+                        _cs_ptb_pct = max(0, min(100, int((_cs_ptb - _c1_l) / _c1_range * 100)))
+                        if _cs_ptb > _c1_h: _cs_ptb_pos = "ABOVE_HIGH"
+                        elif _cs_ptb > max(_c1_o, _c1_c): _cs_ptb_pos = "ABOVE_BODY"
+                        elif _cs_ptb > min(_c1_o, _c1_c): _cs_ptb_pos = "MID_BODY"
+                        elif _cs_ptb > _c1_l: _cs_ptb_pos = "BELOW_BODY"
+                        else: _cs_ptb_pos = "BELOW_LOW"
                         
-                        # ── DECISION ──
-                        if abs(_cs_score) == 0:
-                            # Truly no signal — equal forces both ways
-                            print("P29CL SKIP: {} score=0 ptb_pct={} cpct={} {} (no signal)".format(
-                                _p29cl_asset, _cs_ptb_pct, _cs_cpct, "+".join(_cs_tags[:3])))
-                            continue
+                        # SCORING
+                        # A. Macro structure
+                        if _cs_macro == "BULLISH": _cs_score -= 2; _cs_tags.append("MACRO_BULL")
+                        elif _cs_macro == "BEARISH": _cs_score += 2; _cs_tags.append("MACRO_BEAR")
+                        elif _cs_macro == "LEAN_BULL": _cs_score -= 1; _cs_tags.append("LEAN_BULL")
+                        elif _cs_macro == "LEAN_BEAR": _cs_score += 1; _cs_tags.append("LEAN_BEAR")
+                        elif _cs_macro == "RANGING": _cs_tags.append("MACRO_RANGE")
                         
-                        _p29cl_dir = "UP" if _cs_score < 0 else "DOWN"
+                        # B. Recent trend
+                        if _trend_down and _closes_falling:
+                            _cs_score += 3; _cs_tags.append("TREND_DN")
+                            if _strong_trend_down: _cs_score += 1; _cs_tags.append("3RED")
+                            if _bodies_growing: _cs_score += 1; _cs_tags.append("ACCEL")
+                        elif _trend_down: _cs_score += 2; _cs_tags.append("2RED")
+                        if _trend_up and _closes_rising:
+                            _cs_score -= 3; _cs_tags.append("TREND_UP")
+                            if _strong_trend_up: _cs_score -= 1; _cs_tags.append("3GREEN")
+                            if _bodies_growing: _cs_score -= 1; _cs_tags.append("ACCEL")
+                        elif _trend_up: _cs_score -= 2; _cs_tags.append("2GREEN")
+                        if _strong_trend_down and _bodies_shrinking: _cs_score -= 2; _cs_tags.append("DN_EXHAUST")
+                        if _strong_trend_up and _bodies_shrinking: _cs_score += 2; _cs_tags.append("UP_EXHAUST")
+                        if _bullish_bos: _cs_score -= 3; _cs_tags.append("BOS_BULL")
+                        elif _bearish_bos: _cs_score += 3; _cs_tags.append("BOS_BEAR")
+                        if _bullish_coc: _cs_score -= 2; _cs_tags.append("COC_BULL")
+                        elif _bearish_coc: _cs_score += 2; _cs_tags.append("COC_BEAR")
                         
-                        if abs(_cs_score) >= 8:
-                            _p29cl_conf = "HIGH"
-                        elif abs(_cs_score) >= 5:
-                            _p29cl_conf = "MEDIUM"
+                        # C. PTB vs structure
+                        _ptb_at_support = any(abs(_cs_ptb - s) < _cs_zone_thresh for s in _cs_support_levels)
+                        _ptb_at_resist = any(abs(_cs_ptb - r) < _cs_zone_thresh for r in _cs_resist_levels)
+                        if _ptb_at_support: _cs_score -= 2; _cs_tags.append("PTB_SUPPORT")
+                        if _ptb_at_resist: _cs_score += 2; _cs_tags.append("PTB_RESIST")
+                        if _trend_down and _closes_falling:
+                            if _cs_ptb_pct >= 60: _cs_score += 2; _cs_tags.append("PTB_HIGH_SELL")
+                            elif _cs_ptb_pct <= 20 and _c1_lwick > 40: _cs_score -= 2; _cs_tags.append("PTB_BOUNCE")
+                        elif _trend_up and _closes_rising:
+                            if _cs_ptb_pct <= 40: _cs_score -= 2; _cs_tags.append("PTB_LOW_BUY")
+                            elif _cs_ptb_pct >= 80 and _c1_uwick > 40: _cs_score += 2; _cs_tags.append("PTB_REJECT")
+                        elif _is_ranging or _cs_macro == "RANGING":
+                            if _cs_ptb_pos == "BELOW_LOW": _cs_score -= 3; _cs_tags.append("RNG_PTB_LOW")
+                            elif _cs_ptb_pos == "ABOVE_HIGH": _cs_score += 3; _cs_tags.append("RNG_PTB_HIGH")
+                            elif _cs_ptb_pct <= 25: _cs_score -= 2; _cs_tags.append("RNG_LOW")
+                            elif _cs_ptb_pct >= 75: _cs_score += 2; _cs_tags.append("RNG_HIGH")
                         else:
-                            _p29cl_conf = "LOW"
+                            if _cs_ptb_pos == "BELOW_LOW": _cs_score -= 2; _cs_tags.append("PTB_BELOW")
+                            elif _cs_ptb_pos == "ABOVE_HIGH": _cs_score += 2; _cs_tags.append("PTB_ABOVE")
+                            elif _cs_ptb_pct <= 30: _cs_score -= 1; _cs_tags.append("PTB_LOW")
+                            elif _cs_ptb_pct >= 70: _cs_score += 1; _cs_tags.append("PTB_HIGH")
+                        if not _strong_trend_down and not _strong_trend_up:
+                            if _c1_uwick > 50 and _cs_ptb_pct >= 50: _cs_score += 2; _cs_tags.append("WICK_REJECT")
+                            elif _c1_lwick > 50 and _cs_ptb_pct <= 50: _cs_score -= 2; _cs_tags.append("WICK_SUPPORT")
                         
-                        # Build the tag
-                        _cs_candle_desc = "GREEN" if _cs_is_green else "RED" if _cs_is_red else "DOJI"
-                        _p29cl_tag = "CS_{}_{}_{}_S{}".format(
-                            _p29cl_dir, _cs_candle_desc, _cs_ptb_pos, int(_cs_score))
+                        # D. Indicators
+                        if _p29cl_asset_sma_dir == "BUY": _cs_score -= 1; _cs_tags.append("SMA_BUY")
+                        elif _p29cl_asset_sma_dir == "SELL": _cs_score += 1; _cs_tags.append("SMA_SELL")
+                        if _p29cl_btc_dir == "BUY": _cs_score -= 0.5
+                        elif _p29cl_btc_dir == "SELL": _cs_score += 0.5
+                        
+                        # DECISION
+                        if abs(_cs_score) == 0:
+                            print("P29CL SKIP: {} score=0 ptb={}% {} {}".format(_p29cl_asset, _cs_ptb_pct, _cs_macro, "+".join(_cs_tags[:3])))
+                            continue
+                        _p29cl_dir = "UP" if _cs_score < 0 else "DOWN"
+                        if abs(_cs_score) >= 8: _p29cl_conf = "HIGH"
+                        elif abs(_cs_score) >= 5: _p29cl_conf = "MEDIUM"
+                        else: _p29cl_conf = "LOW"
+                        _cs_candle_desc = "G" if _c1_green else "R" if _c1_red else "D"
+                        _cs_trend = "3R" if _strong_trend_down else "2R" if _trend_down else "3G" if _strong_trend_up else "2G" if _trend_up else "RNG" if _is_ranging else "MIX"
+                        _p29cl_tag = "CS_{}_{}_{}_{}_{}_S{}".format(_p29cl_dir, _cs_candle_desc, _cs_trend, _cs_macro, _cs_ptb_pos, int(_cs_score))
                         _p29cl_score = _cs_score
-                        
-                        # Log the old P2.1 direction for comparison
+                        _cs_cpct = _c1_cpct
+                        _cs_uwick = _c1_uwick
                         if _p29cl_p21_dir and _p29cl_p21_dir != _p29cl_dir:
-                            print("P29CL OVERRIDE: {} P2.1={} → CS={} score={} ptb_pct={} {}".format(
-                                _p29cl_asset, _p29cl_p21_dir, _p29cl_dir, int(_cs_score),
-                                _cs_ptb_pct, "+".join(_cs_tags[:4])))
+                            print("P29CL OVERRIDE: {} P2.1={} > CS={} score={} macro={} trend={} ptb={}% {}".format(_p29cl_asset, _p29cl_p21_dir, _p29cl_dir, int(_cs_score), _cs_macro, _cs_trend, _cs_ptb_pct, "+".join(_cs_tags[:5])))
                         elif not _p29cl_p21_dir:
-                            print("P29CL INDEPENDENT: {} CS={} score={} ptb_pct={} {} (P2.1 had no signal)".format(
-                                _p29cl_asset, _p29cl_dir, int(_cs_score), _cs_ptb_pct,
-                                "+".join(_cs_tags[:4])))
+                            print("P29CL INDEPENDENT: {} CS={} score={} macro={} trend={} ptb={}% {}".format(_p29cl_asset, _p29cl_dir, int(_cs_score), _cs_macro, _cs_trend, _cs_ptb_pct, "+".join(_cs_tags[:5])))
                         
                         # Track main direction for phase detection
                         if not _p29cl_boundary_dir:
@@ -1690,7 +1705,7 @@ def _bot2_sniper_thread():
                                     _p29cl_dist_zone, _p29cl_dist_prob,
                                     _p29cl_tier,
                                     _cs_ptb_pct, _cs_cpct, _cs_uwick),
-                                conf=_p29cl_conf, ms=_p29cl_score,
+                                conf=_p29cl_conf, ms=int(_p29cl_score),
                                 dp=_p29cl_dist_prob, dz=_p29cl_dist_zone,
                                 slg=_p29cl_slug, cid=_p29cl_cid, tid=_p29cl_tid,
                                 fa=_p29cl_now)
@@ -20472,10 +20487,11 @@ if SIGNALS_DB_URL:
     
     # ── P2.9CL init ──
     _saved_p29cl = _saved_balances.get("p29cl", {})
-    if _saved_p29cl and _saved_p29cl.get("balance", 0) > 0:
-        _p29cl_state["balance"] = _saved_p29cl["balance"]
-        _p29cl_state["peak_balance"] = _saved_p29cl.get("peak_balance", _saved_p29cl["balance"])
-        print("P29CL: restored ${:.2f} from DB".format(_p29cl_state["balance"]))
+    # RESET: v3 engine deployed — fresh $200 pool for new direction engine
+    _p29cl_state["balance"] = 200.0
+    _p29cl_state["peak_balance"] = 200.0
+    _p29cl_state["starting_balance"] = 200.0
+    print("P29CL: RESET to $200.00 for v3 engine")
     _save_bot_balance("p29cl", _p29cl_state)
     
     # ── P2.9CL LIVE init ──
