@@ -839,71 +839,40 @@ def _p29cl_calc_dist(asset, chainlink_close):
     return prob_pct, zone
 
 def _p29cl_get_multiplier(conf, dist_zone, dist_prob, minute, direction, asset, phase, last_all_lose, last_all_win, last_dir, btc_dir=None, is_majority_flip=False, momentum_tag="", consecutive_all_lose=0):
-    """Stake multiplier v7.1 — hard reduces first, then phase boosts.
+    """Stake multiplier v8 — stripped back to proven core.
     
-    Added: DUMP_CONFIRMED when 2+ consecutive all-lose boundaries.
+    Only four active tiers:
+    - PHASE_FLIP: 2.0x (88.9% WR on 9 trades, proven)
+    - T1_UP_NEUTRAL: 1.5x (60% WR on 29 trades, proven)
+    - T1_DOWN_NEUTRAL: 1.5x (75% WR on 8 trades, proven)
+    - NORMAL: 1.0x (everything that passes reduces)
+    
+    All reduces stay at 0.4x for paper data collection.
+    PHASE_EXHAUST demoted to 1.0x until timing is fixed.
+    PHASE_FLIP_STRONG disabled (20% WR).
+    
+    Returns: (multiplier, tier_label)
     """
     _is_strong = minute in (15, 45)
     _btc_selling = (btc_dir == "SELL")
     _btc_buying = (btc_dir == "BUY")
-    _tag_upper = str(momentum_tag).upper()
-    
-    # Effective probability: for UP bets, eff_prob = dist_prob
-    # For DOWN bets, eff_prob = 100 - dist_prob (mirrored)
-    # This ensures EXTREME_DOWN(7%) on a DOWN bet → eff_prob=93 (exhausted)
     _eff_prob = dist_prob if direction == "UP" else (100 - dist_prob)
     
-    # ═══ STEP 1: HARD REDUCES (always checked first) ═══
+    # ═══ REDUCES (keep all for data collection) ═══
     
-    # DUMP_CONFIRMED: 2+ consecutive all-lose boundaries
-    # When 4+ assets all lost for 2+ boundaries in a row, the market is in a genuine dump
-    # Reduce all trades in the SAME direction as the dump to 0.4x
-    if consecutive_all_lose >= 2:
-        return 0.4, "REDUCE_DUMP_CONFIRMED"
-    
-    # DOJI (exact tag only) — 20% WR on 5 trades
-    # DOJI_CONFIRMS (67% WR) must NOT be caught — different signal
-    if _tag_upper.endswith("_DOJI") or _tag_upper.endswith("|DOJI") or _tag_upper == "DOJI" or "P21_ONLY_DOJI" in _tag_upper or "DOJI+MOMENTUM" in _tag_upper:
-        if "CONFIRMS" not in _tag_upper:
-            return 0.4, "REDUCE_DOJI"
-    
-    # Momentum engine flagged exhaustion
-    if "EXHAUST" in _tag_upper and conf == "LOW":
-        return 0.4, "REDUCE_EXHAUSTION"
-    
-    # MODERATE_RED_CONFIRMS + MEDIUM conf — 28% WR on 25 trades (p=0.010)
-    # Important: STRONG_MODERATE_RED_CONFIRMS (52% WR) must NOT match
-    if "MODERATE_RED_CONFIRMS" in _tag_upper and "STRONG_MODERATE" not in _tag_upper and conf == "MEDIUM":
-        return 0.4, "REDUCE_MODERATE_RED"
-    
-    # WEAK_SHOOTING_STAR with M2+ — 37% WR losing pattern
-    # M0 (69% WR) and M1 are NOT losers — only M2, M3, M4+
-    if ("WEAK_SHOOTING_STAR_M2" in _tag_upper or 
-        "WEAK_SHOOTING_STAR_M3" in _tag_upper or 
-        "WEAK_SHOOTING_STAR_M4" in _tag_upper or
-        "WEAK_SHOOTING_STAR_M5" in _tag_upper):
-        return 0.4, "REDUCE_SHOOTING_STAR"
-    
-    # STRONG_GREEN in EXTREME_UP — 44% WR on 86 trades
-    # Only in EXTREME_UP — TRANSITION at 65% WR should not be reduced
-    if ("STRONG_STRONG_GREEN_CONFIRMS" in _tag_upper or 
-        "STRONG_MODERATE_GREEN_CONFIRMS" in _tag_upper) and dist_zone == "EXTREME_UP":
-        return 0.4, "REDUCE_STRONG_GREEN_EXTREME"
-    
-    # DOGE/BNB/HYPE: unproven, 32-38% WR
+    # DOGE/BNB/HYPE
     if asset in ("DOGE", "BNB", "HYPE"):
         return 0.4, "REDUCE_NEW_PAIR"
     
-    # ETH in TRANSITION or EXTREME_UP — 20-30% WR confirmed
+    # ETH in TRANSITION or EXTREME_UP
     if asset == "ETH" and dist_zone in ("TRANSITION", "EXTREME_UP"):
         return 0.4, "REDUCE_ETH_WEAK"
     
-    # :30 boundary — 50% WR
+    # :30 boundary
     if minute == 30:
         return 0.4, "REDUCE_30"
     
-    # Effective prob 85+ with HIGH/MEDIUM — unconditional exhaustion
-    # Catches both UP+EXTREME_UP(85+) AND DOWN+EXTREME_DOWN(15-)
+    # Effective prob 85+ exhaustion
     if _eff_prob >= 85 and conf in ("HIGH", "MEDIUM"):
         return 0.4, "REDUCE_EXTREME_85"
     
@@ -911,43 +880,35 @@ def _p29cl_get_multiplier(conf, dist_zone, dist_prob, minute, direction, asset, 
     if _eff_prob >= 80 and _btc_selling:
         return 0.4, "REDUCE_EXTREME_HIGH"
     
-    # Effective prob 0-20 — move barely started or wrong direction
+    # Effective prob 0-20
     if _eff_prob <= 20:
         return 0.4, "REDUCE_EXTREME_LOW"
     
-    # HIGH confidence + non-NEUTRAL — exhaustion trap
+    # HIGH confidence + non-NEUTRAL
     if conf == "HIGH" and dist_zone != "NEUTRAL":
         return 0.4, "REDUCE_HIGH_EXTREME"
     
-    # Counter-trend: betting against BTC in NEUTRAL — 29% WR
+    # Counter-trend
     if dist_zone == "NEUTRAL" and direction == "DOWN" and _btc_buying:
         return 0.4, "REDUCE_COUNTER_TREND"
     if dist_zone == "NEUTRAL" and direction == "UP" and _btc_selling:
         return 0.4, "REDUCE_COUNTER_TREND"
     
-    # ═══ STEP 2: PHASE BOOSTS (only reached if no reduce triggered) ═══
+    # ═══ BOOSTS (only proven tiers) ═══
     
-    # Majority direction flip — 67-69% WR
-    if is_majority_flip and last_dir and direction != last_dir:
-        if _is_strong:
-            return 2.0, "PHASE_FLIP_STRONG"
-        return 1.5, "PHASE_FLIP"
+    # PHASE_FLIP — 88.9% WR, proven (NOT FLIP_STRONG)
+    if is_majority_flip and last_dir and direction != last_dir and not _is_strong:
+        return 2.0, "PHASE_FLIP"
     
-    # After 3+ assets all lost — exhaustion recovery, 63% WR
-    if last_all_lose:
-        return 1.5, "PHASE_EXHAUST"
-    
-    # ═══ STEP 3: T1 BOOSTS ═══
-    
-    # DOWN + NEUTRAL + BTC selling — 81% WR
+    # DOWN + NEUTRAL + BTC selling — 75% WR
     if direction == "DOWN" and dist_zone == "NEUTRAL" and _btc_selling:
         return 1.5, "T1_DOWN_NEUTRAL"
     
-    # UP + NEUTRAL + BTC buying — 59% WR
+    # UP + NEUTRAL + BTC buying — 60% WR
     if direction == "UP" and dist_zone == "NEUTRAL" and _btc_buying:
         return 1.5, "T1_UP_NEUTRAL"
     
-    # ═══ STEP 4: EVERYTHING ELSE ═══
+    # ═══ EVERYTHING ELSE ═══
     return 1.0, "NORMAL"
 
 
@@ -1496,6 +1457,15 @@ def _bot2_sniper_thread():
                         # Calculate DIST_PROB
                         _p29cl_dist_prob, _p29cl_dist_zone = _p29cl_calc_dist(_p29cl_asset, _p29cl_price)
                         
+                        # PRICE CONFIRMS check — log only for now
+                        # Compare current Chainlink price to boundary open (PTB)
+                        _p29cl_ptb = _chainlink_prices.get(_p29cl_asset + "_ptb", _p29cl_price)
+                        _p29cl_price_vs_ptb = (_p29cl_price - _p29cl_ptb) / _p29cl_ptb if _p29cl_ptb > 0 else 0
+                        _p29cl_price_confirms = "CONFIRMS" if (
+                            (_p29cl_dir == "UP" and _p29cl_price_vs_ptb >= 0) or
+                            (_p29cl_dir == "DOWN" and _p29cl_price_vs_ptb <= 0)
+                        ) else "OPPOSES"
+                        
                         # Dedup — check both in-memory set and DB
                         _p29cl_key = "p29cl_{}_{}".format(_p29cl_asset, window_ts)
                         if _p29cl_key in _p29cl_traded:
@@ -1571,10 +1541,10 @@ def _bot2_sniper_thread():
                                 ttl="P29CL {} {} 15M".format(_p29cl_asset, _p29cl_dir),
                                 ast=_p29cl_asset, bs=_p29cl_dir, stk=_p29cl_stake,
                                 pa=_p29cl_state["balance"],
-                                ind="[{}] {} | P21={} | BTC={} | DIST={}({}) | {} | PHASE={}".format(
+                                ind="[{}] {} | P21={} | BTC={} | DIST={}({}) | {} | PHASE={} | PRICE={}".format(
                                     _p29cl_conf, _p29cl_tag, _p29cl_p21_dir or "NONE",
                                     _p29cl_btc_dir or "NONE", _p29cl_dist_zone, _p29cl_dist_prob,
-                                    _p29cl_tier, _p29cl_phase),
+                                    _p29cl_tier, _p29cl_phase, _p29cl_price_confirms),
                                 conf=_p29cl_conf, ms=_p29cl_score,
                                 dp=_p29cl_dist_prob, dz=_p29cl_dist_zone,
                                 slg=_p29cl_slug, cid=_p29cl_cid, tid=_p29cl_tid,
@@ -1653,18 +1623,14 @@ def _bot2_sniper_thread():
                                 
                                 # Skip confirmed losers — paper only for data
                                 _LIVE_SKIP_TIERS = {
-                                    "REDUCE_DUMP_CONFIRMED", # 2+ consecutive all-lose
-                                    "REDUCE_DOJI",           # DOJI at any conf — 45.9% WR
-                                    "REDUCE_NEW_PAIR",       # 41% WR — DOGE/BNB/HYPE
-                                    "REDUCE_ETH_WEAK",       # 30% WR — ETH TRANSITION/EXTREME_UP
-                                    "REDUCE_EXTREME_LOW",    # 0% WR — DIST 0-20
-                                    "REDUCE_COUNTER_TREND",  # 29% WR — fighting BTC
-                                    "REDUCE_EXHAUSTION",     # new, no validation
-                                    "REDUCE_30",             # 53% WR — thin edge
-                                    "REDUCE_EXTREME_85",     # 52% WR — unproven
-                                    "REDUCE_MODERATE_RED",   # 28% WR — confirmed loser
-                                    "REDUCE_SHOOTING_STAR",  # 37% WR — M2+ losing pattern
-                                    "REDUCE_STRONG_GREEN_EXTREME",  # 44% WR — strong green in EXTREME_UP
+                                    "REDUCE_NEW_PAIR",
+                                    "REDUCE_ETH_WEAK",
+                                    "REDUCE_30",
+                                    "REDUCE_EXTREME_85",
+                                    "REDUCE_EXTREME_HIGH",
+                                    "REDUCE_EXTREME_LOW",
+                                    "REDUCE_HIGH_EXTREME",
+                                    "REDUCE_COUNTER_TREND",
                                 }
                                 if _p29l_tier in _LIVE_SKIP_TIERS:
                                     print("P29CL LIVE SKIP: {} {} tier={} (paper only)".format(
@@ -23491,11 +23457,7 @@ def p29cl_page():
     for t in resolved:
         ind = str(t.get("indicators", ""))
         tier = "NORMAL"
-        for label in ["PHASE_FLIP_STRONG", "PHASE_FLIP", "PHASE_EXHAUST",
-                       "T1_DOWN_NEUTRAL", "T1_UP_NEUTRAL",
-                       "REDUCE_DUMP_CONFIRMED", "REDUCE_DOJI",
-                       "REDUCE_EXHAUSTION", "REDUCE_MODERATE_RED", "REDUCE_SHOOTING_STAR",
-                       "REDUCE_STRONG_GREEN_EXTREME",
+        for label in ["PHASE_FLIP", "T1_DOWN_NEUTRAL", "T1_UP_NEUTRAL",
                        "REDUCE_NEW_PAIR", "REDUCE_ETH_WEAK", "REDUCE_30",
                        "REDUCE_EXTREME_85", "REDUCE_EXTREME_HIGH", "REDUCE_EXTREME_LOW",
                        "REDUCE_HIGH_EXTREME", "REDUCE_COUNTER_TREND"]:
