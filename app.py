@@ -334,6 +334,7 @@ _poly_alpha_traded_markets = set()  # Dedup for v1
 # ═══════════════════════════════════════════════════════════
 # POLYMARKET ALPHA 2.0 — P2.1 base + P2.3 boost (volume model)
 # ═══════════════════════════════════════════════════════════
+_PA2_TELEGRAM_ENABLED = False  # Disable PA2 telegram notifications
 _poly_alpha2_state = {
     "enabled": True,
     "balance": 70.0,
@@ -22273,7 +22274,7 @@ def run_poly_scan():
                                                 print("POLY A2 {}: {} {} {} ${:.2f} @{:.0f}% [{}] P2.1{} | pool=${:.2f}".format(
                                                     _pa2_name, _pa2_side, _pa2_sig["asset"], _pa2_sig["tf"],
                                                     _pa2_stake, _pa2_share*100, _fl, _boost, _poly_alpha2_state["balance"]))
-                                                send_telegram("⚡ <b>POLY A2 {}</b>\n{} {} {} ${:.2f} @{:.0f}%\nP2.1{}\nPool: ${:.2f}".format(
+                                                None if not _PA2_TELEGRAM_ENABLED else send_telegram("⚡ <b>POLY A2 {}</b>\n{} {} {} ${:.2f} @{:.0f}%\nP2.1{}\nPool: ${:.2f}".format(
                                                     _pa2_name, _pa2_side, _pa2_sig["asset"], _pa2_sig["tf"],
                                                     _pa2_stake, _pa2_share*100, _boost, _poly_alpha2_state["balance"]))
                                         except Exception as _e2:
@@ -22342,7 +22343,7 @@ def run_poly_scan():
                                                 print("POLY A2 {}: {} {} {} ${:.2f} @{:.0f}% [{}] P2.4 | pool=${:.2f}".format(
                                                     _pa2_name, _pa2_side, asset, tf,
                                                     _pa2_stake, _pa2_share*100, _fl, _poly_alpha2_state["balance"]))
-                                                send_telegram("⚡ <b>POLY A2 {}</b>\n{} {} {} ${:.2f} @{:.0f}%\nP2.4\nPool: ${:.2f}".format(
+                                                None if not _PA2_TELEGRAM_ENABLED else send_telegram("⚡ <b>POLY A2 {}</b>\n{} {} {} ${:.2f} @{:.0f}%\nP2.4\nPool: ${:.2f}".format(
                                                     _pa2_name, _pa2_side, asset, tf,
                                                     _pa2_stake, _pa2_share*100, _poly_alpha2_state["balance"]))
                                         except Exception as _e1h:
@@ -22487,7 +22488,7 @@ def run_poly_scan():
                     print("POLY A2 {}: {} {} {} ${:.2f} @{:.0f}% P2.1 only | pool=${:.2f}".format(
                         _pa2_name, _pa2_side, _pa2_sig["asset"], _pa2_sig["tf"],
                         _pa2_stake, _pa2_share*100, _poly_alpha2_state["balance"]))
-                    send_telegram("⚡ <b>POLY A2 {}</b>\n{} {} {} ${:.2f} @{:.0f}%\nP2.1 only\nPool: ${:.2f}".format(
+                    None if not _PA2_TELEGRAM_ENABLED else send_telegram("⚡ <b>POLY A2 {}</b>\n{} {} {} ${:.2f} @{:.0f}%\nP2.1 only\nPool: ${:.2f}".format(
                         _pa2_name, _pa2_side, _pa2_sig["asset"], _pa2_sig["tf"],
                         _pa2_stake, _pa2_share*100, _poly_alpha2_state["balance"]))
             except Exception as _e2f:
@@ -23043,10 +23044,10 @@ def _resolve_poly_alpha2_trades():
                     _poly_alpha2_state["peak_balance"]=_poly_alpha2_state["balance"]
                 if _poly_alpha2_state["balance"]<=_poly_alpha2_state["floor_balance"]:
                     _poly_alpha2_state["enabled"]=False
-                    send_telegram("🚨 <b>POLY A2 STOPPED — Floor</b>\nPool: ${:.2f}".format(_poly_alpha2_state["balance"]))
+                    None if not _PA2_TELEGRAM_ENABLED else send_telegram("🚨 <b>POLY A2 STOPPED — Floor</b>\nPool: ${:.2f}".format(_poly_alpha2_state["balance"]))
                 _pnl="+${:.2f}".format(payout-stake) if won else "-${:.2f}".format(stake)
                 print("POLY A2 #{} {} {}: ${:.2f} → {} | pool=${:.2f}".format(p["id"],p.get("tier","?"),"WIN" if won else "LOSS",stake,_pnl,_poly_alpha2_state["balance"]))
-                send_telegram("{} <b>POLY A2 {} {}</b>\n{} {} ${:.2f}\nPool: ${:.2f}".format("✅" if won else "❌",p.get("tier","?"),"WIN" if won else "LOSS",_pnl,p.get("asset","?"),stake,_poly_alpha2_state["balance"]))
+                None if not _PA2_TELEGRAM_ENABLED else send_telegram("{} <b>POLY A2 {} {}</b>\n{} {} ${:.2f}\nPool: ${:.2f}".format("✅" if won else "❌",p.get("tier","?"),"WIN" if won else "LOSS",_pnl,p.get("asset","?"),stake,_poly_alpha2_state["balance"]))
             except Exception as e:
                 print("Poly A2 resolve error #{}: {}".format(p.get("id"),e))
         return resolved
