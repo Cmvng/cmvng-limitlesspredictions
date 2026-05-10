@@ -336,7 +336,7 @@ _poly_alpha_traded_markets = set()  # Dedup for v1
 # ═══════════════════════════════════════════════════════════
 _PA2_TELEGRAM_ENABLED = False  # Disable PA2 telegram notifications
 _poly_alpha2_state = {
-    "enabled": True,
+    "enabled": False,  # PAUSED — only P29CL trades live
     "balance": 70.0,
     "peak_balance": 70.0,
     "starting_balance": 70.0,
@@ -24057,8 +24057,8 @@ def p29cl_page():
         dp = t.get("dist_prob", "")
         dz = t.get("dist_zone", "")
         dist_str = "{}({})".format(dz, dp) if dp else ""
-        trade_rows += "<tr><td>{}</td><td>{}</td><td>{}</td><td>${:.2f}</td><td>{}</td><td style='font-size:11px;color:#888'>{}</td><td style='font-size:11px;color:#58a6ff'>{}</td><td>{}</td></tr>".format(
-            icon, t.get("asset","?"), t.get("bet_side","?"), float(t.get("stake") or 0), fired, str(t.get("indicators",""))[:45], dist_str, pstr)
+        trade_rows += "<tr><td>{}</td><td>{}</td><td>{}</td><td>${:.2f}</td><td>{}</td><td style='font-size:10px;color:#888;max-width:400px;word-wrap:break-word'>{}</td><td style='font-size:11px;color:#58a6ff'>{}</td><td>{}</td></tr>".format(
+            icon, t.get("asset","?"), t.get("bet_side","?"), float(t.get("stake") or 0), fired, str(t.get("indicators",""))[:120], dist_str, pstr)
     wrc = "#3fb950" if wr >= 55 else "#f85149" if wr < 50 else "#d29922"
     pnlc = "#3fb950" if pnl >= 0 else "#f85149"
     return """<!DOCTYPE html><html><head><title>P2.9 Chainlink</title>
