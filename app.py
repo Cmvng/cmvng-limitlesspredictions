@@ -453,6 +453,7 @@ _p29cl_fired_boundaries = set()  # prevents entire P29CL block from running twic
 
 # Pre-fetched 15M candle series (fetched at T-22s, 6 completed candles)
 _p29cl_candle_prefetch = {}  # {"BTC": [(o,h,l,c), (o,h,l,c), ...], ...}
+_p29cl_1h_candles = {}  # {"BTC": [(o,h,l,c), ...], "ETH": [...]} — 1H OHLC for macro context
 
 # P2.9CL trades ALL available 15M pairs, not just the sniper 4
 P29CL_ASSETS = ["BTC", "ETH", "SOL", "XRP", "DOGE", "BNB", "HYPE"]
@@ -992,6 +993,8 @@ def _bot2_sniper_thread():
                         if klines and len(klines) >= 10:
                             closes = [float(k[4]) for k in klines]
                             _bot2_prefetch[asset] = closes
+                            # Store full 1H OHLC for candle structure analysis
+                            _p29cl_1h_candles[asset] = [(float(k[1]), float(k[2]), float(k[3]), float(k[4])) for k in klines]
                             print("BOT2 prefetch {}: {} closes, last={:.2f}".format(asset, len(closes), closes[-1]))
                         else:
                             print("BOT2 prefetch {}: only {} candles".format(asset, len(klines) if klines else 0))
@@ -1032,6 +1035,8 @@ def _bot2_sniper_thread():
                         if klines and len(klines) >= 9:
                             closes = [float(k[4]) for k in klines[:-1]]  # exclude current incomplete
                             _bot2_prefetch[asset] = closes[-9:]  # store last 9 completed closes
+                            # Store full 1H OHLC for candle structure
+                            _p29cl_1h_candles[asset] = [(float(k[1]), float(k[2]), float(k[3]), float(k[4])) for k in klines[:-1]]
                 except Exception as e:
                     print("P29CL 1H prefetch error {}: {}".format(asset, e))
             
@@ -1467,6 +1472,235 @@ def _bot2_sniper_thread():
                         _cs_score = 0
                         _cs_tags = []
                         
+                        # ══ STEP 0: 1H FULL STRUCTURAL ANALYSIS ══
+                        # Reads 10 hourly candles like a trader reads a chart:
+                        # OHLC, wicks, body quality, range, momentum, key levels
+                        # Produces: bias, rejection/defense levels, volatility, momentum
+                        _1h_bias = 0
+                        _1h_rejection_level = None  # price where sellers rejected on 1H
+                        _1h_defense_level = None    # price where buyers defended on 1H
+                        _1h_volatility = "NORMAL"
+                        _1h_momentum = "STEADY"
+                        _1h_structure = "NEUTRAL"
+                        _1h_candles = _p29cl_1h_candles.get(_p29cl_asset)
+                        
+                        if _1h_candles and len(_1h_candles) >= 5:
+                            _1h_lookback = min(len(_1h_candles), 10)
+                            _1h_all = _1h_candles[-_1h_lookback:]
+                            
+                            # ── Read EVERY candle's full structure ──
+                            _1h_candle_data = []
+                            for _1hc in _1h_all:
+                                _o, _h, _l, _c = _1hc
+                                _rng = _h - _l if _h > _l else 0.0001
+                                _body = abs(_c - _o)
+                                _cd = {
+                                    "o": _o, "h": _h, "l": _l, "c": _c,
+                                    "range": _rng,
+                                    "body": _body,
+                                    "body_pct": _body / _rng * 100,
+                                    "green": _c > _o,
+                                    "red": _c < _o,
+                                    "cpct": int((_c - _l) / _rng * 100),
+                                    "uwick": (_h - max(_o, _c)) / _rng * 100,
+                                    "lwick": (min(_o, _c) - _l) / _rng * 100,
+                                    "range_pct": _rng / _c * 100 if _c > 0 else 0,
+                                }
+                                _1h_candle_data.append(_cd)
+                            
+                            # ── A. KEY LEVELS from 10 candles ──
+                            # Rejection zones: highs where upper wick > 30% (sellers active)
+                            _1h_rejection_highs = [cd["h"] for cd in _1h_candle_data if cd["uwick"] > 30]
+                            # Defense zones: lows where lower wick > 30% (buyers active)
+                            _1h_defense_lows = [cd["l"] for cd in _1h_candle_data if cd["lwick"] > 30]
+                            
+                            # Also check where multiple candle highs cluster (resistance)
+                            # and where multiple candle lows cluster (support)
+                            _1h_all_highs = [cd["h"] for cd in _1h_candle_data]
+                            _1h_all_lows = [cd["l"] for cd in _1h_candle_data]
+                            _1h_overall_high = max(_1h_all_highs)
+                            _1h_overall_low = min(_1h_all_lows)
+                            _1h_overall_range = _1h_overall_high - _1h_overall_low if _1h_overall_high > _1h_overall_low else 0.0001
+                            
+                            # Strongest rejection = highest point with biggest upper wick
+                            if _1h_rejection_highs:
+                                _1h_rejection_level = max(_1h_rejection_highs)
+                            # Strongest defense = lowest point with biggest lower wick
+                            if _1h_defense_lows:
+                                _1h_defense_level = min(_1h_defense_lows)
+                            
+                            # ── B. TREND QUALITY from 10 candles ──
+                            _1h_first_close = _1h_candle_data[0]["c"]
+                            _1h_last_close = _1h_candle_data[-1]["c"]
+                            _1h_total_move = (_1h_last_close - _1h_first_close) / _1h_first_close * 100 if _1h_first_close > 0 else 0
+                            
+                            _1h_green_count = sum(1 for cd in _1h_candle_data if cd["green"])
+                            _1h_green_pct = _1h_green_count / _1h_lookback * 100
+                            
+                            # Higher highs and higher lows (quality uptrend check)
+                            _1h_hh = sum(1 for i in range(1, len(_1h_candle_data)) if _1h_candle_data[i]["h"] > _1h_candle_data[i-1]["h"])
+                            _1h_hl = sum(1 for i in range(1, len(_1h_candle_data)) if _1h_candle_data[i]["l"] > _1h_candle_data[i-1]["l"])
+                            _1h_ll = sum(1 for i in range(1, len(_1h_candle_data)) if _1h_candle_data[i]["l"] < _1h_candle_data[i-1]["l"])
+                            _1h_lh = sum(1 for i in range(1, len(_1h_candle_data)) if _1h_candle_data[i]["h"] < _1h_candle_data[i-1]["h"])
+                            
+                            # Quality uptrend = higher highs AND higher lows
+                            _1h_quality_uptrend = _1h_hh >= 5 and _1h_hl >= 4
+                            _1h_quality_downtrend = _1h_ll >= 5 and _1h_lh >= 4
+                            
+                            # Determine structure
+                            if _1h_total_move > 0.5 and _1h_green_pct >= 60 and (_1h_hh >= 5 or _1h_quality_uptrend):
+                                _1h_structure = "STRONG_BULL"
+                            elif _1h_total_move > 0.2 and _1h_green_pct >= 55:
+                                _1h_structure = "BULL"
+                            elif _1h_total_move < -0.5 and _1h_green_pct <= 40 and (_1h_ll >= 5 or _1h_quality_downtrend):
+                                _1h_structure = "STRONG_BEAR"
+                            elif _1h_total_move < -0.2 and _1h_green_pct <= 45:
+                                _1h_structure = "BEAR"
+                            elif abs(_1h_total_move) < 0.15:
+                                _1h_structure = "RANGING"
+                            
+                            # ── C. MOMENTUM PROFILE from recent 5 candles ──
+                            _1h_recent = _1h_candle_data[-5:] if len(_1h_candle_data) >= 5 else _1h_candle_data
+                            _1h_recent_bodies = [cd["body"] for cd in _1h_recent]
+                            _1h_recent_ranges = [cd["range"] for cd in _1h_recent]
+                            _1h_recent_uwicks = [cd["uwick"] for cd in _1h_recent]
+                            
+                            # Body momentum
+                            if len(_1h_recent_bodies) >= 3:
+                                if _1h_recent_bodies[-1] > _1h_recent_bodies[-2] > _1h_recent_bodies[-3]:
+                                    _1h_momentum = "ACCELERATING"
+                                elif _1h_recent_bodies[-1] < _1h_recent_bodies[-2] < _1h_recent_bodies[-3]:
+                                    _1h_momentum = "FADING"
+                                elif _1h_recent_bodies[-1] < _1h_recent_ranges[-1] * 0.15:
+                                    _1h_momentum = "DEAD"  # last candle is basically a doji
+                            
+                            # Volatility from range
+                            _1h_avg_range = sum(_1h_recent_ranges) / len(_1h_recent_ranges) if _1h_recent_ranges else 0
+                            _1h_avg_range_pct = sum(cd["range_pct"] for cd in _1h_recent) / len(_1h_recent)
+                            if _1h_avg_range_pct > 0.3:
+                                _1h_volatility = "HIGH"
+                            elif _1h_avg_range_pct < 0.1:
+                                _1h_volatility = "LOW"
+                            
+                            # ── D. RECENT 5 CANDLE CONTEXT ──
+                            _1h_consec_green = 0
+                            _1h_consec_red = 0
+                            for cd in reversed(_1h_recent):
+                                if cd["green"]: _1h_consec_green += 1
+                                else: break
+                            for cd in reversed(_1h_recent):
+                                if cd["red"]: _1h_consec_red += 1
+                                else: break
+                            
+                            _1h_recent_confirms = False
+                            _1h_recent_contradicts = False
+                            _1h_last = _1h_recent[-1]
+                            
+                            if _1h_structure in ("STRONG_BULL", "BULL"):
+                                if _1h_consec_green >= 2: _1h_recent_confirms = True
+                                elif _1h_consec_red >= 2 and _1h_last["body_pct"] > 30: _1h_recent_contradicts = True
+                                elif _1h_consec_red >= 3: _1h_recent_contradicts = True
+                            elif _1h_structure in ("STRONG_BEAR", "BEAR"):
+                                if _1h_consec_red >= 2: _1h_recent_confirms = True
+                                elif _1h_consec_green >= 2 and _1h_last["body_pct"] > 30: _1h_recent_contradicts = True
+                                elif _1h_consec_green >= 3: _1h_recent_contradicts = True
+                            
+                            # ── E. CURRENT PRICE POSITION ──
+                            _1h_price_in_10h = int((_p29cl_price - _1h_overall_low) / _1h_overall_range * 100)
+                            _1h_price_in_10h = max(0, min(100, _1h_price_in_10h))
+                            
+                            # Where is price relative to last 1H candle?
+                            _1h_price_vs_last = "INSIDE"
+                            if _p29cl_price > _1h_last["h"]:
+                                _1h_price_vs_last = "ABOVE_1H"
+                            elif _p29cl_price < _1h_last["l"]:
+                                _1h_price_vs_last = "BELOW_1H"
+                            
+                            # Is price near the 1H rejection or defense level?
+                            _1h_near_rejection = False
+                            _1h_near_defense = False
+                            _1h_level_zone = _1h_overall_range * 0.02  # 2% of 10H range as proximity
+                            if _1h_rejection_level and abs(_p29cl_price - _1h_rejection_level) < _1h_level_zone:
+                                _1h_near_rejection = True
+                            if _1h_defense_level and abs(_p29cl_price - _1h_defense_level) < _1h_level_zone:
+                                _1h_near_defense = True
+                            
+                            # ── F. BUILD THE 1H BIAS SCORE ──
+                            
+                            # Structure direction (base bias)
+                            if _1h_structure == "STRONG_BULL":
+                                _1h_bias = -3
+                                _cs_tags.append("1H_STRONG_BULL")
+                            elif _1h_structure == "BULL":
+                                _1h_bias = -2
+                                _cs_tags.append("1H_BULL")
+                            elif _1h_structure == "STRONG_BEAR":
+                                _1h_bias = 3
+                                _cs_tags.append("1H_STRONG_BEAR")
+                            elif _1h_structure == "BEAR":
+                                _1h_bias = 2
+                                _cs_tags.append("1H_BEAR")
+                            elif _1h_structure == "RANGING":
+                                _cs_tags.append("1H_RANGE")
+                                if _1h_price_in_10h <= 20:
+                                    _1h_bias = -1; _cs_tags.append("1H_RNG_LOW")
+                                elif _1h_price_in_10h >= 80:
+                                    _1h_bias = 1; _cs_tags.append("1H_RNG_HIGH")
+                            
+                            # Adjust for recent action vs structure
+                            if _1h_recent_contradicts:
+                                # Recent candles fighting the structure
+                                if abs(_1h_bias) >= 3:
+                                    _1h_bias = int(_1h_bias * 0.3)  # reduce to ~1
+                                    _cs_tags.append("1H_CONTRADICTED")
+                                else:
+                                    _1h_bias = 0
+                                    _cs_tags.append("1H_WARN")
+                            
+                            # Adjust for momentum
+                            if _1h_momentum == "FADING" and abs(_1h_bias) >= 2:
+                                _1h_bias = int(_1h_bias * 0.5)
+                                _cs_tags.append("1H_MOM_FADING")
+                            elif _1h_momentum == "DEAD":
+                                _1h_bias = int(_1h_bias * 0.3)
+                                _cs_tags.append("1H_MOM_DEAD")
+                            elif _1h_momentum == "ACCELERATING" and _1h_recent_confirms:
+                                _cs_tags.append("1H_MOM_ACCEL")
+                                # keep full bias — momentum confirms
+                            
+                            # Adjust for price position in 10H range
+                            if _1h_bias < 0 and _1h_price_in_10h >= 90:
+                                _1h_bias = max(_1h_bias + 1, -1)  # at top of range, less room UP
+                                _cs_tags.append("1H_AT_TOP")
+                            elif _1h_bias > 0 and _1h_price_in_10h <= 10:
+                                _1h_bias = min(_1h_bias - 1, 1)  # at bottom, less room DOWN
+                                _cs_tags.append("1H_AT_BOTTOM")
+                            
+                            # Key levels — affects PTB evaluation
+                            if _1h_near_rejection:
+                                _1h_bias += 1  # near 1H rejection = sellers here = DOWN pressure
+                                _cs_tags.append("1H_NEAR_REJECT")
+                            if _1h_near_defense:
+                                _1h_bias -= 1  # near 1H defense = buyers here = UP pressure
+                                _cs_tags.append("1H_NEAR_DEFEND")
+                            
+                            # Volatility affects confidence
+                            if _1h_volatility == "HIGH":
+                                _cs_tags.append("1H_HIGH_VOL")
+                            elif _1h_volatility == "LOW":
+                                _cs_tags.append("1H_LOW_VOL")
+                            
+                            # Last 1H candle close position — direct sentiment
+                            if _1h_last["cpct"] >= 80 and _1h_last["body_pct"] > 40:
+                                _1h_bias -= 1  # closed near high with real body = buyers dominated
+                                _cs_tags.append("1H_CLOSE_HIGH")
+                            elif _1h_last["cpct"] <= 20 and _1h_last["body_pct"] > 40:
+                                _1h_bias += 1  # closed near low = sellers dominated
+                                _cs_tags.append("1H_CLOSE_LOW")
+                            
+                            # Cap 1H bias at ±3
+                            _1h_bias = max(-3, min(3, _1h_bias))
+                        
                         # ══ STEP 1: MARKET STRUCTURE (10-20 candles) ══
                         _cs_all_highs = [c[1] for c in _cs_all]
                         _cs_all_lows = [c[2] for c in _cs_all]
@@ -1666,6 +1900,24 @@ def _bot2_sniper_thread():
                         if not _strong_trend_down and not _strong_trend_up:
                             if _c1_uwick > 50 and _cs_ptb_pct >= 50: _ptb_score += 2; _cs_tags.append("WICK_REJECT")
                             elif _c1_lwick > 50 and _cs_ptb_pct <= 50: _ptb_score -= 2; _cs_tags.append("WICK_SUPPORT")
+                        
+                        # PTB near 1H key levels — invisible on 15M chart
+                        if _1h_rejection_level and _1h_rejection_level > 0:
+                            _ptb_dist_to_reject = abs(_cs_ptb - _1h_rejection_level) / _c1_range if _c1_range > 0 else 999
+                            if _ptb_dist_to_reject < 2:  # PTB within 2 candle ranges of 1H rejection
+                                if _cs_ptb <= _1h_rejection_level:
+                                    _ptb_score += 1; _cs_tags.append("PTB_NEAR_1H_REJECT")
+                        if _1h_defense_level and _1h_defense_level > 0:
+                            _ptb_dist_to_defend = abs(_cs_ptb - _1h_defense_level) / _c1_range if _c1_range > 0 else 999
+                            if _ptb_dist_to_defend < 2:
+                                if _cs_ptb >= _1h_defense_level:
+                                    _ptb_score -= 1; _cs_tags.append("PTB_NEAR_1H_DEFEND")
+                        
+                        # High 1H volatility = 15M PTB position less reliable
+                        if _1h_volatility == "HIGH" and abs(_ptb_score) >= 2:
+                            _ptb_score = int(_ptb_score * 0.7)
+                            _cs_tags.append("1H_VOL_REDUCE")
+                        
                         _ptb_score = max(-3, min(3, _ptb_score))  # CAP at ±3
                         
                         # D. Indicators (max ±2)
@@ -1710,7 +1962,7 @@ def _bot2_sniper_thread():
                             _cs_tags.append("RECOVERY")  # boost whatever direction the engine chose
                         
                         # ══ COMBINE ALL SCORES ══
-                        _cs_score = _macro_score + _trend_score + _ptb_score + _ind_score + _dist_score + _doji_score + _session_score + _recovery_score
+                        _cs_score = _macro_score + _trend_score + _ptb_score + _ind_score + _dist_score + _doji_score + _session_score + _recovery_score + _1h_bias
                         
                         # FIX 3: Cap total score — very high = overconfident = priced in
                         _cs_score = max(-10, min(10, _cs_score))
