@@ -1569,13 +1569,13 @@ def _bot2_sniper_thread():
                             _cs_score += 0.5
                         
                         # ── DECISION ──
-                        if abs(_cs_score) < 2:
-                            # Too weak — skip this asset
-                            print("P29CL SKIP: {} score={} ptb_pct={} cpct={} {} (no edge)".format(
-                                _p29cl_asset, _cs_score, _cs_ptb_pct, _cs_cpct, "+".join(_cs_tags[:3])))
+                        if abs(_cs_score) == 0:
+                            # Truly no signal — equal forces both ways
+                            print("P29CL SKIP: {} score=0 ptb_pct={} cpct={} {} (no signal)".format(
+                                _p29cl_asset, _cs_ptb_pct, _cs_cpct, "+".join(_cs_tags[:3])))
                             continue
                         
-                        _p29cl_dir = "UP" if _cs_score <= -2 else "DOWN"
+                        _p29cl_dir = "UP" if _cs_score < 0 else "DOWN"
                         
                         if abs(_cs_score) >= 8:
                             _p29cl_conf = "HIGH"
@@ -1662,6 +1662,7 @@ def _bot2_sniper_thread():
                             "asset": _p29cl_asset, "key": _p29cl_key,
                             "dir": _p29cl_dir, "stake": _p29cl_stake,
                             "conf": _p29cl_conf, "tag": _p29cl_tag,
+                            "cs_score": _cs_score,
                         })
                         
                         # Save to DB
@@ -1780,6 +1781,13 @@ def _bot2_sniper_thread():
                                 if _p29l_tier in _LIVE_SKIP_TIERS:
                                     print("P29CL LIVE SKIP: {} {} tier={} (paper only)".format(
                                         _p29l_dir, _p29l_asset, _p29l_tier))
+                                    continue
+                                
+                                # Skip weak conviction on live — need score >= 3 for real money
+                                _p29l_cs_score = abs(_p29l_t.get("cs_score", 0))
+                                if _p29l_cs_score < 3:
+                                    print("P29CL LIVE SKIP: {} {} score={} (weak conviction)".format(
+                                        _p29l_dir, _p29l_asset, _p29l_cs_score))
                                     continue
                                 
                                 _p29l_stake = round(_p29l_base * _p29l_mult, 2)
