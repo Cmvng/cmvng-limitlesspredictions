@@ -1700,22 +1700,8 @@ def _bot2_sniper_thread():
                             _doji_score = 1 if _cs_score < 0 else -1 if _cs_score > 0 else 0
                             _cs_tags.append("DOJI_WEAK")
                         
-                        # G. Session timing (P2.9 finding: London 55.8%, Late 47.3%)
+                        # G. Session timing — REMOVED (P2.9 data doesn't transfer to P2.9CL timing)
                         _session_score = 0
-                        try:
-                            from datetime import datetime, timezone
-                            _cs_hour = datetime.now(timezone.utc).hour
-                            if 8 <= _cs_hour < 14:
-                                _session_score = 0  # London — no adjustment, baseline is good
-                                _cs_tags.append("LONDON")
-                            elif 20 <= _cs_hour or _cs_hour < 2:
-                                # Late session — reduce confidence, signals less reliable
-                                _session_score = 1 if _cs_score < 0 else -1 if _cs_score > 0 else 0
-                                _cs_tags.append("LATE_SESSION")
-                            elif 14 <= _cs_hour < 20:
-                                # NY — slightly reduce
-                                pass  # no adjustment yet, need more P29CL specific data
-                        except: pass
                         
                         # H. Recovery signal (66-80% WR after all-lose in P2.9)
                         _recovery_score = 0
