@@ -1928,21 +1928,30 @@ def _bot2_sniper_thread():
                         elif _p29cl_btc_dir == "SELL": _ind_score += 1
                         _ind_score = max(-2, min(2, _ind_score))  # CAP at ±2
                         
-                        # E. DIST exhaustion (max ±5 — strongest override)
+                        # E. DIST exhaustion — HARD OVERRIDE at extreme levels
                         _p29cl_dist_prob, _p29cl_dist_zone = _p29cl_calc_dist(_p29cl_asset, _p29cl_price)
-                        _cs_preliminary_dir = "UP" if (_macro_score + _trend_score + _ptb_score + _ind_score) < 0 else "DOWN"
+                        _cs_preliminary_dir = "UP" if (_macro_score + _trend_score + _ptb_score + _ind_score + _1h_bias) < 0 else "DOWN"
                         _cs_eff_prob = _p29cl_dist_prob if _cs_preliminary_dir == "UP" else (100 - _p29cl_dist_prob)
-                        if _cs_eff_prob >= 85:
-                            # FIX 7: At extreme, check if candle shows defense
+                        if _cs_eff_prob >= 90:
+                            # EXTREME — move is DONE. Hard cap the score toward zero
+                            # At 90%+ the fill is 90c+ to win $1. Even 80% WR loses money.
+                            _pre_dist_total = _macro_score + _trend_score + _ptb_score + _ind_score + _1h_bias
+                            if _cs_preliminary_dir == "UP":
+                                _dist_score = -_pre_dist_total + 1  # force score to +1 (weak DOWN)
+                                _cs_tags.append("EXTREME_UP_OVERRIDE")
+                            else:
+                                _dist_score = -_pre_dist_total - 1  # force score to -1 (weak UP)
+                                _cs_tags.append("EXTREME_DN_OVERRIDE")
+                        elif _cs_eff_prob >= 80:
+                            # HIGH EXTREME — strong counter but not full override
                             if _cs_preliminary_dir == "UP" and _c1_uwick < 30:
                                 _dist_score = 5; _cs_tags.append("EXTREME_UP_DONE")
                             elif _cs_preliminary_dir == "DOWN" and _c1_lwick < 30:
                                 _dist_score = -5; _cs_tags.append("EXTREME_DN_DONE")
                             else:
-                                # Candle shows defense at extreme — weaker exhaustion
                                 if _cs_preliminary_dir == "UP": _dist_score = 3; _cs_tags.append("EXTREME_UP_DEF")
                                 else: _dist_score = -3; _cs_tags.append("EXTREME_DN_DEF")
-                        elif _cs_eff_prob >= 75:
+                        elif _cs_eff_prob >= 70:
                             if _cs_preliminary_dir == "UP": _dist_score = 2; _cs_tags.append("HIGH_DIST")
                             else: _dist_score = -2; _cs_tags.append("HIGH_DIST")
                         
