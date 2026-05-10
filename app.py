@@ -2074,12 +2074,11 @@ def _bot2_sniper_thread():
                                 ttl="P29CL {} {} 15M".format(_p29cl_asset, _p29cl_dir),
                                 ast=_p29cl_asset, bs=_p29cl_dir, stk=_p29cl_stake,
                                 pa=_p29cl_state["balance"],
-                                ind="[{}] {} | SMA={} BTC={} P21={} | DIST={}({}) | {} | ptb_pct={} cpct={} uwick={}".format(
+                                ind="[{}] {} | SMA={} BTC={} P21={} | {} | ptb_pct={} cpct={} uwick={}".format(
                                     _p29cl_conf, _p29cl_tag, 
                                     _p29cl_asset_sma_dir or "NONE", _p29cl_btc_dir or "NONE",
                                     _p29cl_p21_dir or "NONE",
-                                    _p29cl_dist_zone, _p29cl_dist_prob,
-                                    _p29cl_tier,
+                                    "+".join(_cs_tags),
                                     _cs_ptb_pct, _cs_cpct, _cs_uwick),
                                 conf=_p29cl_conf, ms=int(_p29cl_score),
                                 dp=_p29cl_dist_prob, dz=_p29cl_dist_zone,
