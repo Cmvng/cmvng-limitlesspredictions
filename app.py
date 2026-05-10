@@ -20871,11 +20871,37 @@ if SIGNALS_DB_URL:
     
     # ── P2.9CL init ──
     _saved_p29cl = _saved_balances.get("p29cl", {})
-    # RESET: v3 engine deployed — fresh $200 pool for new direction engine
-    _p29cl_state["balance"] = 200.0
-    _p29cl_state["peak_balance"] = 200.0
-    _p29cl_state["starting_balance"] = 200.0
-    print("P29CL: RESET to $200.00 for v3 engine")
+    # Check if v4 reset already happened (balance will be exactly 200.0 with no trades)
+    _p29cl_needs_reset = True
+    try:
+        _chk_db = get_db()
+        _chk_rows = _chk_db.run("SELECT COUNT(*) FROM p29cl_trades")
+        _chk_count = _chk_rows[0][0] if _chk_rows else 0
+        _chk_db.close()
+        if _chk_count == 0 and _saved_p29cl.get("balance", 0) >= 199:
+            _p29cl_needs_reset = False  # already reset, no trades recorded yet
+        elif _chk_count > 0:
+            _p29cl_needs_reset = False  # v4 trades exist, don't wipe them
+    except:
+        _p29cl_needs_reset = True
+    
+    if _p29cl_needs_reset:
+        _p29cl_state["balance"] = 200.0
+        _p29cl_state["peak_balance"] = 200.0
+        _p29cl_state["starting_balance"] = 200.0
+        try:
+            _reset_db = get_db()
+            _reset_db.run("DELETE FROM p29cl_trades")
+            _reset_db.close()
+            print("P29CL: CLEARED trade history for v4 engine fresh start")
+        except Exception as _re:
+            print("P29CL: clear trades error: {}".format(_re))
+        print("P29CL: RESET to $200.00 for v4 engine")
+    else:
+        if _saved_p29cl and _saved_p29cl.get("balance", 0) > 0:
+            _p29cl_state["balance"] = _saved_p29cl["balance"]
+            _p29cl_state["peak_balance"] = _saved_p29cl.get("peak_balance", _saved_p29cl["balance"])
+            print("P29CL: restored ${:.2f} from DB".format(_p29cl_state["balance"]))
     _save_bot_balance("p29cl", _p29cl_state)
     
     # ── P2.9CL LIVE init ──
