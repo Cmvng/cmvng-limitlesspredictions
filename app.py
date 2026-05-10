@@ -1435,13 +1435,20 @@ def _bot2_sniper_thread():
                         # Get P2.1 direction from settled SMA
                         _p29cl_prefetch = _bot2_prefetch.get(_p29cl_asset)
                         _p29cl_p21_dir = None
+                        _p29cl_sma_agree = "UNK"
                         if _p29cl_prefetch and len(_p29cl_prefetch) >= 9:
                             _p29cl_closes = _p29cl_prefetch[-9:] + [_p29cl_price]
                             _p29cl_sma = sum(_p29cl_closes) / 10.0
                             _p29cl_asset_dir = "BUY" if _p29cl_price > _p29cl_sma else "SELL"
-                            # P2.1: SMA + BTC agree
+                            # Log divergence before the agreement check
                             if _p29cl_asset_dir == _p29cl_btc_dir:
+                                _p29cl_sma_agree = "AGREE"
                                 _p29cl_p21_dir = "DOWN" if _p29cl_asset_dir == "SELL" else "UP"
+                            else:
+                                _p29cl_sma_agree = "DIVERGE"
+                                # Log the divergence — asset SMA says one thing, BTC says another
+                                print("P29CL DIVERGE: {} SMA={} BTC={} (trade skipped by P2.1)".format(
+                                    _p29cl_asset, _p29cl_asset_dir, _p29cl_btc_dir))
                         
                         # Run momentum scoring
                         _p29cl_dir, _p29cl_conf, _p29cl_score, _p29cl_tag = _p29cl_momentum_score(
@@ -1465,6 +1472,34 @@ def _bot2_sniper_thread():
                             (_p29cl_dir == "UP" and _p29cl_price_vs_ptb >= 0) or
                             (_p29cl_dir == "DOWN" and _p29cl_price_vs_ptb <= 0)
                         ) else "OPPOSES"
+                        
+                        # CANDLE STRUCTURE logging — PTB vs previous candle OHLC
+                        _p29cl_close_pct = 50
+                        _p29cl_upper_wick_pct = 0
+                        _p29cl_ptb_position = "UNK"
+                        _p29cl_prev_candles = _p29cl_candle_prefetch.get(_p29cl_asset)
+                        if _p29cl_prev_candles and len(_p29cl_prev_candles) >= 2:
+                            _pc = _p29cl_prev_candles[-1]  # last settled 15M candle
+                            _pc_o, _pc_h, _pc_l, _pc_c = _pc[0], _pc[1], _pc[2], _pc[3]
+                            _pc_range = _pc_h - _pc_l if _pc_h > _pc_l else 0.0001
+                            
+                            # Close position: 0% = closed at low, 100% = closed at high
+                            _p29cl_close_pct = int((_pc_c - _pc_l) / _pc_range * 100)
+                            
+                            # Upper wick: how much rejection above
+                            _p29cl_upper_wick_pct = int((_pc_h - max(_pc_o, _pc_c)) / _pc_range * 100)
+                            
+                            # Where does PTB sit vs previous candle?
+                            if _p29cl_price > _pc_h:
+                                _p29cl_ptb_position = "ABOVE_HIGH"
+                            elif _p29cl_price > max(_pc_o, _pc_c):
+                                _p29cl_ptb_position = "ABOVE_CLOSE"
+                            elif _p29cl_price > min(_pc_o, _pc_c):
+                                _p29cl_ptb_position = "MID_BODY"
+                            elif _p29cl_price > _pc_l:
+                                _p29cl_ptb_position = "BELOW_CLOSE"
+                            else:
+                                _p29cl_ptb_position = "BELOW_LOW"
                         
                         # Dedup — check both in-memory set and DB
                         _p29cl_key = "p29cl_{}_{}".format(_p29cl_asset, window_ts)
@@ -1541,10 +1576,11 @@ def _bot2_sniper_thread():
                                 ttl="P29CL {} {} 15M".format(_p29cl_asset, _p29cl_dir),
                                 ast=_p29cl_asset, bs=_p29cl_dir, stk=_p29cl_stake,
                                 pa=_p29cl_state["balance"],
-                                ind="[{}] {} | P21={} | BTC={} | DIST={}({}) | {} | PHASE={} | PRICE={}".format(
+                                ind="[{}] {} | P21={} | BTC={} | DIST={}({}) | {} | PHASE={} | PRICE={} | CPCT={} UWICK={} PTB={}".format(
                                     _p29cl_conf, _p29cl_tag, _p29cl_p21_dir or "NONE",
                                     _p29cl_btc_dir or "NONE", _p29cl_dist_zone, _p29cl_dist_prob,
-                                    _p29cl_tier, _p29cl_phase, _p29cl_price_confirms),
+                                    _p29cl_tier, _p29cl_phase, _p29cl_price_confirms,
+                                    _p29cl_close_pct, _p29cl_upper_wick_pct, _p29cl_ptb_position),
                                 conf=_p29cl_conf, ms=_p29cl_score,
                                 dp=_p29cl_dist_prob, dz=_p29cl_dist_zone,
                                 slg=_p29cl_slug, cid=_p29cl_cid, tid=_p29cl_tid,
