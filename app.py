@@ -20691,6 +20691,15 @@ try:
     init_db()
     # Restore Alpha balance from DB if it exists (survives restarts)
     _saved_balances = _load_bot_balances()
+except Exception as _init_err:
+    print("DB init error: {}".format(_init_err))
+    _saved_balances = {}
+    try:
+        init_db()
+        _saved_balances = _load_bot_balances()
+    except:
+        print("DB retry failed — starting with defaults")
+        _saved_balances = {}
     _saved_alpha = _saved_balances.get("alpha", {})
     _alpha_restored = False
     # ONE-TIME STRATEGY F RESET: Clean slate, IDs start from 1
