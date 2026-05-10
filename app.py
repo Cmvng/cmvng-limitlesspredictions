@@ -1928,23 +1928,50 @@ def _bot2_sniper_thread():
                         elif _p29cl_btc_dir == "SELL": _ind_score += 1
                         _ind_score = max(-2, min(2, _ind_score))  # CAP at ±2
                         
-                        # E. DIST exhaustion — HARD OVERRIDE at extreme levels
+                        # E. DIST exhaustion — context-aware, respects breakouts
                         _p29cl_dist_prob, _p29cl_dist_zone = _p29cl_calc_dist(_p29cl_asset, _p29cl_price)
                         _cs_preliminary_dir = "UP" if (_macro_score + _trend_score + _ptb_score + _ind_score + _1h_bias) < 0 else "DOWN"
                         _cs_eff_prob = _p29cl_dist_prob if _cs_preliminary_dir == "UP" else (100 - _p29cl_dist_prob)
+                        
+                        # Detect if this is a BREAKOUT or EXHAUSTION
+                        # Breakout: BOS or COC detected = price entering new territory
+                        # Exhaustion: no structural break = price drifted to extreme
+                        _is_breakout_up = _bullish_bos or _bullish_coc or (_trend_up and _bodies_growing and _c1_genuine_green)
+                        _is_breakout_down = _bearish_bos or _bearish_coc or (_trend_down and _bodies_growing and _c1_genuine_red)
+                        _is_breakout = (_is_breakout_up and _cs_preliminary_dir == "UP") or (_is_breakout_down and _cs_preliminary_dir == "DOWN")
+                        
+                        # Also check 1H context — if 1H confirms the breakout direction, it's genuine
+                        _1h_confirms_breakout = False
+                        if _is_breakout_up and _1h_bias < 0:  # 1H bullish + bullish breakout
+                            _1h_confirms_breakout = True
+                        elif _is_breakout_down and _1h_bias > 0:  # 1H bearish + bearish breakout
+                            _1h_confirms_breakout = True
+                        
                         if _cs_eff_prob >= 90:
-                            # EXTREME — move is DONE. Hard cap the score toward zero
-                            # At 90%+ the fill is 90c+ to win $1. Even 80% WR loses money.
-                            _pre_dist_total = _macro_score + _trend_score + _ptb_score + _ind_score + _1h_bias
-                            if _cs_preliminary_dir == "UP":
-                                _dist_score = -_pre_dist_total + 1  # force score to +1 (weak DOWN)
-                                _cs_tags.append("EXTREME_UP_OVERRIDE")
+                            if _is_breakout and _1h_confirms_breakout:
+                                # GENUINE BREAKOUT — don't flip, but reduce confidence
+                                # The move is big but structural break + 1H confirms = continuation
+                                _dist_score = 2 if _cs_preliminary_dir == "UP" else -2  # mild counter, don't flip
+                                _cs_tags.append("EXTREME_BREAKOUT")
+                            elif _is_breakout:
+                                # Breakout on 15M but 1H doesn't confirm — cautious
+                                _dist_score = 3 if _cs_preliminary_dir == "UP" else -3
+                                _cs_tags.append("EXTREME_BREAKOUT_WEAK")
                             else:
-                                _dist_score = -_pre_dist_total - 1  # force score to -1 (weak UP)
-                                _cs_tags.append("EXTREME_DN_OVERRIDE")
+                                # NO breakout — genuine exhaustion, hard override
+                                _pre_dist_total = _macro_score + _trend_score + _ptb_score + _ind_score + _1h_bias
+                                if _cs_preliminary_dir == "UP":
+                                    _dist_score = -_pre_dist_total + 1
+                                    _cs_tags.append("EXTREME_UP_OVERRIDE")
+                                else:
+                                    _dist_score = -_pre_dist_total - 1
+                                    _cs_tags.append("EXTREME_DN_OVERRIDE")
                         elif _cs_eff_prob >= 80:
-                            # HIGH EXTREME — strong counter but not full override
-                            if _cs_preliminary_dir == "UP" and _c1_uwick < 30:
+                            if _is_breakout:
+                                # Breakout at 80-90% — mild counter only
+                                _dist_score = 1 if _cs_preliminary_dir == "UP" else -1
+                                _cs_tags.append("HIGH_DIST_BREAKOUT")
+                            elif _cs_preliminary_dir == "UP" and _c1_uwick < 30:
                                 _dist_score = 5; _cs_tags.append("EXTREME_UP_DONE")
                             elif _cs_preliminary_dir == "DOWN" and _c1_lwick < 30:
                                 _dist_score = -5; _cs_tags.append("EXTREME_DN_DONE")
