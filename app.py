@@ -20889,38 +20889,13 @@ if SIGNALS_DB_URL:
     
     # ── P2.9CL init ──
     _saved_p29cl = _saved_balances.get("p29cl", {})
-    # V4 reset: check if we already reset by looking for v4 marker
-    _p29cl_v4_done = False
-    try:
-        _v4_db = get_db()
-        _v4_check = _v4_db.run("SELECT value FROM bot_balances WHERE bot_name = 'p29cl_v4_reset'")
-        if _v4_check and len(_v4_check) > 0:
-            _p29cl_v4_done = True
-        _v4_db.close()
-    except:
-        pass
-    
-    if not _p29cl_v4_done:
-        _p29cl_state["balance"] = 200.0
-        _p29cl_state["peak_balance"] = 200.0
-        _p29cl_state["starting_balance"] = 200.0
-        try:
-            _reset_db = get_db()
-            _reset_db.run("DELETE FROM p29cl_trades")
-            _reset_db.run("INSERT INTO bot_balances (bot_name, value) VALUES ('p29cl_v4_reset', '{}')")
-            _reset_db.close()
-            print("P29CL: CLEARED trade history for v4 engine fresh start")
-        except Exception as _re:
-            print("P29CL: clear trades error: {}".format(_re))
-        print("P29CL: RESET to $200.00 for v4 engine")
+    if _saved_p29cl and _saved_p29cl.get("balance", 0) > 0:
+        _p29cl_state["balance"] = _saved_p29cl["balance"]
+        _p29cl_state["peak_balance"] = _saved_p29cl.get("peak_balance", _saved_p29cl["balance"])
+        print("P29CL: restored ${:.2f} from DB".format(_p29cl_state["balance"]))
     else:
-        if _saved_p29cl and _saved_p29cl.get("balance", 0) > 0:
-            _p29cl_state["balance"] = _saved_p29cl["balance"]
-            _p29cl_state["peak_balance"] = _saved_p29cl.get("peak_balance", _saved_p29cl["balance"])
-            print("P29CL: restored ${:.2f} from DB (v4 engine)".format(_p29cl_state["balance"]))
-        else:
-            _p29cl_state["balance"] = 200.0
-            print("P29CL: starting fresh at $200.00")
+        _p29cl_state["balance"] = 200.0
+        print("P29CL: fresh start $200.00")
     _save_bot_balance("p29cl", _p29cl_state)
     
     # ── P2.9CL LIVE init ──
