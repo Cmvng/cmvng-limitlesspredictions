@@ -1432,30 +1432,173 @@ def _bot2_sniper_thread():
                         if not _p29cl_price:
                             continue
                         
-                        # Get P2.1 direction from settled SMA
+                        # Get P2.1 direction from settled SMA (kept for logging/comparison)
                         _p29cl_prefetch = _bot2_prefetch.get(_p29cl_asset)
                         _p29cl_p21_dir = None
                         _p29cl_sma_agree = "UNK"
+                        _p29cl_asset_sma_dir = None
                         if _p29cl_prefetch and len(_p29cl_prefetch) >= 9:
                             _p29cl_closes = _p29cl_prefetch[-9:] + [_p29cl_price]
                             _p29cl_sma = sum(_p29cl_closes) / 10.0
-                            _p29cl_asset_dir = "BUY" if _p29cl_price > _p29cl_sma else "SELL"
-                            # Log divergence before the agreement check
-                            if _p29cl_asset_dir == _p29cl_btc_dir:
+                            _p29cl_asset_sma_dir = "BUY" if _p29cl_price > _p29cl_sma else "SELL"
+                            if _p29cl_asset_sma_dir == _p29cl_btc_dir:
                                 _p29cl_sma_agree = "AGREE"
-                                _p29cl_p21_dir = "DOWN" if _p29cl_asset_dir == "SELL" else "UP"
+                                _p29cl_p21_dir = "DOWN" if _p29cl_asset_sma_dir == "SELL" else "UP"
                             else:
                                 _p29cl_sma_agree = "DIVERGE"
-                                # Log the divergence — asset SMA says one thing, BTC says another
-                                print("P29CL DIVERGE: {} SMA={} BTC={} (trade skipped by P2.1)".format(
-                                    _p29cl_asset, _p29cl_asset_dir, _p29cl_btc_dir))
                         
-                        # Run momentum scoring
-                        _p29cl_dir, _p29cl_conf, _p29cl_score, _p29cl_tag = _p29cl_momentum_score(
-                            _p29cl_asset, _p29cl_price, _p29cl_p21_dir, _p29cl_btc_dir)
+                        # ══════════════════════════════════════════════════
+                        # PTB-RELATIVE CANDLE STRUCTURE DIRECTION ENGINE v1
+                        # ══════════════════════════════════════════════════
+                        # Core question: will price close ABOVE or BELOW the PTB?
+                        # Based on where PTB sits relative to previous candle structure
                         
-                        if not _p29cl_dir:
+                        _p29cl_prev_candles = _p29cl_candle_prefetch.get(_p29cl_asset)
+                        if not _p29cl_prev_candles or len(_p29cl_prev_candles) < 3:
                             continue
+                        
+                        # Settle last candle with Chainlink close
+                        _cs_settled = list(_p29cl_prev_candles)
+                        _cs_last = _cs_settled[-1]
+                        _cs_settled[-1] = (
+                            _cs_last[0],
+                            max(_cs_last[1], _p29cl_price),
+                            min(_cs_last[2], _p29cl_price),
+                            _p29cl_price
+                        )
+                        _cs_recent = _cs_settled[-5:] if len(_cs_settled) >= 5 else _cs_settled
+                        
+                        # ── Read previous candle (just-closed) ──
+                        _cs_prev = _cs_recent[-1]
+                        _cs_o, _cs_h, _cs_l, _cs_c = _cs_prev
+                        _cs_range = _cs_h - _cs_l if _cs_h > _cs_l else 0.0001
+                        _cs_body = abs(_cs_c - _cs_o)
+                        _cs_body_ratio = _cs_body / _cs_range
+                        _cs_is_green = _cs_c > _cs_o
+                        _cs_is_red = _cs_c < _cs_o
+                        _cs_cpct = int((_cs_c - _cs_l) / _cs_range * 100)
+                        _cs_uwick = int((_cs_h - max(_cs_o, _cs_c)) / _cs_range * 100)
+                        _cs_lwick = int((min(_cs_o, _cs_c) - _cs_l) / _cs_range * 100)
+                        
+                        # ── Read candles 2 and 3 back for context ──
+                        _cs_prev2 = _cs_recent[-2] if len(_cs_recent) >= 2 else _cs_prev
+                        _cs_prev3 = _cs_recent[-3] if len(_cs_recent) >= 3 else _cs_prev2
+                        _cs_dirs = []
+                        for _cc in _cs_recent[-3:]:
+                            _cs_dirs.append("G" if _cc[3] > _cc[0] else "R" if _cc[3] < _cc[0] else "F")
+                        _cs_all_green = all(d == "G" for d in _cs_dirs)
+                        _cs_all_red = all(d == "R" for d in _cs_dirs)
+                        
+                        # ── PTB position relative to previous candle ──
+                        _cs_ptb = _p29cl_price  # at T+0.5s, Chainlink price ≈ PTB
+                        _cs_ptb_pct = max(0, min(100, int((_cs_ptb - _cs_l) / _cs_range * 100)))
+                        
+                        if _cs_ptb > _cs_h:
+                            _cs_ptb_pos = "ABOVE_HIGH"
+                        elif _cs_ptb > max(_cs_o, _cs_c):
+                            _cs_ptb_pos = "ABOVE_CLOSE" if _cs_is_green else "ABOVE_OPEN"
+                        elif _cs_ptb > min(_cs_o, _cs_c):
+                            _cs_ptb_pos = "MID_BODY"
+                        elif _cs_ptb > _cs_l:
+                            _cs_ptb_pos = "BELOW_CLOSE" if _cs_is_red else "BELOW_OPEN"
+                        else:
+                            _cs_ptb_pos = "BELOW_LOW"
+                        
+                        # ── SCORE: negative = UP, positive = DOWN ──
+                        _cs_score = 0
+                        _cs_tags = []
+                        
+                        # Rule 1: PTB position is primary signal
+                        if _cs_ptb_pos == "BELOW_LOW":
+                            _cs_score -= 4; _cs_tags.append("PTB_BELOW_LOW")
+                        elif _cs_ptb_pos == "ABOVE_HIGH":
+                            _cs_score += 4; _cs_tags.append("PTB_ABOVE_HIGH")
+                        elif _cs_ptb_pct <= 25:
+                            _cs_score -= 3; _cs_tags.append("PTB_LOW25")
+                        elif _cs_ptb_pct >= 75:
+                            _cs_score += 3; _cs_tags.append("PTB_HIGH75")
+                        elif _cs_ptb_pct < 50:
+                            _cs_score -= 1; _cs_tags.append("PTB_LOWER")
+                        elif _cs_ptb_pct > 50:
+                            _cs_score += 1; _cs_tags.append("PTB_UPPER")
+                        
+                        # Rule 2: Candle color + PTB relationship
+                        if _cs_is_green:
+                            if _cs_ptb_pct <= 30:
+                                _cs_score -= 2; _cs_tags.append("GREEN_PTB_LOW")
+                            elif _cs_ptb_pct >= 70:
+                                _cs_score += 2; _cs_tags.append("GREEN_PTB_HIGH")
+                        elif _cs_is_red:
+                            if _cs_ptb_pct >= 70:
+                                _cs_score += 2; _cs_tags.append("RED_PTB_HIGH")
+                            elif _cs_ptb_pct <= 30:
+                                _cs_score -= 2; _cs_tags.append("RED_PTB_LOW")
+                        
+                        # Rule 3: Wick analysis relative to PTB
+                        if _cs_uwick > 40:
+                            if _cs_ptb_pct >= 60:
+                                _cs_score += 3; _cs_tags.append("REJECT_ABOVE_PTB")
+                            else:
+                                _cs_score -= 1; _cs_tags.append("REJECT_FAR_ABOVE")
+                        if _cs_lwick > 40:
+                            if _cs_ptb_pct <= 40:
+                                _cs_score -= 3; _cs_tags.append("SUPPORT_AT_PTB")
+                            else:
+                                _cs_score += 1; _cs_tags.append("SUPPORT_FAR_BELOW")
+                        
+                        # Rule 4: Multi-candle trend context
+                        if _cs_all_green and _cs_ptb_pct <= 40:
+                            _cs_score -= 2; _cs_tags.append("UPTREND_LOW")
+                        elif _cs_all_green and _cs_ptb_pct >= 70:
+                            _cs_score += 1; _cs_tags.append("UPTREND_EXHAUST")
+                        if _cs_all_red and _cs_ptb_pct >= 60:
+                            _cs_score += 2; _cs_tags.append("DOWNTREND_HIGH")
+                        elif _cs_all_red and _cs_ptb_pct <= 30:
+                            _cs_score -= 1; _cs_tags.append("DOWNTREND_BOUNCE")
+                        
+                        # Rule 5: Asset SMA as secondary (light weight)
+                        if _p29cl_asset_sma_dir == "BUY":
+                            _cs_score -= 1; _cs_tags.append("SMA_BUY")
+                        elif _p29cl_asset_sma_dir == "SELL":
+                            _cs_score += 1; _cs_tags.append("SMA_SELL")
+                        
+                        # BTC direction as very light signal
+                        if _p29cl_btc_dir == "BUY":
+                            _cs_score -= 0.5
+                        elif _p29cl_btc_dir == "SELL":
+                            _cs_score += 0.5
+                        
+                        # ── DECISION ──
+                        if abs(_cs_score) < 2:
+                            # Too weak — skip this asset
+                            print("P29CL SKIP: {} score={} ptb_pct={} cpct={} {} (no edge)".format(
+                                _p29cl_asset, _cs_score, _cs_ptb_pct, _cs_cpct, "+".join(_cs_tags[:3])))
+                            continue
+                        
+                        _p29cl_dir = "UP" if _cs_score <= -2 else "DOWN"
+                        
+                        if abs(_cs_score) >= 8:
+                            _p29cl_conf = "HIGH"
+                        elif abs(_cs_score) >= 5:
+                            _p29cl_conf = "MEDIUM"
+                        else:
+                            _p29cl_conf = "LOW"
+                        
+                        # Build the tag
+                        _cs_candle_desc = "GREEN" if _cs_is_green else "RED" if _cs_is_red else "DOJI"
+                        _p29cl_tag = "CS_{}_{}_{}_S{}".format(
+                            _p29cl_dir, _cs_candle_desc, _cs_ptb_pos, int(_cs_score))
+                        _p29cl_score = _cs_score
+                        
+                        # Log the old P2.1 direction for comparison
+                        if _p29cl_p21_dir and _p29cl_p21_dir != _p29cl_dir:
+                            print("P29CL OVERRIDE: {} P2.1={} → CS={} score={} ptb_pct={} {}".format(
+                                _p29cl_asset, _p29cl_p21_dir, _p29cl_dir, int(_cs_score),
+                                _cs_ptb_pct, "+".join(_cs_tags[:4])))
+                        elif not _p29cl_p21_dir:
+                            print("P29CL INDEPENDENT: {} CS={} score={} ptb_pct={} {} (P2.1 had no signal)".format(
+                                _p29cl_asset, _p29cl_dir, int(_cs_score), _cs_ptb_pct,
+                                "+".join(_cs_tags[:4])))
                         
                         # Track main direction for phase detection
                         if not _p29cl_boundary_dir:
@@ -1463,43 +1606,6 @@ def _bot2_sniper_thread():
                         
                         # Calculate DIST_PROB
                         _p29cl_dist_prob, _p29cl_dist_zone = _p29cl_calc_dist(_p29cl_asset, _p29cl_price)
-                        
-                        # PRICE CONFIRMS check — log only for now
-                        # Compare current Chainlink price to boundary open (PTB)
-                        _p29cl_ptb = _chainlink_prices.get(_p29cl_asset + "_ptb", _p29cl_price)
-                        _p29cl_price_vs_ptb = (_p29cl_price - _p29cl_ptb) / _p29cl_ptb if _p29cl_ptb > 0 else 0
-                        _p29cl_price_confirms = "CONFIRMS" if (
-                            (_p29cl_dir == "UP" and _p29cl_price_vs_ptb >= 0) or
-                            (_p29cl_dir == "DOWN" and _p29cl_price_vs_ptb <= 0)
-                        ) else "OPPOSES"
-                        
-                        # CANDLE STRUCTURE logging — PTB vs previous candle OHLC
-                        _p29cl_close_pct = 50
-                        _p29cl_upper_wick_pct = 0
-                        _p29cl_ptb_position = "UNK"
-                        _p29cl_prev_candles = _p29cl_candle_prefetch.get(_p29cl_asset)
-                        if _p29cl_prev_candles and len(_p29cl_prev_candles) >= 2:
-                            _pc = _p29cl_prev_candles[-1]  # last settled 15M candle
-                            _pc_o, _pc_h, _pc_l, _pc_c = _pc[0], _pc[1], _pc[2], _pc[3]
-                            _pc_range = _pc_h - _pc_l if _pc_h > _pc_l else 0.0001
-                            
-                            # Close position: 0% = closed at low, 100% = closed at high
-                            _p29cl_close_pct = int((_pc_c - _pc_l) / _pc_range * 100)
-                            
-                            # Upper wick: how much rejection above
-                            _p29cl_upper_wick_pct = int((_pc_h - max(_pc_o, _pc_c)) / _pc_range * 100)
-                            
-                            # Where does PTB sit vs previous candle?
-                            if _p29cl_price > _pc_h:
-                                _p29cl_ptb_position = "ABOVE_HIGH"
-                            elif _p29cl_price > max(_pc_o, _pc_c):
-                                _p29cl_ptb_position = "ABOVE_CLOSE"
-                            elif _p29cl_price > min(_pc_o, _pc_c):
-                                _p29cl_ptb_position = "MID_BODY"
-                            elif _p29cl_price > _pc_l:
-                                _p29cl_ptb_position = "BELOW_CLOSE"
-                            else:
-                                _p29cl_ptb_position = "BELOW_LOW"
                         
                         # Dedup — check both in-memory set and DB
                         _p29cl_key = "p29cl_{}_{}".format(_p29cl_asset, window_ts)
@@ -1576,11 +1682,13 @@ def _bot2_sniper_thread():
                                 ttl="P29CL {} {} 15M".format(_p29cl_asset, _p29cl_dir),
                                 ast=_p29cl_asset, bs=_p29cl_dir, stk=_p29cl_stake,
                                 pa=_p29cl_state["balance"],
-                                ind="[{}] {} | P21={} | BTC={} | DIST={}({}) | {} | PHASE={} | PRICE={} | CPCT={} UWICK={} PTB={}".format(
-                                    _p29cl_conf, _p29cl_tag, _p29cl_p21_dir or "NONE",
-                                    _p29cl_btc_dir or "NONE", _p29cl_dist_zone, _p29cl_dist_prob,
-                                    _p29cl_tier, _p29cl_phase, _p29cl_price_confirms,
-                                    _p29cl_close_pct, _p29cl_upper_wick_pct, _p29cl_ptb_position),
+                                ind="[{}] {} | SMA={} BTC={} P21={} | DIST={}({}) | {} | ptb_pct={} cpct={} uwick={}".format(
+                                    _p29cl_conf, _p29cl_tag, 
+                                    _p29cl_asset_sma_dir or "NONE", _p29cl_btc_dir or "NONE",
+                                    _p29cl_p21_dir or "NONE",
+                                    _p29cl_dist_zone, _p29cl_dist_prob,
+                                    _p29cl_tier,
+                                    _cs_ptb_pct, _cs_cpct, _cs_uwick),
                                 conf=_p29cl_conf, ms=_p29cl_score,
                                 dp=_p29cl_dist_prob, dz=_p29cl_dist_zone,
                                 slg=_p29cl_slug, cid=_p29cl_cid, tid=_p29cl_tid,
@@ -1590,10 +1698,11 @@ def _bot2_sniper_thread():
                             print("P29CL DB error {}: {}".format(_p29cl_asset, _p29cl_dbe))
                         
                         _p29cl_count += 1
-                        print("P29CL: {} {} S{} [{}] ${:.2f} DIST={}({}) {}({:.1f}x) | pool=${:.2f}".format(
-                            _p29cl_dir, _p29cl_asset, _p29cl_score, _p29cl_conf,
+                        print("P29CL: {} {} [{}] ${:.2f} DIST={}({}) {}({:.1f}x) ptb={}% {} | pool=${:.2f}".format(
+                            _p29cl_dir, _p29cl_asset, _p29cl_conf,
                             _p29cl_stake, _p29cl_dist_zone, _p29cl_dist_prob,
                             _p29cl_tier, _p29cl_mult,
+                            _cs_ptb_pct, "+".join(_cs_tags[:3]),
                             _p29cl_state["balance"]))
                         
                     except Exception as _p29cl_ae:
