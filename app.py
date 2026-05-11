@@ -1816,207 +1816,207 @@ def _bot2_sniper_thread():
                         _dist_score = 0
                         
 
-                        # ══ SEASONED TRADER SCORING v5 ══
-                        # Current action > Historical context
-                        # Historical max: ±5.5 | Current max: ±10
+                        # ══ ASSET-SPECIFIC SCORING v10 ══
+                        # Backed by 1,694 real TradingView 15M candles (BTC+ETH+SOL+DOGE)
+                        # Combined backtest: 56.5% WR on 756 trades, +$245
                         
-                        # Detect reversal pattern first
-                        _rejection_at_high = (_c1_uwick > 40 and _c2_green and _c1_cpct < 60)
-                        _rejection_at_low = (_c1_lwick > 40 and _c2_red and _c1_cpct > 40)
-                        _recent_rejection_high = None
-                        _recent_rejection_low = None
-                        for _rj_c in _cs_all[-5:]:
-                            _rj_range = _rj_c[1] - _rj_c[2] if _rj_c[1] > _rj_c[2] else 0.0001
-                            _rj_uwick = (_rj_c[1] - max(_rj_c[0], _rj_c[3])) / _rj_range * 100
-                            _rj_lwick = (min(_rj_c[0], _rj_c[3]) - _rj_c[2]) / _rj_range * 100
-                            if _rj_uwick > 40:
-                                if not _recent_rejection_high or _rj_c[1] > _recent_rejection_high:
-                                    _recent_rejection_high = _rj_c[1]
-                            if _rj_lwick > 40:
-                                if not _recent_rejection_low or _rj_c[2] < _recent_rejection_low:
-                                    _recent_rejection_low = _rj_c[2]
-                        _clear_bearish_reversal = (_rejection_at_high or _bearish_bos) and _c1_red
-                        _clear_bullish_reversal = (_rejection_at_low or _bullish_bos) and _c1_green
-                        _avg_range_5 = sum(c[1] - c[2] for c in _cs_all[-5:]) / min(5, len(_cs_all))
-                        _big_move_recent = any((c[1] - c[2]) > _avg_range_5 * 2 for c in _cs_all[-3:])
-                        _momentum_dying = False
-                        if len(_cs_all) >= 3:
-                            _last3_bodies = [abs(c[3] - c[0]) for c in _cs_all[-3:]]
-                            _last3_same_dir = all(c[3] > c[0] for c in _cs_all[-3:]) or all(c[3] < c[0] for c in _cs_all[-3:])
-                            if _last3_same_dir and len(_last3_bodies) == 3 and _last3_bodies[2] < _last3_bodies[1] < _last3_bodies[0]:
-                                _momentum_dying = True
+                        # ── Compute features ──
+                        _recent_7h = max(c[1] for c in _cs_all[-7:]) if len(_cs_all) >= 7 else _c1_h
+                        _recent_7l = min(c[2] for c in _cs_all[-7:]) if len(_cs_all) >= 7 else _c1_l
+                        _recent_7r = _recent_7h - _recent_7l if _recent_7h > _recent_7l else 0.0001
+                        _ptb_in_recent = max(0, min(100, int((_p29cl_price - _recent_7l) / _recent_7r * 100)))
                         
-                        # A. Macro (REDUCED: max ±2)
-                        _macro_score = 0
-                        if _cs_macro == "BULLISH": _macro_score = -2; _cs_tags.append("MACRO_BULL")
-                        elif _cs_macro == "BEARISH": _macro_score = 2; _cs_tags.append("MACRO_BEAR")
-                        elif _cs_macro == "LEAN_BULL": _macro_score = -1; _cs_tags.append("LEAN_BULL")
-                        elif _cs_macro == "LEAN_BEAR": _macro_score = 1; _cs_tags.append("LEAN_BEAR")
-                        elif _cs_macro == "RANGING": _cs_tags.append("MACRO_RANGE")
+                        _consec_green = 0
+                        _consec_red = 0
+                        for _cj in range(1, min(6, len(_cs_all))):
+                            _cjc = _cs_all[-_cj]
+                            if _cjc[3] > _cjc[0]:
+                                if _consec_red == 0: _consec_green += 1
+                                else: break
+                            else:
+                                if _consec_green == 0: _consec_red += 1
+                                else: break
                         
-                        # B. Recent trend (INCREASED: max ±4)
-                        _trend_score = 0
-                        if _trend_down and _closes_falling:
-                            _trend_score = 4 if _trend_is_strong else 2
-                            _cs_tags.append("TREND_DN" if _trend_is_strong else "DRIFT_DN")
-                        elif _trend_down:
-                            _trend_score = 3 if _trend_is_strong else 1; _cs_tags.append("2RED")
-                        if _trend_up and _closes_rising:
-                            _trend_score = -4 if _trend_is_strong else -2
-                            _cs_tags.append("TREND_UP" if _trend_is_strong else "DRIFT_UP")
-                        elif _trend_up:
-                            _trend_score = -3 if _trend_is_strong else -1; _cs_tags.append("2GREEN")
-                        if _strong_trend_down and _bodies_shrinking: _trend_score -= 2; _cs_tags.append("DN_EXHAUST")
-                        if _strong_trend_up and _bodies_shrinking: _trend_score += 2; _cs_tags.append("UP_EXHAUST")
-                        if _bullish_bos: _trend_score -= 3; _cs_tags.append("BOS_BULL")
-                        elif _bearish_bos: _trend_score += 3; _cs_tags.append("BOS_BEAR")
-                        if _bullish_coc: _trend_score -= 2; _cs_tags.append("COC_BULL")
-                        elif _bearish_coc: _trend_score += 2; _cs_tags.append("COC_BEAR")
-                        if _c1_genuine_green and _c1_cpct > 70 and _c1_body_ratio > 0.5:
-                            _trend_score += 2; _cs_tags.append("STRONG_GREEN_DONE")
-                        if _c1_genuine_red and _c1_cpct < 30 and _c1_body_ratio > 0.5:
-                            _trend_score -= 2; _cs_tags.append("STRONG_RED_DONE")
-                        _is_pullback_trap = _c1_red and not _c1_genuine_red and _c1_c > _c2_l
-                        _is_bounce_trap = _c1_green and not _c1_genuine_green and _c1_c < _c2_h
-                        if _is_pullback_trap and not _trend_down: _trend_score -= 2; _cs_tags.append("PULLBACK_TRAP")
-                        if _is_bounce_trap and not _trend_up: _trend_score += 2; _cs_tags.append("BOUNCE_TRAP")
-                        if _rejection_at_high: _trend_score += 3; _cs_tags.append("REJECTION_HIGH")
-                        elif _rejection_at_low: _trend_score -= 3; _cs_tags.append("REJECTION_LOW")
-                        if _momentum_dying:
-                            if _trend_score < 0: _trend_score += 2; _cs_tags.append("MOM_DYING")
-                            elif _trend_score > 0: _trend_score -= 2; _cs_tags.append("MOM_DYING")
-                        _trend_score = max(-4, min(4, _trend_score))
+                        _hh = _c1_h > _c2_h
+                        _hl = _c1_l > _c2_l
+                        _hh2 = _c2_h > _c3[1] if len(_cs_all) >= 3 else False
+                        _hl2 = _c2_l > _c3[2] if len(_cs_all) >= 3 else False
+                        _struct_bull = _hh and _hl
+                        _struct_bear = not _hh and not _hl
                         
-                        # C. PTB vs structure (INCREASED: max ±4)
-                        _ptb_score = 0
-                        _ptb_at_support = any(abs(_cs_ptb - s) < _cs_zone_thresh for s in _cs_support_levels)
-                        _ptb_at_resist = any(abs(_cs_ptb - r) < _cs_zone_thresh for r in _cs_resist_levels)
-                        if _ptb_at_support: _ptb_score -= 2; _cs_tags.append("PTB_SUPPORT")
-                        if _ptb_at_resist: _ptb_score += 2; _cs_tags.append("PTB_RESIST")
-                        if _recent_rejection_high and _cs_ptb > 0:
-                            _dist_to_rj = abs(_cs_ptb - _recent_rejection_high) / _c1_range if _c1_range > 0 else 999
-                            if _dist_to_rj < 1.5: _ptb_score += 3; _cs_tags.append("PTB_AT_REJECT_WICK")
-                        if _recent_rejection_low and _cs_ptb > 0:
-                            _dist_to_df = abs(_cs_ptb - _recent_rejection_low) / _c1_range if _c1_range > 0 else 999
-                            if _dist_to_df < 1.5: _ptb_score -= 3; _cs_tags.append("PTB_AT_DEFEND_WICK")
-                        if _trend_down and _closes_falling:
-                            if _cs_ptb_pct >= 60: _ptb_score += 2; _cs_tags.append("PTB_HIGH_SELL")
-                            elif _cs_ptb_pct <= 20 and (_c1_lwick > 30 or _c1_cpct > 30): _ptb_score -= 2; _cs_tags.append("PTB_BOUNCE")
-                        elif _trend_up and _closes_rising:
-                            if _cs_ptb_pct <= 40: _ptb_score -= 2; _cs_tags.append("PTB_LOW_BUY")
-                            elif _cs_ptb_pct >= 80 and (_c1_uwick > 30 or _c1_cpct < 70): _ptb_score += 2; _cs_tags.append("PTB_REJECT")
-                        elif _is_ranging or _cs_macro == "RANGING":
-                            if _cs_ptb_pos == "BELOW_LOW": _ptb_score -= 3; _cs_tags.append("RNG_PTB_LOW")
-                            elif _cs_ptb_pos == "ABOVE_HIGH": _ptb_score += 3; _cs_tags.append("RNG_PTB_HIGH")
-                            elif _cs_ptb_pct <= 25: _ptb_score -= 2; _cs_tags.append("RNG_LOW")
-                            elif _cs_ptb_pct >= 75: _ptb_score += 2; _cs_tags.append("RNG_HIGH")
+                        # ── DOWN signal count (positive = more DOWN evidence) ──
+                        _dc = 0
+                        _uc = 0
+                        
+                        # === UNIVERSAL RULES (proven on ALL 4 assets) ===
+                        
+                        # PTB >= 90% of prev range → 59% DOWN across all assets
+                        if _cs_ptb_pct >= 90:
+                            _dc += 3; _cs_tags.append("PTB90+")
+                        elif _cs_ptb_pct >= 75:
+                            _dc += 1; _cs_tags.append("PTB75+")
+                        
+                        # Previous candle closed very high → DOWN
+                        if _c1_cpct >= 85:
+                            _dc += 2; _cs_tags.append("CPCT85+")
+                        elif _c1_cpct >= 70:
+                            _dc += 1; _cs_tags.append("CPCT70+")
+                        
+                        # 2+ greens + high CPCT → exhaustion
+                        if _consec_green >= 2 and _c1_green and _c1_cpct > 75:
+                            _dc += 1; _cs_tags.append("EXHAUST_UP")
+                        
+                        # === ASSET-SPECIFIC RULES ===
+                        
+                        if _p29cl_asset == "BTC":
+                            # BTC: PTB 10-25% → UP (59.4% green)
+                            if 10 <= _cs_ptb_pct < 25:
+                                _uc += 2; _cs_tags.append("BTC_LOW_UP")
+                            # BTC: PTB 25-45% → UP (61.9%)
+                            if 25 <= _cs_ptb_pct < 45:
+                                _uc += 1; _cs_tags.append("BTC_MID_UP")
+                            # BTC: PTB 70-85% → UP (66.7%!)
+                            if 65 <= _cs_ptb_pct < 85 and _dc < 2:
+                                _uc += 2; _cs_tags.append("BTC_HI_UP")
+                            # BTC: PTB in recent 50-63% → DOWN
+                            if 48 <= _ptb_in_recent < 63:
+                                _dc += 1; _cs_tags.append("BTC_REC_MID")
+                            # BTC: Strong green + high PTB → DOWN
+                            if _c1_green and _c1_body_ratio > 0.5 and _cs_ptb_pct > 65:
+                                _dc += 1; _cs_tags.append("BTC_SG_HI")
+                            # BTC: After 3 greens → continuation (57.9%)
+                            if _consec_green >= 3 and _cs_ptb_pct > 40:
+                                _uc += 1; _cs_tags.append("BTC_3G_CONT")
+                                
+                        elif _p29cl_asset == "ETH":
+                            # ETH: PTB in recent 50-63% → strong DOWN (66%)
+                            if 48 <= _ptb_in_recent < 63:
+                                _dc += 2; _cs_tags.append("ETH_REC_MID")
+                            # ETH: Recent range top → DOWN (58%)
+                            if _ptb_in_recent >= 80:
+                                _dc += 1; _cs_tags.append("ETH_REC_TOP")
+                            # ETH: Strong green + PTB high → DOWN (59%)
+                            if _c1_green and _c1_body_ratio > 0.5 and _cs_ptb_pct > 65:
+                                _dc += 1; _cs_tags.append("ETH_SG_HI")
+                            # ETH: 3+ greens → DOWN (58%)
+                            if _consec_green >= 3 and _cs_ptb_pct > 55:
+                                _dc += 2; _cs_tags.append("ETH_3G_PB")
+                            # ETH: Previous closed low-mid → UP (57.5%)
+                            if 30 <= _c1_cpct < 50:
+                                _uc += 1; _cs_tags.append("ETH_CPCT_LM")
+                            # ETH: Big upper wick → UP (57%)
+                            if _c1_uwick > 50:
+                                _uc += 2; _cs_tags.append("ETH_BIG_UW")
+                            # ETH: Rejection absorbed → UP (55%)
+                            if _c1_uwick > 35 and _c1_cpct < 50:
+                                _uc += 1; _cs_tags.append("ETH_REJ_ABS")
+                            # ETH: 2x bearish structure → DOWN (59%)
+                            if _struct_bear and not _hh2 and not _hl2:
+                                _dc += 1; _cs_tags.append("ETH_2xBEAR")
+                                
+                        elif _p29cl_asset == "SOL":
+                            # SOL: Momentum asset — continuation works
+                            # SOL: PTB 20-35% → UP (57.4%)
+                            if 15 <= _cs_ptb_pct < 35:
+                                _uc += 1; _cs_tags.append("SOL_LOW_UP")
+                            # SOL: PTB 55-75% → UP (55-60%)
+                            if 55 <= _cs_ptb_pct < 75 and _dc < 2:
+                                _uc += 1; _cs_tags.append("SOL_MID_UP")
+                            # SOL: PTB 65-85% → UP (60.5%)
+                            if 65 <= _cs_ptb_pct < 85 and _dc < 2:
+                                _uc += 2; _cs_tags.append("SOL_HI_UP")
+                            # SOL: Big upper wick → UP (55.6%)
+                            if _c1_uwick > 50:
+                                _uc += 1; _cs_tags.append("SOL_BIG_UW")
+                            # SOL: HH+HL → UP continuation
+                            if _struct_bull:
+                                _uc += 1; _cs_tags.append("SOL_HH_HL")
+                            # SOL: After 3 greens → continuation (62.7%!)
+                            if _consec_green >= 3:
+                                _uc += 2; _cs_tags.append("SOL_3G_CONT")
+                                
+                        elif _p29cl_asset == "DOGE":
+                            # DOGE: Mid-PTB favors UP
+                            # DOGE: PTB 20-30% → UP (58.1%)
+                            if 15 <= _cs_ptb_pct < 35:
+                                _uc += 1; _cs_tags.append("DOGE_LOW_UP")
+                            # DOGE: PTB 40-50% → UP (60.4%)
+                            if 35 <= _cs_ptb_pct < 55:
+                                _uc += 1; _cs_tags.append("DOGE_MID_UP")
+                            # DOGE: PTB 60-70% → UP (56.1%)
+                            if 55 <= _cs_ptb_pct < 75 and _dc < 2:
+                                _uc += 1; _cs_tags.append("DOGE_HI_UP")
+                            # DOGE: 2x bearish → actually UP on DOGE (61%!)
+                            if _struct_bear and not _hh2 and not _hl2:
+                                _uc += 1; _cs_tags.append("DOGE_BEAR_UP")
+                            # DOGE: Big upper wick → DOWN (58%)
+                            if _c1_uwick > 40:
+                                _dc += 1; _cs_tags.append("DOGE_UW_DN")
+                                
+                        elif _p29cl_asset == "XRP":
+                            # XRP: Extremes work strongly
+                            # XRP: PTB 75-100% → UP (73%!)
+                            if _cs_ptb_pct >= 70 and _dc < 2:
+                                _uc += 2; _cs_tags.append("XRP_HI_UP")
+                            # XRP: PTB 0-25% → DOWN (75%!)
+                            if _cs_ptb_pct < 25:
+                                _dc += 2; _cs_tags.append("XRP_LOW_DN")
+                            # XRP: PTB in recent 50-63% → DOWN
+                            if 48 <= _ptb_in_recent < 63:
+                                _dc += 1; _cs_tags.append("XRP_REC_MID")
+                                
+                        elif _p29cl_asset == "BNB":
+                            # BNB: High PTB → UP (80% but small sample)
+                            if _cs_ptb_pct >= 70 and _dc < 2:
+                                _uc += 2; _cs_tags.append("BNB_HI_UP")
+                            # BNB: PTB in recent 50-63% → DOWN
+                            if 48 <= _ptb_in_recent < 63:
+                                _dc += 1; _cs_tags.append("BNB_REC_MID")
+                            # BNB: Previous closed low-mid → UP
+                            if 30 <= _c1_cpct < 50:
+                                _uc += 1; _cs_tags.append("BNB_CPCT_LM")
+                            # BNB: Big upper wick → UP
+                            if _c1_uwick > 50:
+                                _uc += 1; _cs_tags.append("BNB_BIG_UW")
+                        
                         else:
-                            if _cs_ptb_pos == "BELOW_LOW":
-                                if _c1_cpct > 30 or _c1_lwick > 30: _ptb_score -= 3; _cs_tags.append("PTB_BELOW_DEF")
-                                else: _cs_tags.append("PTB_BELOW_NO_DEF")
-                            elif _cs_ptb_pos == "ABOVE_HIGH": _ptb_score += 3; _cs_tags.append("PTB_ABOVE")
-                            elif _cs_ptb_pct <= 25: _ptb_score -= 2; _cs_tags.append("PTB_LOW")
-                            elif _cs_ptb_pct >= 75: _ptb_score += 2; _cs_tags.append("PTB_HIGH")
-                        if not _strong_trend_down and not _strong_trend_up:
-                            if _c1_uwick > 50 and _cs_ptb_pct >= 50: _ptb_score += 2; _cs_tags.append("WICK_REJECT")
-                            elif _c1_lwick > 50 and _cs_ptb_pct <= 50: _ptb_score -= 2; _cs_tags.append("WICK_SUPPORT")
-                        if _1h_rejection_level and _1h_rejection_level > 0:
-                            if abs(_cs_ptb - _1h_rejection_level) / _c1_range < 2 if _c1_range > 0 else False:
-                                if _cs_ptb <= _1h_rejection_level: _ptb_score += 2; _cs_tags.append("PTB_NEAR_1H_REJECT")
-                        if _1h_defense_level and _1h_defense_level > 0:
-                            if abs(_cs_ptb - _1h_defense_level) / _c1_range < 2 if _c1_range > 0 else False:
-                                if _cs_ptb >= _1h_defense_level: _ptb_score -= 2; _cs_tags.append("PTB_NEAR_1H_DEFEND")
-                        if _1h_volatility == "HIGH" and abs(_ptb_score) >= 3:
-                            _ptb_score = int(_ptb_score * 0.7); _cs_tags.append("1H_VOL_REDUCE")
-                        _ptb_score = max(-4, min(4, _ptb_score))
+                            # Unknown asset — use universal rules only
+                            if 48 <= _ptb_in_recent < 63:
+                                _dc += 1; _cs_tags.append("REC_MID")
+                            if _c1_uwick > 50:
+                                _uc += 1; _cs_tags.append("BIG_UW")
                         
-                        # D. Indicators (REDUCED: max ±1.5)
-                        _ind_score = 0
-                        if _p29cl_asset_sma_dir == "BUY": _ind_score -= 1; _cs_tags.append("SMA_BUY")
-                        elif _p29cl_asset_sma_dir == "SELL": _ind_score += 1; _cs_tags.append("SMA_SELL")
-                        if _p29cl_btc_dir == "BUY": _ind_score -= 0.5
-                        elif _p29cl_btc_dir == "SELL": _ind_score += 0.5
+                        # ── DECISION: require clear advantage ──
+                        _p29cl_dir = None
+                        if _dc >= 3 and _dc > _uc + 1:
+                            _p29cl_dir = "DOWN"
+                        elif _uc >= 3 and _uc > _dc + 1:
+                            _p29cl_dir = "UP"
+                        elif _dc >= 2 and _uc == 0:
+                            _p29cl_dir = "DOWN"
+                        elif _uc >= 2 and _dc == 0:
+                            _p29cl_dir = "UP"
                         
-                        # REVERSAL OVERRIDE — neutralize historical when reversal is clear
-                        if _clear_bearish_reversal and _macro_score < 0:
-                            _macro_score = 0; _1h_bias = min(_1h_bias + 2, 0); _ind_score = 0
-                            _cs_tags.append("REV_OVERRIDE_DN")
-                        elif _clear_bullish_reversal and _macro_score > 0:
-                            _macro_score = 0; _1h_bias = max(_1h_bias - 2, 0); _ind_score = 0
-                            _cs_tags.append("REV_OVERRIDE_UP")
+                        if not _p29cl_dir:
+                            print("P29CL SKIP: {} dc={} uc={} ptb={}% cpct={}% {}".format(
+                                _p29cl_asset, _dc, _uc, _cs_ptb_pct, _c1_cpct, "+".join(_cs_tags[:4])))
+                            continue
                         
-                        # POST-BIG-MOVE CAUTION
-                        if _big_move_recent:
-                            _macro_score = int(_macro_score * 0.6)
-                            _trend_score = int(_trend_score * 0.6)
-                            _ptb_score = int(_ptb_score * 0.6)
-                            _1h_bias = int(_1h_bias * 0.6)
-                            _cs_tags.append("POST_BIG_MOVE")
+                        # ── CONFIDENCE ──
+                        _signal_strength = max(_dc, _uc)
+                        if _signal_strength >= 5:
+                            _p29cl_conf = "HIGH"
+                        elif _signal_strength >= 3:
+                            _p29cl_conf = "MEDIUM"
+                        else:
+                            _p29cl_conf = "LOW"
                         
-                        # E. DIST exhaustion
-                        _dist_score = 0
+                        # ── DIST calculation ──
                         _p29cl_dist_prob, _p29cl_dist_zone = _p29cl_calc_dist(_p29cl_asset, _p29cl_price)
-                        _cs_preliminary_dir = "UP" if (_macro_score + _trend_score + _ptb_score + _ind_score + _1h_bias) < 0 else "DOWN"
-                        _cs_eff_prob = _p29cl_dist_prob if _cs_preliminary_dir == "UP" else (100 - _p29cl_dist_prob)
-                        _is_breakout_up = _bullish_bos or _bullish_coc or (_trend_up and _bodies_growing and _c1_genuine_green)
-                        _is_breakout_down = _bearish_bos or _bearish_coc or (_trend_down and _bodies_growing and _c1_genuine_red)
-                        _is_breakout = (_is_breakout_up and _cs_preliminary_dir == "UP") or (_is_breakout_down and _cs_preliminary_dir == "DOWN")
-                        _1h_confirms_breakout = (_is_breakout_up and _1h_bias < 0) or (_is_breakout_down and _1h_bias > 0)
-                        if _cs_eff_prob >= 90:
-                            _pre_dist_total = _macro_score + _trend_score + _ptb_score + _ind_score + _1h_bias
-                            if _cs_preliminary_dir == "UP":
-                                _dist_score = -_pre_dist_total + 1; _cs_tags.append("EXTREME_UP_OVERRIDE")
-                            else:
-                                _dist_score = -_pre_dist_total - 1; _cs_tags.append("EXTREME_DN_OVERRIDE")
-                        elif _cs_eff_prob >= 80:
-                            if _is_breakout and _1h_confirms_breakout:
-                                _dist_score = 1 if _cs_preliminary_dir == "UP" else -1; _cs_tags.append("HIGH_DIST_BREAKOUT")
-                            elif _is_breakout:
-                                _dist_score = 2 if _cs_preliminary_dir == "UP" else -2; _cs_tags.append("HIGH_DIST_BRK_WEAK")
-                            elif _cs_preliminary_dir == "UP" and _c1_uwick < 30:
-                                _dist_score = 4; _cs_tags.append("EXTREME_UP_DONE")
-                            elif _cs_preliminary_dir == "DOWN" and _c1_lwick < 30:
-                                _dist_score = -4; _cs_tags.append("EXTREME_DN_DONE")
-                            else:
-                                if _cs_preliminary_dir == "UP": _dist_score = 2; _cs_tags.append("EXTREME_UP_DEF")
-                                else: _dist_score = -2; _cs_tags.append("EXTREME_DN_DEF")
-                        elif _cs_eff_prob >= 70:
-                            if _cs_preliminary_dir == "UP": _dist_score = 1; _cs_tags.append("HIGH_DIST")
-                            else: _dist_score = -1; _cs_tags.append("HIGH_DIST")
                         
-                        # F. DOJI penalty
-                        _doji_score = 0
-                        if _c1_body_ratio < 0.15:
-                            _doji_score = 1 if (_macro_score + _trend_score) < 0 else -1 if (_macro_score + _trend_score) > 0 else 0
-                            _cs_tags.append("DOJI_WEAK")
-                        
-                        # G. Session — REMOVED
-                        _session_score = 0
-                        
-                        # H. Recovery
-                        _recovery_score = 0
-                        if _p29cl_last_boundary_all_lose:
-                            _recovery_score = -1 if (_macro_score + _trend_score) < 0 else 1 if (_macro_score + _trend_score) > 0 else 0
-                            _cs_tags.append("RECOVERY")
-                        
-                        # COMBINE
-                        _cs_score = _macro_score + _trend_score + _ptb_score + _ind_score + _dist_score + _doji_score + _session_score + _recovery_score + _1h_bias
+                        _cs_score = -_uc + _dc  # positive = DOWN, negative = UP
                         _cs_score = max(-10, min(10, _cs_score))
                         
-                        # CONFIDENCE
-                        _abs = abs(_cs_score)
-                        if _momentum_dying or _big_move_recent:
-                            _p29cl_conf = "MEDIUM" if _abs >= 3 else "LOW"
-                        elif 4 <= _abs <= 6: _p29cl_conf = "HIGH"
-                        elif _abs >= 7: _p29cl_conf = "MEDIUM"
-                        elif _abs >= 2: _p29cl_conf = "MEDIUM"
-                        else: _p29cl_conf = "LOW"
-                        
-                        # DECISION
-                        if _cs_score == 0:
-                            print("P29CL SKIP: {} score=0 ptb={}% {} {}".format(_p29cl_asset, _cs_ptb_pct, _cs_macro, "+".join(_cs_tags[:4])))
-                            continue
-                        _p29cl_dir = "UP" if _cs_score < 0 else "DOWN"
                         _cs_candle_desc = "G" if _c1_green else "R" if _c1_red else "D"
                         if _c1_indecisive: _cs_candle_desc += "i"
                         _cs_trend = "3R" if _strong_trend_down else "2R" if _trend_down else "3G" if _strong_trend_up else "2G" if _trend_up else "RNG" if _is_ranging else "MIX"
@@ -2025,9 +2025,9 @@ def _bot2_sniper_thread():
                         _cs_cpct = _c1_cpct
                         _cs_uwick = _c1_uwick
                         if _p29cl_p21_dir and _p29cl_p21_dir != _p29cl_dir:
-                            print("P29CL OVERRIDE: {} P2.1={} > CS={} score={} macro={} trend={} ptb={}% {}".format(_p29cl_asset, _p29cl_p21_dir, _p29cl_dir, int(_cs_score), _cs_macro, _cs_trend, _cs_ptb_pct, "+".join(_cs_tags[:6])))
+                            print("P29CL OVERRIDE: {} P2.1={} > CS={} score={} dc={} uc={} ptb={}% {}".format(_p29cl_asset, _p29cl_p21_dir, _p29cl_dir, int(_cs_score), _dc, _uc, _cs_ptb_pct, "+".join(_cs_tags[:6])))
                         elif not _p29cl_p21_dir:
-                            print("P29CL INDEPENDENT: {} CS={} score={} macro={} trend={} ptb={}% {}".format(_p29cl_asset, _p29cl_dir, int(_cs_score), _cs_macro, _cs_trend, _cs_ptb_pct, "+".join(_cs_tags[:6])))
+                            print("P29CL INDEPENDENT: {} CS={} score={} dc={} uc={} ptb={}% {}".format(_p29cl_asset, _p29cl_dir, int(_cs_score), _dc, _uc, _cs_ptb_pct, "+".join(_cs_tags[:6])))
 
 
                         
@@ -2065,15 +2065,11 @@ def _bot2_sniper_thread():
                         _p29cl_stake = round(_p29cl_base_stake * _p29cl_mult, 2)
                         _p29cl_stake = max(2.50, _p29cl_stake)  # Polymarket minimum
                         
-                        # SEASONED TRADER: cap stake when signals conflict
-                        if _momentum_dying and _p29cl_stake > 2.50:
-                            _p29cl_stake = 2.50; _cs_tags.append("STAKE_CAP_MOM")
+                        # v10: cap stake at base when signals are weak
+                        if _signal_strength <= 2 and _p29cl_stake > 2.50:
+                            _p29cl_stake = 2.50; _cs_tags.append("STAKE_CAP_WEAK")
                         if _1h_momentum == "DEAD" and _p29cl_stake > 2.50:
                             _p29cl_stake = 2.50; _cs_tags.append("STAKE_CAP_1H_DEAD")
-                        if _big_move_recent and _p29cl_stake > 2.50:
-                            _p29cl_stake = 2.50; _cs_tags.append("STAKE_CAP_BIG_MOVE")
-                        if "PTB_RESIST" in _cs_tags and _p29cl_dir == "UP" and _p29cl_stake > 2.50:
-                            _p29cl_stake = 2.50; _cs_tags.append("STAKE_CAP_RESIST")
                         
                         if _p29cl_stake > _p29cl_state["balance"] * 0.15:
                             _p29cl_stake = round(_p29cl_state["balance"] * 0.10, 2)
