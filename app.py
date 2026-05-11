@@ -2303,25 +2303,13 @@ def _bot2_sniper_thread():
                         if _p29cl_base_stake <= 0:
                             continue
                         
-                        _p29cl_mult, _p29cl_tier = _p29cl_get_multiplier(
-                            _p29cl_conf, _p29cl_dist_zone, _p29cl_dist_prob,
-                            _p29cl_bnd_minute, _p29cl_dir, _p29cl_asset,
-                            _p29cl_phase, _p29cl_last_boundary_all_lose,
-                            _p29cl_last_boundary_all_win, _p29cl_last_boundary_dir,
-                            btc_dir=_p29cl_btc_dir, is_majority_flip=_p29cl_is_majority_flip,
-                            momentum_tag=_p29cl_tag, consecutive_all_lose=_p29cl_consecutive_all_lose)
+                        # FINAL engine: flat $2.50 always
+                        _p29cl_mult_final = 1.0
+                        _p29cl_stake = round(_p29cl_base_stake * _p29cl_mult_final, 2)
+                        _p29cl_stake = max(2.50, _p29cl_stake)
+                        _p29cl_tier = "FINAL_C{}".format(_v11_conf)
+                        _p29cl_mult = _p29cl_mult_final
                         
-                        _p29cl_stake = round(_p29cl_base_stake * _p29cl_mult, 2)
-                        _p29cl_stake = max(2.50, _p29cl_stake)  # Polymarket minimum
-                        
-                        # v11: cap stake when confidence is low
-                        if _v11_conf <= 2 and _p29cl_stake > 2.50:
-                            _p29cl_stake = 2.50; _cs_tags.append("STAKE_CAP_LOW")
-                        if _1h_momentum == "DEAD" and _p29cl_stake > 2.50:
-                            _p29cl_stake = 2.50; _cs_tags.append("STAKE_CAP_1H_DEAD")
-                        
-                        if _p29cl_stake > _p29cl_state["balance"] * 0.15:
-                            _p29cl_stake = round(_p29cl_state["balance"] * 0.10, 2)
                         if _p29cl_stake > _p29cl_state["balance"] - _p29cl_state["floor_balance"]:
                             _p29cl_stake = max(2.50, round(_p29cl_state["balance"] - _p29cl_state["floor_balance"], 2))
                         if _p29cl_stake < 2.50 or _p29cl_stake > _p29cl_state["balance"]:
@@ -2446,7 +2434,7 @@ def _bot2_sniper_thread():
                                 # Flat $2.50 stake, conf=3 gets $3.75 (1.5x)
                                 _p29l_base = _p29cl_live_state["base_stake"]
                                 _p29l_conf_val = _p29l_t.get("v11_conf", 2)
-                                _p29l_mult_final = 1.5 if _p29l_conf_val >= 3 else 1.0
+                                _p29l_mult_final = 1.0  # flat $2.50 always
                                 
                                 # Correlation penalty: reduce to 1x when all same direction
                                 if _p29l_correlated:
@@ -2504,6 +2492,7 @@ def _bot2_sniper_thread():
                                 # Save to DB
                                 try:
                                     _p29l_db = get_db()
+                                    _p29l_dist_prob, _p29l_dist_zone = _p29cl_calc_dist(_p29l_asset, _chainlink_prices.get(_p29l_asset, 0))
                                     _p29l_db.run("""INSERT INTO p29cl_live_trades
                                         (market_id, title, asset, bet_side, stake, fill_price,
                                          pool_after, indicators, confidence, momentum_score,
@@ -2519,12 +2508,12 @@ def _bot2_sniper_thread():
                                         ttl="P29CL LIVE {} {} 15M".format(_p29l_asset, _p29l_dir),
                                         ast=_p29l_asset, bs=_p29l_dir, stk=_p29l_stake,
                                         pa=_p29cl_live_state["balance"],
-                                        ind="[{}] {} | DIST={}({}) | {} | PHASE={}".format(
-                                            _p29l_conf, _p29l_tier, _p29l_dist_zone, _p29l_dist_prob,
+                                        ind="[FINAL conf={}] rule={} | DIST={}({}) | {} | PHASE={}".format(
+                                            _p29l_conf_val, _p29l_t.get("tag","FINAL"), _p29l_dist_zone, _p29l_dist_prob,
                                             _p29l_dir, _p29cl_phase),
-                                        conf=_p29l_conf, ms=0,
+                                        conf="HIGH" if _p29l_conf_val >= 3 else "MEDIUM", ms=0,
                                         dp=_p29l_dist_prob, dz=_p29l_dist_zone,
-                                        tier=_p29l_tier, mult=_p29l_mult,
+                                        tier="FINAL_C{}".format(_p29l_conf_val), mult=_p29l_mult_final,
                                         oid=str(_p29l_oid) if _p29l_oid else "",
                                         tid=_p29l_token,
                                         cid=_p29l_entry.get("condition_id", ""),
@@ -2536,18 +2525,16 @@ def _bot2_sniper_thread():
                                     print("P29CL LIVE DB error {}: {}".format(_p29l_asset, _p29l_dbe))
                                 
                                 _p29l_count += 1
-                                print("P29CL LIVE: {} {} ${:.2f} {}({:.1f}x) oid={} | pool=${:.2f}".format(
+                                print("P29CL LIVE: {} {} ${:.2f} conf={} rule={} | pool=${:.2f}".format(
                                     _p29l_dir, _p29l_asset, _p29l_stake,
-                                    _p29l_tier, _p29l_mult,
-                                    str(_p29l_oid)[:12] if _p29l_oid else "NONE",
+                                    _p29l_conf_val, _p29l_t.get("tag","FINAL"),
                                     _p29cl_live_state["balance"]))
                                 
                                 # Telegram notification
                                 try:
-                                    send_telegram("🧠 <b>P29CL LIVE</b>\n{} {} ${:.2f}\n{} ({:.1f}x)\nDIST={}({})\nPool: ${:.2f}".format(
+                                    send_telegram("🧠 <b>P29CL LIVE</b>\n{} {} ${:.2f}\nconf={} rule={}\nPool: ${:.2f}".format(
                                         _p29l_dir, _p29l_asset, _p29l_stake,
-                                        _p29l_tier, _p29l_mult,
-                                        _p29l_dist_zone, _p29l_dist_prob,
+                                        _p29l_conf_val, _p29l_t.get("tag","FINAL"),
                                         _p29cl_live_state["balance"]))
                                 except: pass
                                 
