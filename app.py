@@ -7,6 +7,555 @@ import time
 import json
 from datetime import datetime, timezone, timedelta
 
+# ══════════════════════════════════════════════════════════════════════════════
+# P29CL V11 SELF-LEARNING ENGINE (embedded from p29cl_v11_engine.py)
+# ══════════════════════════════════════════════════════════════════════════════
+from collections import defaultdict
+
+# ── ASSET-SPECIFIC RULE TABLES ────────────────────────────────────────────────
+# Compiled from V8/V9 backtests. Each asset has rules that WORK and rules that FAIL.
+#
+# UNIVERSAL (>52% on all 3 assets):
+#   VLOW_WEAK_TREND, VLOW_BIGRED, LOW_INSIDE_GREEN, LOW_BIGRED,
+#   MID_INSIDE_GREEN, MID_3BAR_UP
+#
+# BTC-ONLY (fails on ETH/SOL):
+#   VHIGH_RED_LL, VHIGH_NOUP, MID_3BAR_BOUNCE (33% SOL!)
+#
+# BTC+ETH (fails on SOL):
+#   HIGH_HH_RNGEXP (48.8% SOL), HIGH_RNGEXP_UP1 (45.8% SOL)
+
+ASSET_RULES = {
+    # DEFAULT: conservative, works on unknown assets
+    "DEFAULT": {
+        "skip":   ["VHIGH_NOUP", "VHIGH_RED_LL", "HIGH_RNG_CTR"],
+        "demote": {"VHIGH_RED_LL": 1, "VHIGH_NOUP": 1},  # conf overrides
+        "flip":   [],
+    },
+    "BTC": {
+        "skip":   [],               # BTC uses all rules
+        "demote": {},
+        "flip":   [],
+    },
+    "ETH": {
+        "skip":   ["VHIGH_NOUP", "LOW_RNG_CTR", "VLOW_DOJI", "HIGH_RNGEXP_BARE"],
+        "demote": {"VHIGH_RED_LL": 1},  # was 58% BTC, 31% ETH → kill
+        "flip":   ["HIGH_RNG_CTR"],      # 24% on ETH → flip
+    },
+    "SOL": {
+        "skip":   ["VHIGH_RED_LL", "HIGH_RNG_CTR", "VLOW_GREEN_UP1"],
+        "demote": {"HIGH_HH_RNGEXP": 2},  # 48.8% on SOL → demote
+        "flip":   ["MID_3BAR_BOUNCE"],     # 33% on SOL → flip
+    },
+    # Altcoins without backtest data use conservative defaults
+    "BNB":  "DEFAULT",
+    "XRP":  "DEFAULT",
+    "DOGE": "DEFAULT",
+}
+
+
+class P29CLv11:
+    """Production self-learning candle prediction engine."""
+
+    def __init__(self, asset="BTC", state_path=None):
+        self.asset = asset.upper()
+        self.state_path = state_path  # for persistent state across restarts
+
+        # ── Load asset-specific rule table ────────────────────────────────
+        rules = ASSET_RULES.get(self.asset, ASSET_RULES["DEFAULT"])
+        if isinstance(rules, str):
+            rules = ASSET_RULES[rules]
+        self.asset_skip   = set(rules.get("skip", []))
+        self.asset_demote = rules.get("demote", {})
+        self.asset_flip   = set(rules.get("flip", []))
+
+        # ── Adaptive state (persists across candles) ──────────────────────
+        self.mem          = defaultdict(lambda: {"UP": 0, "DOWN": 0})  # 9D pattern memory
+        self.rule_cum     = defaultdict(lambda: {"w": 0, "l": 0})
+        self.rule_window  = defaultdict(list)
+        self.skip_rules   = set(self.asset_skip)   # start with known bad rules
+        self.flip_rules   = set(self.asset_flip)
+        self.boost_rules  = set()
+        self.n            = 0
+        self.learn_log    = []
+        self.last_prediction = None
+
+        # ── Load persisted state if available ─────────────────────────────
+        if state_path and os.path.exists(state_path):
+            self._load_state()
+
+    # ══════════════════════════════════════════════════════════════════════
+    # PUBLIC API
+    # ══════════════════════════════════════════════════════════════════════
+
+    def predict(self, candles_5bar):
+        """
+        Predict next candle direction BEFORE it forms.
+        
+        Args:
+            candles_5bar: list of 5 dicts, oldest first, each with keys:
+                          {open, high, low, close} (floats)
+                          These are the 5 most recent CLOSED 15M candles.
+        
+        Returns:
+            dict with keys:
+                side:       "UP" or "DOWN" or None (skip)
+                confidence: 1-3 (3 = highest)
+                rule:       string identifying which rule fired
+                ptb_zone:   "VLOW"/"LOW"/"MID"/"HIGH"/"VHIGH"
+                reason:     human-readable explanation
+        """
+        if len(candles_5bar) < 5:
+            return {"side": None, "confidence": 0, "rule": "INSUFFICIENT_DATA",
+                    "ptb_zone": "UNKNOWN", "reason": "Need 5 closed candles"}
+
+        c0m2, c0m, c1m2, c1m, c1 = candles_5bar
+        f = self._extract_features(c1, c1m, c1m2, c0m, c0m2)
+        pred, conf, rule = self._predict_internal(f)
+
+        result = {
+            "side":       pred,
+            "confidence": conf,
+            "rule":       rule,
+            "ptb_zone":   f["zone"],
+            "ptb_pct":    f["ptb"],
+            "features":   f,
+            "reason":     self._explain(pred, conf, rule, f),
+        }
+        self.last_prediction = result
+        return result
+
+    def learn(self, actual_direction):
+        """
+        Feed back the actual candle outcome to update the engine.
+        
+        Args:
+            actual_direction: "UP" or "DOWN" (how the candle actually closed)
+        """
+        if self.last_prediction is None or self.last_prediction["side"] is None:
+            return
+
+        pred = self.last_prediction
+        correct = (pred["side"] == actual_direction)
+        f    = pred["features"]
+        rule = pred["rule"]
+
+        self._update_internal(f, rule, actual_direction, correct)
+        self.last_prediction = None  # consume it
+
+        # Persist state after every learn
+        if self.state_path:
+            self._save_state()
+
+    # ══════════════════════════════════════════════════════════════════════
+    # FEATURE EXTRACTION
+    # ══════════════════════════════════════════════════════════════════════
+
+    def _extract_features(self, c1, c1m, c1m2, c0m, c0m2):
+        rng  = max(c1["high"]-c1["low"], 0.0001)
+        rng1 = max(c1m["high"]-c1m["low"], 0.0001)
+        rng2 = max(c1m2["high"]-c1m2["low"], 0.0001)
+        rng3 = max(c0m["high"]-c0m["low"], 0.0001)
+
+        body  = abs(c1["close"]-c1["open"])/rng
+        cpct  = max(0, min(100, int((c1["close"]-c1["low"])/rng*100)))
+        green = c1["close"] > c1["open"]
+        up1   = c1["close"] > c1m["close"]
+        up2   = c1m["close"] > c1m2["close"]
+        up3   = c1m2["close"] > c0m["close"]
+        up4   = c0m["close"] > c0m2["close"]
+        trend = sum([up1, up2, up3, up4])
+        mom   = (c1["close"]-c1m["close"])/c1m["close"]*100 if c1m["close"] else 0
+        avg3  = (rng1+rng2+rng3)/3
+        rng_exp = rng > avg3*1.3
+        rng_ctr = rng < avg3*0.7
+        hh = c1["high"] > c1m["high"]
+        ll = c1["low"]  < c1m["low"]
+        inside = not hh and not ll
+        ptb = cpct
+
+        if ptb < 20: zone = "VLOW"
+        elif ptb < 40: zone = "LOW"
+        elif ptb < 60: zone = "MID"
+        elif ptb < 80: zone = "HIGH"
+        else: zone = "VHIGH"
+
+        return {
+            "body": body, "cpct": cpct, "green": green,
+            "up1": up1, "up2": up2, "up3": up3, "up4": up4,
+            "trend": trend, "mom": mom,
+            "rng_exp": rng_exp, "rng_ctr": rng_ctr,
+            "hh": hh, "ll": ll, "inside": inside,
+            "ptb": ptb, "zone": zone, "rng": rng, "avg_rng": avg3,
+        }
+
+    # ══════════════════════════════════════════════════════════════════════
+    # BASE RULES (V9 — post BTC+ETH+SOL evolution)
+    # ══════════════════════════════════════════════════════════════════════
+
+    def _base_rules(self, f):
+        z = f["zone"]; body = f["body"]; green = f["green"]
+        up1 = f["up1"]; up2 = f["up2"]; up3 = f["up3"]
+        trend = f["trend"]; inside = f["inside"]
+        rng_exp = f["rng_exp"]; rng_ctr = f["rng_ctr"]
+        hh = f["hh"]; ll = f["ll"]; mom = f["mom"]
+
+        if z == "VLOW":
+            if green and up1:              return "UP", 3, "VLOW_GREEN_UP1"
+            if green:                      return "UP", 2, "VLOW_GREEN"
+            if up1 and mom > 0:            return "UP", 3, "VLOW_UP_MOM"
+            if body < 0.15 and trend <= 2: return "UP", 2, "VLOW_DOJI"
+            if trend <= 1:                 return "UP", 2, "VLOW_WEAK_TREND"
+            if not green and body > 0.50:  return "UP", 2, "VLOW_BIGRED"
+            return "UP", 1, "VLOW_DEFAULT"
+
+        elif z == "LOW":
+            if inside and green:
+                return "UP", 3, "LOW_INSIDE_GREEN"
+            if rng_ctr and not up1 and not up2:
+                return "DOWN", 2, "LOW_RNG_CTR"
+            if not green and body > 0.60 and not up1:
+                return "UP", 2, "LOW_BIGRED"
+            return None, 0, "LOW_SKIP"
+
+        elif z == "MID":
+            if inside and green:
+                return "DOWN", 2, "MID_INSIDE_GREEN"
+            if not up1 and not up2 and not up3:
+                return "UP", 3, "MID_3BAR_BOUNCE"
+            if up1 and up2 and up3:
+                return "UP", 2, "MID_3BAR_UP"
+            return None, 0, "MID_SKIP"
+
+        elif z == "HIGH":
+            if hh and rng_exp:
+                return "DOWN", 3, "HIGH_HH_RNGEXP"
+            if rng_exp and up1:
+                return "DOWN", 3, "HIGH_RNGEXP_UP1"
+            if trend == 4:
+                return "DOWN", 3, "HIGH_4BAR"
+            if up1 and up2 and up3:
+                return "DOWN", 2, "HIGH_3BAR"
+            if rng_ctr and not up1 and trend <= 1:
+                return "UP", 2, "HIGH_RNG_CTR"
+            return None, 0, "HIGH_SKIP"
+
+        elif z == "VHIGH":
+            if not green and ll:
+                return "DOWN", 2, "VHIGH_RED_LL"
+            if not up1:
+                return "DOWN", 1, "VHIGH_NOUP"
+            return None, 0, "VHIGH_SKIP"
+
+        return None, 0, "SKIP"
+
+    # ══════════════════════════════════════════════════════════════════════
+    # 9D PATTERN MEMORY
+    # ══════════════════════════════════════════════════════════════════════
+
+    def _ctx_key(self, f):
+        tb = "hi" if f["trend"] >= 3 else "lo" if f["trend"] <= 1 else "md"
+        bb = "big" if f["body"] > 0.50 else "tiny" if f["body"] < 0.15 else "mid"
+        zb = "lo" if f["ptb"] < 10 else "hi" if f["ptb"] > 90 else "mid"
+        return (f["zone"], f["green"], f["up1"], f["up2"], tb,
+                f["rng_exp"], f["inside"], bb, zb)
+
+    def _mem_signal(self, f):
+        key = self._ctx_key(f)
+        m = self.mem[key]
+        tot = m["UP"] + m["DOWN"]
+        if tot < 20:
+            return None, 0
+        max_conf = 3 if tot >= 50 else 2
+        rate = m["UP"] / tot
+        if rate >= 0.60: return "UP",   min(max_conf, 3)
+        if rate >= 0.56: return "UP",   min(max_conf, 2)
+        if rate <= 0.40: return "DOWN", min(max_conf, 3)
+        if rate <= 0.44: return "DOWN", min(max_conf, 2)
+        return None, 0
+
+    # ══════════════════════════════════════════════════════════════════════
+    # PREDICTION LOGIC — 3-layer combination
+    # ══════════════════════════════════════════════════════════════════════
+
+    def _predict_internal(self, f):
+        mem_pred, mem_conf = self._mem_signal(f)
+        base_pred, base_conf, rule = self._base_rules(f)
+
+        # Apply asset-specific demotions
+        if rule in self.asset_demote:
+            base_conf = min(base_conf, self.asset_demote[rule])
+
+        # Apply learned adaptive modifications
+        if base_pred:
+            if rule in self.skip_rules:
+                base_pred, base_conf = None, 0
+            elif rule in self.flip_rules:
+                base_pred = "DOWN" if base_pred == "UP" else "UP"
+                rule = rule + "[F]"
+            elif rule in self.boost_rules:
+                base_conf = min(3, base_conf + 1)
+                rule = rule + "[B]"
+
+        # Drop conf=1 — never profitable across any asset
+        if base_pred and base_conf <= 1:
+            base_pred, base_conf = None, 0
+
+        # ── Combine memory + base ─────────────────────────────────────
+        if mem_pred and base_pred:
+            if mem_pred == base_pred:
+                return base_pred, min(3, max(base_conf, mem_conf) + 1), rule + "[M+]"
+            else:
+                key = self._ctx_key(f)
+                tot = self.mem[key]["UP"] + self.mem[key]["DOWN"]
+                if tot >= 60 and mem_conf == 3:
+                    return mem_pred, 3, f"{f['zone']}_MEM_OVR"
+                if base_conf >= 2:
+                    return base_pred, base_conf, rule + "[MC]"
+                return None, 0, "CONFLICT"
+
+        elif mem_pred and not base_pred:
+            if mem_conf >= 2:
+                return mem_pred, mem_conf, f"{f['zone']}_MEM"
+
+        elif not mem_pred and base_pred:
+            return base_pred, base_conf, rule
+
+        return None, 0, "NO_SIG"
+
+    # ══════════════════════════════════════════════════════════════════════
+    # ADAPTIVE LEARNING
+    # ══════════════════════════════════════════════════════════════════════
+
+    def _update_internal(self, f, rule, actual, correct):
+        self.n += 1
+        base = rule.split("[")[0]
+
+        # Update pattern memory
+        self.mem[self._ctx_key(f)][actual] += 1
+
+        # Update rule stats
+        k = "w" if correct else "l"
+        self.rule_cum[base][k] += 1
+        w = self.rule_window[base]
+        w.append(1 if correct else 0)
+        if len(w) > 50:
+            w.pop(0)
+
+        # Relearn every 50 trades
+        if self.n % 50 == 0:
+            self._relearn()
+
+    def _relearn(self):
+        changed = []
+        for rule in list(self.rule_cum.keys()):
+            cum = self.rule_cum[rule]
+            t = cum["w"] + cum["l"]
+            if t < 25:
+                continue
+
+            win = self.rule_window[rule]
+            rn = len(win)
+            if rn >= 20:
+                wr = 0.70 * (sum(win) / rn) + 0.30 * (cum["w"] / t)
+            else:
+                wr = cum["w"] / t
+
+            wr_pct = round(wr * 100, 1)
+
+            # Skip: < 44%
+            if wr < 0.44 and rule not in self.skip_rules and rule not in self.flip_rules:
+                self.skip_rules.add(rule)
+                self.boost_rules.discard(rule)
+                changed.append(f"SKIP:{rule}({wr_pct}%)")
+
+            # Flip: < 40%
+            elif wr < 0.40 and rule not in self.flip_rules:
+                self.flip_rules.add(rule)
+                self.skip_rules.discard(rule)
+                self.boost_rules.discard(rule)
+                changed.append(f"FLIP:{rule}({wr_pct}%)")
+
+            # Boost: >= 58%
+            elif wr >= 0.58 and rule not in self.boost_rules:
+                self.boost_rules.add(rule)
+                if rule in self.skip_rules:
+                    self.skip_rules.discard(rule)
+                    changed.append(f"RESTORE:{rule}")
+                if rule in self.flip_rules:
+                    self.flip_rules.discard(rule)
+                changed.append(f"BOOST:{rule}({wr_pct}%)")
+
+            # Restore from skip: >= 52%
+            elif wr >= 0.52 and rule in self.skip_rules:
+                self.skip_rules.discard(rule)
+                changed.append(f"RESTORE:{rule}({wr_pct}%)")
+
+            # Unboost: < 54%
+            elif wr < 0.54 and rule in self.boost_rules:
+                self.boost_rules.discard(rule)
+                changed.append(f"UNBOOST:{rule}({wr_pct}%)")
+
+            # Reset window
+            self.rule_window[rule] = []
+
+        if changed:
+            self.learn_log.append({
+                "trade": self.n,
+                "time": datetime.now(timezone.utc).isoformat(),
+                "changes": changed,
+            })
+
+    # ══════════════════════════════════════════════════════════════════════
+    # EXPLANATION
+    # ══════════════════════════════════════════════════════════════════════
+
+    def _explain(self, pred, conf, rule, f):
+        if pred is None:
+            return f"SKIP — no confident signal at {f['zone']} zone (ptb={f['ptb']}%)"
+
+        reasons = []
+        base = rule.split("[")[0]
+
+        zone_meaning = {
+            "VLOW": "candle closed near its low (mean-reversion zone)",
+            "LOW":  "candle in lower range",
+            "MID":  "candle in middle range",
+            "HIGH": "candle in upper range (potential exhaustion)",
+            "VHIGH": "candle closed near its high (extreme zone)",
+        }
+        reasons.append(f"{f['zone']} zone: {zone_meaning.get(f['zone'], '')}")
+
+        if "[M+]" in rule:
+            reasons.append("Pattern memory AGREES with base rule (confidence boosted)")
+        if "[MC]" in rule:
+            reasons.append("Pattern memory CONFLICTS but base rule is strong enough")
+        if "[B]" in rule:
+            reasons.append(f"Rule {base} is currently BOOSTED (recent hot streak ≥58%)")
+        if "[F]" in rule:
+            reasons.append(f"Rule {base} was FLIPPED (historically reversed on {self.asset})")
+        if "MEM" in rule:
+            reasons.append("Pure pattern memory prediction (no base rule matched)")
+
+        return f"{pred} conf={conf} | {' | '.join(reasons)}"
+
+    # ══════════════════════════════════════════════════════════════════════
+    # STATE PERSISTENCE (for Railway deployment)
+    # ══════════════════════════════════════════════════════════════════════
+
+    def _save_state(self):
+        state = {
+            "asset": self.asset,
+            "n": self.n,
+            "mem": {str(k): v for k, v in self.mem.items()},
+            "rule_cum": dict(self.rule_cum),
+            "rule_window": {k: list(v) for k, v in self.rule_window.items()},
+            "skip_rules": list(self.skip_rules),
+            "flip_rules": list(self.flip_rules),
+            "boost_rules": list(self.boost_rules),
+            "learn_log": self.learn_log[-50:],  # keep last 50 events
+            "saved_at": datetime.now(timezone.utc).isoformat(),
+        }
+        with open(self.state_path, "w") as f:
+            json.dump(state, f)
+
+    def _load_state(self):
+        try:
+            with open(self.state_path) as f:
+                state = json.load(f)
+            self.n = state.get("n", 0)
+            for k, v in state.get("mem", {}).items():
+                key = eval(k) if isinstance(k, str) else k
+                self.mem[key] = v
+            for k, v in state.get("rule_cum", {}).items():
+                self.rule_cum[k] = v
+            for k, v in state.get("rule_window", {}).items():
+                self.rule_window[k] = v
+            self.skip_rules = set(state.get("skip_rules", []))
+            self.flip_rules = set(state.get("flip_rules", []))
+            self.boost_rules = set(state.get("boost_rules", []))
+            self.learn_log = state.get("learn_log", [])
+        except Exception as e:
+            print(f"[P29CL] Warning: could not load state: {e}")
+
+    # ══════════════════════════════════════════════════════════════════════
+    # STATUS / DEBUG
+    # ══════════════════════════════════════════════════════════════════════
+
+    def status(self):
+        return {
+            "asset": self.asset,
+            "trades_seen": self.n,
+            "memory_entries": len(self.mem),
+            "skip_rules": sorted(self.skip_rules),
+            "flip_rules": sorted(self.flip_rules),
+            "boost_rules": sorted(self.boost_rules),
+            "learn_events": len(self.learn_log),
+            "rule_accuracy": {
+                rule: {
+                    "wr": round(s["w"]/(s["w"]+s["l"])*100, 1) if s["w"]+s["l"] > 0 else 0,
+                    "trades": s["w"]+s["l"],
+                }
+                for rule, s in self.rule_cum.items()
+                if s["w"]+s["l"] >= 10
+            },
+        }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# INTEGRATION HELPER — Maps existing P29CL indicator format to engine input
+# ══════════════════════════════════════════════════════════════════════════════
+
+def p29cl_should_trade(engine_result, min_confidence=2):
+    """
+    Decision gate: should P29CL place this trade?
+    
+    Returns:
+        dict with:
+            trade:  True/False
+            side:   "UP"/"DOWN"/None
+            stake:  suggested stake multiplier (1x for conf=2, 1.5x for conf=3)
+    """
+    if engine_result["side"] is None:
+        return {"trade": False, "side": None, "stake": 0, "reason": "No signal"}
+
+    if engine_result["confidence"] < min_confidence:
+        return {"trade": False, "side": None, "stake": 0,
+                "reason": f"Confidence {engine_result['confidence']} below minimum {min_confidence}"}
+
+    # Stake sizing by confidence
+    stake_mult = {2: 1.0, 3: 1.5}
+    mult = stake_mult.get(engine_result["confidence"], 1.0)
+
+    return {
+        "trade": True,
+        "side": engine_result["side"],
+        "stake": mult,
+        "confidence": engine_result["confidence"],
+        "rule": engine_result["rule"],
+        "reason": engine_result["reason"],
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# QUICK TEST
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# END P29CL V11 ENGINE
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Initialize one engine per asset (state persists via JSON files)
+_p29cl_v11_engines = {}
+for _v11_asset in ["BTC", "ETH", "SOL", "XRP", "DOGE", "BNB"]:
+    _p29cl_v11_engines[_v11_asset] = P29CLv11(
+        asset=_v11_asset,
+        state_path=f"/tmp/p29cl_v11_{_v11_asset.lower()}.json"
+    )
+print("P29CL V11 engines initialized: " + ", ".join(_p29cl_v11_engines.keys()))
+
+
 app = Flask(__name__)
 
 TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
@@ -1816,127 +2365,53 @@ def _bot2_sniper_thread():
                         _dist_score = 0
                         
 
-                        # ══ P29CL SCORING v11 ══
-                        # Cross-validated on 2,062 TradingView candles + 358 P29CL live trades
-                        # P29CL-confirmed rules: 60.3% WR on 199 trades
-                        # Key insight: Polymarket PTB at T+0.5s behaves differently from candle opens
-                        # Strong candles = move DONE. Weak candles at edges = exhaustion signal.
-                        
-                        _v11_strong_green = _c1_green and _c1_body_ratio > 0.45 and _c1_uwick < 25
-                        _v11_strong_red = _c1_red and _c1_body_ratio > 0.45 and _c1_lwick < 40
-                        _v11_has_small_wick = 20 <= _c1_uwick <= 45
-                        
-                        if _cs_ptb_pct < 20: _v11_zone = "VLOW"
-                        elif _cs_ptb_pct < 40: _v11_zone = "LOW"
-                        elif _cs_ptb_pct < 60: _v11_zone = "MID"
-                        elif _cs_ptb_pct < 80: _v11_zone = "HIGH"
-                        else: _v11_zone = "VHIGH"
-                        
-                        _p29cl_dir = None
-                        _v11_conf = 0
-                        
-                        # RULE 1: PTB VERY LOW (0-20%) → DOWN (58% on P29CL)
-                        if _v11_zone == "VLOW":
-                            if _c1_cpct < 35:
-                                _p29cl_dir = "DOWN"; _v11_conf = 3; _cs_tags.append("VLOW_CPCT_LOW")
-                            elif _c1_uwick > 45:
-                                _p29cl_dir = "DOWN"; _v11_conf = 2; _cs_tags.append("VLOW_BIG_WICK")
+                        # ══ P29CL V11 ENGINE CALL ══
+                        # Feed last 5 closed candles to the self-learning engine
+                        if len(_cs_all) >= 5:
+                            _v11_candles = [
+                                {"open": c[0], "high": c[1], "low": c[2], "close": c[3]}
+                                for c in _cs_all[-5:]
+                            ]
+                            _v11_engine = _p29cl_v11_engines.get(_p29cl_asset)
+                            if _v11_engine:
+                                _v11_result = _v11_engine.predict(_v11_candles)
+                                _v11_decision = p29cl_should_trade(_v11_result, min_confidence=2)
+                                
+                                if not _v11_decision["trade"]:
+                                    print("P29CL SKIP: {} {} ptb={}% cpct={}% {}".format(
+                                        _p29cl_asset, _v11_result.get("rule", "NO_SIG"),
+                                        _cs_ptb_pct, _c1_cpct, _v11_decision.get("reason", "")))
+                                    continue
+                                
+                                _p29cl_dir = _v11_decision["side"]
+                                _p29cl_conf = "HIGH" if _v11_result["confidence"] >= 3 else "MEDIUM"
+                                _v11_conf = _v11_result["confidence"]
+                                
+                                # DIST for display
+                                _p29cl_dist_prob, _p29cl_dist_zone = _p29cl_calc_dist(_p29cl_asset, _p29cl_price)
+                                
+                                _cs_score = -_v11_conf if _p29cl_dir == "UP" else _v11_conf
+                                _cs_tags.append(_v11_result.get("rule", "V11"))
+                                _cs_tags.append(f"ptb={_v11_result.get('ptb_pct', 0)}")
+                                
+                                _cs_candle_desc = "G" if _c1_green else "R" if _c1_red else "D"
+                                if _c1_indecisive: _cs_candle_desc += "i"
+                                _cs_trend = "3R" if _strong_trend_down else "2R" if _trend_down else "3G" if _strong_trend_up else "2G" if _trend_up else "RNG" if _is_ranging else "MIX"
+                                _p29cl_tag = "CS_{}_{}_{}_{}_{}_S{}".format(_p29cl_dir, _cs_candle_desc, _cs_trend, _cs_macro, _cs_ptb_pos, int(_cs_score))
+                                _p29cl_score = _cs_score
+                                _cs_cpct = _c1_cpct
+                                _cs_uwick = _c1_uwick
+                                
+                                print("P29CL V11: {} {} conf={} rule={} zone={} ptb={}% | {}".format(
+                                    _p29cl_asset, _p29cl_dir, _v11_result["confidence"],
+                                    _v11_result["rule"], _v11_result["ptb_zone"],
+                                    _v11_result.get("ptb_pct", 0), _v11_result.get("reason", "")[:60]))
                             else:
-                                _p29cl_dir = "DOWN"; _v11_conf = 1; _cs_tags.append("VLOW_DEFAULT")
-                        
-                        # RULE 2: PTB LOW (20-40%) → DOWN (62% on P29CL)
-                        elif _v11_zone == "LOW":
-                            if _c1_cpct < 35:
-                                _p29cl_dir = "DOWN"; _v11_conf = 3; _cs_tags.append("LOW_CPCT_LOW")
-                            elif _c1_cpct < 65:
-                                _p29cl_dir = "DOWN"; _v11_conf = 2; _cs_tags.append("LOW_CPCT_MID")
-                            else:
-                                _p29cl_dir = "DOWN"; _v11_conf = 1; _cs_tags.append("LOW_GAP_DN")
-                        
-                        # RULE 3: PTB MID (40-60%) → slight DOWN, follow candle
-                        elif _v11_zone == "MID":
-                            if _v11_strong_green:
-                                _p29cl_dir = "DOWN"; _v11_conf = 2; _cs_tags.append("MID_SG_DONE")
-                            elif _v11_strong_red:
-                                _p29cl_dir = "DOWN"; _v11_conf = 2; _cs_tags.append("MID_SR_CONT")
-                            elif _c1_green:
-                                _p29cl_dir = "UP"; _v11_conf = 1; _cs_tags.append("MID_FOLLOW_G")
-                            else:
-                                _p29cl_dir = "DOWN"; _v11_conf = 1; _cs_tags.append("MID_FOLLOW_R")
-                        
-                        # RULE 4: PTB HIGH (60-80%) → UP (62-65% on P29CL)
-                        elif _v11_zone == "HIGH":
-                            if _c1_cpct >= 35 and _c1_cpct < 65:
-                                _p29cl_dir = "UP"; _v11_conf = 3; _cs_tags.append("HIGH_CPCT_MID")
-                            elif _c1_cpct >= 65:
-                                _p29cl_dir = "UP"; _v11_conf = 3; _cs_tags.append("HIGH_CPCT_HIGH")
-                            elif _v11_has_small_wick:
-                                _p29cl_dir = "UP"; _v11_conf = 2; _cs_tags.append("HIGH_SM_WICK")
-                            else:
-                                _p29cl_dir = "UP"; _v11_conf = 1; _cs_tags.append("HIGH_DEFAULT")
-                        
-                        # RULE 5: PTB VERY HIGH (80-100%) → selective
-                        elif _v11_zone == "VHIGH":
-                            if _v11_has_small_wick:
-                                _p29cl_dir = "UP"; _v11_conf = 2; _cs_tags.append("VHIGH_SM_WICK")
-                            elif _c1_cpct >= 65 and _c1_uwick < 20:
-                                _cs_tags.append("VHIGH_SKIP")
-                                print("P29CL SKIP: {} ptb={}% cpct={}% VHIGH_CLEAN {}".format(
-                                    _p29cl_asset, _cs_ptb_pct, _c1_cpct, "+".join(_cs_tags[:3])))
+                                print("P29CL SKIP: {} no V11 engine".format(_p29cl_asset))
                                 continue
-                            else:
-                                _p29cl_dir = "DOWN"; _v11_conf = 1; _cs_tags.append("VHIGH_DEFAULT")
-                        
-                        # ASSET-SPECIFIC ADJUSTMENTS
-                        if _p29cl_asset == "BTC":
-                            if _v11_zone in ("HIGH", "VHIGH") and _p29cl_dir == "UP":
-                                _p29cl_dir = "DOWN"; _cs_tags.append("BTC_TOP_DN"); _v11_conf = 2
-                        elif _p29cl_asset == "XRP":
-                            if _v11_zone in ("HIGH", "VHIGH"):
-                                _p29cl_dir = "UP"; _cs_tags.append("XRP_TOP_UP"); _v11_conf = 3
-                        elif _p29cl_asset == "DOGE":
-                            if _v11_zone == "VLOW":
-                                _v11_conf = 3; _cs_tags.append("DOGE_BOT_DN")
-                            elif _v11_zone == "MID":
-                                _p29cl_dir = "UP"; _v11_conf = 2; _cs_tags.append("DOGE_MID_UP")
-                            elif _v11_zone in ("HIGH", "VHIGH"):
-                                _p29cl_dir = "UP"; _v11_conf = 2; _cs_tags.append("DOGE_TOP_UP")
-                        elif _p29cl_asset == "BNB":
-                            if _v11_zone == "MID" and _p29cl_dir == "DOWN":
-                                _p29cl_dir = "UP"; _cs_tags.append("BNB_MID_UP"); _v11_conf = 2
-                            elif _v11_zone in ("HIGH", "VHIGH"):
-                                _p29cl_dir = "UP"; _cs_tags.append("BNB_TOP_UP"); _v11_conf = 3
-                        elif _p29cl_asset == "SOL":
-                            if _v11_zone == "VLOW":
-                                _v11_conf = 3; _cs_tags.append("SOL_BOT_DN")
-                        elif _p29cl_asset == "ETH":
-                            if _v11_zone == "MID" and _p29cl_dir == "UP":
-                                _p29cl_dir = "DOWN"; _cs_tags.append("ETH_MID_DN"); _v11_conf = 2
-                        
-                        if not _p29cl_dir:
-                            print("P29CL SKIP: {} ptb={}% cpct={}% {}".format(
-                                _p29cl_asset, _cs_ptb_pct, _c1_cpct, "+".join(_cs_tags[:4])))
+                        else:
+                            print("P29CL SKIP: {} insufficient candles ({})".format(_p29cl_asset, len(_cs_all)))
                             continue
-                        
-                        if _v11_conf >= 3: _p29cl_conf = "HIGH"
-                        elif _v11_conf >= 2: _p29cl_conf = "MEDIUM"
-                        else: _p29cl_conf = "LOW"
-                        
-                        _p29cl_dist_prob, _p29cl_dist_zone = _p29cl_calc_dist(_p29cl_asset, _p29cl_price)
-                        _cs_score = -_v11_conf if _p29cl_dir == "UP" else _v11_conf
-                        _cs_score = max(-10, min(10, _cs_score))
-                        
-                        _cs_candle_desc = "G" if _c1_green else "R" if _c1_red else "D"
-                        if _c1_indecisive: _cs_candle_desc += "i"
-                        _cs_trend = "3R" if _strong_trend_down else "2R" if _trend_down else "3G" if _strong_trend_up else "2G" if _trend_up else "RNG" if _is_ranging else "MIX"
-                        _p29cl_tag = "CS_{}_{}_{}_{}_{}_S{}".format(_p29cl_dir, _cs_candle_desc, _cs_trend, _cs_macro, _cs_ptb_pos, int(_cs_score))
-                        _p29cl_score = _cs_score
-                        _cs_cpct = _c1_cpct
-                        _cs_uwick = _c1_uwick
-                        if _p29cl_p21_dir and _p29cl_p21_dir != _p29cl_dir:
-                            print("P29CL OVERRIDE: {} P2.1={} > CS={} score={} conf={} ptb={}% cpct={}% {}".format(_p29cl_asset, _p29cl_p21_dir, _p29cl_dir, int(_cs_score), _p29cl_conf, _cs_ptb_pct, _c1_cpct, "+".join(_cs_tags[:6])))
-                        elif not _p29cl_p21_dir:
-                            print("P29CL INDEPENDENT: {} CS={} score={} conf={} ptb={}% cpct={}% {}".format(_p29cl_asset, _p29cl_dir, int(_cs_score), _p29cl_conf, _cs_ptb_pct, _c1_cpct, "+".join(_cs_tags[:6])))
 
 
                         
@@ -1975,7 +2450,7 @@ def _bot2_sniper_thread():
                         _p29cl_stake = max(2.50, _p29cl_stake)  # Polymarket minimum
                         
                         # v11: cap stake when confidence is low
-                        if _v11_conf <= 1 and _p29cl_stake > 2.50:
+                        if _v11_conf <= 2 and _p29cl_stake > 2.50:
                             _p29cl_stake = 2.50; _cs_tags.append("STAKE_CAP_LOW")
                         if _1h_momentum == "DEAD" and _p29cl_stake > 2.50:
                             _p29cl_stake = 2.50; _cs_tags.append("STAKE_CAP_1H_DEAD")
@@ -23251,6 +23726,17 @@ def _resolve_p29cl_trades():
                 if _p29cl_state["balance"] > _p29cl_state["peak_balance"]:
                     _p29cl_state["peak_balance"] = _p29cl_state["balance"]
                 _pnl = "+${:.2f}".format(payout - stake) if won else "-${:.2f}".format(stake)
+                
+                # Feed outcome to V11 engine for learning
+                try:
+                    _learn_asset = p.get("asset", "BTC")
+                    _learn_engine = _p29cl_v11_engines.get(_learn_asset)
+                    if _learn_engine and _learn_engine.last_prediction:
+                        _learn_actual = "UP" if won else "DOWN"
+                        _learn_engine.learn(_learn_actual)
+                except Exception as _le:
+                    pass  # don't let learn errors block resolution
+                
                 print("P29CL #{} {}: {} | pool=${:.2f}".format(p["id"], "WIN" if won else "LOSS", _pnl, _p29cl_state["balance"]))
                 _save_bot_balance("p29cl", _p29cl_state)
             except Exception as e:
