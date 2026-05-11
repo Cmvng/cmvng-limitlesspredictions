@@ -8,552 +8,417 @@ import json
 from datetime import datetime, timezone, timedelta
 
 # ══════════════════════════════════════════════════════════════════════════════
-# P29CL V11 SELF-LEARNING ENGINE (embedded from p29cl_v11_engine.py)
+# P29CL FINAL ENGINE — 6-Asset Self-Learning Candle Prediction
+# Built from 59,240 candles across BTC, ETH, SOL, DOGE, BNB, XRP
+# 21,821 backtested predictions. $4,472 combined P&L.
 # ══════════════════════════════════════════════════════════════════════════════
 from collections import defaultdict
 
-# ── ASSET-SPECIFIC RULE TABLES ────────────────────────────────────────────────
-# Compiled from V8/V9 backtests. Each asset has rules that WORK and rules that FAIL.
-#
-# UNIVERSAL (>52% on all 3 assets):
-#   VLOW_WEAK_TREND, VLOW_BIGRED, LOW_INSIDE_GREEN, LOW_BIGRED,
-#   MID_INSIDE_GREEN, MID_3BAR_UP
-#
-# BTC-ONLY (fails on ETH/SOL):
-#   VHIGH_RED_LL, VHIGH_NOUP, MID_3BAR_BOUNCE (33% SOL!)
-#
-# BTC+ETH (fails on SOL):
-#   HIGH_HH_RNGEXP (48.8% SOL), HIGH_RNGEXP_UP1 (45.8% SOL)
+def _feats(c1, c1m, c1m2, c0m, c0m2):
+    rng  = max(c1["h"]-c1["l"], 0.0001)
+    rng1 = max(c1m["h"]-c1m["l"], 0.0001)
+    rng2 = max(c1m2["h"]-c1m2["l"], 0.0001)
+    rng3 = max(c0m["h"]-c0m["l"], 0.0001)
+    body = abs(c1["c"]-c1["o"])/rng
+    cpct = max(0, min(100, int((c1["c"]-c1["l"])/rng*100)))
+    green = c1["c"] > c1["o"]
+    up1 = c1["c"]>c1m["c"]; up2 = c1m["c"]>c1m2["c"]
+    up3 = c1m2["c"]>c0m["c"]; up4 = c0m["c"]>c0m2["c"]
+    trend = sum([up1, up2, up3, up4])
+    avg3 = (rng1+rng2+rng3)/3
+    rng_exp = rng > avg3*1.3
+    rng_ctr = rng < avg3*0.7
+    hh = c1["h"] > c1m["h"]
+    ll = c1["l"] < c1m["l"]
+    inside = not hh and not ll
+    zone = "VLOW" if cpct<20 else "LOW" if cpct<40 else "MID" if cpct<60 else "HIGH" if cpct<80 else "VHIGH"
+    return {"body":body,"cpct":cpct,"green":green,"up1":up1,"up2":up2,"up3":up3,"up4":up4,
+            "trend":trend,"rng_exp":rng_exp,"rng_ctr":rng_ctr,
+            "hh":hh,"ll":ll,"inside":inside,"ptb":cpct,"zone":zone}
 
-ASSET_RULES = {
-    # DEFAULT: conservative, works on unknown assets
-    "DEFAULT": {
-        "skip":   ["VHIGH_NOUP", "VHIGH_RED_LL", "HIGH_RNG_CTR"],
-        "demote": {"VHIGH_RED_LL": 1, "VHIGH_NOUP": 1},  # conf overrides
-        "flip":   [],
-    },
-    "BTC": {
-        "skip":   [],               # BTC uses all rules
-        "demote": {},
-        "flip":   [],
-    },
-    "ETH": {
-        "skip":   ["VHIGH_NOUP", "LOW_RNG_CTR", "VLOW_DOJI", "HIGH_RNGEXP_BARE"],
-        "demote": {"VHIGH_RED_LL": 1},  # was 58% BTC, 31% ETH → kill
-        "flip":   ["HIGH_RNG_CTR"],      # 24% on ETH → flip
-    },
-    "SOL": {
-        "skip":   ["VHIGH_RED_LL", "HIGH_RNG_CTR", "VLOW_GREEN_UP1"],
-        "demote": {"HIGH_HH_RNGEXP": 2},  # 48.8% on SOL → demote
-        "flip":   ["MID_3BAR_BOUNCE"],     # 33% on SOL → flip
-    },
-    # Altcoins without backtest data use conservative defaults
-    "BNB":  "DEFAULT",
-    "XRP":  "DEFAULT",
-    "DOGE": "DEFAULT",
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ASSET RULE FUNCTIONS — each mined from thousands of candles
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _rules_BTC(f):
+    z,body,green,trend = f["zone"],f["body"],f["green"],f["trend"]
+    inside,rng_exp,rng_ctr = f["inside"],f["rng_exp"],f["rng_ctr"]
+    hh,ll,up1 = f["hh"],f["ll"],f["up1"]
+
+    if z=="VLOW":
+        if trend==0:                              return "UP",3,"VLOW_FULL_EXHAUST"
+        if not green and body>0.50 and rng_exp:   return "UP",3,"VLOW_BIGRED_TIGHT"
+        if ll and not inside:                     return "UP",2,"VLOW_LL_BOUNCE"
+        if trend<=1 and ll:                       return "UP",2,"VLOW_WEAK_TREND_LL"
+        return None,0,"SKIP"
+    elif z=="LOW":
+        if trend==0:                              return "UP",3,"LOW_FULL_EXHAUST"
+        if inside and green:                      return "UP",3,"LOW_INSIDE_GREEN"
+        if trend==4:                              return "DOWN",3,"LOW_4BAR_DOWN"
+        if not green and body>0.50 and rng_exp:   return "UP",2,"LOW_BIGRED_RNGEXP"
+        return None,0,"SKIP"
+    elif z=="MID":
+        if trend==0:                              return "UP",3,"MID_FULL_EXHAUST"
+        if not green and ll and trend<=1:         return "UP",2,"MID_RED_LL_WEAK"
+        if rng_ctr and trend<=1:                  return "DOWN",2,"MID_RNG_CTR_DOWN"
+        if not green and inside:                  return "DOWN",2,"MID_RED_INSIDE"
+        if green and hh and rng_exp:              return "DOWN",2,"MID_GREEN_HH_RNGEXP"
+        return None,0,"SKIP"
+    elif z=="HIGH":
+        if hh and rng_exp and green:              return "DOWN",3,"HIGH_HH_RNGEXP"
+        if trend==4:                              return "DOWN",3,"HIGH_4BAR"
+        return None,0,"SKIP"
+    elif z=="VHIGH":
+        if not up1:                               return "DOWN",3,"VHIGH_NOUP"
+        if trend==4:                              return "DOWN",3,"VHIGH_TREND4"
+        if not green and ll:                      return "DOWN",3,"VHIGH_RED_LL"
+        if not green:                             return "DOWN",2,"VHIGH_RED"
+        if body<0.15:                             return "DOWN",2,"VHIGH_DOJI"
+        if green and hh and rng_exp:              return "DOWN",2,"VHIGH_GREEN_HH_RNGEXP"
+        return None,0,"SKIP"
+    return None,0,"SKIP"
+
+def _rules_ETH(f):
+    z,body,green,trend = f["zone"],f["body"],f["green"],f["trend"]
+    inside,rng_exp,rng_ctr = f["inside"],f["rng_exp"],f["rng_ctr"]
+    hh,ll = f["hh"],f["ll"]
+
+    if z=="VLOW":
+        if not green and body>0.50 and rng_exp:   return "UP",3,"VLOW_BIGRED_RNGEXP"
+        return None,0,"SKIP"
+    elif z=="LOW":
+        if trend==0:                              return "UP",3,"LOW_FULL_EXHAUST"
+        if trend<=1 and rng_exp:                  return "UP",3,"LOW_WEAK_RNGEXP"
+        if not green and body>0.50 and rng_exp:   return "UP",3,"LOW_BIGRED_RNGEXP"
+        if rng_exp:                               return "UP",2,"LOW_RNGEXP"
+        return None,0,"SKIP"
+    elif z=="MID":
+        if trend==4:                              return "DOWN",3,"MID_TREND4"
+        if trend==0:                              return "UP",3,"MID_FULL_EXHAUST"
+        return None,0,"SKIP"
+    elif z=="HIGH":
+        if trend==4:                              return "DOWN",3,"HIGH_TREND4"
+        if green and hh and rng_exp:              return "DOWN",3,"HIGH_GREEN_HH_RNGEXP"
+        return None,0,"SKIP"
+    elif z=="VHIGH":
+        if trend==4:                              return "DOWN",3,"VHIGH_TREND4"
+        if body>0.50 and hh:                      return "DOWN",2,"VHIGH_BIG_HH"
+        return None,0,"SKIP"
+    return None,0,"SKIP"
+
+def _rules_SOL(f):
+    z,body,green,trend = f["zone"],f["body"],f["green"],f["trend"]
+    inside,rng_exp = f["inside"],f["rng_exp"]
+    hh,ll,up1,up2,up3 = f["hh"],f["ll"],f["up1"],f["up2"],f["up3"]
+
+    if z=="VLOW":
+        if not green and inside:                  return "UP",3,"VLOW_RED_INSIDE"
+        if trend==0:                              return "UP",3,"VLOW_FULL_EXHAUST"
+        if not green and body>0.70 and rng_exp:   return "UP",3,"VLOW_BIGRED_TIGHT"
+        if body<0.15 and trend<=2:                return "UP",2,"VLOW_DOJI"
+        if trend<=1:                              return "UP",2,"VLOW_WEAK_TREND"
+        if not green and body>0.50 and ll:        return "UP",2,"VLOW_BIGRED_LL"
+        return None,0,"SKIP"
+    elif z=="LOW":
+        if inside and green:                      return "UP",3,"LOW_INSIDE_GREEN"
+        if not green and body>0.60 and not up1:   return "UP",2,"LOW_BIGRED"
+        return None,0,"SKIP"
+    elif z=="MID":
+        if inside and green:                      return "DOWN",2,"MID_INSIDE_GREEN"
+        if not up1 and not up2 and not up3:       return "DOWN",2,"MID_3BAR_BOUNCE"
+        if up1 and up2 and up3:                   return "UP",2,"MID_3BAR_UP"
+        return None,0,"SKIP"
+    elif z=="HIGH":
+        if trend==4:                              return "DOWN",3,"HIGH_4BAR"
+        if up1 and up2 and up3:                   return "DOWN",2,"HIGH_3BAR"
+        return None,0,"SKIP"
+    elif z=="VHIGH":
+        if trend>=3 and green:                    return "DOWN",2,"VHIGH_TREND_EXHAUST"
+        return None,0,"SKIP"
+    return None,0,"SKIP"
+
+def _rules_DOGE(f):
+    z,body,green,trend = f["zone"],f["body"],f["green"],f["trend"]
+    rng_exp,rng_ctr,hh,ll = f["rng_exp"],f["rng_ctr"],f["hh"],f["ll"]
+
+    if z=="VLOW":
+        if not green and body>0.50 and rng_exp:   return "UP",3,"VLOW_BIGRED_RNGEXP"
+        if rng_exp:                               return "UP",2,"VLOW_RNGEXP"
+        if trend<=1:                              return "UP",2,"VLOW_WEAK_TREND"
+        return None,0,"SKIP"
+    elif z=="LOW":
+        if not green and body>0.50 and rng_exp:   return "UP",3,"LOW_BIGRED_RNGEXP"
+        if trend==0:                              return "UP",3,"LOW_FULL_EXHAUST"
+        if rng_exp:                               return "UP",2,"LOW_RNGEXP"
+        if ll:                                    return "UP",2,"LOW_LL"
+        return None,0,"SKIP"
+    elif z=="MID":
+        if trend>=3 and hh:                       return "DOWN",3,"MID_TREND3_HH"
+        if trend==4:                              return "DOWN",3,"MID_TREND4"
+        if green and hh and rng_exp:              return "DOWN",2,"MID_GREEN_HH_RNGEXP"
+        return None,0,"SKIP"
+    elif z=="HIGH":
+        if body>0.70:                             return "DOWN",3,"HIGH_HUGE_BODY"
+        if trend==4:                              return "DOWN",3,"HIGH_TREND4"
+        if body>0.50 and trend>=3:                return "DOWN",3,"HIGH_BIGBODY_TREND3"
+        if body>0.50 and hh:                      return "DOWN",2,"HIGH_BIGBODY_HH"
+        return None,0,"SKIP"
+    elif z=="VHIGH":
+        if green and hh and rng_exp:              return "DOWN",3,"VHIGH_GREEN_HH_RNGEXP"
+        if rng_exp:                               return "DOWN",3,"VHIGH_RNGEXP"
+        if trend==4:                              return "DOWN",3,"VHIGH_TREND4"
+        if trend<=1:                              return "DOWN",2,"VHIGH_WEAK_TREND"
+        if hh:                                    return "DOWN",2,"VHIGH_HH"
+        return None,0,"SKIP"
+    return None,0,"SKIP"
+
+def _rules_BNB(f):
+    z,body,green,trend = f["zone"],f["body"],f["green"],f["trend"]
+    rng_exp,rng_ctr,hh,ll,inside = f["rng_exp"],f["rng_ctr"],f["hh"],f["ll"],f["inside"]
+
+    if z=="VLOW":
+        if not green and body>0.50 and rng_exp:   return "UP",3,"VLOW_BIGRED_RNGEXP"
+        if trend<=1 and rng_exp:                  return "UP",2,"VLOW_WEAK_RNGEXP"
+        if ll and body>0.50 and rng_exp:          return "UP",2,"VLOW_LL_BIG_RNGEXP"
+        return None,0,"SKIP"
+    elif z=="LOW":
+        if trend==0 and body>0.50:                return "UP",3,"LOW_EXHAUST_BIG"
+        if trend==0 and ll:                       return "UP",3,"LOW_EXHAUST_LL"
+        if rng_exp and ll:                        return "UP",2,"LOW_RNGEXP_LL"
+        if ll and trend<=1:                       return "UP",2,"LOW_LL_WEAK"
+        if rng_exp:                               return "UP",2,"LOW_RNGEXP"
+        return None,0,"SKIP"
+    elif z=="MID":
+        if trend==0:                              return "UP",3,"MID_FULL_EXHAUST"
+        if trend==4:                              return "DOWN",2,"MID_TREND4"
+        return None,0,"SKIP"
+    elif z=="HIGH":
+        if body>0.70:                             return "DOWN",3,"HIGH_HUGE_BODY"
+        if trend==4:                              return "DOWN",3,"HIGH_TREND4"
+        if body>0.50 and trend>=3:                return "DOWN",3,"HIGH_BIGBODY_TREND3"
+        if body>0.50 and hh:                      return "DOWN",2,"HIGH_BIGBODY_HH"
+        if inside:                                return "DOWN",2,"HIGH_INSIDE"
+        if green and hh and rng_exp:              return "DOWN",2,"HIGH_GREEN_HH_RNGEXP"
+        return None,0,"SKIP"
+    elif z=="VHIGH":
+        if hh and trend==4:                       return "DOWN",3,"VHIGH_HH_TREND4"
+        if rng_exp and body>0.50:                 return "DOWN",2,"VHIGH_RNGEXP_BIG"
+        if body>0.50 and hh and trend>=3:         return "DOWN",2,"VHIGH_BIG_HH_TREND3"
+        if rng_ctr:                               return "DOWN",2,"VHIGH_RNG_CTR"
+        return None,0,"SKIP"
+    return None,0,"SKIP"
+
+def _rules_XRP(f):
+    z,body,green,trend = f["zone"],f["body"],f["green"],f["trend"]
+    rng_exp,rng_ctr,hh,ll,inside = f["rng_exp"],f["rng_ctr"],f["hh"],f["ll"],f["inside"]
+
+    if z=="VLOW":
+        if not green and body>0.50 and rng_exp:   return "UP",3,"VLOW_BIGRED_TIGHT"
+        if rng_exp:                               return "UP",2,"VLOW_RNGEXP"
+        if body>0.50:                             return "UP",2,"VLOW_BIGBODY"
+        return None,0,"SKIP"
+    elif z=="LOW":
+        if trend==0:                              return "UP",2,"LOW_FULL_EXHAUST"
+        return None,0,"SKIP"
+    elif z=="MID":
+        if inside:                                return "DOWN",3,"MID_INSIDE"
+        if ll:                                    return "DOWN",2,"MID_LL"
+        return None,0,"SKIP"
+    elif z=="HIGH":
+        if body>0.50:                             return "UP",3,"HIGH_BIGBODY_UP"
+        if trend<=1:                              return "UP",3,"HIGH_WEAK_TREND_UP"
+        if green:                                 return "UP",2,"HIGH_GREEN_CONT"
+        if hh:                                    return "UP",2,"HIGH_HH_CONT"
+        return "UP",2,"HIGH_DEFAULT_UP"
+    elif z=="VHIGH":
+        if inside:                                return "DOWN",3,"VHIGH_INSIDE"
+        if trend==4:                              return "DOWN",3,"VHIGH_TREND4"
+        if rng_ctr:                               return "DOWN",2,"VHIGH_RNG_CTR"
+        if not green:                             return "DOWN",2,"VHIGH_RED"
+        if ll:                                    return "DOWN",2,"VHIGH_LL"
+        return None,0,"SKIP"
+    return None,0,"SKIP"
+
+ASSET_RULES = {"BTC":_rules_BTC,"ETH":_rules_ETH,"SOL":_rules_SOL,
+               "DOGE":_rules_DOGE,"BNB":_rules_BNB,"XRP":_rules_XRP}
+ASSET_ANCHORS = {
+    "BTC": {"VLOW_FULL_EXHAUST","LOW_FULL_EXHAUST","MID_FULL_EXHAUST","HIGH_HH_RNGEXP","HIGH_4BAR","VHIGH_TREND4","VHIGH_NOUP"},
+    "ETH": {"LOW_FULL_EXHAUST","HIGH_TREND4","HIGH_GREEN_HH_RNGEXP","VHIGH_TREND4","VLOW_BIGRED_RNGEXP","MID_FULL_EXHAUST"},
+    "SOL": {"VLOW_WEAK_TREND","VLOW_FULL_EXHAUST","HIGH_4BAR","VHIGH_TREND_EXHAUST"},
+    "DOGE": {"LOW_BIGRED_RNGEXP","LOW_LL","VHIGH_GREEN_HH_RNGEXP","HIGH_BIGBODY_TREND3"},
+    "BNB": {"HIGH_HUGE_BODY","HIGH_TREND4","VLOW_BIGRED_RNGEXP","MID_FULL_EXHAUST"},
+    "XRP": {"VLOW_BIGRED_TIGHT","HIGH_BIGBODY_UP","MID_INSIDE","VHIGH_TREND4"},
 }
+ASSET_WR = {"BTC":"56.3%","ETH":"58.0%","SOL":"56.1%","DOGE":"54.4%","BNB":"55.1%","XRP":"57.8%"}
+ASSET_PNL = {"BTC":"+$978","ETH":"+$1,161","SOL":"+$506","DOGE":"+$912","BNB":"+$814","XRP":"+$101"}
 
 
-class P29CLv11:
-    """Production self-learning candle prediction engine."""
-
+class P29CLFinal:
     def __init__(self, asset="BTC", state_path=None):
         self.asset = asset.upper()
-        self.state_path = state_path  # for persistent state across restarts
-
-        # ── Load asset-specific rule table ────────────────────────────────
-        rules = ASSET_RULES.get(self.asset, ASSET_RULES["DEFAULT"])
-        if isinstance(rules, str):
-            rules = ASSET_RULES[rules]
-        self.asset_skip   = set(rules.get("skip", []))
-        self.asset_demote = rules.get("demote", {})
-        self.asset_flip   = set(rules.get("flip", []))
-
-        # ── Adaptive state (persists across candles) ──────────────────────
-        self.mem          = defaultdict(lambda: {"UP": 0, "DOWN": 0})  # 9D pattern memory
-        self.rule_cum     = defaultdict(lambda: {"w": 0, "l": 0})
-        self.rule_window  = defaultdict(list)
-        self.skip_rules   = set(self.asset_skip)   # start with known bad rules
-        self.flip_rules   = set(self.asset_flip)
-        self.boost_rules  = set()
-        self.n            = 0
-        self.learn_log    = []
+        self.rules_fn = ASSET_RULES.get(self.asset, _rules_BTC)
+        self.anchors = ASSET_ANCHORS.get(self.asset, set())
+        self.state_path = state_path
+        self.mem = defaultdict(lambda:{"UP":0,"DOWN":0})
+        self.rule_cum = defaultdict(lambda:{"w":0,"l":0})
+        self.rule_window = defaultdict(list)
+        self.rule_recent6 = defaultdict(list)
+        self.skip_rules = set()
+        self.flip_rules = set()
+        self.boost_rules = set()
+        self.demote_rules = set()
+        self.n = 0
+        self.learn_log = []
         self.last_prediction = None
-
-        # ── Load persisted state if available ─────────────────────────────
         if state_path and os.path.exists(state_path):
             self._load_state()
 
-    # ══════════════════════════════════════════════════════════════════════
-    # PUBLIC API
-    # ══════════════════════════════════════════════════════════════════════
-
     def predict(self, candles_5bar):
-        """
-        Predict next candle direction BEFORE it forms.
-        
-        Args:
-            candles_5bar: list of 5 dicts, oldest first, each with keys:
-                          {open, high, low, close} (floats)
-                          These are the 5 most recent CLOSED 15M candles.
-        
-        Returns:
-            dict with keys:
-                side:       "UP" or "DOWN" or None (skip)
-                confidence: 1-3 (3 = highest)
-                rule:       string identifying which rule fired
-                ptb_zone:   "VLOW"/"LOW"/"MID"/"HIGH"/"VHIGH"
-                reason:     human-readable explanation
-        """
         if len(candles_5bar) < 5:
-            return {"side": None, "confidence": 0, "rule": "INSUFFICIENT_DATA",
-                    "ptb_zone": "UNKNOWN", "reason": "Need 5 closed candles"}
-
-        c0m2, c0m, c1m2, c1m, c1 = candles_5bar
-        f = self._extract_features(c1, c1m, c1m2, c0m, c0m2)
-        pred, conf, rule = self._predict_internal(f)
-
-        result = {
-            "side":       pred,
-            "confidence": conf,
-            "rule":       rule,
-            "ptb_zone":   f["zone"],
-            "ptb_pct":    f["ptb"],
-            "features":   f,
-            "reason":     self._explain(pred, conf, rule, f),
-        }
+            return {"side":None,"confidence":0,"rule":"INSUFFICIENT","ptb_zone":"UNKNOWN","reason":"Need 5 candles"}
+        c = [{"o":x["open"],"h":x["high"],"l":x["low"],"c":x["close"]} if "open" in x
+             else {"o":x["o"],"h":x["h"],"l":x["l"],"c":x["c"]} for x in candles_5bar]
+        f = _feats(c[4],c[3],c[2],c[1],c[0])
+        pred,conf,rule = self._predict(f)
+        result = {"side":pred,"confidence":conf,"rule":rule,"ptb_zone":f["zone"],"ptb_pct":f["ptb"],"features":f}
         self.last_prediction = result
         return result
 
     def learn(self, actual_direction):
-        """
-        Feed back the actual candle outcome to update the engine.
-        
-        Args:
-            actual_direction: "UP" or "DOWN" (how the candle actually closed)
-        """
-        if self.last_prediction is None or self.last_prediction["side"] is None:
-            return
+        if not self.last_prediction or not self.last_prediction["side"]: return
+        p = self.last_prediction
+        correct = p["side"] == actual_direction
+        self._update(p["features"], p["rule"], actual_direction, correct)
+        self.last_prediction = None
+        if self.state_path: self._save_state()
 
-        pred = self.last_prediction
-        correct = (pred["side"] == actual_direction)
-        f    = pred["features"]
-        rule = pred["rule"]
+    def _ctx_key(self,f):
+        tb="hi" if f["trend"]>=3 else "lo" if f["trend"]<=1 else "md"
+        bb="big" if f["body"]>0.50 else "tiny" if f["body"]<0.15 else "mid"
+        zb="lo" if f["ptb"]<10 else "hi" if f["ptb"]>90 else "mid"
+        return (f["zone"],f["green"],f["up1"],f["up2"],tb,f["rng_exp"],f["inside"],bb,zb)
 
-        self._update_internal(f, rule, actual_direction, correct)
-        self.last_prediction = None  # consume it
+    def _mem_signal(self,f):
+        m=self.mem[self._ctx_key(f)]; tot=m["UP"]+m["DOWN"]
+        if tot<22: return None,0
+        mc=3 if tot>=55 else 2; r=m["UP"]/tot
+        if r>=0.63: return "UP",min(mc,3)
+        if r>=0.58: return "UP",min(mc,2)
+        if r<=0.37: return "DOWN",min(mc,3)
+        if r<=0.42: return "DOWN",min(mc,2)
+        return None,0
 
-        # Persist state after every learn
-        if self.state_path:
-            self._save_state()
+    def _predict(self,f):
+        mp,mc=self._mem_signal(f)
+        bp,bc,rule=self.rules_fn(f)
+        if bp:
+            if rule in self.skip_rules: bp,bc=None,0
+            elif rule in self.flip_rules: bp="DOWN" if bp=="UP" else "UP"; rule+="[F]"
+            elif rule in self.boost_rules: bc=min(3,bc+1); rule+="[B]"
+            if bp and rule.split("[")[0] in self.demote_rules: bc=min(bc,2)
+            if bp:
+                r6=self.rule_recent6.get(rule.split("[")[0],[])
+                if len(r6)>=6 and sum(r6)<=2: bc=min(bc,2)
+        if bp and bc<=1: bp,bc=None,0
+        if mp and bp:
+            if mp==bp: return bp,min(3,max(bc,mc)+1),rule+"[M+]"
+            elif bc>=2: return bp,bc,rule+"[MC]"
+            else: return None,0,"CONFLICT"
+        elif mp and not bp:
+            if mc>=2: return mp,mc,f"{f['zone']}_MEM"
+        elif bp: return bp,bc,rule
+        return None,0,"NO_SIG"
 
-    # ══════════════════════════════════════════════════════════════════════
-    # FEATURE EXTRACTION
-    # ══════════════════════════════════════════════════════════════════════
-
-    def _extract_features(self, c1, c1m, c1m2, c0m, c0m2):
-        rng  = max(c1["high"]-c1["low"], 0.0001)
-        rng1 = max(c1m["high"]-c1m["low"], 0.0001)
-        rng2 = max(c1m2["high"]-c1m2["low"], 0.0001)
-        rng3 = max(c0m["high"]-c0m["low"], 0.0001)
-
-        body  = abs(c1["close"]-c1["open"])/rng
-        cpct  = max(0, min(100, int((c1["close"]-c1["low"])/rng*100)))
-        green = c1["close"] > c1["open"]
-        up1   = c1["close"] > c1m["close"]
-        up2   = c1m["close"] > c1m2["close"]
-        up3   = c1m2["close"] > c0m["close"]
-        up4   = c0m["close"] > c0m2["close"]
-        trend = sum([up1, up2, up3, up4])
-        mom   = (c1["close"]-c1m["close"])/c1m["close"]*100 if c1m["close"] else 0
-        avg3  = (rng1+rng2+rng3)/3
-        rng_exp = rng > avg3*1.3
-        rng_ctr = rng < avg3*0.7
-        hh = c1["high"] > c1m["high"]
-        ll = c1["low"]  < c1m["low"]
-        inside = not hh and not ll
-        ptb = cpct
-
-        if ptb < 20: zone = "VLOW"
-        elif ptb < 40: zone = "LOW"
-        elif ptb < 60: zone = "MID"
-        elif ptb < 80: zone = "HIGH"
-        else: zone = "VHIGH"
-
-        return {
-            "body": body, "cpct": cpct, "green": green,
-            "up1": up1, "up2": up2, "up3": up3, "up4": up4,
-            "trend": trend, "mom": mom,
-            "rng_exp": rng_exp, "rng_ctr": rng_ctr,
-            "hh": hh, "ll": ll, "inside": inside,
-            "ptb": ptb, "zone": zone, "rng": rng, "avg_rng": avg3,
-        }
-
-    # ══════════════════════════════════════════════════════════════════════
-    # BASE RULES (V9 — post BTC+ETH+SOL evolution)
-    # ══════════════════════════════════════════════════════════════════════
-
-    def _base_rules(self, f):
-        z = f["zone"]; body = f["body"]; green = f["green"]
-        up1 = f["up1"]; up2 = f["up2"]; up3 = f["up3"]
-        trend = f["trend"]; inside = f["inside"]
-        rng_exp = f["rng_exp"]; rng_ctr = f["rng_ctr"]
-        hh = f["hh"]; ll = f["ll"]; mom = f["mom"]
-
-        if z == "VLOW":
-            if green and up1:              return "UP", 3, "VLOW_GREEN_UP1"
-            if green:                      return "UP", 2, "VLOW_GREEN"
-            if up1 and mom > 0:            return "UP", 3, "VLOW_UP_MOM"
-            if body < 0.15 and trend <= 2: return "UP", 2, "VLOW_DOJI"
-            if trend <= 1:                 return "UP", 2, "VLOW_WEAK_TREND"
-            if not green and body > 0.50:  return "UP", 2, "VLOW_BIGRED"
-            return "UP", 1, "VLOW_DEFAULT"
-
-        elif z == "LOW":
-            if inside and green:
-                return "UP", 3, "LOW_INSIDE_GREEN"
-            if rng_ctr and not up1 and not up2:
-                return "DOWN", 2, "LOW_RNG_CTR"
-            if not green and body > 0.60 and not up1:
-                return "UP", 2, "LOW_BIGRED"
-            return None, 0, "LOW_SKIP"
-
-        elif z == "MID":
-            if inside and green:
-                return "DOWN", 2, "MID_INSIDE_GREEN"
-            if not up1 and not up2 and not up3:
-                return "UP", 3, "MID_3BAR_BOUNCE"
-            if up1 and up2 and up3:
-                return "UP", 2, "MID_3BAR_UP"
-            return None, 0, "MID_SKIP"
-
-        elif z == "HIGH":
-            if hh and rng_exp:
-                return "DOWN", 3, "HIGH_HH_RNGEXP"
-            if rng_exp and up1:
-                return "DOWN", 3, "HIGH_RNGEXP_UP1"
-            if trend == 4:
-                return "DOWN", 3, "HIGH_4BAR"
-            if up1 and up2 and up3:
-                return "DOWN", 2, "HIGH_3BAR"
-            if rng_ctr and not up1 and trend <= 1:
-                return "UP", 2, "HIGH_RNG_CTR"
-            return None, 0, "HIGH_SKIP"
-
-        elif z == "VHIGH":
-            if not green and ll:
-                return "DOWN", 2, "VHIGH_RED_LL"
-            if not up1:
-                return "DOWN", 1, "VHIGH_NOUP"
-            return None, 0, "VHIGH_SKIP"
-
-        return None, 0, "SKIP"
-
-    # ══════════════════════════════════════════════════════════════════════
-    # 9D PATTERN MEMORY
-    # ══════════════════════════════════════════════════════════════════════
-
-    def _ctx_key(self, f):
-        tb = "hi" if f["trend"] >= 3 else "lo" if f["trend"] <= 1 else "md"
-        bb = "big" if f["body"] > 0.50 else "tiny" if f["body"] < 0.15 else "mid"
-        zb = "lo" if f["ptb"] < 10 else "hi" if f["ptb"] > 90 else "mid"
-        return (f["zone"], f["green"], f["up1"], f["up2"], tb,
-                f["rng_exp"], f["inside"], bb, zb)
-
-    def _mem_signal(self, f):
-        key = self._ctx_key(f)
-        m = self.mem[key]
-        tot = m["UP"] + m["DOWN"]
-        if tot < 20:
-            return None, 0
-        max_conf = 3 if tot >= 50 else 2
-        rate = m["UP"] / tot
-        if rate >= 0.60: return "UP",   min(max_conf, 3)
-        if rate >= 0.56: return "UP",   min(max_conf, 2)
-        if rate <= 0.40: return "DOWN", min(max_conf, 3)
-        if rate <= 0.44: return "DOWN", min(max_conf, 2)
-        return None, 0
-
-    # ══════════════════════════════════════════════════════════════════════
-    # PREDICTION LOGIC — 3-layer combination
-    # ══════════════════════════════════════════════════════════════════════
-
-    def _predict_internal(self, f):
-        mem_pred, mem_conf = self._mem_signal(f)
-        base_pred, base_conf, rule = self._base_rules(f)
-
-        # Apply asset-specific demotions
-        if rule in self.asset_demote:
-            base_conf = min(base_conf, self.asset_demote[rule])
-
-        # Apply learned adaptive modifications
-        if base_pred:
-            if rule in self.skip_rules:
-                base_pred, base_conf = None, 0
-            elif rule in self.flip_rules:
-                base_pred = "DOWN" if base_pred == "UP" else "UP"
-                rule = rule + "[F]"
-            elif rule in self.boost_rules:
-                base_conf = min(3, base_conf + 1)
-                rule = rule + "[B]"
-
-        # Drop conf=1 — never profitable across any asset
-        if base_pred and base_conf <= 1:
-            base_pred, base_conf = None, 0
-
-        # ── Combine memory + base ─────────────────────────────────────
-        if mem_pred and base_pred:
-            if mem_pred == base_pred:
-                return base_pred, min(3, max(base_conf, mem_conf) + 1), rule + "[M+]"
-            else:
-                key = self._ctx_key(f)
-                tot = self.mem[key]["UP"] + self.mem[key]["DOWN"]
-                if tot >= 60 and mem_conf == 3:
-                    return mem_pred, 3, f"{f['zone']}_MEM_OVR"
-                if base_conf >= 2:
-                    return base_pred, base_conf, rule + "[MC]"
-                return None, 0, "CONFLICT"
-
-        elif mem_pred and not base_pred:
-            if mem_conf >= 2:
-                return mem_pred, mem_conf, f"{f['zone']}_MEM"
-
-        elif not mem_pred and base_pred:
-            return base_pred, base_conf, rule
-
-        return None, 0, "NO_SIG"
-
-    # ══════════════════════════════════════════════════════════════════════
-    # ADAPTIVE LEARNING
-    # ══════════════════════════════════════════════════════════════════════
-
-    def _update_internal(self, f, rule, actual, correct):
-        self.n += 1
-        base = rule.split("[")[0]
-
-        # Update pattern memory
-        self.mem[self._ctx_key(f)][actual] += 1
-
-        # Update rule stats
-        k = "w" if correct else "l"
-        self.rule_cum[base][k] += 1
-        w = self.rule_window[base]
-        w.append(1 if correct else 0)
-        if len(w) > 50:
-            w.pop(0)
-
-        # Relearn every 50 trades
-        if self.n % 50 == 0:
-            self._relearn()
+    def _update(self,f,rule,actual,correct):
+        self.n+=1; base=rule.split("[")[0]
+        self.mem[self._ctx_key(f)][actual]+=1
+        self.rule_cum[base]["w" if correct else "l"]+=1
+        w=self.rule_window[base]; w.append(1 if correct else 0)
+        if len(w)>50: w.pop(0)
+        r6=self.rule_recent6[base]; r6.append(1 if correct else 0)
+        if len(r6)>6: r6.pop(0)
+        if self.n%50==0: self._relearn()
 
     def _relearn(self):
-        changed = []
+        changed=[]
         for rule in list(self.rule_cum.keys()):
-            cum = self.rule_cum[rule]
-            t = cum["w"] + cum["l"]
-            if t < 25:
-                continue
-
-            win = self.rule_window[rule]
-            rn = len(win)
-            if rn >= 20:
-                wr = 0.70 * (sum(win) / rn) + 0.30 * (cum["w"] / t)
-            else:
-                wr = cum["w"] / t
-
-            wr_pct = round(wr * 100, 1)
-
-            # Skip: < 44%
-            if wr < 0.44 and rule not in self.skip_rules and rule not in self.flip_rules:
-                self.skip_rules.add(rule)
-                self.boost_rules.discard(rule)
-                changed.append(f"SKIP:{rule}({wr_pct}%)")
-
-            # Flip: < 40%
-            elif wr < 0.40 and rule not in self.flip_rules:
-                self.flip_rules.add(rule)
-                self.skip_rules.discard(rule)
-                self.boost_rules.discard(rule)
-                changed.append(f"FLIP:{rule}({wr_pct}%)")
-
-            # Boost: >= 58%
-            elif wr >= 0.58 and rule not in self.boost_rules:
-                self.boost_rules.add(rule)
-                if rule in self.skip_rules:
-                    self.skip_rules.discard(rule)
-                    changed.append(f"RESTORE:{rule}")
-                if rule in self.flip_rules:
-                    self.flip_rules.discard(rule)
-                changed.append(f"BOOST:{rule}({wr_pct}%)")
-
-            # Restore from skip: >= 52%
-            elif wr >= 0.52 and rule in self.skip_rules:
-                self.skip_rules.discard(rule)
-                changed.append(f"RESTORE:{rule}({wr_pct}%)")
-
-            # Unboost: < 54%
-            elif wr < 0.54 and rule in self.boost_rules:
-                self.boost_rules.discard(rule)
-                changed.append(f"UNBOOST:{rule}({wr_pct}%)")
-
-            # Reset window
-            self.rule_window[rule] = []
-
-        if changed:
-            self.learn_log.append({
-                "trade": self.n,
-                "time": datetime.now(timezone.utc).isoformat(),
-                "changes": changed,
-            })
-
-    # ══════════════════════════════════════════════════════════════════════
-    # EXPLANATION
-    # ══════════════════════════════════════════════════════════════════════
-
-    def _explain(self, pred, conf, rule, f):
-        if pred is None:
-            return f"SKIP — no confident signal at {f['zone']} zone (ptb={f['ptb']}%)"
-
-        reasons = []
-        base = rule.split("[")[0]
-
-        zone_meaning = {
-            "VLOW": "candle closed near its low (mean-reversion zone)",
-            "LOW":  "candle in lower range",
-            "MID":  "candle in middle range",
-            "HIGH": "candle in upper range (potential exhaustion)",
-            "VHIGH": "candle closed near its high (extreme zone)",
-        }
-        reasons.append(f"{f['zone']} zone: {zone_meaning.get(f['zone'], '')}")
-
-        if "[M+]" in rule:
-            reasons.append("Pattern memory AGREES with base rule (confidence boosted)")
-        if "[MC]" in rule:
-            reasons.append("Pattern memory CONFLICTS but base rule is strong enough")
-        if "[B]" in rule:
-            reasons.append(f"Rule {base} is currently BOOSTED (recent hot streak ≥58%)")
-        if "[F]" in rule:
-            reasons.append(f"Rule {base} was FLIPPED (historically reversed on {self.asset})")
-        if "MEM" in rule:
-            reasons.append("Pure pattern memory prediction (no base rule matched)")
-
-        return f"{pred} conf={conf} | {' | '.join(reasons)}"
-
-    # ══════════════════════════════════════════════════════════════════════
-    # STATE PERSISTENCE (for Railway deployment)
-    # ══════════════════════════════════════════════════════════════════════
+            cum=self.rule_cum[rule]; t=cum["w"]+cum["l"]
+            if t<20: continue
+            win=self.rule_window[rule]; rn=len(win)
+            wr=(0.70*(sum(win)/rn)+0.30*(cum["w"]/t)) if rn>=15 else cum["w"]/t
+            pct=round(wr*100,1); anc=rule in self.anchors
+            if not anc:
+                if wr<0.40 and rule not in self.flip_rules:
+                    self.flip_rules.add(rule); self.skip_rules.discard(rule); self.boost_rules.discard(rule)
+                    changed.append(f"FLIP:{rule}({pct}%)")
+                elif wr<0.44 and rule not in self.skip_rules and rule not in self.flip_rules:
+                    self.skip_rules.add(rule); self.boost_rules.discard(rule)
+                    changed.append(f"SKIP:{rule}({pct}%)")
+            if wr<0.47 and rule not in self.demote_rules and rule not in self.skip_rules and rule not in self.flip_rules:
+                self.demote_rules.add(rule); self.boost_rules.discard(rule)
+                changed.append(f"DEMOTE:{rule}({pct}%)")
+            elif wr>=0.58 and rule not in self.boost_rules:
+                r6=self.rule_recent6.get(rule,[])
+                if len(r6)<6 or sum(r6)>=3:
+                    self.boost_rules.add(rule)
+                    for s in [self.skip_rules,self.flip_rules,self.demote_rules]:
+                        if rule in s: s.discard(rule); changed.append(f"RESTORE:{rule}")
+                    changed.append(f"BOOST:{rule}({pct}%)")
+            elif wr>=0.52:
+                if rule in self.skip_rules: self.skip_rules.discard(rule); changed.append(f"RESTORE:{rule}({pct}%)")
+                if rule in self.demote_rules: self.demote_rules.discard(rule)
+            elif wr<0.54 and rule in self.boost_rules:
+                self.boost_rules.discard(rule); changed.append(f"UNBOOST:{rule}({pct}%)")
+            self.rule_window[rule]=[]
+        if changed: self.learn_log.append({"trade":self.n,"time":datetime.now(timezone.utc).isoformat(),"changes":changed})
 
     def _save_state(self):
-        state = {
-            "asset": self.asset,
-            "n": self.n,
-            "mem": {str(k): v for k, v in self.mem.items()},
-            "rule_cum": dict(self.rule_cum),
-            "rule_window": {k: list(v) for k, v in self.rule_window.items()},
-            "skip_rules": list(self.skip_rules),
-            "flip_rules": list(self.flip_rules),
-            "boost_rules": list(self.boost_rules),
-            "learn_log": self.learn_log[-50:],  # keep last 50 events
-            "saved_at": datetime.now(timezone.utc).isoformat(),
-        }
-        with open(self.state_path, "w") as f:
-            json.dump(state, f)
+        s={"asset":self.asset,"n":self.n,"mem":{str(k):v for k,v in self.mem.items()},
+           "rule_cum":dict(self.rule_cum),"skip":list(self.skip_rules),"flip":list(self.flip_rules),
+           "boost":list(self.boost_rules),"demote":list(self.demote_rules),
+           "learn_log":self.learn_log[-50:],"saved":datetime.now(timezone.utc).isoformat()}
+        os.makedirs(os.path.dirname(self.state_path) or ".", exist_ok=True)
+        with open(self.state_path,"w") as f: json.dump(s,f)
 
     def _load_state(self):
         try:
-            with open(self.state_path) as f:
-                state = json.load(f)
-            self.n = state.get("n", 0)
-            for k, v in state.get("mem", {}).items():
-                key = eval(k) if isinstance(k, str) else k
-                self.mem[key] = v
-            for k, v in state.get("rule_cum", {}).items():
-                self.rule_cum[k] = v
-            for k, v in state.get("rule_window", {}).items():
-                self.rule_window[k] = v
-            self.skip_rules = set(state.get("skip_rules", []))
-            self.flip_rules = set(state.get("flip_rules", []))
-            self.boost_rules = set(state.get("boost_rules", []))
-            self.learn_log = state.get("learn_log", [])
-        except Exception as e:
-            print(f"[P29CL] Warning: could not load state: {e}")
-
-    # ══════════════════════════════════════════════════════════════════════
-    # STATUS / DEBUG
-    # ══════════════════════════════════════════════════════════════════════
+            with open(self.state_path) as f: s=json.load(f)
+            self.n=s.get("n",0)
+            for k,v in s.get("mem",{}).items(): self.mem[eval(k) if isinstance(k,str) else k]=v
+            for k,v in s.get("rule_cum",{}).items(): self.rule_cum[k]=v
+            self.skip_rules=set(s.get("skip",[])); self.flip_rules=set(s.get("flip",[]))
+            self.boost_rules=set(s.get("boost",[])); self.demote_rules=set(s.get("demote",[]))
+            self.learn_log=s.get("learn_log",[])
+        except: pass
 
     def status(self):
-        return {
-            "asset": self.asset,
-            "trades_seen": self.n,
-            "memory_entries": len(self.mem),
-            "skip_rules": sorted(self.skip_rules),
-            "flip_rules": sorted(self.flip_rules),
-            "boost_rules": sorted(self.boost_rules),
-            "learn_events": len(self.learn_log),
-            "rule_accuracy": {
-                rule: {
-                    "wr": round(s["w"]/(s["w"]+s["l"])*100, 1) if s["w"]+s["l"] > 0 else 0,
-                    "trades": s["w"]+s["l"],
-                }
-                for rule, s in self.rule_cum.items()
-                if s["w"]+s["l"] >= 10
-            },
-        }
+        return {"asset":self.asset,"trades":self.n,"memory":len(self.mem),
+                "skip":sorted(self.skip_rules),"boost":sorted(self.boost_rules),
+                "learns":len(self.learn_log),
+                "rules":{r:{"wr":round(s["w"]/(s["w"]+s["l"])*100,1),"n":s["w"]+s["l"]}
+                         for r,s in self.rule_cum.items() if s["w"]+s["l"]>=10}}
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# INTEGRATION HELPER — Maps existing P29CL indicator format to engine input
-# ══════════════════════════════════════════════════════════════════════════════
-
-def p29cl_should_trade(engine_result, min_confidence=2):
-    """
-    Decision gate: should P29CL place this trade?
-    
-    Returns:
-        dict with:
-            trade:  True/False
-            side:   "UP"/"DOWN"/None
-            stake:  suggested stake multiplier (1x for conf=2, 1.5x for conf=3)
-    """
-    if engine_result["side"] is None:
-        return {"trade": False, "side": None, "stake": 0, "reason": "No signal"}
-
-    if engine_result["confidence"] < min_confidence:
-        return {"trade": False, "side": None, "stake": 0,
-                "reason": f"Confidence {engine_result['confidence']} below minimum {min_confidence}"}
-
-    # Stake sizing by confidence
-    stake_mult = {2: 1.0, 3: 1.5}
-    mult = stake_mult.get(engine_result["confidence"], 1.0)
-
-    return {
-        "trade": True,
-        "side": engine_result["side"],
-        "stake": mult,
-        "confidence": engine_result["confidence"],
-        "rule": engine_result["rule"],
-        "reason": engine_result["reason"],
-    }
+def should_trade(result, min_conf=2):
+    if not result["side"] or result["confidence"]<min_conf:
+        return {"trade":False,"side":None,"stake":0}
+    return {"trade":True,"side":result["side"],
+            "stake":{2:1.0,3:1.5}.get(result["confidence"],1.0),
+            "confidence":result["confidence"],"rule":result["rule"]}
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# QUICK TEST
-# ══════════════════════════════════════════════════════════════════════════════
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# END P29CL V11 ENGINE
-# ══════════════════════════════════════════════════════════════════════════════
-
-# Initialize one engine per asset (state persists via JSON files)
-_p29cl_v11_engines = {}
-for _v11_asset in ["BTC", "ETH", "SOL", "XRP", "DOGE", "BNB"]:
-    _p29cl_v11_engines[_v11_asset] = P29CLv11(
-        asset=_v11_asset,
-        state_path=f"/tmp/p29cl_v11_{_v11_asset.lower()}.json"
+# Initialize one engine per asset
+_p29cl_engines = {}
+for _ea in ["BTC", "ETH", "SOL", "XRP", "DOGE", "BNB"]:
+    _p29cl_engines[_ea] = P29CLFinal(
+        asset=_ea,
+        state_path=f"/tmp/p29cl_final_{_ea.lower()}.json"
     )
-print("P29CL V11 engines initialized: " + ", ".join(_p29cl_v11_engines.keys()))
+print("P29CL FINAL engines initialized: " + ", ".join(_p29cl_engines.keys()))
+
 
 
 app = Flask(__name__)
@@ -1032,12 +897,12 @@ _p29cl_boundary_results = []        # list of (asset, outcome) for current bound
 # ── P2.9CL LIVE trading state ──
 _p29cl_live_state = {
     "enabled": True,  # LIVE TRADING ACTIVE
-    "balance": 150.0,
-    "peak_balance": 150.0,
-    "starting_balance": 150.0,
-    "floor_balance": 50.0,     # stop loss at $50
+    "balance": 100.0,
+    "peak_balance": 100.0,
+    "starting_balance": 100.0,
+    "floor_balance": 20.0,     # stop loss at $20
     "base_stake": 2.50,        # flat $2.50
-    "max_stake": 5.00,         # 2.0x cap
+    "max_stake": 5.00,         # 2.0x cap for conf=3
     "max_per_boundary": 20.00, # $20 max exposure per boundary
     "trades_today": 0,
     "wins_today": 0,
@@ -1725,8 +1590,8 @@ def _bot2_sniper_thread():
             
             # Calculate direction for each asset
             snipe_targets = []
-            # Build Bot2 targets if BTC direction available (paper or live)
-            if btc_dir:
+            # Bot2 Chainlink Sniper DISABLED — replaced by P29CL FINAL engine
+            if False and btc_dir:
               for asset in SNIPER_ASSETS:
                 if asset not in token_map:
                     continue
@@ -2365,17 +2230,17 @@ def _bot2_sniper_thread():
                         _dist_score = 0
                         
 
-                        # ══ P29CL V11 ENGINE CALL ══
+                        # ══ P29CL FINAL ENGINE CALL ══
                         # Feed last 5 closed candles to the self-learning engine
                         if len(_cs_all) >= 5:
                             _v11_candles = [
                                 {"open": c[0], "high": c[1], "low": c[2], "close": c[3]}
                                 for c in _cs_all[-5:]
                             ]
-                            _v11_engine = _p29cl_v11_engines.get(_p29cl_asset)
+                            _v11_engine = _p29cl_engines.get(_p29cl_asset)
                             if _v11_engine:
                                 _v11_result = _v11_engine.predict(_v11_candles)
-                                _v11_decision = p29cl_should_trade(_v11_result, min_confidence=2)
+                                _v11_decision = should_trade(_v11_result, min_conf=2)
                                 
                                 if not _v11_decision["trade"]:
                                     print("P29CL SKIP: {} {} ptb={}% cpct={}% {}".format(
@@ -2402,7 +2267,7 @@ def _bot2_sniper_thread():
                                 _cs_cpct = _c1_cpct
                                 _cs_uwick = _c1_uwick
                                 
-                                print("P29CL V11: {} {} conf={} rule={} zone={} ptb={}% | {}".format(
+                                print("P29CL FINAL: {} {} conf={} rule={} zone={} ptb={}% | {}".format(
                                     _p29cl_asset, _p29cl_dir, _v11_result["confidence"],
                                     _v11_result["rule"], _v11_result["ptb_zone"],
                                     _v11_result.get("ptb_pct", 0), _v11_result.get("reason", "")[:60]))
@@ -2481,7 +2346,7 @@ def _bot2_sniper_thread():
                             "asset": _p29cl_asset, "key": _p29cl_key,
                             "dir": _p29cl_dir, "stake": _p29cl_stake,
                             "conf": _p29cl_conf, "tag": _p29cl_tag,
-                            "cs_score": _cs_score,
+                            "cs_score": _cs_score, "v11_conf": _v11_conf,
                         })
                         
                         # Save to DB
@@ -2577,47 +2442,16 @@ def _bot2_sniper_thread():
                                 if not _p29l_token:
                                     continue
                                 
-                                # Calculate live stake (flat base + multiplier)
-                                _p29l_base = _p29cl_live_state["base_stake"]
+                                # FINAL engine already filtered conf<2 — trade what paper trades
+                                # Flat $2.50 stake, conf=3 gets $3.75 (1.5x)
+                                _p29l_conf_val = _p29l_t.get("v11_conf", 2)
+                                _p29l_mult_final = 1.5 if _p29l_conf_val >= 3 else 1.0
                                 
-                                # Reuse the same multiplier that paper calculated
-                                _p29l_dist_prob, _p29l_dist_zone = _p29cl_calc_dist(_p29l_asset, _chainlink_prices.get(_p29l_asset, 0))
-                                _p29l_conf = _p29l_t.get("conf", "MEDIUM")
-                                _p29l_tag = _p29l_t.get("tag", "")
-                                _p29l_mult, _p29l_tier = _p29cl_get_multiplier(
-                                    _p29l_conf, _p29l_dist_zone, _p29l_dist_prob,
-                                    _p29cl_bnd_minute, _p29l_dir, _p29l_asset,
-                                    _p29cl_phase, _p29cl_last_boundary_all_lose,
-                                    _p29cl_last_boundary_all_win, _p29cl_last_boundary_dir,
-                                    btc_dir=_p29cl_btc_dir, is_majority_flip=_p29cl_is_majority_flip,
-                                    momentum_tag=_p29l_tag, consecutive_all_lose=_p29cl_consecutive_all_lose)
+                                # Correlation penalty: reduce to 1x when all same direction
+                                if _p29l_correlated:
+                                    _p29l_mult_final = 1.0
                                 
-                                # Skip confirmed losers — paper only for data
-                                _LIVE_SKIP_TIERS = {
-                                    "REDUCE_NEW_PAIR",
-                                    "REDUCE_ETH_WEAK",
-                                    "REDUCE_30",
-                                    "REDUCE_EXTREME_85",
-                                    "REDUCE_EXTREME_HIGH",
-                                    "REDUCE_EXTREME_LOW",
-                                    "REDUCE_HIGH_EXTREME",
-                                    "REDUCE_COUNTER_TREND",
-                                }
-                                if _p29l_tier in _LIVE_SKIP_TIERS:
-                                    print("P29CL LIVE SKIP: {} {} tier={} (paper only)".format(
-                                        _p29l_dir, _p29l_asset, _p29l_tier))
-                                    continue
-                                
-                                # Skip weak conviction on live — need score >= 3 for real money
-                                _p29l_cs_score = abs(_p29l_t.get("cs_score", 0))
-                                _p29l_min_score = 5 if _p29l_correlated else 3  # higher bar when all same direction
-                                if _p29l_cs_score < _p29l_min_score:
-                                    print("P29CL LIVE SKIP: {} {} score={} min={} (weak conviction{})".format(
-                                        _p29l_dir, _p29l_asset, _p29l_cs_score, _p29l_min_score,
-                                        " +correlated" if _p29l_correlated else ""))
-                                    continue
-                                
-                                _p29l_stake = round(_p29l_base * _p29l_mult, 2)
+                                _p29l_stake = round(_p29l_base * _p29l_mult_final, 2)
                                 _p29l_stake = max(2.50, _p29l_stake)
                                 _p29l_stake = min(_p29l_stake, _p29cl_live_state["max_stake"])
                                 
@@ -21282,7 +21116,7 @@ if SIGNALS_DB_URL:
         _bot2_sniper_state["peak_balance"] = _saved_bot2s.get("peak_balance", _saved_bot2s["balance"])
     _bot2_sniper_state["enabled"] = False  # PAUSED — A4 Chainlink is live instead
     _save_bot_balance("bot2_sniper", _bot2_sniper_state)
-    print("BOT2 SNIPER: PAUSED — paper mode | ${:.2f} pool".format(_bot2_sniper_state["balance"]))
+    print("BOT2 SNIPER: DISABLED — replaced by P29CL FINAL engine")
     
     # ── SNIPER A4 CHAINLINK init ──
     _saved_pa4 = _saved_balances.get("poly_alpha4", {})
@@ -23730,7 +23564,7 @@ def _resolve_p29cl_trades():
                 # Feed outcome to V11 engine for learning
                 try:
                     _learn_asset = p.get("asset", "BTC")
-                    _learn_engine = _p29cl_v11_engines.get(_learn_asset)
+                    _learn_engine = _p29cl_engines.get(_learn_asset)
                     if _learn_engine and _learn_engine.last_prediction:
                         _learn_actual = "UP" if won else "DOWN"
                         _learn_engine.learn(_learn_actual)
