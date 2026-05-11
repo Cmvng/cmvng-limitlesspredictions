@@ -1816,205 +1816,114 @@ def _bot2_sniper_thread():
                         _dist_score = 0
                         
 
-                        # ══ ASSET-SPECIFIC SCORING v10 ══
-                        # Backed by 1,694 real TradingView 15M candles (BTC+ETH+SOL+DOGE)
-                        # Combined backtest: 56.5% WR on 756 trades, +$245
+                        # ══ P29CL SCORING v11 ══
+                        # Cross-validated on 2,062 TradingView candles + 358 P29CL live trades
+                        # P29CL-confirmed rules: 60.3% WR on 199 trades
+                        # Key insight: Polymarket PTB at T+0.5s behaves differently from candle opens
+                        # Strong candles = move DONE. Weak candles at edges = exhaustion signal.
                         
-                        # ── Compute features ──
-                        _recent_7h = max(c[1] for c in _cs_all[-7:]) if len(_cs_all) >= 7 else _c1_h
-                        _recent_7l = min(c[2] for c in _cs_all[-7:]) if len(_cs_all) >= 7 else _c1_l
-                        _recent_7r = _recent_7h - _recent_7l if _recent_7h > _recent_7l else 0.0001
-                        _ptb_in_recent = max(0, min(100, int((_p29cl_price - _recent_7l) / _recent_7r * 100)))
+                        _v11_strong_green = _c1_green and _c1_body_ratio > 0.45 and _c1_uwick < 25
+                        _v11_strong_red = _c1_red and _c1_body_ratio > 0.45 and _c1_lwick < 40
+                        _v11_has_small_wick = 20 <= _c1_uwick <= 45
                         
-                        _consec_green = 0
-                        _consec_red = 0
-                        for _cj in range(1, min(6, len(_cs_all))):
-                            _cjc = _cs_all[-_cj]
-                            if _cjc[3] > _cjc[0]:
-                                if _consec_red == 0: _consec_green += 1
-                                else: break
-                            else:
-                                if _consec_green == 0: _consec_red += 1
-                                else: break
+                        if _cs_ptb_pct < 20: _v11_zone = "VLOW"
+                        elif _cs_ptb_pct < 40: _v11_zone = "LOW"
+                        elif _cs_ptb_pct < 60: _v11_zone = "MID"
+                        elif _cs_ptb_pct < 80: _v11_zone = "HIGH"
+                        else: _v11_zone = "VHIGH"
                         
-                        _hh = _c1_h > _c2_h
-                        _hl = _c1_l > _c2_l
-                        _hh2 = _c2_h > _c3[1] if len(_cs_all) >= 3 else False
-                        _hl2 = _c2_l > _c3[2] if len(_cs_all) >= 3 else False
-                        _struct_bull = _hh and _hl
-                        _struct_bear = not _hh and not _hl
-                        
-                        # ── DOWN signal count (positive = more DOWN evidence) ──
-                        _dc = 0
-                        _uc = 0
-                        
-                        # === UNIVERSAL RULES (proven on ALL 4 assets) ===
-                        
-                        # PTB >= 90% of prev range → 59% DOWN across all assets
-                        if _cs_ptb_pct >= 90:
-                            _dc += 3; _cs_tags.append("PTB90+")
-                        elif _cs_ptb_pct >= 75:
-                            _dc += 1; _cs_tags.append("PTB75+")
-                        
-                        # Previous candle closed very high → DOWN
-                        if _c1_cpct >= 85:
-                            _dc += 2; _cs_tags.append("CPCT85+")
-                        elif _c1_cpct >= 70:
-                            _dc += 1; _cs_tags.append("CPCT70+")
-                        
-                        # 2+ greens + high CPCT → exhaustion
-                        if _consec_green >= 2 and _c1_green and _c1_cpct > 75:
-                            _dc += 1; _cs_tags.append("EXHAUST_UP")
-                        
-                        # === ASSET-SPECIFIC RULES ===
-                        
-                        if _p29cl_asset == "BTC":
-                            # BTC: PTB 10-25% → UP (59.4% green)
-                            if 10 <= _cs_ptb_pct < 25:
-                                _uc += 2; _cs_tags.append("BTC_LOW_UP")
-                            # BTC: PTB 25-45% → UP (61.9%)
-                            if 25 <= _cs_ptb_pct < 45:
-                                _uc += 1; _cs_tags.append("BTC_MID_UP")
-                            # BTC: PTB 70-85% → UP (66.7%!)
-                            if 65 <= _cs_ptb_pct < 85 and _dc < 2:
-                                _uc += 2; _cs_tags.append("BTC_HI_UP")
-                            # BTC: PTB in recent 50-63% → DOWN
-                            if 48 <= _ptb_in_recent < 63:
-                                _dc += 1; _cs_tags.append("BTC_REC_MID")
-                            # BTC: Strong green + high PTB → DOWN
-                            if _c1_green and _c1_body_ratio > 0.5 and _cs_ptb_pct > 65:
-                                _dc += 1; _cs_tags.append("BTC_SG_HI")
-                            # BTC: After 3 greens → continuation (57.9%)
-                            if _consec_green >= 3 and _cs_ptb_pct > 40:
-                                _uc += 1; _cs_tags.append("BTC_3G_CONT")
-                                
-                        elif _p29cl_asset == "ETH":
-                            # ETH: PTB in recent 50-63% → strong DOWN (66%)
-                            if 48 <= _ptb_in_recent < 63:
-                                _dc += 2; _cs_tags.append("ETH_REC_MID")
-                            # ETH: Recent range top → DOWN (58%)
-                            if _ptb_in_recent >= 80:
-                                _dc += 1; _cs_tags.append("ETH_REC_TOP")
-                            # ETH: Strong green + PTB high → DOWN (59%)
-                            if _c1_green and _c1_body_ratio > 0.5 and _cs_ptb_pct > 65:
-                                _dc += 1; _cs_tags.append("ETH_SG_HI")
-                            # ETH: 3+ greens → DOWN (58%)
-                            if _consec_green >= 3 and _cs_ptb_pct > 55:
-                                _dc += 2; _cs_tags.append("ETH_3G_PB")
-                            # ETH: Previous closed low-mid → UP (57.5%)
-                            if 30 <= _c1_cpct < 50:
-                                _uc += 1; _cs_tags.append("ETH_CPCT_LM")
-                            # ETH: Big upper wick → UP (57%)
-                            if _c1_uwick > 50:
-                                _uc += 2; _cs_tags.append("ETH_BIG_UW")
-                            # ETH: Rejection absorbed → UP (55%)
-                            if _c1_uwick > 35 and _c1_cpct < 50:
-                                _uc += 1; _cs_tags.append("ETH_REJ_ABS")
-                            # ETH: 2x bearish structure → DOWN (59%)
-                            if _struct_bear and not _hh2 and not _hl2:
-                                _dc += 1; _cs_tags.append("ETH_2xBEAR")
-                                
-                        elif _p29cl_asset == "SOL":
-                            # SOL: Momentum asset — continuation works
-                            # SOL: PTB 20-35% → UP (57.4%)
-                            if 15 <= _cs_ptb_pct < 35:
-                                _uc += 1; _cs_tags.append("SOL_LOW_UP")
-                            # SOL: PTB 55-75% → UP (55-60%)
-                            if 55 <= _cs_ptb_pct < 75 and _dc < 2:
-                                _uc += 1; _cs_tags.append("SOL_MID_UP")
-                            # SOL: PTB 65-85% → UP (60.5%)
-                            if 65 <= _cs_ptb_pct < 85 and _dc < 2:
-                                _uc += 2; _cs_tags.append("SOL_HI_UP")
-                            # SOL: Big upper wick → UP (55.6%)
-                            if _c1_uwick > 50:
-                                _uc += 1; _cs_tags.append("SOL_BIG_UW")
-                            # SOL: HH+HL → UP continuation
-                            if _struct_bull:
-                                _uc += 1; _cs_tags.append("SOL_HH_HL")
-                            # SOL: After 3 greens → continuation (62.7%!)
-                            if _consec_green >= 3:
-                                _uc += 2; _cs_tags.append("SOL_3G_CONT")
-                                
-                        elif _p29cl_asset == "DOGE":
-                            # DOGE: Mid-PTB favors UP
-                            # DOGE: PTB 20-30% → UP (58.1%)
-                            if 15 <= _cs_ptb_pct < 35:
-                                _uc += 1; _cs_tags.append("DOGE_LOW_UP")
-                            # DOGE: PTB 40-50% → UP (60.4%)
-                            if 35 <= _cs_ptb_pct < 55:
-                                _uc += 1; _cs_tags.append("DOGE_MID_UP")
-                            # DOGE: PTB 60-70% → UP (56.1%)
-                            if 55 <= _cs_ptb_pct < 75 and _dc < 2:
-                                _uc += 1; _cs_tags.append("DOGE_HI_UP")
-                            # DOGE: 2x bearish → actually UP on DOGE (61%!)
-                            if _struct_bear and not _hh2 and not _hl2:
-                                _uc += 1; _cs_tags.append("DOGE_BEAR_UP")
-                            # DOGE: Big upper wick → DOWN (58%)
-                            if _c1_uwick > 40:
-                                _dc += 1; _cs_tags.append("DOGE_UW_DN")
-                                
-                        elif _p29cl_asset == "XRP":
-                            # XRP: Extremes work strongly
-                            # XRP: PTB 75-100% → UP (73%!)
-                            if _cs_ptb_pct >= 70 and _dc < 2:
-                                _uc += 2; _cs_tags.append("XRP_HI_UP")
-                            # XRP: PTB 0-25% → DOWN (75%!)
-                            if _cs_ptb_pct < 25:
-                                _dc += 2; _cs_tags.append("XRP_LOW_DN")
-                            # XRP: PTB in recent 50-63% → DOWN
-                            if 48 <= _ptb_in_recent < 63:
-                                _dc += 1; _cs_tags.append("XRP_REC_MID")
-                                
-                        elif _p29cl_asset == "BNB":
-                            # BNB: High PTB → UP (80% but small sample)
-                            if _cs_ptb_pct >= 70 and _dc < 2:
-                                _uc += 2; _cs_tags.append("BNB_HI_UP")
-                            # BNB: PTB in recent 50-63% → DOWN
-                            if 48 <= _ptb_in_recent < 63:
-                                _dc += 1; _cs_tags.append("BNB_REC_MID")
-                            # BNB: Previous closed low-mid → UP
-                            if 30 <= _c1_cpct < 50:
-                                _uc += 1; _cs_tags.append("BNB_CPCT_LM")
-                            # BNB: Big upper wick → UP
-                            if _c1_uwick > 50:
-                                _uc += 1; _cs_tags.append("BNB_BIG_UW")
-                        
-                        else:
-                            # Unknown asset — use universal rules only
-                            if 48 <= _ptb_in_recent < 63:
-                                _dc += 1; _cs_tags.append("REC_MID")
-                            if _c1_uwick > 50:
-                                _uc += 1; _cs_tags.append("BIG_UW")
-                        
-                        # ── DECISION: require clear advantage ──
                         _p29cl_dir = None
-                        if _dc >= 3 and _dc > _uc + 1:
-                            _p29cl_dir = "DOWN"
-                        elif _uc >= 3 and _uc > _dc + 1:
-                            _p29cl_dir = "UP"
-                        elif _dc >= 2 and _uc == 0:
-                            _p29cl_dir = "DOWN"
-                        elif _uc >= 2 and _dc == 0:
-                            _p29cl_dir = "UP"
+                        _v11_conf = 0
+                        
+                        # RULE 1: PTB VERY LOW (0-20%) → DOWN (58% on P29CL)
+                        if _v11_zone == "VLOW":
+                            if _c1_cpct < 35:
+                                _p29cl_dir = "DOWN"; _v11_conf = 3; _cs_tags.append("VLOW_CPCT_LOW")
+                            elif _c1_uwick > 45:
+                                _p29cl_dir = "DOWN"; _v11_conf = 2; _cs_tags.append("VLOW_BIG_WICK")
+                            else:
+                                _p29cl_dir = "DOWN"; _v11_conf = 1; _cs_tags.append("VLOW_DEFAULT")
+                        
+                        # RULE 2: PTB LOW (20-40%) → DOWN (62% on P29CL)
+                        elif _v11_zone == "LOW":
+                            if _c1_cpct < 35:
+                                _p29cl_dir = "DOWN"; _v11_conf = 3; _cs_tags.append("LOW_CPCT_LOW")
+                            elif _c1_cpct < 65:
+                                _p29cl_dir = "DOWN"; _v11_conf = 2; _cs_tags.append("LOW_CPCT_MID")
+                            else:
+                                _p29cl_dir = "DOWN"; _v11_conf = 1; _cs_tags.append("LOW_GAP_DN")
+                        
+                        # RULE 3: PTB MID (40-60%) → slight DOWN, follow candle
+                        elif _v11_zone == "MID":
+                            if _v11_strong_green:
+                                _p29cl_dir = "DOWN"; _v11_conf = 2; _cs_tags.append("MID_SG_DONE")
+                            elif _v11_strong_red:
+                                _p29cl_dir = "DOWN"; _v11_conf = 2; _cs_tags.append("MID_SR_CONT")
+                            elif _c1_green:
+                                _p29cl_dir = "UP"; _v11_conf = 1; _cs_tags.append("MID_FOLLOW_G")
+                            else:
+                                _p29cl_dir = "DOWN"; _v11_conf = 1; _cs_tags.append("MID_FOLLOW_R")
+                        
+                        # RULE 4: PTB HIGH (60-80%) → UP (62-65% on P29CL)
+                        elif _v11_zone == "HIGH":
+                            if _c1_cpct >= 35 and _c1_cpct < 65:
+                                _p29cl_dir = "UP"; _v11_conf = 3; _cs_tags.append("HIGH_CPCT_MID")
+                            elif _c1_cpct >= 65:
+                                _p29cl_dir = "UP"; _v11_conf = 3; _cs_tags.append("HIGH_CPCT_HIGH")
+                            elif _v11_has_small_wick:
+                                _p29cl_dir = "UP"; _v11_conf = 2; _cs_tags.append("HIGH_SM_WICK")
+                            else:
+                                _p29cl_dir = "UP"; _v11_conf = 1; _cs_tags.append("HIGH_DEFAULT")
+                        
+                        # RULE 5: PTB VERY HIGH (80-100%) → selective
+                        elif _v11_zone == "VHIGH":
+                            if _v11_has_small_wick:
+                                _p29cl_dir = "UP"; _v11_conf = 2; _cs_tags.append("VHIGH_SM_WICK")
+                            elif _c1_cpct >= 65 and _c1_uwick < 20:
+                                _cs_tags.append("VHIGH_SKIP")
+                                print("P29CL SKIP: {} ptb={}% cpct={}% VHIGH_CLEAN {}".format(
+                                    _p29cl_asset, _cs_ptb_pct, _c1_cpct, "+".join(_cs_tags[:3])))
+                                continue
+                            else:
+                                _p29cl_dir = "DOWN"; _v11_conf = 1; _cs_tags.append("VHIGH_DEFAULT")
+                        
+                        # ASSET-SPECIFIC ADJUSTMENTS
+                        if _p29cl_asset == "BTC":
+                            if _v11_zone in ("HIGH", "VHIGH") and _p29cl_dir == "UP":
+                                _p29cl_dir = "DOWN"; _cs_tags.append("BTC_TOP_DN"); _v11_conf = 2
+                        elif _p29cl_asset == "XRP":
+                            if _v11_zone in ("HIGH", "VHIGH"):
+                                _p29cl_dir = "UP"; _cs_tags.append("XRP_TOP_UP"); _v11_conf = 3
+                        elif _p29cl_asset == "DOGE":
+                            if _v11_zone == "VLOW":
+                                _v11_conf = 3; _cs_tags.append("DOGE_BOT_DN")
+                            elif _v11_zone == "MID":
+                                _p29cl_dir = "UP"; _v11_conf = 2; _cs_tags.append("DOGE_MID_UP")
+                            elif _v11_zone in ("HIGH", "VHIGH"):
+                                _p29cl_dir = "UP"; _v11_conf = 2; _cs_tags.append("DOGE_TOP_UP")
+                        elif _p29cl_asset == "BNB":
+                            if _v11_zone == "MID" and _p29cl_dir == "DOWN":
+                                _p29cl_dir = "UP"; _cs_tags.append("BNB_MID_UP"); _v11_conf = 2
+                            elif _v11_zone in ("HIGH", "VHIGH"):
+                                _p29cl_dir = "UP"; _cs_tags.append("BNB_TOP_UP"); _v11_conf = 3
+                        elif _p29cl_asset == "SOL":
+                            if _v11_zone == "VLOW":
+                                _v11_conf = 3; _cs_tags.append("SOL_BOT_DN")
+                        elif _p29cl_asset == "ETH":
+                            if _v11_zone == "MID" and _p29cl_dir == "UP":
+                                _p29cl_dir = "DOWN"; _cs_tags.append("ETH_MID_DN"); _v11_conf = 2
                         
                         if not _p29cl_dir:
-                            print("P29CL SKIP: {} dc={} uc={} ptb={}% cpct={}% {}".format(
-                                _p29cl_asset, _dc, _uc, _cs_ptb_pct, _c1_cpct, "+".join(_cs_tags[:4])))
+                            print("P29CL SKIP: {} ptb={}% cpct={}% {}".format(
+                                _p29cl_asset, _cs_ptb_pct, _c1_cpct, "+".join(_cs_tags[:4])))
                             continue
                         
-                        # ── CONFIDENCE ──
-                        _signal_strength = max(_dc, _uc)
-                        if _signal_strength >= 5:
-                            _p29cl_conf = "HIGH"
-                        elif _signal_strength >= 3:
-                            _p29cl_conf = "MEDIUM"
-                        else:
-                            _p29cl_conf = "LOW"
+                        if _v11_conf >= 3: _p29cl_conf = "HIGH"
+                        elif _v11_conf >= 2: _p29cl_conf = "MEDIUM"
+                        else: _p29cl_conf = "LOW"
                         
-                        # ── DIST calculation ──
                         _p29cl_dist_prob, _p29cl_dist_zone = _p29cl_calc_dist(_p29cl_asset, _p29cl_price)
-                        
-                        _cs_score = -_uc + _dc  # positive = DOWN, negative = UP
+                        _cs_score = -_v11_conf if _p29cl_dir == "UP" else _v11_conf
                         _cs_score = max(-10, min(10, _cs_score))
                         
                         _cs_candle_desc = "G" if _c1_green else "R" if _c1_red else "D"
@@ -2025,9 +1934,9 @@ def _bot2_sniper_thread():
                         _cs_cpct = _c1_cpct
                         _cs_uwick = _c1_uwick
                         if _p29cl_p21_dir and _p29cl_p21_dir != _p29cl_dir:
-                            print("P29CL OVERRIDE: {} P2.1={} > CS={} score={} dc={} uc={} ptb={}% {}".format(_p29cl_asset, _p29cl_p21_dir, _p29cl_dir, int(_cs_score), _dc, _uc, _cs_ptb_pct, "+".join(_cs_tags[:6])))
+                            print("P29CL OVERRIDE: {} P2.1={} > CS={} score={} conf={} ptb={}% cpct={}% {}".format(_p29cl_asset, _p29cl_p21_dir, _p29cl_dir, int(_cs_score), _p29cl_conf, _cs_ptb_pct, _c1_cpct, "+".join(_cs_tags[:6])))
                         elif not _p29cl_p21_dir:
-                            print("P29CL INDEPENDENT: {} CS={} score={} dc={} uc={} ptb={}% {}".format(_p29cl_asset, _p29cl_dir, int(_cs_score), _dc, _uc, _cs_ptb_pct, "+".join(_cs_tags[:6])))
+                            print("P29CL INDEPENDENT: {} CS={} score={} conf={} ptb={}% cpct={}% {}".format(_p29cl_asset, _p29cl_dir, int(_cs_score), _p29cl_conf, _cs_ptb_pct, _c1_cpct, "+".join(_cs_tags[:6])))
 
 
                         
@@ -2065,9 +1974,9 @@ def _bot2_sniper_thread():
                         _p29cl_stake = round(_p29cl_base_stake * _p29cl_mult, 2)
                         _p29cl_stake = max(2.50, _p29cl_stake)  # Polymarket minimum
                         
-                        # v10: cap stake at base when signals are weak
-                        if _signal_strength <= 2 and _p29cl_stake > 2.50:
-                            _p29cl_stake = 2.50; _cs_tags.append("STAKE_CAP_WEAK")
+                        # v11: cap stake when confidence is low
+                        if _v11_conf <= 1 and _p29cl_stake > 2.50:
+                            _p29cl_stake = 2.50; _cs_tags.append("STAKE_CAP_LOW")
                         if _1h_momentum == "DEAD" and _p29cl_stake > 2.50:
                             _p29cl_stake = 2.50; _cs_tags.append("STAKE_CAP_1H_DEAD")
                         
