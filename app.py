@@ -2444,6 +2444,7 @@ def _bot2_sniper_thread():
                                 
                                 # FINAL engine already filtered conf<2 — trade what paper trades
                                 # Flat $2.50 stake, conf=3 gets $3.75 (1.5x)
+                                _p29l_base = _p29cl_live_state["base_stake"]
                                 _p29l_conf_val = _p29l_t.get("v11_conf", 2)
                                 _p29l_mult_final = 1.5 if _p29l_conf_val >= 3 else 1.0
                                 
