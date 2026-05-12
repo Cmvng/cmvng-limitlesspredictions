@@ -473,7 +473,9 @@ def _p29cl_save_engine_state():
             state_json = json.dumps({
                 "mem": {str(k): v for k, v in engine.mem.items()},
                 "n": engine.n,
-                "rule_history": dict(engine.rule_history),
+                "rule_cum": {k: v for k, v in engine.rule_cum.items()},
+                "rule_window": {k: v for k, v in engine.rule_window.items()},
+                "rule_recent6": {k: v for k, v in engine.rule_recent6.items()},
                 "skip_rules": list(engine.skip_rules),
                 "flip_rules": list(engine.flip_rules),
                 "boost_rules": list(engine.boost_rules),
@@ -507,9 +509,15 @@ def _p29cl_load_engine_state():
                         engine.mem[key] = v
                     except: pass
                 engine.n = state.get("n", 0)
-                engine.rule_history = defaultdict(lambda: {"w":0,"l":0,"recent":[]})
-                for k, v in state.get("rule_history", {}).items():
-                    engine.rule_history[k] = v
+                engine.rule_cum = defaultdict(lambda: {"w":0,"l":0})
+                for k, v in state.get("rule_cum", {}).items():
+                    engine.rule_cum[k] = v
+                engine.rule_window = defaultdict(list)
+                for k, v in state.get("rule_window", {}).items():
+                    engine.rule_window[k] = v
+                engine.rule_recent6 = defaultdict(list)
+                for k, v in state.get("rule_recent6", {}).items():
+                    engine.rule_recent6[k] = v
                 engine.skip_rules = set(state.get("skip_rules", []))
                 engine.flip_rules = set(state.get("flip_rules", []))
                 engine.boost_rules = set(state.get("boost_rules", []))
