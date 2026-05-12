@@ -2575,13 +2575,13 @@ def _bot2_sniper_thread():
                                     _p29l_mult_final = 1.0
                                 
                                 _p29l_stake = round(_p29l_base * _p29l_mult_final, 2)
-                                _p29l_stake = max(2.50, _p29l_stake)
+                                _p29l_stake = max(3.00, _p29l_stake)
                                 _p29l_stake = min(_p29l_stake, _p29cl_live_state["max_stake"])
                                 
                                 # Per-boundary cap
                                 if _p29l_boundary_spent + _p29l_stake > _p29cl_live_state["max_per_boundary"]:
-                                    _p29l_stake = max(2.50, round(_p29cl_live_state["max_per_boundary"] - _p29l_boundary_spent, 2))
-                                    if _p29l_stake < 2.50:
+                                    _p29l_stake = max(3.00, round(_p29cl_live_state["max_per_boundary"] - _p29l_boundary_spent, 2))
+                                    if _p29l_stake < 3.00:
                                         continue
                                 
                                 # Balance check
