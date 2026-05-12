@@ -419,6 +419,82 @@ for _ea in ["BTC", "ETH", "SOL", "XRP", "DOGE", "BNB"]:
     )
 print("P29CL FINAL engines initialized: " + ", ".join(_p29cl_engines.keys()))
 
+# Prediction storage for self-learning: keyed by (asset, boundary_ts)
+# This survives across boundaries so learn() can match predictions to outcomes
+_p29cl_predictions = {}  # {(asset, boundary_ts): {features, rule, side, conf}}
+
+# Persist engine state to DB (survives deploys)
+def _p29cl_save_engine_state():
+    """Save all engine states to database."""
+    try:
+        import json
+        db = get_db()
+        for asset, engine in _p29cl_engines.items():
+            state_json = json.dumps({
+                "mem": {str(k): v for k, v in engine.mem.items()},
+                "n": engine.n,
+                "rule_history": dict(engine.rule_history),
+                "skip_rules": list(engine.skip_rules),
+                "flip_rules": list(engine.flip_rules),
+                "boost_rules": list(engine.boost_rules),
+                "demote_rules": list(getattr(engine, 'demote_rules', set())),
+                "learns": engine.learns,
+            })
+            db.run("""INSERT INTO bot_state (bot_name, json_state) VALUES (:bn, :js)
+                      ON CONFLICT(bot_name) DO UPDATE SET json_state=:js""",
+                   bn="p29cl_engine_{}".format(asset.lower()), js=state_json)
+        db.close()
+    except Exception as e:
+        print("P29CL state save error: {}".format(e))
+
+def _p29cl_load_engine_state():
+    """Load engine states from database on startup."""
+    loaded = 0
+    try:
+        import json
+        db = get_db()
+        for asset, engine in _p29cl_engines.items():
+            row = db.run("SELECT json_state FROM bot_state WHERE bot_name=:bn",
+                        bn="p29cl_engine_{}".format(asset.lower()))
+            if row and len(row) > 0:
+                state = json.loads(row[0]["json_state"])
+                # Restore memory
+                engine.mem = defaultdict(lambda: {"UP":0,"DOWN":0})
+                for k, v in state.get("mem", {}).items():
+                    try:
+                        key = eval(k) if k.startswith("(") else k
+                        engine.mem[key] = v
+                    except: pass
+                engine.n = state.get("n", 0)
+                engine.rule_history = defaultdict(lambda: {"w":0,"l":0,"recent":[]})
+                for k, v in state.get("rule_history", {}).items():
+                    engine.rule_history[k] = v
+                engine.skip_rules = set(state.get("skip_rules", []))
+                engine.flip_rules = set(state.get("flip_rules", []))
+                engine.boost_rules = set(state.get("boost_rules", []))
+                if hasattr(engine, 'demote_rules'):
+                    engine.demote_rules = set(state.get("demote_rules", []))
+                engine.learns = state.get("learns", 0)
+                loaded += 1
+                print("P29CL engine {} restored: {} trades, {} memory entries, {} learns".format(
+                    asset, engine.n, len(engine.mem), engine.learns))
+        db.close()
+    except Exception as e:
+        print("P29CL state load error: {}".format(e))
+    return loaded
+
+# Try loading state from DB on startup
+try:
+    _p29cl_engine_loaded = _p29cl_load_engine_state()
+    if _p29cl_engine_loaded > 0:
+        print("P29CL: restored {} engine states from DB".format(_p29cl_engine_loaded))
+    else:
+        print("P29CL: no saved engine state in DB — starting fresh")
+except:
+    print("P29CL: DB state load failed — starting fresh")
+
+
+
 
 
 app = Flask(__name__)
@@ -1551,6 +1627,11 @@ def _bot2_sniper_thread():
                                 "slug": slug,
                                 "title": md.get("question", slug),
                             }
+                            print("P29CL TOKEN OK {}: slug={} tokens={}".format(asset, slug, tokens[:2]))
+                        else:
+                            print("P29CL TOKEN MISS {}: slug={} tokens={} outcomes={}".format(asset, slug, tokens, outcomes))
+                    else:
+                        print("P29CL TOKEN MISS {}: slug={} status={}".format(asset, slug, r.status_code))
                 except Exception as e:
                     print("P29CL token fetch error {}: {}".format(asset, e))
             
@@ -2264,6 +2345,14 @@ def _bot2_sniper_thread():
                                 _cs_cpct = _c1_cpct
                                 _cs_uwick = _c1_uwick
                                 
+                                # Store prediction for self-learning (keyed by asset+boundary)
+                                _p29cl_predictions[(_p29cl_asset, _p29cl_key)] = {
+                                    "features": _v11_result.get("features", {}),
+                                    "rule": _v11_result.get("rule", ""),
+                                    "side": _p29cl_dir,
+                                    "confidence": _v11_result.get("confidence", 0),
+                                }
+                                
                                 print("P29CL FINAL: {} {} conf={} rule={} zone={} ptb={}% | {}".format(
                                     _p29cl_asset, _p29cl_dir, _v11_result["confidence"],
                                     _v11_result["rule"], _v11_result["ptb_zone"],
@@ -2425,6 +2514,9 @@ def _bot2_sniper_thread():
                                     _p29l_entry = token_map.get(_p29l_asset, {})
                                 _p29l_token = _p29l_entry.get("up_token" if _p29l_dir == "UP" else "down_token", "")
                                 if not _p29l_token:
+                                    print("P29CL LIVE SKIP {}: no {} token found (entry={})".format(
+                                        _p29l_asset, "up" if _p29l_dir == "UP" else "down",
+                                        "p29cl_map" if _p29cl_token_map.get(_p29l_asset) else "token_map" if token_map.get(_p29l_asset) else "NONE"))
                                     continue
                                 
                                 # FINAL engine already filtered conf<2 — trade what paper trades
@@ -5900,6 +5992,14 @@ def init_db():
             peak_balance REAL DEFAULT 20.0,
             enabled BOOLEAN DEFAULT TRUE,
             updated_at TEXT
+        )
+    """)
+    # P29CL engine state persistence (self-learning memory)
+    conn.run("""
+        CREATE TABLE IF NOT EXISTS bot_state (
+            bot_name TEXT PRIMARY KEY,
+            json_state TEXT,
+            updated_at TEXT DEFAULT CURRENT_TIMESTAMP
         )
     """)
     conn.run("""
@@ -23578,15 +23678,45 @@ def _resolve_p29cl_trades():
                     _p29cl_state["peak_balance"] = _p29cl_state["balance"]
                 _pnl = "+${:.2f}".format(payout - stake) if won else "-${:.2f}".format(stake)
                 
-                # Feed outcome to V11 engine for learning
+                # Feed outcome to FINAL engine for self-learning
                 try:
                     _learn_asset = p.get("asset", "BTC")
                     _learn_engine = _p29cl_engines.get(_learn_asset)
-                    if _learn_engine and _learn_engine.last_prediction:
-                        _learn_actual = "UP" if won else "DOWN"
+                    _learn_key = (_learn_asset, p.get("market_id", ""))
+                    _learn_pred = _p29cl_predictions.get(_learn_key)
+                    
+                    if _learn_engine and _learn_pred:
+                        # FIX 3: Determine actual candle direction from bet outcome
+                        # If bet was UP and won → candle went UP
+                        # If bet was UP and lost → candle went DOWN
+                        # If bet was DOWN and won → candle went DOWN
+                        # If bet was DOWN and lost → candle went UP
+                        _learn_bet_side = p.get("bet_side", _learn_pred["side"])
+                        if won:
+                            _learn_actual = _learn_bet_side  # bet was correct
+                        else:
+                            _learn_actual = "DOWN" if _learn_bet_side == "UP" else "UP"
+                        
+                        # Temporarily set last_prediction to the stored one
+                        _learn_engine.last_prediction = _learn_pred
                         _learn_engine.learn(_learn_actual)
+                        
+                        # Clean up stored prediction
+                        _p29cl_predictions.pop(_learn_key, None)
+                        
+                        # Save engine state to DB after learning
+                        _p29cl_save_engine_state()
+                        
+                        print("P29CL LEARN: {} {} rule={} actual={} correct={}".format(
+                            _learn_asset, _learn_pred["side"], _learn_pred["rule"],
+                            _learn_actual, _learn_pred["side"] == _learn_actual))
+                    elif _learn_engine:
+                        # No stored prediction — try to derive direction anyway
+                        _learn_bet_side = p.get("bet_side", "UP")
+                        _learn_actual = _learn_bet_side if won else ("DOWN" if _learn_bet_side == "UP" else "UP")
+                        print("P29CL LEARN (no stored pred): {} actual={}".format(_learn_asset, _learn_actual))
                 except Exception as _le:
-                    pass  # don't let learn errors block resolution
+                    print("P29CL LEARN error {}: {}".format(p.get("asset","?"), _le))
                 
                 print("P29CL #{} {}: {} | pool=${:.2f}".format(p["id"], "WIN" if won else "LOSS", _pnl, _p29cl_state["balance"]))
                 _save_bot_balance("p29cl", _p29cl_state)
