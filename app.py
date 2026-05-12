@@ -1940,6 +1940,7 @@ def _bot2_sniper_thread():
                 _p29cl_paper_spent = 0.0
                 _p29cl_boundary_trades = []
                 _p29cl_boundary_dir = None
+                _p29cl_instant_live_queue = []  # live orders fire as each signal is decided
                 
                 # Ensure phase state variables are read from global scope
                 global _p29cl_last_boundary_dominant_dir, _p29cl_is_majority_flip
@@ -2541,6 +2542,24 @@ def _bot2_sniper_thread():
                             "cs_score": _cs_score, "v11_conf": _v11_conf,
                         })
                         
+                        # ── FIRE LIVE ORDER IMMEDIATELY ──
+                        # Don't wait for all paper trades — fire as each signal is decided
+                        if _p29cl_live_state.get("enabled") and not _p29cl_skip_boundary:
+                            _p29l_live_key = "p29cl_live_{}_{}".format(_p29cl_asset, window_ts)
+                            if _p29l_live_key not in _p29cl_live_traded and _p29cl_asset in ("BTC", "ETH", "SOL", "XRP", "DOGE", "BNB", "HYPE"):
+                                _p29l_entry_now = _p29cl_token_map.get(_p29cl_asset, {})
+                                if not _p29l_entry_now:
+                                    _p29l_entry_now = token_map.get(_p29cl_asset, {})
+                                _p29l_token_now = _p29l_entry_now.get("up_token" if _p29cl_dir == "UP" else "down_token", "")
+                                if _p29l_token_now:
+                                    _p29l_trade_data = {
+                                        "asset": _p29cl_asset, "dir": _p29cl_dir, "key": _p29cl_key,
+                                        "v11_conf": _v11_conf, "tag": _p29cl_tag,
+                                        "token": _p29l_token_now, "entry": _p29l_entry_now,
+                                        "live_key": _p29l_live_key,
+                                    }
+                                    _p29cl_instant_live_queue.append(_p29l_trade_data)
+                        
                         # Save to DB
                         try:
                             _p29cl_db = get_db()
@@ -2600,76 +2619,55 @@ def _bot2_sniper_thread():
                 print("P29CL error: {}".format(_p29cl_err))
                 traceback.print_exc()
 
-            # ── P2.9CL LIVE: Real orders using same signals as paper ──
+            # ── P2.9CL LIVE: Fire orders from instant queue (signals already collected during scoring) ──
             try:
-                if _p29cl_live_state["enabled"] and _p29cl_boundary_trades:
+                if _p29cl_live_state["enabled"] and _p29cl_instant_live_queue:
                     _p29l_count = 0
                     _p29l_boundary_spent = 0.0
                     
-                    # FIX 4: Correlation check — if all assets same direction, reduce confidence
-                    _p29l_dirs = set(t["dir"] for t in _p29cl_boundary_trades)
-                    _p29l_correlated = len(_p29l_dirs) == 1 and len(_p29cl_boundary_trades) >= 4
-                    if _p29l_correlated:
-                        print("P29CL LIVE WARNING: all {} trades same direction ({}) — correlation penalty active".format(
-                            len(_p29cl_boundary_trades), list(_p29l_dirs)[0]))
-                    
                     # ── CRASH FILTER: throttle during correlated dumps ──
                     _cf_items = []
-                    for _cf_t in _p29cl_boundary_trades:
-                        _cf_asset = _cf_t["asset"]
-                        _cf_v11 = _p29cl_engines.get(_cf_asset)
-                        _cf_result = {"confidence": _cf_t.get("v11_conf", 2), "rule": _cf_t.get("tag", ""), "ptb_zone": "VLOW" if _cf_t.get("tag", "").startswith("CS_UP_R_") and "BELOW_LOW" in _cf_t.get("tag", "") else "MID", "ptb_pct": 0, "side": _cf_t["dir"]}
-                        # Try to get actual ptb_zone from the last v11 result
-                        _cf_pred = _p29cl_predictions.get((_cf_asset, _cf_t.get("key", "")))
+                    for _cf_t in _p29cl_instant_live_queue:
+                        _cf_result = {"confidence": _cf_t.get("v11_conf", 2), "rule": _cf_t.get("tag", ""), "ptb_zone": "MID", "ptb_pct": 0, "side": _cf_t["dir"]}
+                        _cf_pred = _p29cl_predictions.get((_cf_t["asset"], _cf_t.get("key", "")))
                         if _cf_pred:
                             _cf_result["ptb_zone"] = _cf_pred.get("features", {}).get("zone", "MID")
                             _cf_result["ptb_pct"] = _cf_pred.get("features", {}).get("ptb", 0)
-                        _cf_items.append({"asset": _cf_asset, "result": _cf_result, "decision": {"trade": True, "side": _cf_t["dir"]}, "trade_data": _cf_t})
+                        _cf_items.append({"asset": _cf_t["asset"], "result": _cf_result, "decision": {"trade": True, "side": _cf_t["dir"]}, "trade_data": _cf_t})
                     
                     _cf_filtered, _cf_log = _crash_filter.filter_boundary(_cf_items)
                     if _cf_log:
                         print("P29CL CRASH FILTER: {}".format(_cf_log))
                     
-                    # Only keep trades that passed the filter
-                    _p29cl_boundary_trades_filtered = [item["trade_data"] for item in _cf_filtered if item["decision"]["trade"]]
-                    _p29cl_blocked = len(_p29cl_boundary_trades) - len(_p29cl_boundary_trades_filtered)
+                    _p29cl_live_queue_filtered = [item["trade_data"] for item in _cf_filtered if item["decision"]["trade"]]
+                    _p29cl_blocked = len(_p29cl_instant_live_queue) - len(_p29cl_live_queue_filtered)
                     if _p29cl_blocked > 0:
-                        print("P29CL FILTER: {} of {} trades blocked".format(_p29cl_blocked, len(_p29cl_boundary_trades)))
+                        print("P29CL FILTER: {} of {} trades blocked".format(_p29cl_blocked, len(_p29cl_instant_live_queue)))
                     
-                    # Check stop loss
                     if _p29cl_live_state["balance"] <= _p29cl_live_state["floor_balance"]:
                         _p29cl_live_state["enabled"] = False
                         print("P29CL LIVE STOPPED: balance ${:.2f} hit floor ${:.2f}".format(
                             _p29cl_live_state["balance"], _p29cl_live_state["floor_balance"]))
                     else:
-                        # ═══ PARALLEL ORDER: all assets fire simultaneously ═══
+                        # ═══ PARALLEL ORDER: all assets fire simultaneously at 50c ═══
                         from py_clob_client_v2 import Side as _P29LSide, OrderArgs as _P29LArgs, OrderType as _P29LOT
                         _p29l_client = _get_poly_client()
                         _p29l_max_price = 0.50
-                        _p29l_count = 0
-                        _p29l_results = []  # collect results from threads
+                        _p29l_results = []
                         _p29l_lock = threading.Lock()
                         
-                        def _p29l_place_order(_t, _stake, _token, _entry, _key):
+                        def _p29l_place_order(_td, _stake):
                             """Place one order — runs in its own thread."""
-                            _asset = _t["asset"]
-                            _dir = _t["dir"]
-                            _conf_val = _t.get("v11_conf", 2)
+                            _asset = _td["asset"]
+                            _dir = _td["dir"]
+                            _token = _td["token"]
+                            _conf_val = _td.get("v11_conf", 2)
                             _price = _p29l_max_price
                             _oid = None
                             _filled = False
                             
                             try:
-                                # Flat 50c — maximum edge, fair price on binary market
-                                _price = _p29l_max_price
-                                
-                                # Ensure token count >= 5
                                 _shares = round(_stake / _price, 4)
-                                if _shares < 5:
-                                    _price = round(_stake / 5.0, 2)
-                                    _shares = round(_stake / _price, 4)
-                                
-                                # Place order
                                 if _p29l_client:
                                     _args = _P29LArgs(token_id=str(_token), price=_price, size=_shares, side=_P29LSide.BUY)
                                     _signed = _p29l_client.create_order(_args)
@@ -2684,57 +2682,36 @@ def _bot2_sniper_thread():
                             
                             with _p29l_lock:
                                 _p29l_results.append({
-                                    "asset": _asset, "dir": _dir, "key": _key,
+                                    "asset": _asset, "dir": _dir, "key": _td["live_key"],
                                     "stake": _stake, "price": _price, "token": _token,
                                     "oid": _oid, "filled": _filled, "conf_val": _conf_val,
-                                    "tag": _t.get("tag", "FINAL"), "mult": 1.0, "entry": _entry,
+                                    "tag": _td.get("tag", "FINAL"), "mult": 1.0, "entry": _td["entry"],
                                 })
                         
-                        # Prep all trades and launch threads
+                        # Launch all threads simultaneously
                         _p29l_threads = []
-                        for _p29l_t in _p29cl_boundary_trades_filtered:
+                        for _p29l_td in _p29cl_live_queue_filtered:
                             try:
-                                _p29l_asset = _p29l_t["asset"]
-                                _p29l_dir = _p29l_t["dir"]
-                                _p29l_key = "p29cl_live_{}_{}".format(_p29l_asset, window_ts)
-                                
-                                if _p29l_key in _p29cl_live_traded:
-                                    continue
-                                if _p29l_asset not in ("BTC", "ETH", "SOL", "XRP", "DOGE", "BNB", "HYPE"):
+                                if _p29l_td["live_key"] in _p29cl_live_traded:
                                     continue
                                 
-                                _p29l_entry = _p29cl_token_map.get(_p29l_asset, {})
-                                if not _p29l_entry:
-                                    _p29l_entry = token_map.get(_p29l_asset, {})
-                                _p29l_token = _p29l_entry.get("up_token" if _p29l_dir == "UP" else "down_token", "")
-                                if not _p29l_token:
-                                    continue
-                                
-                                _p29l_base = _p29cl_live_state["base_stake"]
-                                _p29l_mult_final = 1.0
-                                _p29l_stake = round(_p29l_base * _p29l_mult_final, 2)
-                                _p29l_stake = max(3.00, _p29l_stake)
+                                _p29l_stake = max(3.00, round(_p29cl_live_state["base_stake"], 2))
                                 _p29l_stake = min(_p29l_stake, _p29cl_live_state["max_stake"])
                                 
                                 if _p29l_boundary_spent + _p29l_stake > _p29cl_live_state["max_per_boundary"]:
-                                    _p29l_stake = max(3.00, round(_p29cl_live_state["max_per_boundary"] - _p29l_boundary_spent, 2))
-                                    if _p29l_stake < 3.00:
-                                        continue
+                                    continue
                                 if _p29l_stake > _p29cl_live_state["balance"] - _p29cl_live_state["floor_balance"]:
                                     continue
                                 
-                                # Reserve balance before firing thread
                                 _p29l_boundary_spent += _p29l_stake
                                 
-                                _th = threading.Thread(target=_p29l_place_order,
-                                    args=(_p29l_t, _p29l_stake, _p29l_token, _p29l_entry, _p29l_key),
-                                    daemon=True)
+                                _th = threading.Thread(target=_p29l_place_order, args=(_p29l_td, _p29l_stake), daemon=True)
                                 _th.start()
                                 _p29l_threads.append(_th)
                             except Exception as _p29l_prep_e:
-                                print("P29CL LIVE prep error {}: {}".format(_p29l_t.get("asset","?"), _p29l_prep_e))
+                                print("P29CL LIVE prep error: {}".format(_p29l_prep_e))
                         
-                        # Wait for all orders to complete (max 5 seconds)
+                        # Wait for all (max 5 seconds)
                         for _th in _p29l_threads:
                             _th.join(timeout=5)
                         
