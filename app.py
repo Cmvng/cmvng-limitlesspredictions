@@ -484,14 +484,8 @@ def _p29cl_load_engine_state():
     return loaded
 
 # Try loading state from DB on startup
-try:
-    _p29cl_engine_loaded = _p29cl_load_engine_state()
-    if _p29cl_engine_loaded > 0:
-        print("P29CL: restored {} engine states from DB".format(_p29cl_engine_loaded))
-    else:
-        print("P29CL: no saved engine state in DB — starting fresh")
-except:
-    print("P29CL: DB state load failed — starting fresh")
+# P29CL engine state will be loaded after DB init (see below)
+print("P29CL: engine state will load after DB init")
 
 
 
@@ -2345,14 +2339,6 @@ def _bot2_sniper_thread():
                                 _cs_cpct = _c1_cpct
                                 _cs_uwick = _c1_uwick
                                 
-                                # Store prediction for self-learning (keyed by asset+boundary)
-                                _p29cl_predictions[(_p29cl_asset, _p29cl_key)] = {
-                                    "features": _v11_result.get("features", {}),
-                                    "rule": _v11_result.get("rule", ""),
-                                    "side": _p29cl_dir,
-                                    "confidence": _v11_result.get("confidence", 0),
-                                }
-                                
                                 print("P29CL FINAL: {} {} conf={} rule={} zone={} ptb={}% | {}".format(
                                     _p29cl_asset, _p29cl_dir, _v11_result["confidence"],
                                     _v11_result["rule"], _v11_result["ptb_zone"],
@@ -2372,6 +2358,15 @@ def _bot2_sniper_thread():
                         
                         # Dedup — check both in-memory set and DB
                         _p29cl_key = "p29cl_{}_{}".format(_p29cl_asset, window_ts)
+                        
+                        # Store prediction for self-learning (keyed by asset+boundary)
+                        _p29cl_predictions[(_p29cl_asset, _p29cl_key)] = {
+                            "features": _v11_result.get("features", {}),
+                            "rule": _v11_result.get("rule", ""),
+                            "side": _p29cl_dir,
+                            "confidence": _v11_result.get("confidence", 0),
+                        }
+                        
                         if _p29cl_key in _p29cl_traded:
                             continue
                         # Also check DB to prevent cross-restart duplicates
@@ -6678,6 +6673,16 @@ def init_db():
     """)
     conn.close()
     print("DB initialized OK")
+
+# Load P29CL engine state from DB (now that DB is available)
+try:
+    _p29cl_engine_loaded = _p29cl_load_engine_state()
+    if _p29cl_engine_loaded > 0:
+        print("P29CL: restored {} engine states from DB".format(_p29cl_engine_loaded))
+    else:
+        print("P29CL: no saved engine state in DB — starting fresh")
+except Exception as _load_err:
+    print("P29CL: DB state load failed — starting fresh: {}".format(_load_err))
 
 # ═══════════════════════════════════════════════════════════
 # TELEGRAM
