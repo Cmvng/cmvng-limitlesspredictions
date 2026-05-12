@@ -452,7 +452,8 @@ def _p29cl_load_predictions():
                     bn="p29cl_predictions")
         db.close()
         if row and len(row) > 0:
-            raw = json.loads(row[0]["json_state"])
+            _raw_val = row[0]["json_state"] if isinstance(row[0], dict) else row[0][0]
+            raw = json.loads(_raw_val)
             for k, v in raw.items():
                 try:
                     key = eval(k) if k.startswith("(") else k
@@ -496,7 +497,8 @@ def _p29cl_load_engine_state():
             row = db.run("SELECT json_state FROM bot_state WHERE bot_name=:bn",
                         bn="p29cl_engine_{}".format(asset.lower()))
             if row and len(row) > 0:
-                state = json.loads(row[0]["json_state"])
+                _raw_val = row[0]["json_state"] if isinstance(row[0], dict) else row[0][0]
+                state = json.loads(_raw_val)
                 # Restore memory
                 engine.mem = defaultdict(lambda: {"UP":0,"DOWN":0})
                 for k, v in state.get("mem", {}).items():
@@ -2651,9 +2653,9 @@ def _bot2_sniper_thread():
                             for _p29l_p in _p29l_unfilled:
                                 try:
                                     if _p29l_p["oid"] and _p29l_client:
-                                        # Use Polymarket client's native cancel method
+                                        # Use Polymarket client's native cancel_order method
                                         try:
-                                            _cancel_resp = _p29l_client.cancel(_p29l_p["oid"])
+                                            _cancel_resp = _p29l_client.cancel_order(_p29l_p["oid"])
                                             print("P29CL SWEEP cancel {}: {}".format(_p29l_p["asset"], _cancel_resp))
                                         except Exception as _ce:
                                             _ce_msg = str(_ce).lower()
