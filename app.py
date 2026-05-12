@@ -2650,12 +2650,21 @@ def _bot2_sniper_thread():
                             
                             for _p29l_p in _p29l_unfilled:
                                 try:
-                                    if _p29l_p["oid"]:
-                                        _cr = _cancel_order(_p29l_p["oid"])
-                                        if _cr == "FILLED":
-                                            _p29l_p["filled"] = True
-                                            print("P29CL SWEEP P{} {} filled on cancel".format(_p29l_phase, _p29l_p["asset"]))
-                                            continue
+                                    if _p29l_p["oid"] and _p29l_client:
+                                        # Use Polymarket client's native cancel method
+                                        try:
+                                            _cancel_resp = _p29l_client.cancel(_p29l_p["oid"])
+                                            print("P29CL SWEEP cancel {}: {}".format(_p29l_p["asset"], _cancel_resp))
+                                        except Exception as _ce:
+                                            _ce_msg = str(_ce).lower()
+                                            # If cancel fails with "not found" or "already" — order was filled or expired
+                                            if "not found" in _ce_msg or "already" in _ce_msg or "filled" in _ce_msg:
+                                                _p29l_p["filled"] = True
+                                                print("P29CL SWEEP P{} {} filled (cancel rejected: {})".format(
+                                                    _p29l_phase, _p29l_p["asset"], str(_ce)[:80]))
+                                                continue
+                                            else:
+                                                print("P29CL SWEEP cancel {} error: {}".format(_p29l_p["asset"], _ce))
                                     
                                     _p29l_price = _p29l_max_price
                                     if _p29l_phase == 2 and _p29l_client:
@@ -8292,10 +8301,14 @@ def _cancel_order(order_id):
             print("Order {} cancelled OK".format(order_id[:12]))
             return True
         elif r.status_code == 400:
-            # 400 usually means order already filled or already cancelled
-            body = r.text[:100] if r.text else ""
-            print("Cancel {} returned 400: {} — likely already filled/cancelled".format(order_id[:12], body))
-            return "FILLED"
+            body = r.text[:200] if r.text else ""
+            # Distinguish between "already filled/cancelled" and "bad request" (wrong ID format)
+            if "UUIDv4" in body or "must be" in body or "invalid" in body.lower():
+                print("Cancel {} BAD REQUEST: {}".format(order_id[:12], body[:100]))
+                return False  # bad ID format, NOT filled
+            else:
+                print("Cancel {} returned 400: {} — likely already filled/cancelled".format(order_id[:12], body[:100]))
+                return "FILLED"
         else:
             print("Cancel {} HTTP {}".format(order_id[:12], r.status_code))
             return False
