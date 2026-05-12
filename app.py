@@ -2645,7 +2645,7 @@ def _bot2_sniper_thread():
                         # ═══ PARALLEL ORDER: all assets fire simultaneously ═══
                         from py_clob_client_v2 import Side as _P29LSide, OrderArgs as _P29LArgs, OrderType as _P29LOT
                         _p29l_client = _get_poly_client()
-                        _p29l_max_price = 0.53
+                        _p29l_max_price = 0.50
                         _p29l_count = 0
                         _p29l_results = []  # collect results from threads
                         _p29l_lock = threading.Lock()
@@ -2660,16 +2660,8 @@ def _bot2_sniper_thread():
                             _filled = False
                             
                             try:
-                                # Check best ask
-                                try:
-                                    if _p29l_client:
-                                        _best = _p29l_client.get_price(str(_token), side="BUY")
-                                        if _best:
-                                            _bp = float(_best.get("price", _p29l_max_price) if isinstance(_best, dict) else _best)
-                                            if _bp <= _p29l_max_price:
-                                                _price = _bp
-                                except:
-                                    pass
+                                # Flat 50c — maximum edge, fair price on binary market
+                                _price = _p29l_max_price
                                 
                                 # Ensure token count >= 5
                                 _shares = round(_stake / _price, 4)
