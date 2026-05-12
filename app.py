@@ -24003,8 +24003,12 @@ def _resolve_p29cl_live_trades():
                 try:
                     _learn_asset = p.get("asset", "BTC")
                     _learn_engine = _p29cl_engines.get(_learn_asset)
-                    _learn_key = (_learn_asset, p.get("market_id", ""))
-                    _learn_pred = _p29cl_predictions.get(_learn_key)
+                    _learn_mid = p.get("market_id", "")
+                    # Predictions stored under paper key format, not live key
+                    _learn_paper_mid = _learn_mid.replace("p29cl_live_", "p29cl_") if "p29cl_live_" in _learn_mid else _learn_mid
+                    _learn_key = (_learn_asset, _learn_mid)
+                    _learn_key_paper = (_learn_asset, _learn_paper_mid)
+                    _learn_pred = _p29cl_predictions.get(_learn_key) or _p29cl_predictions.get(_learn_key_paper)
                     if _learn_engine and _learn_pred:
                         _learn_bet_side = p.get("bet_side", _learn_pred["side"])
                         if won:
@@ -24014,6 +24018,7 @@ def _resolve_p29cl_live_trades():
                         _learn_engine.last_prediction = _learn_pred
                         _learn_engine.learn(_learn_actual)
                         _p29cl_predictions.pop(_learn_key, None)
+                        _p29cl_predictions.pop(_learn_key_paper, None)
                         _p29cl_save_engine_state()
                         _p29cl_save_predictions()
                         _learn_zone = _learn_pred.get("features", {}).get("zone", "MID")
