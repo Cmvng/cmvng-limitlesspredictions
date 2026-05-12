@@ -2542,16 +2542,12 @@ def _bot2_sniper_thread():
                         print("P29CL LIVE STOPPED: balance ${:.2f} hit floor ${:.2f}".format(
                             _p29cl_live_state["balance"], _p29cl_live_state["floor_balance"]))
                     else:
-                        # ═══ BATCH SMART ORDER SWEEP ═══
-                        # Phase 1: Fire all first attempts at best ask (≤53c)
-                        # Phase 2: Wait 10s, retry unfilled at new best ask
-                        # Phase 3: Wait 10s, place ceiling 53c on remaining
+                        # ═══ SIMPLE ORDER: check best ask, match or GTC at 53c ═══
                         from py_clob_client_v2 import Side as _P29LSide, OrderArgs as _P29LArgs, OrderType as _P29LOT
                         _p29l_client = _get_poly_client()
                         _p29l_max_price = 0.53
-                        _p29l_pending = []  # tracks all order attempts
+                        _p29l_count = 0
                         
-                        # ── Phase 1: First attempt for all assets ──
                         for _p29l_t in _p29cl_boundary_trades:
                             try:
                                 _p29l_asset = _p29l_t["asset"]
@@ -2572,11 +2568,10 @@ def _bot2_sniper_thread():
                                     print("P29CL LIVE SKIP {}: no token".format(_p29l_asset))
                                     continue
                                 
+                                # Calculate stake
                                 _p29l_base = _p29cl_live_state["base_stake"]
                                 _p29l_conf_val = _p29l_t.get("v11_conf", 2)
                                 _p29l_mult_final = 1.0
-                                if _p29l_correlated:
-                                    _p29l_mult_final = 1.0
                                 
                                 _p29l_stake = round(_p29l_base * _p29l_mult_final, 2)
                                 _p29l_stake = max(3.00, _p29l_stake)
@@ -2590,10 +2585,7 @@ def _bot2_sniper_thread():
                                 if _p29l_stake > _p29cl_live_state["balance"] - _p29cl_live_state["floor_balance"]:
                                     continue
                                 
-                                # Reserve balance immediately
-                                _p29l_boundary_spent += _p29l_stake
-                                
-                                # Get best ask
+                                # Check best ask — match if cheap, otherwise 53c ceiling
                                 _p29l_price = _p29l_max_price
                                 try:
                                     if _p29l_client:
@@ -2611,7 +2603,7 @@ def _bot2_sniper_thread():
                                     _p29l_price = round(_p29l_stake / 5.0, 2)
                                     _p29l_shares = round(_p29l_stake / _p29l_price, 4)
                                 
-                                # Place order
+                                # Place ONE order — that's it
                                 _p29l_oid = None
                                 _p29l_filled = False
                                 try:
@@ -2624,96 +2616,21 @@ def _bot2_sniper_thread():
                                             _p29l_status = (_p29l_resp.get("status") or "").upper()
                                             _p29l_matched = float(_p29l_resp.get("sizeMatched") or 0)
                                             _p29l_filled = _p29l_status in ("MATCHED", "FILLED") or _p29l_matched > 0
-                                except Exception as _p29l_pe:
-                                    print("P29CL SWEEP P1 {} error: {}".format(_p29l_asset, _p29l_pe))
+                                except Exception as _p29l_oe:
+                                    print("P29CL LIVE order error {}: {}".format(_p29l_asset, _p29l_oe))
                                 
-                                _p29l_pending.append({
-                                    "asset": _p29l_asset, "dir": _p29l_dir, "key": _p29l_key,
-                                    "token": _p29l_token, "stake": _p29l_stake, "price": _p29l_price,
-                                    "oid": _p29l_oid, "filled": _p29l_filled, "conf_val": _p29l_conf_val,
-                                    "tag": _p29l_t.get("tag", "FINAL"), "mult": _p29l_mult_final,
-                                    "entry": _p29l_entry,
-                                })
-                                
-                                _s = "FILLED@{}c".format(int(_p29l_price*100)) if _p29l_filled else "POSTED@{}c".format(int(_p29l_price*100))
-                                print("P29CL SWEEP P1 {}: {} {}".format(_p29l_asset, _p29l_dir, _s))
-                                
-                            except Exception as _p29l_e:
-                                print("P29CL SWEEP P1 error: {}".format(_p29l_e))
-                        
-                        # ── Phase 2 & 3: Retry unfilled ──
-                        import time as _time
-                        for _p29l_phase in (2, 3):
-                            _p29l_unfilled = [p for p in _p29l_pending if not p["filled"]]
-                            if not _p29l_unfilled:
-                                break
-                            
-                            _time.sleep(10)
-                            
-                            for _p29l_p in _p29l_unfilled:
-                                try:
-                                    if _p29l_p["oid"] and _p29l_client:
-                                        # Use Polymarket client's native cancel_order method
-                                        try:
-                                            _cancel_resp = _p29l_client.cancel_order(_p29l_p["oid"])
-                                            print("P29CL SWEEP cancel {}: {}".format(_p29l_p["asset"], _cancel_resp))
-                                        except Exception as _ce:
-                                            _ce_msg = str(_ce).lower()
-                                            # If cancel fails with "not found" or "already" — order was filled or expired
-                                            if "not found" in _ce_msg or "already" in _ce_msg or "filled" in _ce_msg:
-                                                _p29l_p["filled"] = True
-                                                print("P29CL SWEEP P{} {} filled (cancel rejected: {})".format(
-                                                    _p29l_phase, _p29l_p["asset"], str(_ce)[:80]))
-                                                continue
-                                            else:
-                                                print("P29CL SWEEP cancel {} error: {}".format(_p29l_p["asset"], _ce))
-                                    
-                                    _p29l_price = _p29l_max_price
-                                    if _p29l_phase == 2 and _p29l_client:
-                                        try:
-                                            _p29l_best = _p29l_client.get_price(str(_p29l_p["token"]), side="BUY")
-                                            if _p29l_best:
-                                                _p29l_bp = float(_p29l_best.get("price", _p29l_max_price) if isinstance(_p29l_best, dict) else _p29l_best)
-                                                if _p29l_bp <= _p29l_max_price:
-                                                    _p29l_price = _p29l_bp
-                                        except:
-                                            pass
-                                    
-                                    _p29l_shares = round(_p29l_p["stake"] / _p29l_price, 4)
-                                    if _p29l_shares < 5:
-                                        _p29l_price = round(_p29l_p["stake"] / 5.0, 2)
-                                        _p29l_shares = round(_p29l_p["stake"] / _p29l_price, 4)
-                                    
-                                    if _p29l_client:
-                                        _p29l_args = _P29LArgs(token_id=str(_p29l_p["token"]), price=_p29l_price, size=_p29l_shares, side=_P29LSide.BUY)
-                                        _p29l_signed = _p29l_client.create_order(_p29l_args)
-                                        _p29l_resp = _p29l_client.post_order(_p29l_signed, _P29LOT.GTC)
-                                        if _p29l_resp:
-                                            _p29l_p["oid"] = _p29l_resp.get("orderID") or _p29l_resp.get("id") or None
-                                            _p29l_status = (_p29l_resp.get("status") or "").upper()
-                                            _p29l_matched = float(_p29l_resp.get("sizeMatched") or 0)
-                                            _p29l_p["filled"] = _p29l_status in ("MATCHED", "FILLED") or _p29l_matched > 0
-                                    
-                                    _p29l_p["price"] = _p29l_price
-                                    _s = "FILLED@{}c".format(int(_p29l_price*100)) if _p29l_p["filled"] else "POSTED@{}c".format(int(_p29l_price*100))
-                                    print("P29CL SWEEP P{} {}: {} {}".format(_p29l_phase, _p29l_p["asset"], _p29l_p["dir"], _s))
-                                    
-                                except Exception as _p29l_re:
-                                    print("P29CL SWEEP P{} {} error: {}".format(_p29l_phase, _p29l_p["asset"], _p29l_re))
-                        
-                        # ── Record all trades ──
-                        _p29l_count = 0
-                        for _p29l_p in _p29l_pending:
-                            try:
-                                _p29cl_live_state["balance"] = round(_p29cl_live_state["balance"] - _p29l_p["stake"], 2)
+                                # Update balance
+                                _p29cl_live_state["balance"] = round(_p29cl_live_state["balance"] - _p29l_stake, 2)
                                 _p29cl_live_state["trades_today"] += 1
-                                _p29cl_live_traded.add(_p29l_p["key"])
+                                _p29cl_live_traded.add(_p29l_key)
+                                _p29l_boundary_spent += _p29l_stake
                                 if _p29cl_live_state["balance"] > _p29cl_live_state["peak_balance"]:
                                     _p29cl_live_state["peak_balance"] = _p29cl_live_state["balance"]
                                 
+                                # Save to DB
                                 try:
                                     _p29l_db = get_db()
-                                    _p29l_dist_prob, _p29l_dist_zone = _p29cl_calc_dist(_p29l_p["asset"], _chainlink_prices.get(_p29l_p["asset"], 0))
+                                    _p29l_dist_prob, _p29l_dist_zone = _p29cl_calc_dist(_p29l_asset, _chainlink_prices.get(_p29l_asset, 0))
                                     _p29l_db.run("""INSERT INTO p29cl_live_trades
                                         (market_id, title, asset, bet_side, stake, fill_price,
                                          pool_after, indicators, confidence, momentum_score,
@@ -2725,44 +2642,44 @@ def _bot2_sniper_thread():
                                                 :dp, :dz, :tier, :mult,
                                                 :oid, :tid, :cid, :slg, :fld,
                                                 'Pending', 'PENDING', :fa)""",
-                                        mid=_p29l_p["key"],
-                                        ttl="P29CL LIVE {} {} 15M".format(_p29l_p["asset"], _p29l_p["dir"]),
-                                        ast=_p29l_p["asset"], bs=_p29l_p["dir"], stk=_p29l_p["stake"],
-                                        fp=_p29l_p["price"],
+                                        mid=_p29l_key,
+                                        ttl="P29CL LIVE {} {} 15M".format(_p29l_asset, _p29l_dir),
+                                        ast=_p29l_asset, bs=_p29l_dir, stk=_p29l_stake,
+                                        fp=_p29l_price,
                                         pa=_p29cl_live_state["balance"],
                                         ind="[FINAL conf={}] rule={} | DIST={}({}) | PHASE={}".format(
-                                            _p29l_p["conf_val"], _p29l_p["tag"], _p29l_dist_zone, _p29l_dist_prob, _p29cl_phase),
-                                        conf="HIGH" if _p29l_p["conf_val"] >= 3 else "MEDIUM", ms=0,
+                                            _p29l_conf_val, _p29l_t.get("tag","FINAL"), _p29l_dist_zone, _p29l_dist_prob, _p29cl_phase),
+                                        conf="HIGH" if _p29l_conf_val >= 3 else "MEDIUM", ms=0,
                                         dp=_p29l_dist_prob, dz=_p29l_dist_zone,
-                                        tier="FINAL_C{}".format(_p29l_p["conf_val"]), mult=_p29l_p["mult"],
-                                        oid=str(_p29l_p["oid"])[:50] if _p29l_p["oid"] else "",
-                                        tid=str(_p29l_p["token"])[:80],
-                                        cid=_p29l_p["entry"].get("condition_id", ""),
-                                        slg=_p29l_p["entry"].get("slug", ""),
-                                        fld=_p29l_p["filled"],
+                                        tier="FINAL_C{}".format(_p29l_conf_val), mult=_p29l_mult_final,
+                                        oid=str(_p29l_oid)[:50] if _p29l_oid else "",
+                                        tid=str(_p29l_token)[:80],
+                                        cid=_p29l_entry.get("condition_id", ""),
+                                        slg=_p29l_entry.get("slug", ""),
+                                        fld=_p29l_filled,
                                         fa=datetime.now(timezone.utc).isoformat())
                                     _p29l_db.close()
                                 except Exception as _p29l_dbe:
-                                    print("P29CL LIVE DB error {}: {}".format(_p29l_p["asset"], _p29l_dbe))
+                                    print("P29CL LIVE DB error {}: {}".format(_p29l_asset, _p29l_dbe))
                                 
                                 _p29l_count += 1
-                                _fs = "FILLED" if _p29l_p["filled"] else "GTC"
+                                _fs = "FILLED" if _p29l_filled else "GTC"
                                 print("P29CL LIVE: {} {} ${:.2f} @{}c {} conf={} rule={} | pool=${:.2f}".format(
-                                    _p29l_p["dir"], _p29l_p["asset"], _p29l_p["stake"],
-                                    int(_p29l_p["price"]*100), _fs,
-                                    _p29l_p["conf_val"], _p29l_p["tag"],
+                                    _p29l_dir, _p29l_asset, _p29l_stake,
+                                    int(_p29l_price * 100), _fs,
+                                    _p29l_conf_val, _p29l_t.get("tag","FINAL"),
                                     _p29cl_live_state["balance"]))
                                 
                                 try:
                                     send_telegram("\U0001f9e0 <b>P29CL LIVE</b>\n{} {} ${:.2f} @{}c {}\nconf={} rule={}\nPool: ${:.2f}".format(
-                                        _p29l_p["dir"], _p29l_p["asset"], _p29l_p["stake"],
-                                        int(_p29l_p["price"]*100), _fs,
-                                        _p29l_p["conf_val"], _p29l_p["tag"],
+                                        _p29l_dir, _p29l_asset, _p29l_stake,
+                                        int(_p29l_price * 100), _fs,
+                                        _p29l_conf_val, _p29l_t.get("tag","FINAL"),
                                         _p29cl_live_state["balance"]))
                                 except: pass
                                 
                             except Exception as _p29l_ae:
-                                print("P29CL LIVE record error {}: {}".format(_p29l_p.get("asset","?"), _p29l_ae))
+                                print("P29CL LIVE error {}: {}".format(_p29l_asset, _p29l_ae))
 
                         if _p29l_count > 0:
                             _save_bot_balance("p29cl_live", _p29cl_live_state)
