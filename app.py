@@ -1184,13 +1184,10 @@ def _p29cl_momentum_score(asset, chainlink_close, p21_dir, btc_dir):
     return direction, confidence, m_score, full_tag
 
 def _p29cl_calc_stake(balance):
-    """Compounding stake: 5% of pool, min $2.50, max $4 (capped to match live)."""
-    stake = round(balance * 0.05, 2)
-    stake = max(stake, 2.50)
-    stake = min(stake, 4.00)  # capped at $4 — prevents $8-11 single-trade losses
-    if stake > balance * 0.15:
+    """Flat $2.50 stake — FINAL engine decides direction, not stake sizing."""
+    if balance < 5.00:
         return 0
-    return stake
+    return 2.50
 
 def _p29cl_calc_dist(asset, chainlink_close):
     """Calculate DIST_PROB from settled 15M candles at T+0.5s.
@@ -2463,8 +2460,8 @@ def _bot2_sniper_thread():
                                     if not _p29l_client:
                                         print("P29CL LIVE: no client for {}".format(_p29l_asset))
                                         continue
-                                    _p29l_price = 0.50
-                                    _p29l_shares = round(_p29l_stake / _p29l_price, 4)
+                                    _p29l_price = 0.55  # Aggressive fill — bid up to 55c to ensure execution
+                                    _p29l_shares = round(_p29l_stake / _p29l_price, 4)  # fewer shares but guaranteed fill
                                     _p29l_args = _P29LArgs(
                                         token_id=str(_p29l_token),
                                         price=_p29l_price,
@@ -2499,7 +2496,7 @@ def _bot2_sniper_thread():
                                          dist_prob, dist_zone, tier, multiplier,
                                          order_id, token_id, condition_id, slug, filled,
                                          status, outcome, fired_at)
-                                        VALUES (:mid, :ttl, :ast, :bs, :stk, 0.50,
+                                        VALUES (:mid, :ttl, :ast, :bs, :stk, :fp,
                                                 :pa, :ind, :conf, :ms,
                                                 :dp, :dz, :tier, :mult,
                                                 :oid, :tid, :cid, :slg, :fld,
@@ -2507,6 +2504,7 @@ def _bot2_sniper_thread():
                                         mid=_p29l_key,
                                         ttl="P29CL LIVE {} {} 15M".format(_p29l_asset, _p29l_dir),
                                         ast=_p29l_asset, bs=_p29l_dir, stk=_p29l_stake,
+                                        fp=_p29l_price,
                                         pa=_p29cl_live_state["balance"],
                                         ind="[FINAL conf={}] rule={} | DIST={}({}) | {} | PHASE={}".format(
                                             _p29l_conf_val, _p29l_t.get("tag","FINAL"), _p29l_dist_zone, _p29l_dist_prob,
