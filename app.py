@@ -22248,6 +22248,10 @@ def run_poly_scan():
                     share_price = effective_odds / 100.0
                     sim_payout = round(1.0 / share_price, 4) if share_price > 0 else 0
 
+                    # P2.1 15M minimum odds filter — drop sub-55c coin-flips
+                    if strat == "p21" and section == "all15m" and effective_odds < 55:
+                        continue
+
                     inserts.append({
                         "sec": section, "strat": strat, "mid": parsed["market_id"],
                         "ttl": parsed["title"], "ast": asset,
