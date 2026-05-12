@@ -2513,6 +2513,7 @@ def _bot2_sniper_thread():
                 if _p29cl_count > 0:
                     _save_bot_balance("p29cl", _p29cl_state)
                     _p29cl_save_predictions()  # persist pending predictions for deploy survival
+                    _p29cl_save_engine_state()  # persist engine learning state
                     print("P29CL: {} paper trades | phase={} | pool=${:.2f}".format(
                         _p29cl_count, _p29cl_phase, _p29cl_state["balance"]))
                 else:
