@@ -2454,14 +2454,17 @@ def _bot2_sniper_thread():
                                 # Place real GTC order
                                 _p29l_oid = None
                                 _p29l_filled = False
+                                _p29l_oid2 = None
                                 try:
                                     from py_clob_client_v2 import Side as _P29LSide, OrderArgs as _P29LArgs, OrderType as _P29LOT
                                     _p29l_client = _get_poly_client()
                                     if not _p29l_client:
                                         print("P29CL LIVE: no client for {}".format(_p29l_asset))
                                         continue
-                                    _p29l_price = 0.55  # Aggressive fill — bid up to 55c to ensure execution
-                                    _p29l_shares = round(_p29l_stake / _p29l_price, 4)  # fewer shares but guaranteed fill
+                                    
+                                    # ORDER 1: Aggressive fill at 55c — guaranteed execution
+                                    _p29l_price = 0.55
+                                    _p29l_shares = round(_p29l_stake / _p29l_price, 4)
                                     _p29l_args = _P29LArgs(
                                         token_id=str(_p29l_token),
                                         price=_p29l_price,
@@ -2475,6 +2478,34 @@ def _bot2_sniper_thread():
                                         _p29l_status = (_p29l_resp.get("status") or "").upper()
                                         _p29l_matched = float(_p29l_resp.get("sizeMatched") or 0)
                                         _p29l_filled = _p29l_status in ("MATCHED", "FILLED") or _p29l_matched > 0
+                                        
+                                        # Actual fill price — Polymarket fills at best available, often below 55c
+                                        _p29l_actual_fill = _p29l_resp.get("averagePrice") or _p29l_resp.get("price") or _p29l_price
+                                        try: _p29l_actual_fill = float(_p29l_actual_fill)
+                                        except: _p29l_actual_fill = _p29l_price
+                                    
+                                    # ORDER 2: Remainder at 50c — catches pullback
+                                    # At 50c you get more shares for the same money
+                                    # The "leftover" is the share difference between 50c and actual fill
+                                    _p29l_shares_at_50 = round(_p29l_stake / 0.50, 4)  # shares if filled at 50c
+                                    _p29l_remainder_shares = round(_p29l_shares_at_50 - _p29l_shares, 4)
+                                    if _p29l_remainder_shares >= 0.5:  # only if meaningful (at least 0.5 shares)
+                                        try:
+                                            _p29l_args2 = _P29LArgs(
+                                                token_id=str(_p29l_token),
+                                                price=0.50,
+                                                size=_p29l_remainder_shares,
+                                                side=_P29LSide.BUY,
+                                            )
+                                            _p29l_signed2 = _p29l_client.create_order(_p29l_args2)
+                                            _p29l_resp2 = _p29l_client.post_order(_p29l_signed2, _P29LOT.GTC)
+                                            if _p29l_resp2:
+                                                _p29l_oid2 = _p29l_resp2.get("orderID") or _p29l_resp2.get("id") or None
+                                            print("P29CL LIVE 50c order: {} {} +{} shares oid={}".format(
+                                                _p29l_dir, _p29l_asset, _p29l_remainder_shares, str(_p29l_oid2)[:12] if _p29l_oid2 else "NONE"))
+                                        except Exception as _p29l_e2:
+                                            print("P29CL LIVE 50c order error {}: {}".format(_p29l_asset, _p29l_e2))
+                                    
                                 except Exception as _p29l_oe:
                                     print("P29CL LIVE order error {}: {}".format(_p29l_asset, _p29l_oe))
                                 
