@@ -23998,6 +23998,30 @@ def _resolve_p29cl_live_trades():
                     _p29cl_live_state["peak_balance"] = _p29cl_live_state["balance"]
                 _pnl = "+${:.2f}".format(payout - stake) if won else "-${:.2f}".format(stake)
                 print("P29CL LIVE #{} {}: {} | pool=${:.2f}".format(p["id"], "WIN" if won else "LOSS", _pnl, _p29cl_live_state["balance"]))
+                
+                # Feed outcome to engine for self-learning
+                try:
+                    _learn_asset = p.get("asset", "BTC")
+                    _learn_engine = _p29cl_engines.get(_learn_asset)
+                    _learn_key = (_learn_asset, p.get("market_id", ""))
+                    _learn_pred = _p29cl_predictions.get(_learn_key)
+                    if _learn_engine and _learn_pred:
+                        _learn_bet_side = p.get("bet_side", _learn_pred["side"])
+                        if won:
+                            _learn_actual = _learn_bet_side
+                        else:
+                            _learn_actual = "DOWN" if _learn_bet_side == "UP" else "UP"
+                        _learn_engine.last_prediction = _learn_pred
+                        _learn_engine.learn(_learn_actual)
+                        _p29cl_predictions.pop(_learn_key, None)
+                        _p29cl_save_engine_state()
+                        _p29cl_save_predictions()
+                        _learn_zone = _learn_pred.get("features", {}).get("zone", "MID")
+                        _crash_filter.record_outcome(_learn_asset, _learn_zone, _learn_pred["side"] == _learn_actual)
+                        print("P29CL LIVE LEARN: {} actual={} correct={}".format(
+                            _learn_asset, _learn_actual, _learn_pred["side"] == _learn_actual))
+                except Exception as _le:
+                    print("P29CL LIVE LEARN error: {}".format(_le))
                 try:
                     _emoji = "✅" if won else "❌"
                     send_telegram("{} <b>P29CL LIVE</b> #{}\n{} {} {}\nPool: ${:.2f}".format(
