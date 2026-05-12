@@ -2652,7 +2652,7 @@ def _bot2_sniper_thread():
                         # ═══ PARALLEL ORDER: all assets fire simultaneously at 50c ═══
                         from py_clob_client_v2 import Side as _P29LSide, OrderArgs as _P29LArgs, OrderType as _P29LOT
                         _p29l_client = _get_poly_client()
-                        _p29l_max_price = 0.50
+                        _p29l_max_price = 0.54
                         _p29l_results = []
                         _p29l_lock = threading.Lock()
                         
