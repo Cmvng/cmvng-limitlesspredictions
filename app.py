@@ -269,6 +269,7 @@ class P29CLFinal:
         self.boost_rules = set()
         self.demote_rules = set()
         self.n = 0
+        self.learns = 0
         self.learn_log = []
         self.last_prediction = None
         if state_path and os.path.exists(state_path):
@@ -282,7 +283,9 @@ class P29CLFinal:
         f = _feats(c[4],c[3],c[2],c[1],c[0])
         pred,conf,rule = self._predict(f)
         result = {"side":pred,"confidence":conf,"rule":rule,"ptb_zone":f["zone"],"ptb_pct":f["ptb"],"features":f}
-        self.last_prediction = result
+        # NOTE: Do NOT set self.last_prediction here — it gets overwritten
+        # before learn() fires. Predictions are stored in _p29cl_predictions
+        # dict keyed by (asset, boundary_ts) and restored at learn() call site.
         return result
 
     def learn(self, actual_direction):
@@ -290,6 +293,7 @@ class P29CLFinal:
         p = self.last_prediction
         correct = p["side"] == actual_direction
         self._update(p["features"], p["rule"], actual_direction, correct)
+        self.learns += 1
         self.last_prediction = None
         if self.state_path: self._save_state()
 
@@ -422,6 +426,41 @@ print("P29CL FINAL engines initialized: " + ", ".join(_p29cl_engines.keys()))
 # Prediction storage for self-learning: keyed by (asset, boundary_ts)
 # This survives across boundaries so learn() can match predictions to outcomes
 _p29cl_predictions = {}  # {(asset, boundary_ts): {features, rule, side, conf}}
+
+def _p29cl_save_predictions():
+    """Persist pending predictions to DB so they survive deploys."""
+    try:
+        import json
+        db = get_db()
+        preds_json = json.dumps({
+            str(k): v for k, v in _p29cl_predictions.items()
+        })
+        db.run("""INSERT INTO bot_state (bot_name, json_state) VALUES (:bn, :js)
+                  ON CONFLICT(bot_name) DO UPDATE SET json_state=:js""",
+               bn="p29cl_predictions", js=preds_json)
+        db.close()
+    except Exception as e:
+        print("P29CL predictions save error: {}".format(e))
+
+def _p29cl_load_predictions():
+    """Load pending predictions from DB on startup."""
+    global _p29cl_predictions
+    try:
+        import json
+        db = get_db()
+        row = db.run("SELECT json_state FROM bot_state WHERE bot_name=:bn",
+                    bn="p29cl_predictions")
+        db.close()
+        if row and len(row) > 0:
+            raw = json.loads(row[0]["json_state"])
+            for k, v in raw.items():
+                try:
+                    key = eval(k) if k.startswith("(") else k
+                    _p29cl_predictions[key] = v
+                except: pass
+            print("P29CL predictions restored: {} pending".format(len(_p29cl_predictions)))
+    except Exception as e:
+        print("P29CL predictions load error: {}".format(e))
 
 # Persist engine state to DB (survives deploys)
 def _p29cl_save_engine_state():
@@ -1920,6 +1959,8 @@ def _bot2_sniper_thread():
                     if _p29cl_skip_boundary:
                         break
                     try:
+                        _v11_result = None  # reset per asset to prevent stale variable
+                        _v11_conf = 0
                         _p29cl_price = _chainlink_prices.get(_p29cl_asset)
                         if not _p29cl_price:
                             continue
@@ -2359,6 +2400,10 @@ def _bot2_sniper_thread():
                         # Dedup — check both in-memory set and DB
                         _p29cl_key = "p29cl_{}_{}".format(_p29cl_asset, window_ts)
                         
+                        # Guard: skip if _v11_result wasn't set (predict() failed)
+                        if _v11_result is None:
+                            continue
+                        
                         # Store prediction for self-learning (keyed by asset+boundary)
                         _p29cl_predictions[(_p29cl_asset, _p29cl_key)] = {
                             "features": _v11_result.get("features", {}),
@@ -2459,17 +2504,22 @@ def _bot2_sniper_thread():
                             _p29cl_state["balance"]))
                         
                     except Exception as _p29cl_ae:
+                        import traceback
                         print("P29CL error {}: {}".format(_p29cl_asset, _p29cl_ae))
+                        traceback.print_exc()
                 
                 if _p29cl_count > 0:
                     _save_bot_balance("p29cl", _p29cl_state)
+                    _p29cl_save_predictions()  # persist pending predictions for deploy survival
                     print("P29CL: {} paper trades | phase={} | pool=${:.2f}".format(
                         _p29cl_count, _p29cl_phase, _p29cl_state["balance"]))
                 else:
                     print("P29CL: 0 trades (no momentum signal) | candles={} chainlink={}".format(
                         len(_p29cl_candle_prefetch), len(_chainlink_prices)))
             except Exception as _p29cl_err:
+                import traceback
                 print("P29CL error: {}".format(_p29cl_err))
+                traceback.print_exc()
 
             # ── P2.9CL LIVE: Real orders using same signals as paper ──
             try:
@@ -6681,6 +6731,7 @@ try:
         print("P29CL: restored {} engine states from DB".format(_p29cl_engine_loaded))
     else:
         print("P29CL: no saved engine state in DB — starting fresh")
+    _p29cl_load_predictions()
 except Exception as _load_err:
     print("P29CL: DB state load failed — starting fresh: {}".format(_load_err))
 
@@ -23711,6 +23762,7 @@ def _resolve_p29cl_trades():
                         
                         # Save engine state to DB after learning
                         _p29cl_save_engine_state()
+                        _p29cl_save_predictions()  # persist updated predictions
                         
                         print("P29CL LEARN: {} {} rule={} actual={} correct={}".format(
                             _learn_asset, _learn_pred["side"], _learn_pred["rule"],
