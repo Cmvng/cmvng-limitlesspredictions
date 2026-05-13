@@ -413,6 +413,290 @@ def should_trade(result, min_conf=2):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# STRUCTURAL LAYER v1 — Asset-Specific Candle Pattern Filter (Boost Only)
+# Session 21 finding: suppress = harmful, boost = meaningful edge (+$241, 57.6% WR)
+# Reads 20 candles → extracts pos10/pos20/g8/slope/expansion/engulfing/patterns
+# Each asset has rules backtested from thousands of candles
+# Integration: BOOST only — confirms PTB prediction → +1 confidence
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _structural_feats(candles):
+    """Extract structural features from last 20+ candles (OHLC tuples).
+    Returns dict with pos10, pos20, g8, slope, expansion, body_pct, patterns, etc.
+    Returns None if insufficient data."""
+    if not candles or len(candles) < 10:
+        return None
+
+    n = len(candles)
+    c_last = candles[-1]  # most recent candle
+    o, h, l, c = c_last
+    rng = h - l if h > l else 0.0001
+    body = abs(c - o)
+    body_pct = body / rng  # 0.0–1.0
+    green = c > o
+
+    # ── pos10: price position in last 10 candles' range (0.0 = bottom, 1.0 = top) ──
+    last10 = candles[-10:]
+    h10 = max(x[1] for x in last10)
+    l10 = min(x[2] for x in last10)
+    rng10 = h10 - l10 if h10 > l10 else 0.0001
+    pos10 = (c - l10) / rng10
+
+    # ── pos20: price position in last 20 candles' range ──
+    last20 = candles[-min(20, n):]
+    h20 = max(x[1] for x in last20)
+    l20 = min(x[2] for x in last20)
+    rng20 = h20 - l20 if h20 > l20 else 0.0001
+    pos20 = (c - l20) / rng20
+
+    # ── g8: green count in last 8 candles ──
+    last8 = candles[-min(8, n):]
+    g8 = sum(1 for x in last8 if x[3] > x[0])
+
+    # ── slope: 20-bar price change as percentage ──
+    c_first = last20[0][3]
+    slope = ((c - c_first) / c_first * 100) if c_first > 0 else 0.0
+
+    # ── avg_rng20: average range of last 20 candles ──
+    ranges20 = [x[1] - x[2] for x in last20]
+    avg_rng20 = sum(ranges20) / len(ranges20) if ranges20 else 0.0001
+    expansion = rng > avg_rng20 * 1.3
+
+    # ── Consecutive sequences ──
+    consec_red = 0
+    for x in reversed(candles[:-1]):  # don't count current in consecutive
+        if x[3] < x[0]:
+            consec_red += 1
+        else:
+            break
+    # Also count current
+    if not green:
+        consec_red += 1
+
+    consec_green = 0
+    for x in reversed(candles[:-1]):
+        if x[3] > x[0]:
+            consec_green += 1
+        else:
+            break
+    if green:
+        consec_green += 1
+
+    # ── Engulfing detection ──
+    prev = candles[-2] if n >= 2 else None
+    bull_engulf = False
+    bear_engulf = False
+    if prev:
+        p_o, p_h, p_l, p_c = prev
+        p_green = p_c > p_o
+        p_body_top = max(p_o, p_c)
+        p_body_bot = min(p_o, p_c)
+        c_body_top = max(o, c)
+        c_body_bot = min(o, c)
+        if green and not p_green and c_body_top > p_body_top and c_body_bot < p_body_bot:
+            bull_engulf = True
+        if not green and p_green and c_body_top > p_body_top and c_body_bot < p_body_bot:
+            bear_engulf = True
+
+    # ── HH / LL detection ──
+    hh = h > candles[-2][1] if n >= 2 else False
+    ll = l < candles[-2][2] if n >= 2 else False
+
+    # ── Hammer detection (small body, long lower wick) ──
+    uwick = (h - max(o, c)) / rng
+    lwick = (min(o, c) - l) / rng
+    hammer = body_pct < 0.35 and lwick > 0.50
+
+    # ── Doji (body < 10% of range) ──
+    doji = body_pct < 0.10
+
+    # ── Marubozu (body > 80% of range) ──
+    marubozu = body_pct > 0.80
+
+    # ── Trending check (for slope-based rules) ──
+    trending = abs(slope) > 0.5
+
+    return {
+        "pos10": pos10, "pos20": pos20, "g8": g8, "slope": slope,
+        "expansion": expansion, "body_pct": body_pct, "green": green,
+        "consec_red": consec_red, "consec_green": consec_green,
+        "bull_engulf": bull_engulf, "bear_engulf": bear_engulf,
+        "hh": hh, "ll": ll, "hammer": hammer, "doji": doji, "marubozu": marubozu,
+        "trending": trending, "avg_rng20": avg_rng20, "rng": rng,
+    }
+
+
+def _structural_check_xrp(sf):
+    """XRP structural rules. Returns (direction, win_rate, rule_name) or None."""
+    p10, p20, g8 = sf["pos10"], sf["pos20"], sf["g8"]
+    exp, maru = sf["expansion"], sf["marubozu"]
+    cr, cg = sf["consec_red"], sf["consec_green"]
+    bull_e, green = sf["bull_engulf"], sf["green"]
+
+    if cr >= 4 and exp:                             return "UP", 65.4, "XRP_4RED_EXP"
+    if cr >= 3 and p10 < 0.25 and exp:              return "UP", 64.2, "XRP_3RED_BOT_EXP"
+    if cg >= 3 and p10 > 0.75 and exp:              return "DOWN", 60.3, "XRP_3GRN_TOP_EXP"
+    if g8 >= 7:                                     return "DOWN", 60.1, "XRP_BULL8"
+    if bull_e and p10 < 0.30:                       return "UP", 59.3, "XRP_BULLENG_BOT"
+    if maru and exp and p10 < 0.50:                 return "UP" if not green else None, 56.6 if not green else 0, "XRP_MARU_EXP_BOT"
+    if maru and exp and p10 >= 0.50:                return "DOWN" if green else None, 58.1 if green else 0, "XRP_MARU_EXP_TOP"
+    if p10 > 0.85 and sf["slope"] < 2.0:            return "DOWN", 57.8, "XRP_TOP85_LOWSLOPE"
+    if g8 >= 7 and p20 > 0.80:                      return "DOWN", 58.3, "XRP_BULL8_TOP20"
+    if maru and not green and p10 < 0.40:           return "UP", 54.9, "XRP_MARU_RED_BOT"
+    return None
+
+
+def _structural_check_btc(sf):
+    """BTC structural rules."""
+    p10, p20, g8 = sf["pos10"], sf["pos20"], sf["g8"]
+    exp, hammer = sf["expansion"], sf["hammer"]
+    cr, cg = sf["consec_red"], sf["consec_green"]
+    maru, green = sf["marubozu"], sf["green"]
+
+    if hammer and p10 < 0.30:                       return "UP", 61.3, "BTC_HAMMER_BOT"
+    if cg >= 3 and p10 > 0.75 and exp:              return "DOWN", 61.2, "BTC_3GRN_TOP_EXP"
+    if cr >= 3 and p10 < 0.25 and exp:              return "UP", 59.4, "BTC_3RED_BOT_EXP"
+    if g8 <= 1 and p10 < 0.35:                      return "UP", 58.2, "BTC_BEAR8_BOT"
+    if p10 < 0.20:                                  return "UP", 54.9, "BTC_BOT20"
+    if p10 > 0.85:                                  return "DOWN", 55.5, "BTC_TOP85"
+    if maru and green and p10 > 0.50:               return "DOWN", 55.1, "BTC_MARU_GRN_TOP"
+    return None
+
+
+def _structural_check_eth(sf):
+    """ETH structural rules."""
+    p10, p20, g8 = sf["pos10"], sf["pos20"], sf["g8"]
+    exp, hammer, doji = sf["expansion"], sf["hammer"], sf["doji"]
+    cr, cg = sf["consec_red"], sf["consec_green"]
+    maru, green, ll = sf["marubozu"], sf["green"], sf["ll"]
+
+    if cg >= 4 and exp:                             return "DOWN", 67.6, "ETH_4GRN_EXP"
+    if doji and p10 > 0.80:                         return "DOWN", 63.8, "ETH_DOJI_TOP"
+    if cg >= 4 and p10 > 0.70:                      return "DOWN", 62.5, "ETH_4GRN_TOP"
+    if cr >= 3 and ll and p10 < 0.30:               return "UP", 62.1, "ETH_3RED_LL_BOT"
+    if g8 >= 7 and p20 > 0.80:                      return "DOWN", 60.9, "ETH_BULL8_TOP20"
+    if maru and green and p10 > 0.60:               return "DOWN", 58.3, "ETH_MARU_GRN_TOP"
+    if g8 <= 1 and p20 < 0.20:                      return "UP", 58.4, "ETH_BEAR8_BOT20"
+    if hammer and p10 < 0.30:                       return "UP", 58.7, "ETH_HAMMER_BOT"
+    if p20 < 0.20:                                  return "UP", 55.6, "ETH_BOT20"
+    if p10 > 0.85:                                  return "DOWN", 55.0, "ETH_TOP85"
+    return None
+
+
+def _structural_check_sol(sf):
+    """SOL structural rules (V3 with slope)."""
+    p10, p20, g8, slope = sf["pos10"], sf["pos20"], sf["g8"], sf["slope"]
+    exp, doji = sf["expansion"], sf["doji"]
+    cr, cg = sf["consec_red"], sf["consec_green"]
+    maru, green, trending = sf["marubozu"], sf["green"], sf["trending"]
+
+    if cr >= 4 and p10 < 0.30 and slope > 0.5:     return "UP", 68.3, "SOL_4RED_BOT_UPSLOPE"
+    if maru and green and p10 > 0.60 and slope < -0.5: return "DOWN", 68.1, "SOL_MARU_GRN_TOP_DNSLOPE"
+    if maru and not green and p10 < 0.40 and trending: return "UP", 64.1, "SOL_MARU_RED_BOT_TREND"
+    if g8 <= 1:                                     return "UP", 63.0, "SOL_BEAR8"
+    if cr >= 4 and exp:                             return "UP", 62.2, "SOL_4RED_EXP"
+    if cr >= 3 and p10 < 0.25 and exp:              return "UP", 60.0, "SOL_3RED_BOT_EXP"
+    if doji and p10 > 0.80 and trending:            return "DOWN", 61.3, "SOL_DOJI_TOP_TREND"
+    if g8 >= 7:                                     return "DOWN", 59.0, "SOL_BULL8"
+    if cg >= 4 and p10 > 0.70 and abs(slope) < 1.0: return "DOWN", 59.0, "SOL_4GRN_TOP_FLATSLOPE"
+    if p10 > 0.80:                                  return "DOWN", 55.1, "SOL_TOP80"
+    return None
+
+
+def _structural_check_doge(sf):
+    """DOGE structural rules (V2 with slope)."""
+    p10, p20, g8, slope = sf["pos10"], sf["pos20"], sf["g8"], sf["slope"]
+    exp, ll = sf["expansion"], sf["ll"]
+    cr, cg = sf["consec_red"], sf["consec_green"]
+    maru, green, trending = sf["marubozu"], sf["green"], sf["trending"]
+    bear_e, bull_e = sf["bear_engulf"], sf["bull_engulf"]
+
+    if bear_e and exp and trending:                 return "UP", 65.6, "DOGE_BEARENG_EXP_TREND"
+    if maru and green and p10 > 0.60 and abs(slope) < 1.0: return "DOWN", 62.5, "DOGE_MARU_GRN_TOP_FLAT"
+    if ll and g8 <= 1 and slope > -1.0:             return "UP", 62.8, "DOGE_LL_BEAR8_UPSLOPE"
+    if cr >= 4 and exp:                             return "UP", 61.7, "DOGE_4RED_EXP"
+    if bull_e and exp:                              return "DOWN", 59.6, "DOGE_BULLENG_EXP"
+    if cr >= 3 and p10 < 0.25 and exp:              return "UP", 57.8, "DOGE_3RED_BOT_EXP"
+    if cr >= 3 and ll and p10 < 0.30:               return "UP", 57.3, "DOGE_3RED_LL_BOT"
+    if p10 > 0.85 and slope < 2.0:                  return "DOWN", 59.8, "DOGE_TOP85_LOWSLOPE"
+    if cg >= 4 and p10 > 0.70:                      return "DOWN", 55.3, "DOGE_4GRN_TOP"
+    return None
+
+
+def _structural_check_bnb(sf):
+    """BNB structural rules (V2 with slope)."""
+    p10, p20, g8, slope = sf["pos10"], sf["pos20"], sf["g8"], sf["slope"]
+    exp, hammer, hh = sf["expansion"], sf["hammer"], sf["hh"]
+    cr, cg = sf["consec_red"], sf["consec_green"]
+    maru, green, trending = sf["marubozu"], sf["green"], sf["trending"]
+    bear_e, bull_e = sf["bear_engulf"], sf["bull_engulf"]
+
+    if bear_e and exp and trending:                 return "UP", 64.4, "BNB_BEARENG_EXP_TREND"
+    if bull_e and exp and trending:                 return "DOWN", 64.2, "BNB_BULLENG_EXP_TREND"
+    if g8 >= 7 and p10 > 0.70 and abs(slope) < 1.0: return "DOWN", 62.2, "BNB_BULL8_TOP_FLAT"
+    if g8 <= 1 and trending:                        return "UP", 61.7, "BNB_BEAR8_TREND"
+    if cr >= 3 and p10 < 0.25 and exp and slope > -1.0: return "UP", 59.6, "BNB_3RED_BOT_EXP_UPSLOPE"
+    if p10 > 0.85 and trending:                     return "DOWN", 59.3, "BNB_TOP85_TREND"
+    if cg >= 4 and p10 > 0.70:                      return "DOWN", 58.0, "BNB_4GRN_TOP"
+    if maru and exp and p10 > 0.50:                 return "DOWN", 57.8, "BNB_MARU_EXP_TOP"
+    if hh and g8 >= 7:                              return "DOWN", 56.1, "BNB_HH_BULL8"
+    if hammer and p10 < 0.30:                       return "UP", 58.1, "BNB_HAMMER_BOT"
+    return None
+
+
+_STRUCTURAL_FNS = {
+    "BTC": _structural_check_btc,
+    "ETH": _structural_check_eth,
+    "XRP": _structural_check_xrp,
+    "SOL": _structural_check_sol,
+    "DOGE": _structural_check_doge,
+    "BNB": _structural_check_bnb,
+}
+
+
+def structural_layer_check(asset, candles_ohlc, ptb_direction, ptb_confidence):
+    """Run structural layer on candle history. BOOST-ONLY per Session 21.
+    
+    Args:
+        asset: "BTC", "ETH", etc.
+        candles_ohlc: list of (o, h, l, c) tuples, at least 10 candles
+        ptb_direction: "UP" or "DOWN" from PTB engine
+        ptb_confidence: int confidence from PTB engine (1-3)
+    
+    Returns:
+        (direction, confidence, struct_tag) — boosted or unchanged
+        struct_tag is the rule name if structural fired, else "NO_STRUCT"
+    """
+    if asset not in _STRUCTURAL_FNS:
+        return ptb_direction, ptb_confidence, "NO_STRUCT"
+
+    sf = _structural_feats(candles_ohlc)
+    if sf is None:
+        return ptb_direction, ptb_confidence, "NO_STRUCT"
+
+    check_fn = _STRUCTURAL_FNS[asset]
+    result = check_fn(sf)
+
+    if result is None:
+        return ptb_direction, ptb_confidence, "NO_STRUCT"
+
+    struct_dir, struct_wr, struct_rule = result
+
+    if struct_dir is None:
+        return ptb_direction, ptb_confidence, "NO_STRUCT"
+
+    # BOOST ONLY — Session 21 finding: suppress is harmful, boost adds edge
+    if struct_dir == ptb_direction:
+        # Structure AGREES with PTB → boost confidence by 1 (cap at 3)
+        boosted_conf = min(3, ptb_confidence + 1)
+        return ptb_direction, boosted_conf, "BOOST_" + struct_rule
+    else:
+        # Structure DISAGREES — do NOT suppress/flip per Session 21
+        # Just tag it for logging, keep original prediction unchanged
+        return ptb_direction, ptb_confidence, "DISAGREE_" + struct_rule
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # CRASH FILTER — Cross-Asset Correlation Protection
 # Backtested: +$208 P&L improvement on 6,190 overlapping candles
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1609,7 +1893,7 @@ def _bot2_sniper_thread():
                     symbol = P29CL_BINANCE_MAP.get(asset)
                     if not symbol: continue
                     r = _req.get("https://api.binance.com/api/v3/klines",
-                        params={"symbol": symbol, "interval": "15m", "limit": 25},
+                        params={"symbol": symbol, "interval": "15m", "limit": 100},
                         timeout=3)
                     if r.status_code == 200:
                         klines = r.json()
@@ -2444,6 +2728,18 @@ def _bot2_sniper_thread():
                                 _p29cl_conf = "HIGH" if _v11_result["confidence"] >= 3 else "MEDIUM"
                                 _v11_conf = _v11_result["confidence"]
                                 
+                                # ══ STRUCTURAL LAYER CHECK (boost-only) ══
+                                _struct_dir, _struct_conf, _struct_tag = structural_layer_check(
+                                    _p29cl_asset, _cs_all, _p29cl_dir, _v11_conf)
+                                if _struct_tag.startswith("BOOST_"):
+                                    _v11_conf = _struct_conf
+                                    _p29cl_conf = "HIGH" if _v11_conf >= 3 else "MEDIUM"
+                                    _cs_tags.append(_struct_tag)
+                                    print("P29CL STRUCT: {} {} BOOSTED conf {} → {} ({})".format(
+                                        _p29cl_asset, _p29cl_dir, _v11_result["confidence"], _v11_conf, _struct_tag))
+                                elif _struct_tag.startswith("DISAGREE_"):
+                                    _cs_tags.append(_struct_tag)
+                                
                                 # DIST for display
                                 _p29cl_dist_prob, _p29cl_dist_zone = _p29cl_calc_dist(_p29cl_asset, _p29cl_price)
                                 
@@ -2555,6 +2851,7 @@ def _bot2_sniper_thread():
                                     _p29l_trade_data = {
                                         "asset": _p29cl_asset, "dir": _p29cl_dir, "key": _p29cl_key,
                                         "v11_conf": _v11_conf, "tag": _p29cl_tag,
+                                        "struct_tag": _struct_tag,
                                         "token": _p29l_token_now, "entry": _p29l_entry_now,
                                         "live_key": _p29l_live_key,
                                     }
@@ -2649,10 +2946,24 @@ def _bot2_sniper_thread():
                         print("P29CL LIVE STOPPED: balance ${:.2f} hit floor ${:.2f}".format(
                             _p29cl_live_state["balance"], _p29cl_live_state["floor_balance"]))
                     else:
-                        # ═══ PARALLEL ORDER: all assets fire simultaneously at 50c ═══
+                        # ═══ PARALLEL ORDER: tiered fill pricing by asset + structural confidence ═══
                         from py_clob_client_v2 import Side as _P29LSide, OrderArgs as _P29LArgs, OrderType as _P29LOT
                         _p29l_client = _get_poly_client()
-                        _p29l_max_price = 0.54
+                        
+                        # Tiered fill prices: (structural_boost_conf3, regular)
+                        # BTC/XRP: deepest books, can pay more
+                        # ETH/SOL: medium liquidity
+                        # DOGE/BNB/HYPE: thin books, stay cheap
+                        _p29l_fill_tiers = {
+                            "BTC":  {"boost": 0.55, "base": 0.52},
+                            "XRP":  {"boost": 0.55, "base": 0.52},
+                            "ETH":  {"boost": 0.54, "base": 0.50},
+                            "SOL":  {"boost": 0.54, "base": 0.50},
+                            "DOGE": {"boost": 0.50, "base": 0.50},
+                            "BNB":  {"boost": 0.50, "base": 0.50},
+                            "HYPE": {"boost": 0.50, "base": 0.50},
+                        }
+                        
                         _p29l_results = []
                         _p29l_lock = threading.Lock()
                         
@@ -2662,7 +2973,15 @@ def _bot2_sniper_thread():
                             _dir = _td["dir"]
                             _token = _td["token"]
                             _conf_val = _td.get("v11_conf", 2)
-                            _price = _p29l_max_price
+                            _s_tag = _td.get("struct_tag", "NO_STRUCT")
+                            
+                            # Tiered fill price: boost price if structural confirms + conf 3
+                            _tier = _p29l_fill_tiers.get(_asset, {"boost": 0.50, "base": 0.50})
+                            if _s_tag.startswith("BOOST_") and _conf_val >= 3:
+                                _price = _tier["boost"]
+                            else:
+                                _price = _tier["base"]
+                            
                             _oid = None
                             _filled = False
                             
@@ -6804,6 +7123,35 @@ try:
     _p29cl_load_predictions()
 except Exception as _load_err:
     print("P29CL: DB state load failed — starting fresh: {}".format(_load_err))
+
+# ── Pre-seed toxic rules identified from 952 paper trades ──
+# These rules have 10+ trades and WR < 45%. Self-learning will still run
+# on top — if any of these recover, _relearn() will restore them at wr >= 0.52.
+# Rules already in skip/flip from self-learning are left untouched.
+_TOXIC_RULES_PRESEED = {
+    "VLOW_BIGRED_TIGHT",   # 30.0% WR, -$37.08 (30 trades)
+    "VLOW_CPCT_LOW",       # 35.5% WR, -$28.32 (31 trades)
+    "TREND_DN",            # 15.4% WR, -$27.24 (13 trades)
+    "BOS_BEAR",            # 23.1% WR, -$21.36 (13 trades)
+    "BOS_BULL",            # 37.5% WR, -$19.08 (24 trades)
+}
+# LEAN_BEAR (44.9%) is borderline — demote instead of skip so it still trades at reduced conf
+_TOXIC_DEMOTE_PRESEED = {
+    "LEAN_BEAR",           # 44.9% WR, -$28.20 (78 trades) — too close to 45% to hard-skip
+}
+
+_preseed_count = 0
+for _asset, _engine in _p29cl_engines.items():
+    for _toxic_rule in _TOXIC_RULES_PRESEED:
+        if _toxic_rule not in _engine.skip_rules and _toxic_rule not in _engine.flip_rules:
+            _engine.skip_rules.add(_toxic_rule)
+            _preseed_count += 1
+    for _demote_rule in _TOXIC_DEMOTE_PRESEED:
+        if _demote_rule not in _engine.demote_rules and _demote_rule not in _engine.skip_rules and _demote_rule not in _engine.flip_rules:
+            _engine.demote_rules.add(_demote_rule)
+            _preseed_count += 1
+if _preseed_count > 0:
+    print("P29CL: pre-seeded {} toxic rule entries across all engines".format(_preseed_count))
 
 # ═══════════════════════════════════════════════════════════
 # TELEGRAM
@@ -24554,7 +24902,7 @@ def p29cl_page():
     """P2.9 Chainlink — Momentum paper bot dashboard."""
     try:
         conn = get_db()
-        rows = conn.run("SELECT * FROM p29cl_trades ORDER BY id DESC LIMIT 1000")
+        rows = conn.run("SELECT * FROM p29cl_trades ORDER BY id DESC LIMIT 2000")
         cols = [c['name'] for c in conn.columns]
         trades = [dict(zip(cols, r)) for r in rows]
         conn.close()
@@ -24690,7 +25038,7 @@ def p29cl_live_page():
     """P2.9CL LIVE — Real trading dashboard."""
     try:
         conn = get_db()
-        rows = conn.run("SELECT * FROM p29cl_live_trades ORDER BY id DESC LIMIT 500")
+        rows = conn.run("SELECT * FROM p29cl_live_trades ORDER BY id DESC LIMIT 2000")
         cols = [c['name'] for c in conn.columns]
         trades = [dict(zip(cols, r)) for r in rows]
         conn.close()
