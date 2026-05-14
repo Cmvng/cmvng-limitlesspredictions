@@ -1418,7 +1418,7 @@ _poly_alpha3_state = {
     "balance": 60.0,
     "peak_balance": 60.0,
     "starting_balance": 60.0,
-    "floor_balance": 5.0,
+    "floor_balance": 10.0,
     "trades_today": 0,
     "wins_today": 0,
     "losses_today": 0,
@@ -3348,15 +3348,10 @@ def _bot2_sniper_thread():
         pass
 
 def _poly_alpha3_calc_stake(pool_balance):
-    """Compounding stake: 5% of pool, min $2.50, max $8.00.
-    As pool grows → stakes grow. As pool shrinks → stakes shrink.
-    This protects downside and accelerates upside."""
-    stake = round(pool_balance * 0.05, 2)
-    stake = max(stake, 2.50)  # Polymarket minimum ~5 shares
-    stake = min(stake, 8.00)  # Cap per-trade risk
-    if stake > pool_balance * 0.15:
-        return 0  # Safety: don't risk more than 15% on one trade
-    return stake
+    """Flat $3 stake per trade. Simple and proven."""
+    if pool_balance < 3.0:
+        return 0
+    return 3.0
 
 # ═══════════════════════════════════════════════════════════
 # POLY ALPHA 4.0 — THE SNIPER
@@ -21797,19 +21792,19 @@ except Exception as _init_err:
     _poly_alpha2_load_recent()
 
     # ── POLY ALPHA 3.0 init — Pure P2.3 with compounding stakes ──
-    # P2.3: 59.6% WR over 2,329 paper trades. Proven profitable.
+    # P2.3: 60.3% WR over 3,895 paper trades. Proven profitable. NOW LIVE.
     _saved_pa3 = _saved_balances.get("poly_alpha3", {})
     if _saved_pa3 and _saved_pa3.get("balance", 0) >= 10:
         _poly_alpha3_state["balance"] = _saved_pa3["balance"]
         _poly_alpha3_state["peak_balance"] = _saved_pa3.get("peak_balance", _saved_pa3["balance"])
     else:
-        _poly_alpha3_state["balance"] = 100.0
-        _poly_alpha3_state["peak_balance"] = 100.0
-    _poly_alpha3_state["starting_balance"] = 100.0
-    _poly_alpha3_state["floor_balance"] = 5.0
-    _poly_alpha3_state["enabled"] = False  # PAUSED — only Bot2 Chainlink Sniper trades live
+        _poly_alpha3_state["balance"] = 60.0
+        _poly_alpha3_state["peak_balance"] = 60.0
+    _poly_alpha3_state["starting_balance"] = 60.0
+    _poly_alpha3_state["floor_balance"] = 10.0
+    _poly_alpha3_state["enabled"] = True  # LIVE — P2.3 on 15M markets, $3 flat, max 70c
     _save_bot_balance("poly_alpha3", _poly_alpha3_state)
-    print("POLY ALPHA 3.0: PAUSED — only Bot2 Chainlink Sniper trades live")
+    print("POLY ALPHA 3.0: LIVE — P2.3 15M | $3 flat | max 70c | pool=${:.2f}".format(_poly_alpha3_state["balance"]))
     _poly_alpha3_load_recent()
 
     _poly_alpha_load_recent_trades()
@@ -21885,9 +21880,8 @@ if SIGNALS_DB_URL:
     threading.Thread(target=_bot2_sniper_thread, daemon=True).start()
     print("BOT2 SNIPER thread launched")
     
-    # ── PAUSE Alpha 3.0 — replaced by Bot2 Sniper ──
-    _poly_alpha3_state["enabled"] = False
-    print("POLY ALPHA 3.0: PAUSED — replaced by Bot2 Chainlink Sniper")
+    # ── Alpha 3.0 (P23 LIVE) running alongside Bot2 Sniper ──
+    print("POLY ALPHA 3.0: LIVE — running alongside Bot2 Sniper")
 
     # ── LIMITLESS SNIPER init ──
     _saved_lmts = _saved_balances.get("limitless_sniper", {})
@@ -23072,7 +23066,7 @@ def run_poly_scan():
                         _pa3_mkey = parsed["market_id"]
                         if _pa3_mkey not in _poly_alpha3_traded_markets and _poly_alpha3_state["enabled"] and _poly_has_creds():
                             _pa3_stake = _poly_alpha3_calc_stake(_poly_alpha3_state["balance"])
-                            _pa3_max_fill = 0.62
+                            _pa3_max_fill = 0.70
                             if _pa3_stake > 0 and _pa3_stake <= _poly_alpha3_state["balance"] and share_price <= _pa3_max_fill:
                                 clob_toks = parsed.get("clob_tokens", [])
                                 cid = parsed.get("condition_id", "")
@@ -25283,6 +25277,7 @@ a{{color:#ff6b35}}
         statusc=status_color, status=status)
 
 
+@app.route("/app/poly-alpha3")
 def poly_alpha3_page():
     """Polymarket Alpha 3.0 — Pure P2.3 with Compounding."""
     try:
