@@ -12,7 +12,7 @@ from datetime import datetime, timezone, timedelta
 # Built from 59,240 candles across BTC, ETH, SOL, DOGE, BNB, XRP
 # 21,821 backtested predictions. $4,472 combined P&L.
 # ══════════════════════════════════════════════════════════════════════════════
-from collections import defaultdict
+from collections import defaultdict, deque
 
 def _feats(c1, c1m, c1m2, c0m, c0m2):
     rng  = max(c1["h"]-c1["l"], 0.0001)
