@@ -2866,13 +2866,25 @@ def _bot2_sniper_thread():
                             _cs_uwick = _c1_uwick
 
                             # Fake _v11_result for compatibility with downstream code
+                            # Features must include all keys that _ctx_key() and _update() access
                             _v11_result = {
                                 "confidence": _v11_conf,
                                 "rule": _struct_rule,
                                 "side": _p29cl_dir,
                                 "ptb_zone": _p29cl_dist_zone if _p29cl_dist_zone else "MID",
                                 "ptb_pct": _cs_ptb_pct,
-                                "features": {"zone": _p29cl_dist_zone or "MID", "ptb": _cs_ptb_pct},
+                                "features": {
+                                    "zone": _p29cl_dist_zone or "MID",
+                                    "ptb": _cs_ptb_pct,
+                                    "trend": 2,       # neutral default
+                                    "body": 0.3,      # mid-range default
+                                    "green": _c1_green,
+                                    "up1": False,
+                                    "up2": False,
+                                    "rng_exp": False,
+                                    "inside": False,
+                                    "rng_ctr": False,
+                                },
                             }
 
                             print("P29CL FINAL: {} {} conf={} rule={} | STRUCTURAL PRIMARY".format(
