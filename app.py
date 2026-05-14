@@ -559,7 +559,6 @@ def _structural_check_btc(sf):
     if g8 <= 1 and p10 < 0.35:                      return "UP", 58.2, "BTC_BEAR8_BOT"
     if p10 < 0.20:                                  return "UP", 54.9, "BTC_BOT20"
     if p10 > 0.85:                                  return "DOWN", 55.5, "BTC_TOP85"
-    if maru and green and p10 > 0.50:               return "DOWN", 55.1, "BTC_MARU_GRN_TOP"
     return None
 
 
@@ -626,7 +625,7 @@ def _structural_check_doge(sf):
 def _structural_check_bnb(sf):
     """BNB structural rules (V2 with slope)."""
     p10, p20, g8, slope = sf["pos10"], sf["pos20"], sf["g8"], sf["slope"]
-    exp, hammer, hh = sf["expansion"], sf["hammer"], sf["hh"]
+    exp, hammer = sf["expansion"], sf["hammer"]
     cr, cg = sf["consec_red"], sf["consec_green"]
     maru, green, trending = sf["marubozu"], sf["green"], sf["trending"]
     bear_e, bull_e = sf["bear_engulf"], sf["bull_engulf"]
@@ -639,7 +638,6 @@ def _structural_check_bnb(sf):
     if p10 > 0.85 and trending:                     return "DOWN", 59.3, "BNB_TOP85_TREND"
     if cg >= 4 and p10 > 0.70:                      return "DOWN", 58.0, "BNB_4GRN_TOP"
     if maru and exp and p10 > 0.50:                 return "DOWN", 57.8, "BNB_MARU_EXP_TOP"
-    if hh and g8 >= 7:                              return "DOWN", 56.1, "BNB_HH_BULL8"
     if hammer and p10 < 0.30:                       return "UP", 58.1, "BNB_HAMMER_BOT"
     return None
 
@@ -694,6 +692,136 @@ def structural_layer_check(asset, candles_ohlc, ptb_direction, ptb_confidence):
         # Structure DISAGREES — do NOT suppress/flip per Session 21
         # Just tag it for logging, keep original prediction unchanged
         return ptb_direction, ptb_confidence, "DISAGREE_" + struct_rule
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STRUCTURAL SELF-LEARNER — Tracks per-asset per-rule recent performance
+# Adjusts confidence in real time based on whether a rule is working now
+# ══════════════════════════════════════════════════════════════════════════════
+
+class StructuralSelfLearner:
+    def __init__(self, window=20):
+        self.window = window
+        # {asset: {rule: deque of bools (True=win)}}
+        self.history = defaultdict(lambda: defaultdict(lambda: deque(maxlen=20)))
+        self.skip_rules = defaultdict(set)    # {asset: {rules to skip}}
+        self.boost_rules = defaultdict(set)   # {asset: {rules to boost}}
+
+    def record(self, asset, rule, won):
+        """Called after each trade settles."""
+        self.history[asset][rule].append(won)
+        # Re-evaluate after recording
+        recent = self.history[asset][rule]
+        if len(recent) >= 5:
+            wr = sum(recent) / len(recent)
+            if wr < 0.30:
+                self.skip_rules[asset].add(rule)
+                self.boost_rules[asset].discard(rule)
+            elif wr > 0.60:
+                self.boost_rules[asset].add(rule)
+                self.skip_rules[asset].discard(rule)
+            elif wr >= 0.47:
+                # Recovered — remove from skip/boost
+                self.skip_rules[asset].discard(rule)
+                self.boost_rules[asset].discard(rule)
+
+    def adjust(self, asset, rule, base_conf):
+        """Adjust confidence based on recent rule performance."""
+        # Skip check
+        if rule in self.skip_rules.get(asset, set()):
+            return 0  # Signal caller to skip this trade
+
+        recent = self.history[asset][rule]
+        if len(recent) < 5:
+            return base_conf  # Not enough data
+
+        wr = sum(recent) / len(recent)
+        if wr > 0.60:
+            return min(base_conf + 1, 3)
+        elif wr < 0.30:
+            return 0  # Skip
+        elif wr < 0.40:
+            return max(base_conf - 1, 1)
+        else:
+            return base_conf
+
+    def get_state(self):
+        """Serialize for DB persistence."""
+        state = {}
+        for asset in self.history:
+            state[asset] = {}
+            for rule in self.history[asset]:
+                state[asset][rule] = list(self.history[asset][rule])
+        return state
+
+    def load_state(self, state):
+        """Restore from DB."""
+        if not state:
+            return
+        for asset in state:
+            for rule in state[asset]:
+                self.history[asset][rule] = deque(state[asset][rule], maxlen=self.window)
+        # Rebuild skip/boost from loaded history
+        for asset in self.history:
+            for rule in self.history[asset]:
+                recent = self.history[asset][rule]
+                if len(recent) >= 5:
+                    wr = sum(recent) / len(recent)
+                    if wr < 0.30:
+                        self.skip_rules[asset].add(rule)
+                    elif wr > 0.60:
+                        self.boost_rules[asset].add(rule)
+
+
+_structural_self_learner = StructuralSelfLearner()
+
+
+def structural_predict(asset, candles_ohlc):
+    """PRIMARY PREDICTION ENGINE — Structural candlestick patterns.
+
+    Reads last 20 candles, applies asset-specific rules,
+    self-learning adjusts confidence based on recent performance.
+
+    Args:
+        asset: "BTC", "ETH", etc.
+        candles_ohlc: list of (o, h, l, c) tuples, at least 10 candles
+
+    Returns:
+        (side, confidence, rule_name) or (None, 0, "NO_SIG")
+    """
+    if asset not in _STRUCTURAL_FNS:
+        return None, 0, "NO_ASSET"
+
+    sf = _structural_feats(candles_ohlc)
+    if sf is None:
+        return None, 0, "NO_SIG"
+
+    check_fn = _STRUCTURAL_FNS[asset]
+    result = check_fn(sf)
+
+    if result is None:
+        return None, 0, "NO_SIG"
+
+    struct_dir, struct_wr, struct_rule = result
+
+    if struct_dir is None:
+        return None, 0, "NO_SIG"
+
+    # Base confidence from backtested win rate
+    if struct_wr >= 62.0:
+        base_conf = 3
+    elif struct_wr >= 57.0:
+        base_conf = 2
+    else:
+        base_conf = 2  # minimum tradeable confidence
+
+    # Self-learning adjustment
+    adjusted_conf = _structural_self_learner.adjust(asset, struct_rule, base_conf)
+
+    if adjusted_conf == 0:
+        return None, 0, "SKIP_" + struct_rule  # Self-learner says skip
+
+    return struct_dir, adjusted_conf, struct_rule
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2706,62 +2834,49 @@ def _bot2_sniper_thread():
                         _dist_score = 0
                         
 
-                        # ══ P29CL FINAL ENGINE CALL ══
-                        # Feed last 5 closed candles to the self-learning engine
-                        if len(_cs_all) >= 5:
-                            _v11_candles = [
-                                {"open": c[0], "high": c[1], "low": c[2], "close": c[3]}
-                                for c in _cs_all[-5:]
-                            ]
-                            _v11_engine = _p29cl_engines.get(_p29cl_asset)
-                            if _v11_engine:
-                                _v11_result = _v11_engine.predict(_v11_candles)
-                                _v11_decision = should_trade(_v11_result, min_conf=2)
-                                
-                                if not _v11_decision["trade"]:
-                                    print("P29CL SKIP: {} {} ptb={}% cpct={}% {}".format(
-                                        _p29cl_asset, _v11_result.get("rule", "NO_SIG"),
-                                        _cs_ptb_pct, _c1_cpct, _v11_decision.get("reason", "")))
-                                    continue
-                                
-                                _p29cl_dir = _v11_decision["side"]
-                                _p29cl_conf = "HIGH" if _v11_result["confidence"] >= 3 else "MEDIUM"
-                                _v11_conf = _v11_result["confidence"]
-                                
-                                # ══ STRUCTURAL LAYER CHECK (boost-only) ══
-                                _struct_dir, _struct_conf, _struct_tag = structural_layer_check(
-                                    _p29cl_asset, _cs_all, _p29cl_dir, _v11_conf)
-                                if _struct_tag.startswith("BOOST_"):
-                                    _v11_conf = _struct_conf
-                                    _p29cl_conf = "HIGH" if _v11_conf >= 3 else "MEDIUM"
-                                    _cs_tags.append(_struct_tag)
-                                    print("P29CL STRUCT: {} {} BOOSTED conf {} → {} ({})".format(
-                                        _p29cl_asset, _p29cl_dir, _v11_result["confidence"], _v11_conf, _struct_tag))
-                                elif _struct_tag.startswith("DISAGREE_"):
-                                    _cs_tags.append(_struct_tag)
-                                
-                                # DIST for display
-                                _p29cl_dist_prob, _p29cl_dist_zone = _p29cl_calc_dist(_p29cl_asset, _p29cl_price)
-                                
-                                _cs_score = -_v11_conf if _p29cl_dir == "UP" else _v11_conf
-                                _cs_tags.append(_v11_result.get("rule", "V11"))
-                                _cs_tags.append(f"ptb={_v11_result.get('ptb_pct', 0)}")
-                                
-                                _cs_candle_desc = "G" if _c1_green else "R" if _c1_red else "D"
-                                if _c1_indecisive: _cs_candle_desc += "i"
-                                _cs_trend = "3R" if _strong_trend_down else "2R" if _trend_down else "3G" if _strong_trend_up else "2G" if _trend_up else "RNG" if _is_ranging else "MIX"
-                                _p29cl_tag = "CS_{}_{}_{}_{}_{}_S{}".format(_p29cl_dir, _cs_candle_desc, _cs_trend, _cs_macro, _cs_ptb_pos, int(_cs_score))
-                                _p29cl_score = _cs_score
-                                _cs_cpct = _c1_cpct
-                                _cs_uwick = _c1_uwick
-                                
-                                print("P29CL FINAL: {} {} conf={} rule={} zone={} ptb={}% | {}".format(
-                                    _p29cl_asset, _p29cl_dir, _v11_result["confidence"],
-                                    _v11_result["rule"], _v11_result["ptb_zone"],
-                                    _v11_result.get("ptb_pct", 0), _v11_result.get("reason", "")[:60]))
-                            else:
-                                print("P29CL SKIP: {} no V11 engine".format(_p29cl_asset))
+                        # ══ P29CL PRIMARY ENGINE: STRUCTURAL CANDLESTICK PREDICTION ══
+                        # Reads last 20 candles, applies asset-specific pattern rules
+                        # Self-learning adjusts confidence per rule per asset in real time
+                        if len(_cs_all) >= 10:
+                            _p29cl_dir_raw, _struct_conf_raw, _struct_rule = structural_predict(
+                                _p29cl_asset, _cs_all)
+
+                            if _p29cl_dir_raw is None or _struct_conf_raw == 0:
+                                print("P29CL SKIP: {} {} (structural)".format(
+                                    _p29cl_asset, _struct_rule))
                                 continue
+
+                            _p29cl_dir = _p29cl_dir_raw
+                            _v11_conf = _struct_conf_raw
+                            _p29cl_conf = "HIGH" if _v11_conf >= 3 else "MEDIUM"
+
+                            # DIST for display
+                            _p29cl_dist_prob, _p29cl_dist_zone = _p29cl_calc_dist(_p29cl_asset, _p29cl_price)
+
+                            _cs_score = -_v11_conf if _p29cl_dir == "UP" else _v11_conf
+                            _cs_tags.append(_struct_rule)
+                            _cs_tags.append(f"ptb={_cs_ptb_pct}")
+
+                            _cs_candle_desc = "G" if _c1_green else "R" if _c1_red else "D"
+                            if _c1_indecisive: _cs_candle_desc += "i"
+                            _cs_trend = "3R" if _strong_trend_down else "2R" if _trend_down else "3G" if _strong_trend_up else "2G" if _trend_up else "RNG" if _is_ranging else "MIX"
+                            _p29cl_tag = "ST_{}_{}_{}_{}_{}_S{}".format(_p29cl_dir, _cs_candle_desc, _cs_trend, _cs_macro, _cs_ptb_pos, int(_cs_score))
+                            _p29cl_score = _cs_score
+                            _cs_cpct = _c1_cpct
+                            _cs_uwick = _c1_uwick
+
+                            # Fake _v11_result for compatibility with downstream code
+                            _v11_result = {
+                                "confidence": _v11_conf,
+                                "rule": _struct_rule,
+                                "side": _p29cl_dir,
+                                "ptb_zone": _p29cl_dist_zone if _p29cl_dist_zone else "MID",
+                                "ptb_pct": _cs_ptb_pct,
+                                "features": {"zone": _p29cl_dist_zone or "MID", "ptb": _cs_ptb_pct},
+                            }
+
+                            print("P29CL FINAL: {} {} conf={} rule={} | STRUCTURAL PRIMARY".format(
+                                _p29cl_asset, _p29cl_dir, _v11_conf, _struct_rule))
                         else:
                             print("P29CL SKIP: {} insufficient candles ({})".format(_p29cl_asset, len(_cs_all)))
                             continue
@@ -2851,7 +2966,7 @@ def _bot2_sniper_thread():
                                     _p29l_trade_data = {
                                         "asset": _p29cl_asset, "dir": _p29cl_dir, "key": _p29cl_key,
                                         "v11_conf": _v11_conf, "tag": _p29cl_tag,
-                                        "struct_tag": _struct_tag,
+                                        "struct_tag": _struct_rule,
                                         "token": _p29l_token_now, "entry": _p29l_entry_now,
                                         "live_key": _p29l_live_key,
                                     }
@@ -2975,9 +3090,9 @@ def _bot2_sniper_thread():
                             _conf_val = _td.get("v11_conf", 2)
                             _s_tag = _td.get("struct_tag", "NO_STRUCT")
                             
-                            # Tiered fill price: boost price if structural confirms + conf 3
+                            # Tiered fill price: conf 3 = high conviction structural → boost price
                             _tier = _p29l_fill_tiers.get(_asset, {"boost": 0.50, "base": 0.50})
-                            if _s_tag.startswith("BOOST_") and _conf_val >= 3:
+                            if _conf_val >= 3:
                                 _price = _tier["boost"]
                             else:
                                 _price = _tier["base"]
@@ -24183,6 +24298,11 @@ def _resolve_p29cl_trades():
                         _learn_engine.last_prediction = _learn_pred
                         _learn_engine.learn(_learn_actual)
                         
+                        # ── STRUCTURAL SELF-LEARNER: record outcome per rule ──
+                        _learn_rule = _learn_pred.get("rule", "")
+                        _learn_correct = _learn_pred["side"] == _learn_actual
+                        _structural_self_learner.record(_learn_asset, _learn_rule, _learn_correct)
+                        
                         # Clean up stored prediction
                         _p29cl_predictions.pop(_learn_key, None)
                         
@@ -24369,6 +24489,12 @@ def _resolve_p29cl_live_trades():
                             _learn_actual = "DOWN" if _learn_bet_side == "UP" else "UP"
                         _learn_engine.last_prediction = _learn_pred
                         _learn_engine.learn(_learn_actual)
+                        
+                        # ── STRUCTURAL SELF-LEARNER: record outcome per rule ──
+                        _learn_rule = _learn_pred.get("rule", "")
+                        _learn_correct = _learn_pred["side"] == _learn_actual
+                        _structural_self_learner.record(_learn_asset, _learn_rule, _learn_correct)
+                        
                         _p29cl_predictions.pop(_learn_key, None)
                         _p29cl_predictions.pop(_learn_key_paper, None)
                         _p29cl_save_engine_state()
