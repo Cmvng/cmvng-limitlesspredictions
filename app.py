@@ -776,6 +776,41 @@ class StructuralSelfLearner:
 _structural_self_learner = StructuralSelfLearner()
 
 
+def _save_structural_learner():
+    """Persist structural self-learner state to DB."""
+    try:
+        import json
+        state_json = json.dumps(_structural_self_learner.get_state())
+        db = get_db()
+        db.run("""INSERT INTO bot_state (bot_name, json_state) VALUES (:bn, :js)
+                  ON CONFLICT(bot_name) DO UPDATE SET json_state=:js""",
+               bn="structural_self_learner", js=state_json)
+        db.close()
+    except Exception as e:
+        print("Structural learner save error: {}".format(e))
+
+
+def _load_structural_learner():
+    """Load structural self-learner state from DB on startup."""
+    try:
+        import json
+        db = get_db()
+        row = db.run("SELECT json_state FROM bot_state WHERE bot_name=:bn",
+                     bn="structural_self_learner")
+        db.close()
+        if row and len(row) > 0:
+            _raw = row[0]["json_state"] if isinstance(row[0], dict) else row[0][0]
+            state = json.loads(_raw)
+            _structural_self_learner.load_state(state)
+            total_rules = sum(len(v) for v in state.values())
+            print("STRUCTURAL LEARNER: restored {} rules across {} assets from DB".format(
+                total_rules, len(state)))
+        else:
+            print("STRUCTURAL LEARNER: no saved state — starting fresh")
+    except Exception as e:
+        print("STRUCTURAL LEARNER load error: {}".format(e))
+
+
 def structural_predict(asset, candles_ohlc):
     """PRIMARY PREDICTION ENGINE — Structural candlestick patterns.
 
@@ -7274,6 +7309,12 @@ for _asset, _engine in _p29cl_engines.items():
             _preseed_count += 1
 if _preseed_count > 0:
     print("P29CL: pre-seeded {} toxic rule entries across all engines".format(_preseed_count))
+
+# Load structural self-learner state from DB
+try:
+    _load_structural_learner()
+except Exception as _sl_err:
+    print("STRUCTURAL LEARNER: load failed — starting fresh: {}".format(_sl_err))
 
 # ═══════════════════════════════════════════════════════════
 # TELEGRAM
@@ -24308,6 +24349,7 @@ def _resolve_p29cl_trades():
                         _learn_rule = _learn_pred.get("rule", "")
                         _learn_correct = _learn_pred["side"] == _learn_actual
                         _structural_self_learner.record(_learn_asset, _learn_rule, _learn_correct)
+                        _save_structural_learner()
                         
                         # Clean up stored prediction
                         _p29cl_predictions.pop(_learn_key, None)
@@ -24500,6 +24542,7 @@ def _resolve_p29cl_live_trades():
                         _learn_rule = _learn_pred.get("rule", "")
                         _learn_correct = _learn_pred["side"] == _learn_actual
                         _structural_self_learner.record(_learn_asset, _learn_rule, _learn_correct)
+                        _save_structural_learner()
                         
                         _p29cl_predictions.pop(_learn_key, None)
                         _p29cl_predictions.pop(_learn_key_paper, None)
