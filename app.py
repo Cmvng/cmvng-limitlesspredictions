@@ -2286,9 +2286,16 @@ def _bot2_sniper_thread():
                                 "oid": _oid, "filled": _filled, "price": _price,
                             })
                         _fl = "FILLED" if _filled else "GTC"
-                        print("P29CL T0: {} {} @{}c {} conf={} rule={}".format(
+                        print("P29CL T0: {} {} @{}c {} conf={} rule={} | pool=${:.2f}".format(
                             _asset, _order_info["dir"], int(_price*100), _fl,
-                            _order_info["conf"], _order_info["rule"]))
+                            _order_info["conf"], _order_info["rule"],
+                            _p29cl_live_state["balance"]))
+                        try:
+                            send_telegram("\U0001f3af <b>P29CL T0</b>\n{} {} $3.00 @{}c {}\nconf={} rule={}\nPool: ${:.2f}".format(
+                                _order_info["dir"], _asset, int(_price*100), _fl,
+                                _order_info["conf"], _order_info["rule"],
+                                _p29cl_live_state["balance"]))
+                        except: pass
                     except Exception as _e:
                         print("P29CL T0 error {}: {}".format(_asset, _e))
                 
