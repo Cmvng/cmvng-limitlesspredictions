@@ -2201,16 +2201,112 @@ def _bot2_sniper_thread():
                 _time.sleep(max(secs_to_boundary + 5, 5))
                 continue
             
+            # ── T-10s: PRE-PREDICT — Run structural engine on 96%-formed candles ──
+            # The candle is almost complete. Pre-compute directions so orders fire at T+0.
+            _p29cl_pre_orders = {}  # {asset: {"dir": "UP"/"DOWN", "conf": int, "rule": str, "token": str}}
+            for _pre_asset in P29CL_ASSETS:
+                try:
+                    _pre_candles = _p29cl_candle_prefetch.get(_pre_asset)
+                    if not _pre_candles or len(_pre_candles) < 10:
+                        continue
+                    _pre_dir, _pre_conf, _pre_rule = structural_predict(_pre_asset, _pre_candles)
+                    if _pre_dir and _pre_conf >= 2:
+                        # Get token for this direction
+                        _pre_tmap = _p29cl_token_map.get(_pre_asset)
+                        if _pre_tmap:
+                            _pre_token = _pre_tmap["up_token"] if _pre_dir == "UP" else _pre_tmap["down_token"]
+                            _p29cl_pre_orders[_pre_asset] = {
+                                "dir": _pre_dir, "conf": _pre_conf, "rule": _pre_rule,
+                                "token": _pre_token, "slug": _pre_tmap.get("slug", ""),
+                            }
+                except Exception as _pre_err:
+                    print("P29CL PRE-PREDICT error {}: {}".format(_pre_asset, _pre_err))
+            
+            if _p29cl_pre_orders:
+                print("P29CL PRE-PREDICT: {} orders ready — {}".format(
+                    len(_p29cl_pre_orders),
+                    ", ".join("{} {}".format(a, d["dir"]) for a, d in _p29cl_pre_orders.items())))
+            
             print("BOT2: {} tokens ready, {} prefetched, waiting for boundary...".format(
                 len(token_map), len(_bot2_prefetch)))
             
-            # ── Wait until T+0 ──
+            # ── Wait until exactly T+0.000 — fire pre-built orders immediately ──
             now2 = datetime.now(timezone.utc)
             wait_secs = (next_boundary - now2).total_seconds()
             if 0 < wait_secs < 120:
-                _time.sleep(max(wait_secs + 0.3, 0))  # Wait 0.3s AFTER boundary for Chainlink to settle
+                _time.sleep(max(wait_secs, 0))  # Wait until EXACTLY T+0, not T+0.3
+            
+            # ── T+0.000: FIRE PRE-BUILT ORDERS IMMEDIATELY ──
+            if _p29cl_pre_orders and _p29cl_live_state["enabled"] and _poly_has_creds():
+                import threading as _pre_threading
+                from py_clob_client_v2 import Side as _PreSide, OrderArgs as _PreArgs, OrderType as _PreOT
+                _pre_client = _get_poly_client()
+                _pre_results = []
+                _pre_lock = _pre_threading.Lock()
+                
+                def _fire_pre_order(_asset, _order_info):
+                    """Fire pre-built order at T+0.000 — runs in own thread."""
+                    try:
+                        _tok = _order_info["token"]
+                        _price = 0.50  # Fixed 50c — above this loses money per adverse selection data
+                        _stake = 3.0
+                        _shares = round(_stake / _price, 2)
+                        oa = _PreArgs(token_id=str(_tok), price=_price, size=_shares, side=_PreSide.BUY)
+                        signed = _pre_client.create_order(oa)
+                        resp = _pre_client.post_order(signed, _PreOT.GTC)
+                        _oid = resp.get("orderID") or resp.get("order_id") if resp else None
+                        _filled = (resp.get("status") or "").upper() in ("MATCHED", "FILLED") if resp else False
+                        
+                        # Deduct from live pool
+                        _p29cl_live_state["balance"] = round(_p29cl_live_state["balance"] - _stake, 2)
+                        
+                        # Record in DB for resolution
+                        try:
+                            _t0db = get_db()
+                            _t0_key = "{}_15M_{}".format(_asset, window_ts)
+                            _t0db.run("""INSERT INTO p29cl_live_trades
+                                (market_id,asset,bet_side,stake,fill_price,pool_after,
+                                 order_id,token_id,slug,filled,status,confidence,indicators,fired_at)
+                                VALUES(:mid,:ast,:bs,:stake,:fill,:pool,:oid,:tid,:slg,:filled,'Pending','HIGH',:ind,:now)""",
+                                mid=_t0_key, ast=_asset, bs=_order_info["dir"],
+                                stake=_stake, fill=_price,
+                                pool=_p29cl_live_state["balance"],
+                                oid=_oid, tid=str(_tok)[:50],
+                                slg=_order_info.get("slug", ""),
+                                filled=_filled, ind=_order_info["rule"],
+                                now=datetime.now(timezone.utc).isoformat())
+                            _t0db.close()
+                        except Exception as _dbe:
+                            print("P29CL T0 DB error {}: {}".format(_asset, _dbe))
+                        
+                        with _pre_lock:
+                            _pre_results.append({
+                                "asset": _asset, "dir": _order_info["dir"],
+                                "conf": _order_info["conf"], "rule": _order_info["rule"],
+                                "oid": _oid, "filled": _filled, "price": _price,
+                            })
+                        _fl = "FILLED" if _filled else "GTC"
+                        print("P29CL T0: {} {} @{}c {} conf={} rule={}".format(
+                            _asset, _order_info["dir"], int(_price*100), _fl,
+                            _order_info["conf"], _order_info["rule"]))
+                    except Exception as _e:
+                        print("P29CL T0 error {}: {}".format(_asset, _e))
+                
+                _pre_threads = []
+                for _pa, _po in _p29cl_pre_orders.items():
+                    t = _pre_threading.Thread(target=_fire_pre_order, args=(_pa, _po), daemon=True)
+                    t.start()
+                    _pre_threads.append(t)
+                for t in _pre_threads:
+                    t.join(timeout=3)
+                
+                if _pre_results:
+                    print("P29CL T0: {} orders fired at T+0.000".format(len(_pre_results)))
             
             # ── T+0.3s: Read Chainlink prices and calculate direction ──
+            # Still wait for Chainlink to settle for the regular prediction flow
+            _time.sleep(0.3)
+            
             # Get BTC direction first (needed for all assets)
             btc_chainlink = _chainlink_prices.get("BTC")
             btc_dir = None
@@ -3099,6 +3195,11 @@ def _bot2_sniper_thread():
                         print("P29CL CRASH FILTER: {}".format(_cf_log))
                     
                     _p29cl_live_queue_filtered = [item["trade_data"] for item in _cf_filtered if item["decision"]["trade"]]
+                    
+                    # Skip assets that already got T+0 pre-orders
+                    if _p29cl_pre_orders:
+                        _p29cl_live_queue_filtered = [t for t in _p29cl_live_queue_filtered if t["asset"] not in _p29cl_pre_orders]
+                    
                     _p29cl_blocked = len(_p29cl_instant_live_queue) - len(_p29cl_live_queue_filtered)
                     if _p29cl_blocked > 0:
                         print("P29CL FILTER: {} of {} trades blocked".format(_p29cl_blocked, len(_p29cl_instant_live_queue)))
