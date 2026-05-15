@@ -21953,7 +21953,7 @@ except Exception as _init_err:
     _poly_alpha3_state["floor_balance"] = 10.0
     _poly_alpha3_state["enabled"] = False  # PAUSED — isolating P29CL T+0 first
     _save_bot_balance("poly_alpha3", _poly_alpha3_state)
-    print("POLY ALPHA 3.0: LIVE — P2.3 15M | $3 flat | max 70c | pool=${:.2f}".format(_poly_alpha3_state["balance"]))
+    print("POLY ALPHA 3.0: PAUSED — P2.3 15M | pool=${:.2f}".format(_poly_alpha3_state["balance"]))
     _poly_alpha3_load_recent()
 
     _poly_alpha_load_recent_trades()
@@ -22029,8 +22029,8 @@ if SIGNALS_DB_URL:
     threading.Thread(target=_bot2_sniper_thread, daemon=True).start()
     print("BOT2 SNIPER thread launched")
     
-    # ── Alpha 3.0 (P23 LIVE) running alongside Bot2 Sniper ──
-    print("POLY ALPHA 3.0: LIVE — running alongside Bot2 Sniper")
+    # ── Alpha 3.0 (P23) — PAUSED for P29CL T+0 isolation ──
+    print("POLY ALPHA 3.0: PAUSED — isolating P29CL T+0 | pool=${:.2f}".format(_poly_alpha3_state["balance"]))
 
     # ── LIMITLESS SNIPER init ──
     _saved_lmts = _saved_balances.get("limitless_sniper", {})
