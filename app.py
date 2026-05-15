@@ -3174,7 +3174,7 @@ def _bot2_sniper_thread():
                     print("P29CL: {} paper trades | phase={} | pool=${:.2f}".format(
                         _p29cl_count, _p29cl_phase, _p29cl_state["balance"]))
                 else:
-                    print("P29CL: 0 trades (no momentum signal) | candles={} chainlink={}".format(
+                    print("P29CL: 0 trades (no structural pattern matched) | candles={} chainlink={}".format(
                         len(_p29cl_candle_prefetch), len(_chainlink_prices)))
             except Exception as _p29cl_err:
                 import traceback
@@ -21951,7 +21951,7 @@ except Exception as _init_err:
         _poly_alpha3_state["peak_balance"] = 60.0
     _poly_alpha3_state["starting_balance"] = 60.0
     _poly_alpha3_state["floor_balance"] = 10.0
-    _poly_alpha3_state["enabled"] = True  # LIVE — P2.3 on 15M markets, $3 flat, max 70c
+    _poly_alpha3_state["enabled"] = False  # PAUSED — isolating P29CL T+0 first
     _save_bot_balance("poly_alpha3", _poly_alpha3_state)
     print("POLY ALPHA 3.0: LIVE — P2.3 15M | $3 flat | max 70c | pool=${:.2f}".format(_poly_alpha3_state["balance"]))
     _poly_alpha3_load_recent()
