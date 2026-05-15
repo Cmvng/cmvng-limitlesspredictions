@@ -2248,7 +2248,7 @@ def _bot2_sniper_thread():
                     """Fire pre-built order at T+0.000 — runs in own thread."""
                     try:
                         _tok = _order_info["token"]
-                        _price = 0.50  # Fixed 50c — above this loses money per adverse selection data
+                        _price = 0.55  # Max 55c — buys at best available up to this limit
                         _stake = 3.0
                         _shares = round(_stake / _price, 2)
                         oa = _PreArgs(token_id=str(_tok), price=_price, size=_shares, side=_PreSide.BUY)
@@ -24609,6 +24609,27 @@ def _resolve_p29cl_live_trades():
                 if won is None:
                     if now > expiry + timedelta(hours=1): won = False
                     else: continue
+                
+                # ── CHECK IF ORDER ACTUALLY FILLED ──
+                _was_filled = p.get("filled")
+                if _was_filled is False or str(_was_filled).lower() == "false":
+                    try:
+                        _cancel_oid = p.get("order_id")
+                        if _cancel_oid:
+                            _cancel_client = _get_poly_client()
+                            _cancel_client.cancel(_cancel_oid)
+                    except: pass
+                    _p29cl_live_state["balance"] = round(_p29cl_live_state["balance"] + stake, 2)
+                    c3 = get_db()
+                    c3.run("UPDATE p29cl_live_trades SET status=:s,outcome=:o,resolved_at=:r WHERE id=:i",
+                        s="Cancelled", o="UNFILLED", r=now.isoformat(), i=p["id"])
+                    c3.close()
+                    resolved += 1
+                    print("P29CL LIVE #{} UNFILLED: cancelled, ${:.2f} refunded | pool=${:.2f}".format(
+                        p["id"], stake, _p29cl_live_state["balance"]))
+                    _save_bot_balance("p29cl_live", _p29cl_live_state)
+                    continue
+                
                 fill = float(p.get("fill_price") or 0.50)
                 payout = round(stake / fill, 4) if won else 0
                 c3 = get_db()
