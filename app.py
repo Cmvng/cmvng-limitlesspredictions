@@ -2290,12 +2290,6 @@ def _bot2_sniper_thread():
                             _asset, _order_info["dir"], int(_price*100), _fl,
                             _order_info["conf"], _order_info["rule"],
                             _p29cl_live_state["balance"]))
-                        try:
-                            send_telegram("\U0001f3af <b>P29CL T0</b>\n{} {} $3.00 @{}c {}\nconf={} rule={}\nPool: ${:.2f}".format(
-                                _order_info["dir"], _asset, int(_price*100), _fl,
-                                _order_info["conf"], _order_info["rule"],
-                                _p29cl_live_state["balance"]))
-                        except: pass
                     except Exception as _e:
                         print("P29CL T0 error {}: {}".format(_asset, _e))
                 
@@ -2309,6 +2303,16 @@ def _bot2_sniper_thread():
                 
                 if _pre_results:
                     print("P29CL T0: {} orders fired at T+0.000".format(len(_pre_results)))
+                    # Send Telegram from main thread (not from order threads)
+                    for _t0r in _pre_results:
+                        try:
+                            _t0_fl = "FILLED" if _t0r.get("filled") else "GTC"
+                            send_telegram("\U0001f3af <b>P29CL T0</b>\n{} {} $3.00 @{}c {}\nconf={} rule={}\nPool: ${:.2f}".format(
+                                _t0r["dir"], _t0r["asset"], int(_t0r["price"]*100), _t0_fl,
+                                _t0r["conf"], _t0r["rule"],
+                                _p29cl_live_state["balance"]))
+                        except Exception as _tg_err:
+                            print("P29CL T0 telegram error: {}".format(_tg_err))
             
             # ── T+0.3s: Read Chainlink prices and calculate direction ──
             # Still wait for Chainlink to settle for the regular prediction flow
@@ -3361,7 +3365,8 @@ def _bot2_sniper_thread():
                                         int(_p29l_r["price"] * 100), _fs,
                                         _p29l_r["conf_val"], _p29l_r["tag"],
                                         _p29cl_live_state["balance"]))
-                                except: pass
+                                except Exception as _tg_err:
+                                    print("P29CL LIVE telegram error: {}".format(_tg_err))
                                 
                             except Exception as _p29l_ae:
                                 print("P29CL LIVE record error {}: {}".format(_p29l_r.get("asset","?"), _p29l_ae))
