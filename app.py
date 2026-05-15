@@ -1449,7 +1449,7 @@ def _poly_alpha_load_recent_trades():
 # ═══════════════════════════════════════════════════════════
 
 _poly_alpha3_state = {
-    "enabled": True,
+    "enabled": False,  # PAUSED — isolating P29CL T+0 first
     "balance": 60.0,
     "peak_balance": 60.0,
     "starting_balance": 60.0,
