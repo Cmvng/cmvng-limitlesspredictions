@@ -2241,9 +2241,10 @@ def _bot2_sniper_thread():
                 send_telegram("🛑 BOT2 SNIPER STOPPED — balance ${:.2f}".format(_bot2_sniper_state["balance"]))
             
     # ── P2.9CL: Phase-aware momentum engine at T+0.5s ──
+            _p29cl_should_run = _p29cl_state["enabled"]
             try:
-                if not _p29cl_state["enabled"]:
-                    continue
+                if not _p29cl_should_run:
+                    raise Exception("P29CL disabled — skip to P3.0")
                 
                 # Boundary-level dedup — prevent entire block from running twice
                 _p29cl_skip_boundary = (window_ts in _p29cl_fired_boundaries)
