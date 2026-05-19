@@ -3173,16 +3173,22 @@ def _bot2_sniper_thread():
                             _p30_filled = False
                             
                             try:
-                                if hasattr(_p29l_client if '_p29l_client' in dir() else None, 'create_order'):
+                                from py_clob_client_v2 import Side as _P30Side, OrderArgs as _P30Args, OrderType as _P30OT
+                                _p30_client = _get_poly_client()
+                                if _p30_client:
                                     _p30_shares = round(_p30_stake / _p30_price, 4)
-                                    _p30_args = _P29LArgs(token_id=str(_p30_tid), price=_p30_price, size=_p30_shares, side=_P29LSide.BUY)
-                                    _p30_signed = _p29l_client.create_order(_p30_args)
-                                    _p30_resp = _p29l_client.post_order(_p30_signed, _P29LOT.GTC)
+                                    _p30_args = _P30Args(token_id=str(_p30_tid), price=_p30_price, size=_p30_shares, side=_P30Side.BUY)
+                                    _p30_signed = _p30_client.create_order(_p30_args)
+                                    _p30_resp = _p30_client.post_order(_p30_signed, _P30OT.GTC)
                                     if _p30_resp:
                                         _p30_oid = _p30_resp.get("orderID") or _p30_resp.get("id")
                                         _p30_status = (_p30_resp.get("status") or "").upper()
                                         _p30_matched = float(_p30_resp.get("sizeMatched") or 0)
                                         _p30_filled = _p30_status in ("MATCHED", "FILLED") or _p30_matched > 0
+                                        print("P3.0 ORDER OK {}: oid={} status={} matched={}".format(
+                                            _p30_asset, str(_p30_oid)[:20], _p30_status, _p30_matched))
+                                else:
+                                    print("P3.0 NO CLIENT: {} — order not placed".format(_p30_asset))
                             except Exception as _p30_oe:
                                 print("P3.0 order error {}: {}".format(_p30_asset, _p30_oe))
                             
