@@ -24544,43 +24544,27 @@ def _resolve_p30_live_trades():
                 order_id = p.get("order_id", "")
                 was_filled = p.get("filled", False)
                 
-                # Check if order was filled by checking order status or position
-                if not was_filled and order_id:
-                    try:
-                        import requests as _req
-                        # Try to cancel — if already filled, cancel returns FILLED
-                        cancel_result = _cancel_order(order_id)
-                        if cancel_result == "FILLED":
-                            was_filled = True
-                        elif cancel_result == True:
-                            # Successfully cancelled — never filled
-                            c_upd = get_db()
-                            c_upd.run("UPDATE p30_live_trades SET status='Cancelled',outcome='UNFILLED',resolved_at=:r WHERE id=:i",
-                                r=now.isoformat(), i=p["id"])
-                            c_upd.close()
-                            resolved += 1
-                            print("P3.0 #{} CANCELLED (unfilled)".format(p["id"]))
-                            continue
-                    except:
-                        pass
-                
-                if not was_filled:
-                    # Also check via position
+                # Check if order was filled
+                # Orders marked MATCHED/FILLED at placement are already filled
+                if was_filled:
+                    pass  # already filled at order time
+                elif not was_filled:
+                    # Check via portfolio position (don't try cancel — order IDs are hex, not UUID)
                     try:
                         if slug and _check_has_position(slug):
                             was_filled = True
+                            print("P3.0 #{} fill detected via position check".format(p["id"]))
                     except:
                         pass
                 
                 if not was_filled:
-                    # After 1 hour, mark as unfilled
-                    if now > expiry + timedelta(hours=1):
+                    # After 20 minutes (5 min grace after 15M window), mark as unfilled
+                    if now > expiry + timedelta(minutes=20):
                         c_upd = get_db()
                         c_upd.run("UPDATE p30_live_trades SET status='Cancelled',outcome='UNFILLED',resolved_at=:r WHERE id=:i",
                             r=now.isoformat(), i=p["id"])
                         c_upd.close()
                         resolved += 1
-                        # Refund balance
                         _p30_state["balance"] = round(_p30_state["balance"] + stake, 2)
                         print("P3.0 #{} UNFILLED (refunded ${:.2f})".format(p["id"], stake))
                         continue
