@@ -12,7 +12,7 @@ from datetime import datetime, timezone, timedelta
 # Built from 59,240 candles across BTC, ETH, SOL, DOGE, BNB, XRP
 # 21,821 backtested predictions. $4,472 combined P&L.
 # ══════════════════════════════════════════════════════════════════════════════
-from collections import defaultdict, deque
+from collections import defaultdict
 
 def _feats(c1, c1m, c1m2, c0m, c0m2):
     rng  = max(c1["h"]-c1["l"], 0.0001)
@@ -253,6 +253,143 @@ ASSET_ANCHORS = {
 ASSET_WR = {"BTC":"56.3%","ETH":"58.0%","SOL":"56.1%","DOGE":"54.4%","BNB":"55.1%","XRP":"57.8%"}
 ASSET_PNL = {"BTC":"+$978","ETH":"+$1,161","SOL":"+$506","DOGE":"+$912","BNB":"+$814","XRP":"+$101"}
 
+# ══════════════════════════════════════════════════════════════════════════════
+# STRUCTURAL LAYER v2 — Session 21
+# Swing point detection, trend/BOS/CHoCH/S-R/momentum analysis
+# Applied as confidence booster (NOT suppress) across all 6 assets
+# Backtested: +$241 P&L on 25,718 trades, zero WR degradation
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _struct_find_swings(candles, lookback=5):
+    """Find swing highs/lows with N-bar lookback."""
+    swings = []
+    for i in range(lookback, len(candles) - lookback):
+        h = candles[i]["h"]; l = candles[i]["l"]
+        is_high = all(h > candles[i-j]["h"] and h > candles[i+j]["h"] for j in range(1, lookback+1))
+        is_low  = all(l < candles[i-j]["l"] and l < candles[i+j]["l"] for j in range(1, lookback+1))
+        if is_high: swings.append({"idx": i, "type": "SH", "price": h})
+        if is_low:  swings.append({"idx": i, "type": "SL", "price": l})
+    return sorted(swings, key=lambda x: x["idx"])
+
+def _struct_context(candle_idx, candles, swings):
+    """Build structural context for a candle position."""
+    price = candles[candle_idx]["c"]
+    price_low = candles[candle_idx]["l"]
+    price_high = candles[candle_idx]["h"]
+    recent = sorted([s for s in swings if s["idx"] < candle_idx and s["idx"] > candle_idx - 400], key=lambda x: x["idx"])
+    if len(recent) < 4:
+        return {"trend":"UNKNOWN","strength":0,"bos":None,"choch":None,"at_support":False,"at_resistance":False,
+                "near_support":False,"near_resistance":False,"support_tests":0,"resistance_tests":0,
+                "momentum":"UNKNOWN","dist_from_support":999,"dist_from_resistance":999}
+    highs = [s for s in recent if s["type"] == "SH"]
+    lows  = [s for s in recent if s["type"] == "SL"]
+    # Trend
+    trend = "RANGE"; strength = 0
+    if len(highs) >= 2 and len(lows) >= 2:
+        h_rising  = sum(1 for i in range(1, len(highs)) if highs[i]["price"] > highs[i-1]["price"])
+        h_falling = sum(1 for i in range(1, len(highs)) if highs[i]["price"] < highs[i-1]["price"])
+        l_rising  = sum(1 for i in range(1, len(lows))  if lows[i]["price"] > lows[i-1]["price"])
+        l_falling = sum(1 for i in range(1, len(lows))  if lows[i]["price"] < lows[i-1]["price"])
+        if h_rising > h_falling and l_rising > l_falling: trend = "UPTREND"; strength = min(h_rising + l_rising, 3)
+        elif h_falling > h_rising and l_falling > l_rising: trend = "DOWNTREND"; strength = min(h_falling + l_falling, 3)
+        elif h_rising > h_falling and l_rising == l_falling: trend = "WEAK_UP"; strength = 1
+        elif h_falling > h_rising and l_falling == l_rising: trend = "WEAK_DOWN"; strength = 1
+    # S/R
+    supports = sorted([s["price"] for s in recent if s["type"]=="SL" and s["price"]<price], reverse=True)
+    resistances = sorted([s["price"] for s in recent if s["type"]=="SH" and s["price"]>price])
+    nearest_sup = supports[0] if supports else None
+    nearest_res = resistances[0] if resistances else None
+    sup_dist = (price-nearest_sup)/price*100 if nearest_sup else 999
+    res_dist = (nearest_res-price)/price*100 if nearest_res else 999
+    at_support = sup_dist < 0.5; at_resistance = res_dist < 0.5
+    near_support = sup_dist < 1.5; near_resistance = res_dist < 1.5
+    sup_tests = sum(1 for s in supports if nearest_sup and abs(s-nearest_sup)/nearest_sup<0.005) if nearest_sup else 0
+    res_tests = sum(1 for r in resistances if nearest_res and abs(r-nearest_res)/nearest_res<0.005) if nearest_res else 0
+    # BOS
+    bos = None; last_sl = lows[-1] if lows else None; last_sh = highs[-1] if highs else None
+    if trend in ("UPTREND","WEAK_UP") and last_sl and price_low < last_sl["price"]: bos = "BEARISH_BOS"
+    elif trend in ("DOWNTREND","WEAK_DOWN") and last_sh and price_high > last_sh["price"]: bos = "BULLISH_BOS"
+    # CHoCH
+    choch = None
+    if len(highs)>=2 and trend in ("UPTREND","WEAK_UP") and highs[-1]["price"]<highs[-2]["price"]: choch = "BEARISH_CHOCH"
+    if len(lows)>=2 and trend in ("DOWNTREND","WEAK_DOWN") and lows[-1]["price"]>lows[-2]["price"]: choch = "BULLISH_CHOCH"
+    # Momentum
+    momentum = "UNKNOWN"
+    if trend in ("UPTREND","WEAK_UP") and len(highs)>=3:
+        moves = [highs[i]["price"]-highs[i-1]["price"] for i in range(1,len(highs))]
+        if len(moves)>=2:
+            if moves[-1]>moves[-2]*1.3: momentum="ACCELERATING"
+            elif moves[-1]<moves[-2]*0.5: momentum="EXHAUSTING"
+            else: momentum="STEADY"
+    elif trend in ("DOWNTREND","WEAK_DOWN") and len(lows)>=3:
+        moves = [lows[i-1]["price"]-lows[i]["price"] for i in range(1,len(lows))]
+        if len(moves)>=2:
+            if moves[-1]>moves[-2]*1.3: momentum="ACCELERATING"
+            elif moves[-1]<moves[-2]*0.5: momentum="EXHAUSTING"
+            else: momentum="STEADY"
+    return {"trend":trend,"strength":strength,"bos":bos,"choch":choch,"momentum":momentum,
+            "at_support":at_support,"at_resistance":at_resistance,"near_support":near_support,
+            "near_resistance":near_resistance,"support_tests":sup_tests,"resistance_tests":res_tests,
+            "dist_from_support":round(sup_dist,2),"dist_from_resistance":round(res_dist,2)}
+
+# ── STRUCTURAL FILTER v2: Asset-specific boost-only ──
+# Proven on 6-asset backtest: +$241 P&L, 0% WR loss
+_STRUCT_BOOST_RULES = {
+    "BTC": {("DOWNTREND","DOWN"):59.1,("DOWNTREND","DOWN","EXHAUST"):60.1,("DOWNTREND","UP","EXHAUST"):58.7,
+            ("BULLISH_BOS","DOWN"):59.5,("BEARISH_CHOCH","DOWN"):59.5,("BULLISH_CHOCH","UP"):59.5,("BULLISH_CHOCH","DOWN"):57.4,("DOWNTREND","DOWN","ACCEL"):58.1},
+    "ETH": {("DOWNTREND","UP"):58.9,("DOWNTREND","UP","ACCEL"):62.2,("DOWNTREND","UP","AT_SUP"):60.8,
+            ("RANGE","DOWN"):59.8,("RANGE","UP"):60.7,("RANGE","UP","AT_SUP"):60.7,("UPTREND","DOWN"):58.3,
+            ("BEARISH_CHOCH","DOWN"):58.8,("BULLISH_CHOCH","UP"):61.7,("BULLISH_BOS","DOWN"):57.7},
+    "SOL": {("RANGE","UP"):59.0,("RANGE","UP","AT_SUP"):62.0,("BEARISH_CHOCH","UP"):59.0,
+            ("DOWNTREND","UP","ACCEL"):57.8,("DOWNTREND","UP","AT_SUP"):58.4,("UPTREND","UP","AT_SUP"):57.7,("UPTREND","UP","EXHAUST"):58.7},
+    "DOGE":{("RANGE","DOWN"):57.5,("RANGE","DOWN","AT_RES"):58.8,("RANGE","DOWN","AT_SUP"):58.2,
+            ("BEARISH_BOS","UP"):64.2,("BULLISH_CHOCH","UP"):57.3,("DOWNTREND","UP","EXHAUST"):57.3,
+            ("DOWNTREND","UP","AT_SUP"):57.3,("UPTREND","DOWN","AT_RES"):57.7},
+    "BNB": {("DOWNTREND","DOWN"):57.5,("DOWNTREND","DOWN","ACCEL"):59.6,("BEARISH_BOS","DOWN"):68.5,
+            ("BEARISH_CHOCH","UP"):58.8,("RANGE","UP"):58.3},
+    "XRP": {},
+}
+_STRUCT_SUPPRESS_RULES = {"XRP": {("BULLISH_BOS","DOWN"):42.3}}
+
+def _struct_filter(prediction, confidence, rule, sc, asset):
+    """Apply asset-specific structural filter. Returns (pred, conf, action, reason)."""
+    if not prediction: return prediction, confidence, "PASS", "NO_PRED"
+    trend = sc["trend"]
+    if trend == "WEAK_UP": trend = "UPTREND"
+    if trend == "WEAK_DOWN": trend = "DOWNTREND"
+    bos=sc["bos"]; choch=sc["choch"]; momentum=sc["momentum"]
+    at_sup=sc["at_support"]; at_res=sc["at_resistance"]
+    # Suppress (XRP only)
+    for key, wr in _STRUCT_SUPPRESS_RULES.get(asset, {}).items():
+        if len(key)==2:
+            sig, pred = key
+            if prediction==pred and (sig==bos or sig==choch):
+                return None, 0, "SUPPRESS", "{}+{}_{}pct".format(sig,pred,wr)
+    # Boost
+    boost_rules = _STRUCT_BOOST_RULES.get(asset, {})
+    best_boost = None; best_wr = 0
+    for key, wr in boost_rules.items():
+        if len(key)==3:
+            a,b,c = key
+            if b!=prediction: continue
+            if a!=trend and a!=bos and a!=choch: continue
+            if c=="ACCEL" and momentum!="ACCELERATING": continue
+            if c=="EXHAUST" and momentum!="EXHAUSTING": continue
+            if c=="AT_SUP" and not at_sup: continue
+            if c=="AT_RES" and not at_res: continue
+            if wr>best_wr: best_boost="{}+{}+{}".format(a,b,c); best_wr=wr
+        elif len(key)==2:
+            a,b = key
+            if b!=prediction: continue
+            if a==trend or a==bos or a==choch:
+                if wr>best_wr: best_boost="{}+{}".format(a,b); best_wr=wr
+    if best_boost and best_wr>=57:
+        return prediction, min(3, confidence+1), "BOOST", "{}_{}pct".format(best_boost,best_wr)
+    return prediction, confidence, "PASS", "NO_FILTER"
+
+# Cache for structural data per asset (recomputed each cycle)
+_struct_cache = {}  # {"BTC": {"swings": [...], "candles": [...], "sc": {...}}, ...}
+
 
 class P29CLFinal:
     def __init__(self, asset="BTC", state_path=None):
@@ -410,453 +547,6 @@ def should_trade(result, min_conf=2):
     return {"trade":True,"side":result["side"],
             "stake":{2:1.0,3:1.5}.get(result["confidence"],1.0),
             "confidence":result["confidence"],"rule":result["rule"]}
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# STRUCTURAL LAYER v1 — Asset-Specific Candle Pattern Filter (Boost Only)
-# Session 21 finding: suppress = harmful, boost = meaningful edge (+$241, 57.6% WR)
-# Reads 20 candles → extracts pos10/pos20/g8/slope/expansion/engulfing/patterns
-# Each asset has rules backtested from thousands of candles
-# Integration: BOOST only — confirms PTB prediction → +1 confidence
-# ══════════════════════════════════════════════════════════════════════════════
-
-def _structural_feats(candles):
-    """Extract structural features from last 20+ candles (OHLC tuples).
-    Returns dict with pos10, pos20, g8, slope, expansion, body_pct, patterns, etc.
-    Returns None if insufficient data."""
-    if not candles or len(candles) < 10:
-        return None
-
-    n = len(candles)
-    c_last = candles[-1]  # most recent candle
-    o, h, l, c = c_last
-    rng = h - l if h > l else 0.0001
-    body = abs(c - o)
-    body_pct = body / rng  # 0.0–1.0
-    green = c > o
-
-    # ── pos10: price position in last 10 candles' range (0.0 = bottom, 1.0 = top) ──
-    last10 = candles[-10:]
-    h10 = max(x[1] for x in last10)
-    l10 = min(x[2] for x in last10)
-    rng10 = h10 - l10 if h10 > l10 else 0.0001
-    pos10 = (c - l10) / rng10
-
-    # ── pos20: price position in last 20 candles' range ──
-    last20 = candles[-min(20, n):]
-    h20 = max(x[1] for x in last20)
-    l20 = min(x[2] for x in last20)
-    rng20 = h20 - l20 if h20 > l20 else 0.0001
-    pos20 = (c - l20) / rng20
-
-    # ── g8: green count in last 8 candles ──
-    last8 = candles[-min(8, n):]
-    g8 = sum(1 for x in last8 if x[3] > x[0])
-
-    # ── slope: 20-bar price change as percentage ──
-    c_first = last20[0][3]
-    slope = ((c - c_first) / c_first * 100) if c_first > 0 else 0.0
-
-    # ── avg_rng20: average range of last 20 candles ──
-    ranges20 = [x[1] - x[2] for x in last20]
-    avg_rng20 = sum(ranges20) / len(ranges20) if ranges20 else 0.0001
-    expansion = rng > avg_rng20 * 1.3
-
-    # ── Consecutive sequences ──
-    consec_red = 0
-    for x in reversed(candles[:-1]):  # don't count current in consecutive
-        if x[3] < x[0]:
-            consec_red += 1
-        else:
-            break
-    # Also count current
-    if not green:
-        consec_red += 1
-
-    consec_green = 0
-    for x in reversed(candles[:-1]):
-        if x[3] > x[0]:
-            consec_green += 1
-        else:
-            break
-    if green:
-        consec_green += 1
-
-    # ── Engulfing detection ──
-    prev = candles[-2] if n >= 2 else None
-    bull_engulf = False
-    bear_engulf = False
-    if prev:
-        p_o, p_h, p_l, p_c = prev
-        p_green = p_c > p_o
-        p_body_top = max(p_o, p_c)
-        p_body_bot = min(p_o, p_c)
-        c_body_top = max(o, c)
-        c_body_bot = min(o, c)
-        if green and not p_green and c_body_top > p_body_top and c_body_bot < p_body_bot:
-            bull_engulf = True
-        if not green and p_green and c_body_top > p_body_top and c_body_bot < p_body_bot:
-            bear_engulf = True
-
-    # ── HH / LL detection ──
-    hh = h > candles[-2][1] if n >= 2 else False
-    ll = l < candles[-2][2] if n >= 2 else False
-
-    # ── Hammer detection (small body, long lower wick) ──
-    uwick = (h - max(o, c)) / rng
-    lwick = (min(o, c) - l) / rng
-    hammer = body_pct < 0.35 and lwick > 0.50
-
-    # ── Doji (body < 10% of range) ──
-    doji = body_pct < 0.10
-
-    # ── Marubozu (body > 80% of range) ──
-    marubozu = body_pct > 0.80
-
-    # ── Trending check (for slope-based rules) ──
-    trending = abs(slope) > 0.5
-
-    return {
-        "pos10": pos10, "pos20": pos20, "g8": g8, "slope": slope,
-        "expansion": expansion, "body_pct": body_pct, "green": green,
-        "consec_red": consec_red, "consec_green": consec_green,
-        "bull_engulf": bull_engulf, "bear_engulf": bear_engulf,
-        "hh": hh, "ll": ll, "hammer": hammer, "doji": doji, "marubozu": marubozu,
-        "trending": trending, "avg_rng20": avg_rng20, "rng": rng,
-    }
-
-
-def _structural_check_xrp(sf):
-    """XRP structural rules. Returns (direction, win_rate, rule_name) or None."""
-    p10, p20, g8 = sf["pos10"], sf["pos20"], sf["g8"]
-    exp, maru = sf["expansion"], sf["marubozu"]
-    cr, cg = sf["consec_red"], sf["consec_green"]
-    bull_e, green = sf["bull_engulf"], sf["green"]
-
-    if cr >= 4 and exp:                             return "UP", 65.4, "XRP_4RED_EXP"
-    if cr >= 3 and p10 < 0.25 and exp:              return "UP", 64.2, "XRP_3RED_BOT_EXP"
-    if cg >= 3 and p10 > 0.75 and exp:              return "DOWN", 60.3, "XRP_3GRN_TOP_EXP"
-    if g8 >= 7:                                     return "DOWN", 60.1, "XRP_BULL8"
-    if bull_e and p10 < 0.30:                       return "UP", 59.3, "XRP_BULLENG_BOT"
-    if maru and exp and p10 < 0.50:                 return "UP" if not green else None, 56.6 if not green else 0, "XRP_MARU_EXP_BOT"
-    if maru and exp and p10 >= 0.50:                return "DOWN" if green else None, 58.1 if green else 0, "XRP_MARU_EXP_TOP"
-    if p10 > 0.85 and sf["slope"] < 2.0:            return "DOWN", 57.8, "XRP_TOP85_LOWSLOPE"
-    if g8 >= 7 and p20 > 0.80:                      return "DOWN", 58.3, "XRP_BULL8_TOP20"
-    if maru and not green and p10 < 0.40:           return "UP", 54.9, "XRP_MARU_RED_BOT"
-    return None
-
-
-def _structural_check_btc(sf):
-    """BTC structural rules."""
-    p10, p20, g8 = sf["pos10"], sf["pos20"], sf["g8"]
-    exp, hammer = sf["expansion"], sf["hammer"]
-    cr, cg = sf["consec_red"], sf["consec_green"]
-    maru, green = sf["marubozu"], sf["green"]
-
-    if hammer and p10 < 0.30:                       return "UP", 61.3, "BTC_HAMMER_BOT"
-    if cg >= 3 and p10 > 0.75 and exp:              return "DOWN", 61.2, "BTC_3GRN_TOP_EXP"
-    if cr >= 3 and p10 < 0.25 and exp:              return "UP", 59.4, "BTC_3RED_BOT_EXP"
-    if g8 <= 1 and p10 < 0.35:                      return "UP", 58.2, "BTC_BEAR8_BOT"
-    if p10 < 0.20:                                  return "UP", 54.9, "BTC_BOT20"
-    if p10 > 0.85:                                  return "DOWN", 55.5, "BTC_TOP85"
-    return None
-
-
-def _structural_check_eth(sf):
-    """ETH structural rules."""
-    p10, p20, g8 = sf["pos10"], sf["pos20"], sf["g8"]
-    exp, hammer, doji = sf["expansion"], sf["hammer"], sf["doji"]
-    cr, cg = sf["consec_red"], sf["consec_green"]
-    maru, green, ll = sf["marubozu"], sf["green"], sf["ll"]
-
-    if cg >= 4 and exp:                             return "DOWN", 67.6, "ETH_4GRN_EXP"
-    if doji and p10 > 0.80:                         return "DOWN", 63.8, "ETH_DOJI_TOP"
-    if cg >= 4 and p10 > 0.70:                      return "DOWN", 62.5, "ETH_4GRN_TOP"
-    if cr >= 3 and ll and p10 < 0.30:               return "UP", 62.1, "ETH_3RED_LL_BOT"
-    if g8 >= 7 and p20 > 0.80:                      return "DOWN", 60.9, "ETH_BULL8_TOP20"
-    if maru and green and p10 > 0.60:               return "DOWN", 58.3, "ETH_MARU_GRN_TOP"
-    if g8 <= 1 and p20 < 0.20:                      return "UP", 58.4, "ETH_BEAR8_BOT20"
-    if hammer and p10 < 0.30:                       return "UP", 58.7, "ETH_HAMMER_BOT"
-    if p20 < 0.20:                                  return "UP", 55.6, "ETH_BOT20"
-    if p10 > 0.85:                                  return "DOWN", 55.0, "ETH_TOP85"
-    return None
-
-
-def _structural_check_sol(sf):
-    """SOL structural rules (V3 with slope)."""
-    p10, p20, g8, slope = sf["pos10"], sf["pos20"], sf["g8"], sf["slope"]
-    exp, doji = sf["expansion"], sf["doji"]
-    cr, cg = sf["consec_red"], sf["consec_green"]
-    maru, green, trending = sf["marubozu"], sf["green"], sf["trending"]
-
-    if cr >= 4 and p10 < 0.30 and slope > 0.5:     return "UP", 68.3, "SOL_4RED_BOT_UPSLOPE"
-    if maru and green and p10 > 0.60 and slope < -0.5: return "DOWN", 68.1, "SOL_MARU_GRN_TOP_DNSLOPE"
-    if maru and not green and p10 < 0.40 and trending: return "UP", 64.1, "SOL_MARU_RED_BOT_TREND"
-    if g8 <= 1:                                     return "UP", 63.0, "SOL_BEAR8"
-    if cr >= 4 and exp:                             return "UP", 62.2, "SOL_4RED_EXP"
-    if cr >= 3 and p10 < 0.25 and exp:              return "UP", 60.0, "SOL_3RED_BOT_EXP"
-    if doji and p10 > 0.80 and trending:            return "DOWN", 61.3, "SOL_DOJI_TOP_TREND"
-    if g8 >= 7:                                     return "DOWN", 59.0, "SOL_BULL8"
-    if cg >= 4 and p10 > 0.70 and abs(slope) < 1.0: return "DOWN", 59.0, "SOL_4GRN_TOP_FLATSLOPE"
-    if p10 > 0.80:                                  return "DOWN", 55.1, "SOL_TOP80"
-    return None
-
-
-def _structural_check_doge(sf):
-    """DOGE structural rules (V2 with slope)."""
-    p10, p20, g8, slope = sf["pos10"], sf["pos20"], sf["g8"], sf["slope"]
-    exp, ll = sf["expansion"], sf["ll"]
-    cr, cg = sf["consec_red"], sf["consec_green"]
-    maru, green, trending = sf["marubozu"], sf["green"], sf["trending"]
-    bear_e, bull_e = sf["bear_engulf"], sf["bull_engulf"]
-
-    if bear_e and exp and trending:                 return "UP", 65.6, "DOGE_BEARENG_EXP_TREND"
-    if maru and green and p10 > 0.60 and abs(slope) < 1.0: return "DOWN", 62.5, "DOGE_MARU_GRN_TOP_FLAT"
-    if ll and g8 <= 1 and slope > -1.0:             return "UP", 62.8, "DOGE_LL_BEAR8_UPSLOPE"
-    if cr >= 4 and exp:                             return "UP", 61.7, "DOGE_4RED_EXP"
-    if bull_e and exp:                              return "DOWN", 59.6, "DOGE_BULLENG_EXP"
-    if cr >= 3 and p10 < 0.25 and exp:              return "UP", 57.8, "DOGE_3RED_BOT_EXP"
-    if cr >= 3 and ll and p10 < 0.30:               return "UP", 57.3, "DOGE_3RED_LL_BOT"
-    if p10 > 0.85 and slope < 2.0:                  return "DOWN", 59.8, "DOGE_TOP85_LOWSLOPE"
-    if cg >= 4 and p10 > 0.70:                      return "DOWN", 55.3, "DOGE_4GRN_TOP"
-    return None
-
-
-def _structural_check_bnb(sf):
-    """BNB structural rules (V2 with slope)."""
-    p10, p20, g8, slope = sf["pos10"], sf["pos20"], sf["g8"], sf["slope"]
-    exp, hammer = sf["expansion"], sf["hammer"]
-    cr, cg = sf["consec_red"], sf["consec_green"]
-    maru, green, trending = sf["marubozu"], sf["green"], sf["trending"]
-    bear_e, bull_e = sf["bear_engulf"], sf["bull_engulf"]
-
-    if bear_e and exp and trending:                 return "UP", 64.4, "BNB_BEARENG_EXP_TREND"
-    if bull_e and exp and trending:                 return "DOWN", 64.2, "BNB_BULLENG_EXP_TREND"
-    if g8 >= 7 and p10 > 0.70 and abs(slope) < 1.0: return "DOWN", 62.2, "BNB_BULL8_TOP_FLAT"
-    if g8 <= 1 and trending:                        return "UP", 61.7, "BNB_BEAR8_TREND"
-    if cr >= 3 and p10 < 0.25 and exp and slope > -1.0: return "UP", 59.6, "BNB_3RED_BOT_EXP_UPSLOPE"
-    if p10 > 0.85 and trending:                     return "DOWN", 59.3, "BNB_TOP85_TREND"
-    if cg >= 4 and p10 > 0.70:                      return "DOWN", 58.0, "BNB_4GRN_TOP"
-    if maru and exp and p10 > 0.50:                 return "DOWN", 57.8, "BNB_MARU_EXP_TOP"
-    if hammer and p10 < 0.30:                       return "UP", 58.1, "BNB_HAMMER_BOT"
-    return None
-
-
-_STRUCTURAL_FNS = {
-    "BTC": _structural_check_btc,
-    "ETH": _structural_check_eth,
-    "XRP": _structural_check_xrp,
-    "SOL": _structural_check_sol,
-    "DOGE": _structural_check_doge,
-    "BNB": _structural_check_bnb,
-}
-
-
-def structural_layer_check(asset, candles_ohlc, ptb_direction, ptb_confidence):
-    """Run structural layer on candle history. BOOST-ONLY per Session 21.
-    
-    Args:
-        asset: "BTC", "ETH", etc.
-        candles_ohlc: list of (o, h, l, c) tuples, at least 10 candles
-        ptb_direction: "UP" or "DOWN" from PTB engine
-        ptb_confidence: int confidence from PTB engine (1-3)
-    
-    Returns:
-        (direction, confidence, struct_tag) — boosted or unchanged
-        struct_tag is the rule name if structural fired, else "NO_STRUCT"
-    """
-    if asset not in _STRUCTURAL_FNS:
-        return ptb_direction, ptb_confidence, "NO_STRUCT"
-
-    sf = _structural_feats(candles_ohlc)
-    if sf is None:
-        return ptb_direction, ptb_confidence, "NO_STRUCT"
-
-    check_fn = _STRUCTURAL_FNS[asset]
-    result = check_fn(sf)
-
-    if result is None:
-        return ptb_direction, ptb_confidence, "NO_STRUCT"
-
-    struct_dir, struct_wr, struct_rule = result
-
-    if struct_dir is None:
-        return ptb_direction, ptb_confidence, "NO_STRUCT"
-
-    # BOOST ONLY — Session 21 finding: suppress is harmful, boost adds edge
-    if struct_dir == ptb_direction:
-        # Structure AGREES with PTB → boost confidence by 1 (cap at 3)
-        boosted_conf = min(3, ptb_confidence + 1)
-        return ptb_direction, boosted_conf, "BOOST_" + struct_rule
-    else:
-        # Structure DISAGREES — do NOT suppress/flip per Session 21
-        # Just tag it for logging, keep original prediction unchanged
-        return ptb_direction, ptb_confidence, "DISAGREE_" + struct_rule
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# STRUCTURAL SELF-LEARNER — Tracks per-asset per-rule recent performance
-# Adjusts confidence in real time based on whether a rule is working now
-# ══════════════════════════════════════════════════════════════════════════════
-
-class StructuralSelfLearner:
-    def __init__(self, window=20):
-        self.window = window
-        # {asset: {rule: deque of bools (True=win)}}
-        self.history = defaultdict(lambda: defaultdict(lambda: deque(maxlen=20)))
-        self.skip_rules = defaultdict(set)    # {asset: {rules to skip}}
-        self.boost_rules = defaultdict(set)   # {asset: {rules to boost}}
-
-    def record(self, asset, rule, won):
-        """Called after each trade settles."""
-        self.history[asset][rule].append(won)
-        # Re-evaluate after recording
-        recent = self.history[asset][rule]
-        if len(recent) >= 5:
-            wr = sum(recent) / len(recent)
-            if wr < 0.30:
-                self.skip_rules[asset].add(rule)
-                self.boost_rules[asset].discard(rule)
-            elif wr > 0.60:
-                self.boost_rules[asset].add(rule)
-                self.skip_rules[asset].discard(rule)
-            elif wr >= 0.47:
-                # Recovered — remove from skip/boost
-                self.skip_rules[asset].discard(rule)
-                self.boost_rules[asset].discard(rule)
-
-    def adjust(self, asset, rule, base_conf):
-        """Adjust confidence based on recent rule performance."""
-        # Skip check
-        if rule in self.skip_rules.get(asset, set()):
-            return 0  # Signal caller to skip this trade
-
-        recent = self.history[asset][rule]
-        if len(recent) < 5:
-            return base_conf  # Not enough data
-
-        wr = sum(recent) / len(recent)
-        if wr > 0.60:
-            return min(base_conf + 1, 3)
-        elif wr < 0.30:
-            return 0  # Skip
-        elif wr < 0.40:
-            return max(base_conf - 1, 1)
-        else:
-            return base_conf
-
-    def get_state(self):
-        """Serialize for DB persistence."""
-        state = {}
-        for asset in self.history:
-            state[asset] = {}
-            for rule in self.history[asset]:
-                state[asset][rule] = list(self.history[asset][rule])
-        return state
-
-    def load_state(self, state):
-        """Restore from DB."""
-        if not state:
-            return
-        for asset in state:
-            for rule in state[asset]:
-                self.history[asset][rule] = deque(state[asset][rule], maxlen=self.window)
-        # Rebuild skip/boost from loaded history
-        for asset in self.history:
-            for rule in self.history[asset]:
-                recent = self.history[asset][rule]
-                if len(recent) >= 5:
-                    wr = sum(recent) / len(recent)
-                    if wr < 0.30:
-                        self.skip_rules[asset].add(rule)
-                    elif wr > 0.60:
-                        self.boost_rules[asset].add(rule)
-
-
-_structural_self_learner = StructuralSelfLearner()
-
-
-def _save_structural_learner():
-    """Persist structural self-learner state to DB."""
-    try:
-        import json
-        state_json = json.dumps(_structural_self_learner.get_state())
-        db = get_db()
-        db.run("""INSERT INTO bot_state (bot_name, json_state) VALUES (:bn, :js)
-                  ON CONFLICT(bot_name) DO UPDATE SET json_state=:js""",
-               bn="structural_self_learner", js=state_json)
-        db.close()
-    except Exception as e:
-        print("Structural learner save error: {}".format(e))
-
-
-def _load_structural_learner():
-    """Load structural self-learner state from DB on startup."""
-    try:
-        import json
-        db = get_db()
-        row = db.run("SELECT json_state FROM bot_state WHERE bot_name=:bn",
-                     bn="structural_self_learner")
-        db.close()
-        if row and len(row) > 0:
-            _raw = row[0]["json_state"] if isinstance(row[0], dict) else row[0][0]
-            state = json.loads(_raw)
-            _structural_self_learner.load_state(state)
-            total_rules = sum(len(v) for v in state.values())
-            print("STRUCTURAL LEARNER: restored {} rules across {} assets from DB".format(
-                total_rules, len(state)))
-        else:
-            print("STRUCTURAL LEARNER: no saved state — starting fresh")
-    except Exception as e:
-        print("STRUCTURAL LEARNER load error: {}".format(e))
-
-
-def structural_predict(asset, candles_ohlc):
-    """PRIMARY PREDICTION ENGINE — Structural candlestick patterns.
-
-    Reads last 20 candles, applies asset-specific rules,
-    self-learning adjusts confidence based on recent performance.
-
-    Args:
-        asset: "BTC", "ETH", etc.
-        candles_ohlc: list of (o, h, l, c) tuples, at least 10 candles
-
-    Returns:
-        (side, confidence, rule_name) or (None, 0, "NO_SIG")
-    """
-    if asset not in _STRUCTURAL_FNS:
-        return None, 0, "NO_ASSET"
-
-    sf = _structural_feats(candles_ohlc)
-    if sf is None:
-        return None, 0, "NO_SIG"
-
-    check_fn = _STRUCTURAL_FNS[asset]
-    result = check_fn(sf)
-
-    if result is None:
-        return None, 0, "NO_SIG"
-
-    struct_dir, struct_wr, struct_rule = result
-
-    if struct_dir is None:
-        return None, 0, "NO_SIG"
-
-    # Base confidence from backtested win rate
-    if struct_wr >= 62.0:
-        base_conf = 3
-    elif struct_wr >= 57.0:
-        base_conf = 2
-    else:
-        base_conf = 2  # minimum tradeable confidence
-
-    # Self-learning adjustment
-    adjusted_conf = _structural_self_learner.adjust(asset, struct_rule, base_conf)
-
-    if adjusted_conf == 0:
-        return None, 0, "SKIP_" + struct_rule  # Self-learner says skip
-
-    return struct_dir, adjusted_conf, struct_rule
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1449,11 +1139,11 @@ def _poly_alpha_load_recent_trades():
 # ═══════════════════════════════════════════════════════════
 
 _poly_alpha3_state = {
-    "enabled": False,  # PAUSED — isolating P29CL T+0 first
+    "enabled": True,
     "balance": 60.0,
     "peak_balance": 60.0,
     "starting_balance": 60.0,
-    "floor_balance": 10.0,
+    "floor_balance": 5.0,
     "trades_today": 0,
     "wins_today": 0,
     "losses_today": 0,
@@ -1487,7 +1177,7 @@ _bot2_prefetch = {}  # {"BTC": [close1, close2, ..., close9], "ETH": [...], ...}
 # Thinks for itself instead of rigid pattern matching
 # ═══════════════════════════════════════════════════════════
 _p29cl_state = {
-    "enabled": True,
+    "enabled": False,  # PAUSED — P3.0 LIVE replaces all P29CL trading
     "balance": 100.0,
     "peak_balance": 100.0,
     "starting_balance": 100.0,
@@ -1530,7 +1220,7 @@ _p29cl_boundary_results = []        # list of (asset, outcome) for current bound
 
 # ── P2.9CL LIVE trading state ──
 _p29cl_live_state = {
-    "enabled": True,  # LIVE TRADING ACTIVE
+    "enabled": False,  # PAUSED — P3.0 LIVE replaces P29CL Live
     "balance": 100.0,
     "peak_balance": 100.0,
     "starting_balance": 100.0,
@@ -1543,6 +1233,159 @@ _p29cl_live_state = {
     "losses_today": 0,
 }
 _p29cl_live_traded = set()
+
+# ═══════════════════════════════════════════════════════════════════════════
+# P3.0 LIVE — 12-Component Scoring Engine
+# Predicts 15M candle direction at T+0 using candle patterns + indicators
+# Trades all 6 assets: BTC, ETH, SOL, XRP, DOGE, BNB
+# $2.50 flat stake per trade, $100 starting balance
+# ═══════════════════════════════════════════════════════════════════════════
+
+_p30_state = {
+    "enabled": True,
+    "balance": 100.0,
+    "peak_balance": 100.0,
+    "starting_balance": 100.0,
+    "floor_balance": 10.0,
+    "base_stake": 2.50,
+    "trades_today": 0,
+    "wins_today": 0,
+    "losses_today": 0,
+}
+_p30_traded = set()
+_p30_fired_boundaries = set()
+_p30_token_map = {}
+
+P30_ASSETS = ["BTC", "ETH", "SOL", "XRP", "DOGE", "BNB"]
+P30_SLUGS = {
+    "BTC": "btc-updown-15m-{}", "ETH": "eth-updown-15m-{}",
+    "SOL": "sol-updown-15m-{}", "XRP": "xrp-updown-15m-{}",
+    "DOGE": "doge-updown-15m-{}", "BNB": "bnb-updown-15m-{}",
+}
+P30_BINANCE_MAP = {
+    "BTC": "BTCUSDT", "ETH": "ETHUSDT", "SOL": "SOLUSDT",
+    "XRP": "XRPUSDT", "DOGE": "DOGEUSDT", "BNB": "BNBUSDT",
+}
+
+# Minimum confidence to trade (score magnitude)
+P30_MIN_CONF = 1
+
+def _p30_compute_score(candles_list):
+    """
+    Compute P3.0 score from list of closed OHLC candles.
+    Last candle in list is the most recent CLOSED candle.
+    Returns (score, confidence, direction, tag_string)
+    """
+    import math as _m
+    n = len(candles_list)
+    if n < 50:
+        return 0, 0, None, "INSUFFICIENT"
+    
+    prev = candles_list[-1]  # last closed candle
+    p = prev[3]  # close price (o,h,l,c tuple)
+    prng = max(prev[1] - prev[2], 0.0001)
+    pbody = abs(prev[3] - prev[0])
+    pg = prev[3] >= prev[0]
+    puw = (prev[1] - max(prev[0], prev[3])) / prng
+    plw = (min(prev[0], prev[3]) - prev[2]) / prng
+    
+    avg5 = sum(abs(candles_list[-j][3] - candles_list[-j][0]) for j in range(1, 6)) / 5
+    bm = pbody / avg5 if avg5 > 0 else 1
+    
+    con = 0; cdir = pg
+    for j in range(len(candles_list)-1, max(len(candles_list)-20, -1), -1):
+        if (candles_list[j][3] >= candles_list[j][0]) == cdir: con += 1
+        else: break
+    
+    # SMAs
+    s5 = sum(candles_list[-j][3] for j in range(1, 6)) / 5
+    s10 = sum(candles_list[-j][3] for j in range(1, 11)) / 10
+    s20 = sum(candles_list[-j][3] for j in range(1, 21)) / 20
+    s50 = sum(candles_list[-j][3] for j in range(1, 51)) / 50
+    
+    # EMAs
+    def _ema(period):
+        m = 2 / (period + 1)
+        e = candles_list[-period][3]
+        for j in range(len(candles_list)-period+1, len(candles_list)):
+            e = (candles_list[j][3] - e) * m + e
+        return e
+    e5 = _ema(5); e9 = _ema(9); e13 = _ema(13); e21 = _ema(21); e34 = _ema(34)
+    
+    ma_above = sum([p>s5, p>s10, p>s20, p>s50, p>e5, p>e9, p>e13, p>e21, p>e34])
+    
+    # RSI14
+    gains = 0; losses_r = 0
+    for j in range(-14, 0):
+        d = candles_list[j][3] - candles_list[j-1][3]
+        if d > 0: gains += d
+        else: losses_r += abs(d)
+    ag = gains / 14; al = losses_r / 14
+    rsi14 = 100 - (100 / (1 + ag/al)) if al > 0 else 100
+    
+    # Stoch14
+    hi14 = max(candles_list[j][1] for j in range(-14, 0))
+    lo14 = min(candles_list[j][2] for j in range(-14, 0))
+    stoch14 = (p - lo14) / max(hi14 - lo14, 0.0001) * 100
+    
+    # BB
+    std20 = _m.sqrt(sum((candles_list[-j][3] - s20)**2 for j in range(1, 21)) / 20)
+    bb = (p - (s20 - 2*std20)) / max(4*std20, 0.0001)
+    bb_sq = bb**2 if bb > 0.5 else -(1-bb)**2
+    
+    # Range position
+    hi20 = max(candles_list[j][1] for j in range(-20, 0))
+    lo20 = min(candles_list[j][2] for j in range(-20, 0))
+    rp20 = (p - lo20) / max(hi20 - lo20, 0.0001)
+    
+    # CCI
+    tp_avg = sum((candles_list[j][1]+candles_list[j][2]+candles_list[j][3])/3 for j in range(-20, 0)) / 20
+    tp = (prev[1]+prev[2]+prev[3]) / 3
+    md = sum(abs((candles_list[j][1]+candles_list[j][2]+candles_list[j][3])/3 - tp_avg) for j in range(-20, 0)) / 20
+    cci = (tp - tp_avg) / (0.015 * md) if md > 0 else 0
+    
+    # Williams %R
+    willr = -(hi14 - p) / max(hi14 - lo14, 0.0001) * 100
+    
+    # Momentum
+    mom3 = (p - candles_list[-4][3]) / candles_list[-4][3] * 100 if candles_list[-4][3] > 0 else 0
+    
+    # Wick
+    wick = 0
+    if cdir and puw > 0.3: wick = 1
+    if not cdir and plw > 0.3: wick = -1
+    
+    # ═══ SCORE ═══
+    score = 0
+    if cdir:
+        score += con * 1.0 + max(0, bm - 1) * 2.5
+    else:
+        score -= con * 1.0 + max(0, bm - 1) * 2.5
+    score += (ma_above - 4.5) * 2.0 / 4.5
+    score += (rsi14 - 50) * 1.0 / 50
+    score += (bb - 0.5) * 2.0 * 2
+    score += (stoch14 - 50) * 2.0 / 50
+    score += min(max(cci / 100, -2), 2) * 1.0
+    score += (willr + 50) / 50 * 1.0
+    score += (rp20 - 0.5) * 1.0 * 2
+    score += (1 if mom3 > 0 else -1) * 1.0
+    score += wick * 0.5
+    score += bb_sq * 1.5
+    
+    confidence = int(abs(score))
+    direction = "DOWN" if score > 0 else "UP" if score < 0 else None
+    
+    tag = "P30_{}_{}_c{}_bm{:.1f}_ma{}_rsi{:.0f}_bb{:.2f}_st{:.0f}_sc{:.1f}".format(
+        direction or "NONE", "G" if pg else "R",
+        con, bm, ma_above, rsi14, bb, stoch14, score)
+    
+    return score, confidence, direction, tag
+
+def _p30_candles_to_list(prefetch_tuples):
+    """Convert prefetched (o,h,l,c) tuples to list format."""
+    return list(prefetch_tuples) if prefetch_tuples else []
+
+print("P3.0 LIVE engine initialized: {} assets, ${} balance".format(len(P30_ASSETS), _p30_state["balance"]))
 
 def _p29cl_momentum_score(asset, chainlink_close, p21_dir, btc_dir):
     """P2.9 Chainlink: P2.1 direction + candle analysis + momentum tiebreaker.
@@ -2003,7 +1846,7 @@ def _bot2_sniper_thread():
     
     while True:
         try:
-            if not _bot2_sniper_state["enabled"] and not _p29cl_state["enabled"]:
+            if not _bot2_sniper_state["enabled"] and not _p29cl_state["enabled"] and not _p30_state["enabled"]:
                 _time.sleep(30)
                 continue
             
@@ -2085,6 +1928,31 @@ def _bot2_sniper_thread():
                             _p29cl_1h_candles[asset] = [(float(k[1]), float(k[2]), float(k[3]), float(k[4])) for k in klines[:-1]]
                 except Exception as e:
                     print("P29CL 1H prefetch error {}: {}".format(asset, e))
+            
+            # ── T-18s: STRUCTURAL LAYER — compute swings + context per asset ──
+            for asset in P29CL_ASSETS:
+                try:
+                    raw = _p29cl_candle_prefetch.get(asset)
+                    if raw and len(raw) >= 20:
+                        # Convert tuples to dict format for structural layer
+                        sc_candles = [{"o":c[0],"h":c[1],"l":c[2],"c":c[3]} for c in raw]
+                        sc_swings = _struct_find_swings(sc_candles, lookback=5)
+                        # Context at the last completed candle (index -2, since -1 is current/incomplete)
+                        sc_idx = len(sc_candles) - 2
+                        if sc_idx >= 10:
+                            sc = _struct_context(sc_idx, sc_candles, sc_swings)
+                        else:
+                            sc = {"trend":"UNKNOWN","strength":0,"bos":None,"choch":None,"at_support":False,
+                                  "at_resistance":False,"near_support":False,"near_resistance":False,
+                                  "support_tests":0,"resistance_tests":0,"momentum":"UNKNOWN",
+                                  "dist_from_support":999,"dist_from_resistance":999}
+                        _struct_cache[asset] = {"swings": sc_swings, "candles": sc_candles, "sc": sc}
+                        if sc["trend"] != "UNKNOWN":
+                            print("STRUCT {}: {} str={} bos={} choch={} mom={} sup={} res={}".format(
+                                asset, sc["trend"], sc["strength"], sc["bos"], sc["choch"],
+                                sc["momentum"], sc["at_support"], sc["at_resistance"]))
+                except Exception as e:
+                    print("STRUCT error {}: {}".format(asset, e))
             
             # ── T-15s: Fetch token IDs from Polymarket ──
             # Calculate next boundary timestamp
@@ -2201,123 +2069,16 @@ def _bot2_sniper_thread():
                 _time.sleep(max(secs_to_boundary + 5, 5))
                 continue
             
-            # ── T-10s: PRE-PREDICT — Run structural engine on 96%-formed candles ──
-            # The candle is almost complete. Pre-compute directions so orders fire at T+0.
-            _p29cl_pre_orders = {}  # {asset: {"dir": "UP"/"DOWN", "conf": int, "rule": str, "token": str}}
-            for _pre_asset in P29CL_ASSETS:
-                try:
-                    _pre_candles = _p29cl_candle_prefetch.get(_pre_asset)
-                    if not _pre_candles or len(_pre_candles) < 10:
-                        continue
-                    _pre_dir, _pre_conf, _pre_rule = structural_predict(_pre_asset, _pre_candles)
-                    if _pre_dir and _pre_conf >= 2:
-                        # Get token for this direction
-                        _pre_tmap = _p29cl_token_map.get(_pre_asset)
-                        if _pre_tmap:
-                            _pre_token = _pre_tmap["up_token"] if _pre_dir == "UP" else _pre_tmap["down_token"]
-                            _p29cl_pre_orders[_pre_asset] = {
-                                "dir": _pre_dir, "conf": _pre_conf, "rule": _pre_rule,
-                                "token": _pre_token, "slug": _pre_tmap.get("slug", ""),
-                            }
-                except Exception as _pre_err:
-                    print("P29CL PRE-PREDICT error {}: {}".format(_pre_asset, _pre_err))
-            
-            if _p29cl_pre_orders:
-                print("P29CL PRE-PREDICT: {} orders ready — {}".format(
-                    len(_p29cl_pre_orders),
-                    ", ".join("{} {}".format(a, d["dir"]) for a, d in _p29cl_pre_orders.items())))
-            
             print("BOT2: {} tokens ready, {} prefetched, waiting for boundary...".format(
                 len(token_map), len(_bot2_prefetch)))
             
-            # ── Wait until exactly T+0.000 — fire pre-built orders immediately ──
+            # ── Wait until T+0 ──
             now2 = datetime.now(timezone.utc)
             wait_secs = (next_boundary - now2).total_seconds()
             if 0 < wait_secs < 120:
-                _time.sleep(max(wait_secs, 0))  # Wait until EXACTLY T+0, not T+0.3
-            
-            # ── T+0.000: FIRE PRE-BUILT ORDERS IMMEDIATELY ──
-            if _p29cl_pre_orders and _p29cl_live_state["enabled"] and _poly_has_creds():
-                import threading as _pre_threading
-                from py_clob_client_v2 import Side as _PreSide, OrderArgs as _PreArgs, OrderType as _PreOT
-                _pre_client = _get_poly_client()
-                _pre_results = []
-                _pre_lock = _pre_threading.Lock()
-                
-                def _fire_pre_order(_asset, _order_info):
-                    """Fire pre-built order at T+0.000 — runs in own thread."""
-                    try:
-                        _tok = _order_info["token"]
-                        _price = 0.55  # Max 55c — buys at best available up to this limit
-                        _stake = 3.0
-                        _shares = round(_stake / _price, 2)
-                        oa = _PreArgs(token_id=str(_tok), price=_price, size=_shares, side=_PreSide.BUY)
-                        signed = _pre_client.create_order(oa)
-                        resp = _pre_client.post_order(signed, _PreOT.GTC)
-                        _oid = resp.get("orderID") or resp.get("order_id") if resp else None
-                        _filled = (resp.get("status") or "").upper() in ("MATCHED", "FILLED") if resp else False
-                        
-                        # Deduct from live pool
-                        _p29cl_live_state["balance"] = round(_p29cl_live_state["balance"] - _stake, 2)
-                        
-                        # Record in DB for resolution
-                        try:
-                            _t0db = get_db()
-                            _t0_key = "{}_15M_{}".format(_asset, window_ts)
-                            _t0db.run("""INSERT INTO p29cl_live_trades
-                                (market_id,asset,bet_side,stake,fill_price,pool_after,
-                                 order_id,token_id,slug,filled,status,confidence,indicators,fired_at)
-                                VALUES(:mid,:ast,:bs,:stake,:fill,:pool,:oid,:tid,:slg,:filled,'Pending','HIGH',:ind,:now)""",
-                                mid=_t0_key, ast=_asset, bs=_order_info["dir"],
-                                stake=_stake, fill=_price,
-                                pool=_p29cl_live_state["balance"],
-                                oid=_oid, tid=str(_tok)[:50],
-                                slg=_order_info.get("slug", ""),
-                                filled=_filled, ind=_order_info["rule"],
-                                now=datetime.now(timezone.utc).isoformat())
-                            _t0db.close()
-                        except Exception as _dbe:
-                            print("P29CL T0 DB error {}: {}".format(_asset, _dbe))
-                        
-                        with _pre_lock:
-                            _pre_results.append({
-                                "asset": _asset, "dir": _order_info["dir"],
-                                "conf": _order_info["conf"], "rule": _order_info["rule"],
-                                "oid": _oid, "filled": _filled, "price": _price,
-                            })
-                        _fl = "FILLED" if _filled else "GTC"
-                        print("P29CL T0: {} {} @{}c {} conf={} rule={} | pool=${:.2f}".format(
-                            _asset, _order_info["dir"], int(_price*100), _fl,
-                            _order_info["conf"], _order_info["rule"],
-                            _p29cl_live_state["balance"]))
-                    except Exception as _e:
-                        print("P29CL T0 error {}: {}".format(_asset, _e))
-                
-                _pre_threads = []
-                for _pa, _po in _p29cl_pre_orders.items():
-                    t = _pre_threading.Thread(target=_fire_pre_order, args=(_pa, _po), daemon=True)
-                    t.start()
-                    _pre_threads.append(t)
-                for t in _pre_threads:
-                    t.join(timeout=3)
-                
-                if _pre_results:
-                    print("P29CL T0: {} orders fired at T+0.000".format(len(_pre_results)))
-                    # Send Telegram from main thread (not from order threads)
-                    for _t0r in _pre_results:
-                        try:
-                            _t0_fl = "FILLED" if _t0r.get("filled") else "GTC"
-                            send_telegram("\U0001f3af <b>P29CL T0</b>\n{} {} $3.00 @{}c {}\nconf={} rule={}\nPool: ${:.2f}".format(
-                                _t0r["dir"], _t0r["asset"], int(_t0r["price"]*100), _t0_fl,
-                                _t0r["conf"], _t0r["rule"],
-                                _p29cl_live_state["balance"]))
-                        except Exception as _tg_err:
-                            print("P29CL T0 telegram error: {}".format(_tg_err))
+                _time.sleep(max(wait_secs + 0.3, 0))  # Wait 0.3s AFTER boundary for Chainlink to settle
             
             # ── T+0.3s: Read Chainlink prices and calculate direction ──
-            # Still wait for Chainlink to settle for the regular prediction flow
-            _time.sleep(0.3)
-            
             # Get BTC direction first (needed for all assets)
             btc_chainlink = _chainlink_prices.get("BTC")
             btc_dir = None
@@ -2976,61 +2737,68 @@ def _bot2_sniper_thread():
                         _dist_score = 0
                         
 
-                        # ══ P29CL PRIMARY ENGINE: STRUCTURAL CANDLESTICK PREDICTION ══
-                        # Reads last 20 candles, applies asset-specific pattern rules
-                        # Self-learning adjusts confidence per rule per asset in real time
-                        if len(_cs_all) >= 10:
-                            _p29cl_dir_raw, _struct_conf_raw, _struct_rule = structural_predict(
-                                _p29cl_asset, _cs_all)
-
-                            if _p29cl_dir_raw is None or _struct_conf_raw == 0:
-                                print("P29CL SKIP: {} {} (structural)".format(
-                                    _p29cl_asset, _struct_rule))
+                        # ══ P29CL FINAL ENGINE CALL ══
+                        # Feed last 5 closed candles to the self-learning engine
+                        if len(_cs_all) >= 5:
+                            _v11_candles = [
+                                {"open": c[0], "high": c[1], "low": c[2], "close": c[3]}
+                                for c in _cs_all[-5:]
+                            ]
+                            _v11_engine = _p29cl_engines.get(_p29cl_asset)
+                            if _v11_engine:
+                                _v11_result = _v11_engine.predict(_v11_candles)
+                                _v11_decision = should_trade(_v11_result, min_conf=2)
+                                
+                                if not _v11_decision["trade"]:
+                                    print("P29CL SKIP: {} {} ptb={}% cpct={}% {}".format(
+                                        _p29cl_asset, _v11_result.get("rule", "NO_SIG"),
+                                        _cs_ptb_pct, _c1_cpct, _v11_decision.get("reason", "")))
+                                    continue
+                                
+                                _p29cl_dir = _v11_decision["side"]
+                                _p29cl_conf = "HIGH" if _v11_result["confidence"] >= 3 else "MEDIUM"
+                                _v11_conf = _v11_result["confidence"]
+                                
+                                # DIST for display
+                                _p29cl_dist_prob, _p29cl_dist_zone = _p29cl_calc_dist(_p29cl_asset, _p29cl_price)
+                                
+                                _cs_score = -_v11_conf if _p29cl_dir == "UP" else _v11_conf
+                                _cs_tags.append(_v11_result.get("rule", "V11"))
+                                _cs_tags.append(f"ptb={_v11_result.get('ptb_pct', 0)}")
+                                
+                                _cs_candle_desc = "G" if _c1_green else "R" if _c1_red else "D"
+                                if _c1_indecisive: _cs_candle_desc += "i"
+                                _cs_trend = "3R" if _strong_trend_down else "2R" if _trend_down else "3G" if _strong_trend_up else "2G" if _trend_up else "RNG" if _is_ranging else "MIX"
+                                _p29cl_tag = "CS_{}_{}_{}_{}_{}_S{}".format(_p29cl_dir, _cs_candle_desc, _cs_trend, _cs_macro, _cs_ptb_pos, int(_cs_score))
+                                _p29cl_score = _cs_score
+                                _cs_cpct = _c1_cpct
+                                _cs_uwick = _c1_uwick
+                                
+                                print("P29CL FINAL: {} {} conf={} rule={} zone={} ptb={}% | {}".format(
+                                    _p29cl_asset, _p29cl_dir, _v11_result["confidence"],
+                                    _v11_result["rule"], _v11_result["ptb_zone"],
+                                    _v11_result.get("ptb_pct", 0), _v11_result.get("reason", "")[:60]))
+                                
+                                # ══ STRUCTURAL FILTER v2 — Session 21 ══
+                                # Apply asset-specific boost/suppress based on swing structure
+                                _sc_data = _struct_cache.get(_p29cl_asset)
+                                if _sc_data and _sc_data["sc"]["trend"] != "UNKNOWN":
+                                    _sf_pred, _sf_conf, _sf_action, _sf_reason = _struct_filter(
+                                        _p29cl_dir, _v11_conf, _v11_result.get("rule",""), _sc_data["sc"], _p29cl_asset)
+                                    if _sf_action == "SUPPRESS":
+                                        print("STRUCT SUPPRESS: {} {} → SKIP ({})".format(_p29cl_asset, _p29cl_dir, _sf_reason))
+                                        continue
+                                    elif _sf_action == "BOOST":
+                                        _v11_conf_pre = _v11_conf
+                                        _v11_conf = _sf_conf
+                                        _v11_result["confidence"] = _sf_conf
+                                        _p29cl_conf = "HIGH" if _sf_conf >= 3 else "MEDIUM"
+                                        print("STRUCT BOOST: {} {} conf {}→{} ({})".format(
+                                            _p29cl_asset, _p29cl_dir, _v11_conf_pre, _sf_conf, _sf_reason))
+                                # ══ END STRUCTURAL FILTER ══
+                            else:
+                                print("P29CL SKIP: {} no V11 engine".format(_p29cl_asset))
                                 continue
-
-                            _p29cl_dir = _p29cl_dir_raw
-                            _v11_conf = _struct_conf_raw
-                            _p29cl_conf = "HIGH" if _v11_conf >= 3 else "MEDIUM"
-
-                            # DIST for display
-                            _p29cl_dist_prob, _p29cl_dist_zone = _p29cl_calc_dist(_p29cl_asset, _p29cl_price)
-
-                            _cs_score = -_v11_conf if _p29cl_dir == "UP" else _v11_conf
-                            _cs_tags.append(_struct_rule)
-                            _cs_tags.append(f"ptb={_cs_ptb_pct}")
-
-                            _cs_candle_desc = "G" if _c1_green else "R" if _c1_red else "D"
-                            if _c1_indecisive: _cs_candle_desc += "i"
-                            _cs_trend = "3R" if _strong_trend_down else "2R" if _trend_down else "3G" if _strong_trend_up else "2G" if _trend_up else "RNG" if _is_ranging else "MIX"
-                            _p29cl_tag = "ST_{}_{}_{}_{}_{}_S{}".format(_p29cl_dir, _cs_candle_desc, _cs_trend, _cs_macro, _cs_ptb_pos, int(_cs_score))
-                            _p29cl_score = _cs_score
-                            _cs_cpct = _c1_cpct
-                            _cs_uwick = _c1_uwick
-
-                            # Fake _v11_result for compatibility with downstream code
-                            # Features must include all keys that _ctx_key() and _update() access
-                            _v11_result = {
-                                "confidence": _v11_conf,
-                                "rule": _struct_rule,
-                                "side": _p29cl_dir,
-                                "ptb_zone": _p29cl_dist_zone if _p29cl_dist_zone else "MID",
-                                "ptb_pct": _cs_ptb_pct,
-                                "features": {
-                                    "zone": _p29cl_dist_zone or "MID",
-                                    "ptb": _cs_ptb_pct,
-                                    "trend": 2,       # neutral default
-                                    "body": 0.3,      # mid-range default
-                                    "green": _c1_green,
-                                    "up1": False,
-                                    "up2": False,
-                                    "rng_exp": False,
-                                    "inside": False,
-                                    "rng_ctr": False,
-                                },
-                            }
-
-                            print("P29CL FINAL: {} {} conf={} rule={} | STRUCTURAL PRIMARY".format(
-                                _p29cl_asset, _p29cl_dir, _v11_conf, _struct_rule))
                         else:
                             print("P29CL SKIP: {} insufficient candles ({})".format(_p29cl_asset, len(_cs_all)))
                             continue
@@ -3105,6 +2873,7 @@ def _bot2_sniper_thread():
                             "dir": _p29cl_dir, "stake": _p29cl_stake,
                             "conf": _p29cl_conf, "tag": _p29cl_tag,
                             "cs_score": _cs_score, "v11_conf": _v11_conf,
+                            "struct": _struct_cache.get(_p29cl_asset, {}).get("sc", {}).get("trend", "N/A"),
                         })
                         
                         # ── FIRE LIVE ORDER IMMEDIATELY ──
@@ -3120,7 +2889,6 @@ def _bot2_sniper_thread():
                                     _p29l_trade_data = {
                                         "asset": _p29cl_asset, "dir": _p29cl_dir, "key": _p29cl_key,
                                         "v11_conf": _v11_conf, "tag": _p29cl_tag,
-                                        "struct_tag": _struct_rule,
                                         "token": _p29l_token_now, "entry": _p29l_entry_now,
                                         "live_key": _p29l_live_key,
                                     }
@@ -3178,7 +2946,7 @@ def _bot2_sniper_thread():
                     print("P29CL: {} paper trades | phase={} | pool=${:.2f}".format(
                         _p29cl_count, _p29cl_phase, _p29cl_state["balance"]))
                 else:
-                    print("P29CL: 0 trades (no structural pattern matched) | candles={} chainlink={}".format(
+                    print("P29CL: 0 trades (no momentum signal) | candles={} chainlink={}".format(
                         len(_p29cl_candle_prefetch), len(_chainlink_prices)))
             except Exception as _p29cl_err:
                 import traceback
@@ -3206,11 +2974,6 @@ def _bot2_sniper_thread():
                         print("P29CL CRASH FILTER: {}".format(_cf_log))
                     
                     _p29cl_live_queue_filtered = [item["trade_data"] for item in _cf_filtered if item["decision"]["trade"]]
-                    
-                    # Skip assets that already got T+0 pre-orders
-                    if _p29cl_pre_orders:
-                        _p29cl_live_queue_filtered = [t for t in _p29cl_live_queue_filtered if t["asset"] not in _p29cl_pre_orders]
-                    
                     _p29cl_blocked = len(_p29cl_instant_live_queue) - len(_p29cl_live_queue_filtered)
                     if _p29cl_blocked > 0:
                         print("P29CL FILTER: {} of {} trades blocked".format(_p29cl_blocked, len(_p29cl_instant_live_queue)))
@@ -3220,24 +2983,10 @@ def _bot2_sniper_thread():
                         print("P29CL LIVE STOPPED: balance ${:.2f} hit floor ${:.2f}".format(
                             _p29cl_live_state["balance"], _p29cl_live_state["floor_balance"]))
                     else:
-                        # ═══ PARALLEL ORDER: tiered fill pricing by asset + structural confidence ═══
+                        # ═══ PARALLEL ORDER: all assets fire simultaneously at 50c ═══
                         from py_clob_client_v2 import Side as _P29LSide, OrderArgs as _P29LArgs, OrderType as _P29LOT
                         _p29l_client = _get_poly_client()
-                        
-                        # Tiered fill prices: (structural_boost_conf3, regular)
-                        # BTC/XRP: deepest books, can pay more
-                        # ETH/SOL: medium liquidity
-                        # DOGE/BNB/HYPE: thin books, stay cheap
-                        _p29l_fill_tiers = {
-                            "BTC":  {"boost": 0.55, "base": 0.52},
-                            "XRP":  {"boost": 0.55, "base": 0.52},
-                            "ETH":  {"boost": 0.54, "base": 0.50},
-                            "SOL":  {"boost": 0.54, "base": 0.50},
-                            "DOGE": {"boost": 0.50, "base": 0.50},
-                            "BNB":  {"boost": 0.50, "base": 0.50},
-                            "HYPE": {"boost": 0.50, "base": 0.50},
-                        }
-                        
+                        _p29l_max_price = 0.54
                         _p29l_results = []
                         _p29l_lock = threading.Lock()
                         
@@ -3247,15 +2996,7 @@ def _bot2_sniper_thread():
                             _dir = _td["dir"]
                             _token = _td["token"]
                             _conf_val = _td.get("v11_conf", 2)
-                            _s_tag = _td.get("struct_tag", "NO_STRUCT")
-                            
-                            # Tiered fill price: conf 3 = high conviction structural → boost price
-                            _tier = _p29l_fill_tiers.get(_asset, {"boost": 0.50, "base": 0.50})
-                            if _conf_val >= 3:
-                                _price = _tier["boost"]
-                            else:
-                                _price = _tier["base"]
-                            
+                            _price = _p29l_max_price
                             _oid = None
                             _filled = False
                             
@@ -3365,8 +3106,7 @@ def _bot2_sniper_thread():
                                         int(_p29l_r["price"] * 100), _fs,
                                         _p29l_r["conf_val"], _p29l_r["tag"],
                                         _p29cl_live_state["balance"]))
-                                except Exception as _tg_err:
-                                    print("P29CL LIVE telegram error: {}".format(_tg_err))
+                                except: pass
                                 
                             except Exception as _p29l_ae:
                                 print("P29CL LIVE record error {}: {}".format(_p29l_r.get("asset","?"), _p29l_ae))
@@ -3377,6 +3117,124 @@ def _bot2_sniper_thread():
                                 _p29l_count, _p29l_boundary_spent, _p29cl_live_state["balance"]))
             except Exception as _p29l_err:
                 print("P29CL LIVE error: {}".format(_p29l_err))
+
+            # ── P3.0 LIVE: 12-Component Scoring Engine at T+0.5s ──
+            try:
+                if _p30_state["enabled"] and window_ts not in _p30_fired_boundaries:
+                    _p30_fired_boundaries.add(window_ts)
+                    _p30_count = 0
+                    _p30_boundary_spent = 0.0
+                    _p30_orders = []
+                    
+                    for _p30_asset in P30_ASSETS:
+                        try:
+                            # Get candle data from P29CL prefetch (already fetched at T-22s)
+                            _p30_candles = _p29cl_candle_prefetch.get(_p30_asset, [])
+                            if len(_p30_candles) < 50:
+                                continue
+                            
+                            # Compute P3.0 score
+                            _p30_score, _p30_conf, _p30_dir, _p30_tag = _p30_compute_score(_p30_candles)
+                            
+                            if _p30_dir is None or _p30_conf < P30_MIN_CONF:
+                                continue
+                            
+                            # Check balance
+                            _p30_stake = _p30_state["base_stake"]
+                            if _p30_stake > _p30_state["balance"] - _p30_state["floor_balance"]:
+                                continue
+                            if _p30_boundary_spent + _p30_stake > 20.0:
+                                continue
+                            
+                            _p30_key = "p30_{}_{}".format(_p30_asset, window_ts)
+                            if _p30_key in _p30_traded:
+                                continue
+                            
+                            # Get token from P29CL token map or own map
+                            _p30_entry = _p29cl_token_map.get(_p30_asset) or _p30_token_map.get(_p30_asset)
+                            if not _p30_entry:
+                                continue
+                            
+                            _p30_slug = _p30_entry.get("slug", P30_SLUGS.get(_p30_asset, "").format(window_ts))
+                            _p30_cid = _p30_entry.get("condition_id", "")
+                            
+                            # Get token ID — token map uses up_token/down_token keys
+                            if _p30_dir == "UP":
+                                _p30_tid = _p30_entry.get("up_token")
+                            else:
+                                _p30_tid = _p30_entry.get("down_token")
+                            if not _p30_tid:
+                                continue
+                            
+                            # Place order
+                            _p30_price = 0.50
+                            _p30_oid = None
+                            _p30_filled = False
+                            
+                            try:
+                                if hasattr(_p29l_client if '_p29l_client' in dir() else None, 'create_order'):
+                                    _p30_shares = round(_p30_stake / _p30_price, 4)
+                                    _p30_args = _P29LArgs(token_id=str(_p30_tid), price=_p30_price, size=_p30_shares, side=_P29LSide.BUY)
+                                    _p30_signed = _p29l_client.create_order(_p30_args)
+                                    _p30_resp = _p29l_client.post_order(_p30_signed, _P29LOT.GTC)
+                                    if _p30_resp:
+                                        _p30_oid = _p30_resp.get("orderID") or _p30_resp.get("id")
+                                        _p30_status = (_p30_resp.get("status") or "").upper()
+                                        _p30_matched = float(_p30_resp.get("sizeMatched") or 0)
+                                        _p30_filled = _p30_status in ("MATCHED", "FILLED") or _p30_matched > 0
+                            except Exception as _p30_oe:
+                                print("P3.0 order error {}: {}".format(_p30_asset, _p30_oe))
+                            
+                            # Deduct from balance
+                            _p30_state["balance"] = round(_p30_state["balance"] - _p30_stake, 2)
+                            _p30_state["trades_today"] += 1
+                            _p30_boundary_spent += _p30_stake
+                            _p30_traded.add(_p30_key)
+                            
+                            if _p30_state["balance"] > _p30_state["peak_balance"]:
+                                _p30_state["peak_balance"] = _p30_state["balance"]
+                            
+                            # Save to DB
+                            try:
+                                _p30_db = get_db()
+                                _p30_db.run("""INSERT INTO p30_live_trades
+                                    (market_id, title, asset, bet_side, stake, fill_price,
+                                     pool_after, indicators, confidence, score,
+                                     order_id, token_id, condition_id, slug, filled,
+                                     status, outcome, fired_at)
+                                    VALUES (:mid, :ttl, :ast, :bs, :stk, :fp,
+                                            :pa, :ind, :conf, :sc,
+                                            :oid, :tid, :cid, :slg, :fld,
+                                            'Pending', 'PENDING', :fa)""",
+                                    mid=_p30_key,
+                                    ttl="P3.0 {} {} 15M".format(_p30_asset, _p30_dir),
+                                    ast=_p30_asset, bs=_p30_dir, stk=_p30_stake, fp=_p30_price,
+                                    pa=_p30_state["balance"],
+                                    ind=_p30_tag,
+                                    conf=_p30_conf, sc=round(_p30_score, 2),
+                                    oid=str(_p30_oid)[:50] if _p30_oid else "",
+                                    tid=str(_p30_tid)[:80],
+                                    cid=_p30_cid, slg=_p30_slug, fld=_p30_filled,
+                                    fa=datetime.now(timezone.utc).isoformat())
+                                _p30_db.close()
+                            except Exception as _p30_dbe:
+                                print("P3.0 DB error {}: {}".format(_p30_asset, _p30_dbe))
+                            
+                            _p30_count += 1
+                            _fs30 = "FILLED" if _p30_filled else "GTC"
+                            print("P3.0: {} {} ${:.2f} @50c {} conf={} sc={:.1f} | pool=${:.2f}".format(
+                                _p30_dir, _p30_asset, _p30_stake, _fs30,
+                                _p30_conf, _p30_score, _p30_state["balance"]))
+                            
+                        except Exception as _p30_ae:
+                            print("P3.0 asset error {}: {}".format(_p30_asset, _p30_ae))
+                    
+                    if _p30_count > 0:
+                        _save_bot_balance("p30_live", _p30_state)
+                        print("P3.0: {} orders | ${:.2f} spent | pool=${:.2f}".format(
+                            _p30_count, _p30_boundary_spent, _p30_state["balance"]))
+            except Exception as _p30_err:
+                print("P3.0 error: {}".format(_p30_err))
 
             _time.sleep(60)  # Wait before next cycle
             
@@ -3496,10 +3354,15 @@ def _bot2_sniper_thread():
         pass
 
 def _poly_alpha3_calc_stake(pool_balance):
-    """Flat $3 stake per trade. Simple and proven."""
-    if pool_balance < 3.0:
-        return 0
-    return 3.0
+    """Compounding stake: 5% of pool, min $2.50, max $8.00.
+    As pool grows → stakes grow. As pool shrinks → stakes shrink.
+    This protects downside and accelerates upside."""
+    stake = round(pool_balance * 0.05, 2)
+    stake = max(stake, 2.50)  # Polymarket minimum ~5 shares
+    stake = min(stake, 8.00)  # Cap per-trade risk
+    if stake > pool_balance * 0.15:
+        return 0  # Safety: don't risk more than 15% on one trade
+    return stake
 
 # ═══════════════════════════════════════════════════════════
 # POLY ALPHA 4.0 — THE SNIPER
@@ -7267,6 +7130,19 @@ def init_db():
         )
     """)
     conn.run("""
+        CREATE TABLE IF NOT EXISTS p30_live_trades (
+            id SERIAL PRIMARY KEY,
+            market_id TEXT, title TEXT, asset TEXT,
+            bet_side TEXT, stake REAL, fill_price REAL DEFAULT 0.50,
+            pool_after REAL, payout REAL, indicators TEXT,
+            confidence INTEGER DEFAULT 0, score REAL DEFAULT 0,
+            order_id TEXT, token_id TEXT, condition_id TEXT, slug TEXT,
+            filled BOOLEAN DEFAULT FALSE,
+            status TEXT DEFAULT 'Pending', outcome TEXT DEFAULT 'PENDING',
+            fired_at TEXT, resolved_at TEXT
+        )
+    """)
+    conn.run("""
         CREATE TABLE IF NOT EXISTS poly_alpha4_trades (
             id SERIAL PRIMARY KEY,
             market_id TEXT, title TEXT, asset TEXT, timeframe TEXT,
@@ -7393,41 +7269,6 @@ try:
     _p29cl_load_predictions()
 except Exception as _load_err:
     print("P29CL: DB state load failed — starting fresh: {}".format(_load_err))
-
-# ── Pre-seed toxic rules identified from 952 paper trades ──
-# These rules have 10+ trades and WR < 45%. Self-learning will still run
-# on top — if any of these recover, _relearn() will restore them at wr >= 0.52.
-# Rules already in skip/flip from self-learning are left untouched.
-_TOXIC_RULES_PRESEED = {
-    "VLOW_BIGRED_TIGHT",   # 30.0% WR, -$37.08 (30 trades)
-    "VLOW_CPCT_LOW",       # 35.5% WR, -$28.32 (31 trades)
-    "TREND_DN",            # 15.4% WR, -$27.24 (13 trades)
-    "BOS_BEAR",            # 23.1% WR, -$21.36 (13 trades)
-    "BOS_BULL",            # 37.5% WR, -$19.08 (24 trades)
-}
-# LEAN_BEAR (44.9%) is borderline — demote instead of skip so it still trades at reduced conf
-_TOXIC_DEMOTE_PRESEED = {
-    "LEAN_BEAR",           # 44.9% WR, -$28.20 (78 trades) — too close to 45% to hard-skip
-}
-
-_preseed_count = 0
-for _asset, _engine in _p29cl_engines.items():
-    for _toxic_rule in _TOXIC_RULES_PRESEED:
-        if _toxic_rule not in _engine.skip_rules and _toxic_rule not in _engine.flip_rules:
-            _engine.skip_rules.add(_toxic_rule)
-            _preseed_count += 1
-    for _demote_rule in _TOXIC_DEMOTE_PRESEED:
-        if _demote_rule not in _engine.demote_rules and _demote_rule not in _engine.skip_rules and _demote_rule not in _engine.flip_rules:
-            _engine.demote_rules.add(_demote_rule)
-            _preseed_count += 1
-if _preseed_count > 0:
-    print("P29CL: pre-seeded {} toxic rule entries across all engines".format(_preseed_count))
-
-# Load structural self-learner state from DB
-try:
-    _load_structural_learner()
-except Exception as _sl_err:
-    print("STRUCTURAL LEARNER: load failed — starting fresh: {}".format(_sl_err))
 
 # ═══════════════════════════════════════════════════════════
 # TELEGRAM
@@ -21592,6 +21433,7 @@ td{padding:8px 12px;border-bottom:1px solid #f4f3ed;color:var(--ink-2)}tr:last-c
     <a href="/app/paper210" class="nav-tab""" + (" active" if nav_active == "paper210" else "") + """">Paper 2.10</a>
     <a href="/app/bot2-sniper" class="nav-tab""" + (" active" if nav_active == "bot2-sniper" else "") + """">🤖 Bot2 Sniper</a>
     <a href="/app/p29cl" class="nav-tab""" + (" active" if nav_active == "p29cl" else "") + """">🧠 P2.9CL</a>
+    <a href="/app/p30-live" class="nav-tab"''' + (" active" if nav_active == "p30" else "") + '''">🎯 P3.0 Live</a>
     <a href="/app/poly-alpha3" class="nav-tab""" + (" active" if nav_active == "poly-alpha3" else "") + """">⚡ Poly A3</a>
     <a href="/app/poly-alpha4" class="nav-tab""" + (" active" if nav_active == "poly-alpha4" else "") + """">🎯 Sniper A4</a>
     <a href="/app/lmts-sniper" class="nav-tab""" + (" active" if nav_active == "lmts-sniper" else "") + """">🎯 LMTS Sniper</a>
@@ -21946,19 +21788,19 @@ except Exception as _init_err:
     _poly_alpha2_load_recent()
 
     # ── POLY ALPHA 3.0 init — Pure P2.3 with compounding stakes ──
-    # P2.3: 60.3% WR over 3,895 paper trades. Proven profitable. NOW LIVE.
+    # P2.3: 59.6% WR over 2,329 paper trades. Proven profitable.
     _saved_pa3 = _saved_balances.get("poly_alpha3", {})
     if _saved_pa3 and _saved_pa3.get("balance", 0) >= 10:
         _poly_alpha3_state["balance"] = _saved_pa3["balance"]
         _poly_alpha3_state["peak_balance"] = _saved_pa3.get("peak_balance", _saved_pa3["balance"])
     else:
-        _poly_alpha3_state["balance"] = 60.0
-        _poly_alpha3_state["peak_balance"] = 60.0
-    _poly_alpha3_state["starting_balance"] = 60.0
-    _poly_alpha3_state["floor_balance"] = 10.0
-    _poly_alpha3_state["enabled"] = False  # PAUSED — isolating P29CL T+0 first
+        _poly_alpha3_state["balance"] = 100.0
+        _poly_alpha3_state["peak_balance"] = 100.0
+    _poly_alpha3_state["starting_balance"] = 100.0
+    _poly_alpha3_state["floor_balance"] = 5.0
+    _poly_alpha3_state["enabled"] = False  # PAUSED — only Bot2 Chainlink Sniper trades live
     _save_bot_balance("poly_alpha3", _poly_alpha3_state)
-    print("POLY ALPHA 3.0: PAUSED — P2.3 15M | pool=${:.2f}".format(_poly_alpha3_state["balance"]))
+    print("POLY ALPHA 3.0: PAUSED — only Bot2 Chainlink Sniper trades live")
     _poly_alpha3_load_recent()
 
     _poly_alpha_load_recent_trades()
@@ -22034,8 +21876,9 @@ if SIGNALS_DB_URL:
     threading.Thread(target=_bot2_sniper_thread, daemon=True).start()
     print("BOT2 SNIPER thread launched")
     
-    # ── Alpha 3.0 (P23) — PAUSED for P29CL T+0 isolation ──
-    print("POLY ALPHA 3.0: PAUSED — isolating P29CL T+0 | pool=${:.2f}".format(_poly_alpha3_state["balance"]))
+    # ── PAUSE Alpha 3.0 — replaced by Bot2 Sniper ──
+    _poly_alpha3_state["enabled"] = False
+    print("POLY ALPHA 3.0: PAUSED — replaced by Bot2 Chainlink Sniper")
 
     # ── LIMITLESS SNIPER init ──
     _saved_lmts = _saved_balances.get("limitless_sniper", {})
@@ -23220,7 +23063,7 @@ def run_poly_scan():
                         _pa3_mkey = parsed["market_id"]
                         if _pa3_mkey not in _poly_alpha3_traded_markets and _poly_alpha3_state["enabled"] and _poly_has_creds():
                             _pa3_stake = _poly_alpha3_calc_stake(_poly_alpha3_state["balance"])
-                            _pa3_max_fill = 0.70
+                            _pa3_max_fill = 0.62
                             if _pa3_stake > 0 and _pa3_stake <= _poly_alpha3_state["balance"] and share_price <= _pa3_max_fill:
                                 clob_toks = parsed.get("clob_tokens", [])
                                 cid = parsed.get("condition_id", "")
@@ -24458,12 +24301,6 @@ def _resolve_p29cl_trades():
                         _learn_engine.last_prediction = _learn_pred
                         _learn_engine.learn(_learn_actual)
                         
-                        # ── STRUCTURAL SELF-LEARNER: record outcome per rule ──
-                        _learn_rule = _learn_pred.get("rule", "")
-                        _learn_correct = _learn_pred["side"] == _learn_actual
-                        _structural_self_learner.record(_learn_asset, _learn_rule, _learn_correct)
-                        _save_structural_learner()
-                        
                         # Clean up stored prediction
                         _p29cl_predictions.pop(_learn_key, None)
                         
@@ -24614,27 +24451,6 @@ def _resolve_p29cl_live_trades():
                 if won is None:
                     if now > expiry + timedelta(hours=1): won = False
                     else: continue
-                
-                # ── CHECK IF ORDER ACTUALLY FILLED ──
-                _was_filled = p.get("filled")
-                if _was_filled is False or str(_was_filled).lower() == "false":
-                    try:
-                        _cancel_oid = p.get("order_id")
-                        if _cancel_oid:
-                            _cancel_client = _get_poly_client()
-                            _cancel_client.cancel(_cancel_oid)
-                    except: pass
-                    _p29cl_live_state["balance"] = round(_p29cl_live_state["balance"] + stake, 2)
-                    c3 = get_db()
-                    c3.run("UPDATE p29cl_live_trades SET status=:s,outcome=:o,resolved_at=:r WHERE id=:i",
-                        s="Cancelled", o="UNFILLED", r=now.isoformat(), i=p["id"])
-                    c3.close()
-                    resolved += 1
-                    print("P29CL LIVE #{} UNFILLED: cancelled, ${:.2f} refunded | pool=${:.2f}".format(
-                        p["id"], stake, _p29cl_live_state["balance"]))
-                    _save_bot_balance("p29cl_live", _p29cl_live_state)
-                    continue
-                
                 fill = float(p.get("fill_price") or 0.50)
                 payout = round(stake / fill, 4) if won else 0
                 c3 = get_db()
@@ -24671,13 +24487,6 @@ def _resolve_p29cl_live_trades():
                             _learn_actual = "DOWN" if _learn_bet_side == "UP" else "UP"
                         _learn_engine.last_prediction = _learn_pred
                         _learn_engine.learn(_learn_actual)
-                        
-                        # ── STRUCTURAL SELF-LEARNER: record outcome per rule ──
-                        _learn_rule = _learn_pred.get("rule", "")
-                        _learn_correct = _learn_pred["side"] == _learn_actual
-                        _structural_self_learner.record(_learn_asset, _learn_rule, _learn_correct)
-                        _save_structural_learner()
-                        
                         _p29cl_predictions.pop(_learn_key, None)
                         _p29cl_predictions.pop(_learn_key_paper, None)
                         _p29cl_save_engine_state()
@@ -24699,6 +24508,139 @@ def _resolve_p29cl_live_trades():
         return resolved
     except Exception as e:
         print("P29CL LIVE resolve error: {}".format(e)); return 0
+
+def _resolve_p30_live_trades():
+    """Resolve P3.0 LIVE trades — check Polymarket API for settlement."""
+    try:
+        conn = get_db()
+        rows = conn.run("SELECT * FROM p30_live_trades WHERE status='Pending' ORDER BY id")
+        cols = [c['name'] for c in conn.columns]
+        items = [dict(zip(cols, r)) for r in rows]
+        conn.close()
+        if not items: return 0
+        now = datetime.now(timezone.utc)
+        resolved = 0
+        for p in items:
+            try:
+                if not p.get("fired_at"): continue
+                fired = datetime.fromisoformat(str(p["fired_at"]).replace("+00:00","").replace("Z","")[:26])
+                if fired.tzinfo is None: fired = fired.replace(tzinfo=timezone.utc)
+                m15 = (fired.minute // 15) * 15
+                window_start = fired.replace(minute=m15, second=0, microsecond=0)
+                expiry = window_start + timedelta(minutes=15)
+                if now < expiry + timedelta(minutes=2): continue
+                
+                stake = float(p.get("stake") or 2.50)
+                won = None
+                slug = p.get("slug", "")
+                bs = p.get("bet_side", "UP")
+                order_id = p.get("order_id", "")
+                was_filled = p.get("filled", False)
+                
+                # Check if order was filled by checking order status or position
+                if not was_filled and order_id:
+                    try:
+                        import requests as _req
+                        # Try to cancel — if already filled, cancel returns FILLED
+                        cancel_result = _cancel_order(order_id)
+                        if cancel_result == "FILLED":
+                            was_filled = True
+                        elif cancel_result == True:
+                            # Successfully cancelled — never filled
+                            c_upd = get_db()
+                            c_upd.run("UPDATE p30_live_trades SET status='Cancelled',outcome='UNFILLED',resolved_at=:r WHERE id=:i",
+                                r=now.isoformat(), i=p["id"])
+                            c_upd.close()
+                            resolved += 1
+                            print("P3.0 #{} CANCELLED (unfilled)".format(p["id"]))
+                            continue
+                    except:
+                        pass
+                
+                if not was_filled:
+                    # Also check via position
+                    try:
+                        if slug and _check_has_position(slug):
+                            was_filled = True
+                    except:
+                        pass
+                
+                if not was_filled:
+                    # After 1 hour, mark as unfilled
+                    if now > expiry + timedelta(hours=1):
+                        c_upd = get_db()
+                        c_upd.run("UPDATE p30_live_trades SET status='Cancelled',outcome='UNFILLED',resolved_at=:r WHERE id=:i",
+                            r=now.isoformat(), i=p["id"])
+                        c_upd.close()
+                        resolved += 1
+                        # Refund balance
+                        _p30_state["balance"] = round(_p30_state["balance"] + stake, 2)
+                        print("P3.0 #{} UNFILLED (refunded ${:.2f})".format(p["id"], stake))
+                        continue
+                    continue  # wait longer
+                
+                # Order was filled — check outcome via Polymarket API
+                try:
+                    import requests as _req
+                    if slug:
+                        r = _req.get("https://gamma-api.polymarket.com/markets/slug/{}".format(slug), timeout=8)
+                        if r.status_code == 200:
+                            md = r.json()
+                            ops = md.get("outcomePrices")
+                            if ops:
+                                if isinstance(ops, str):
+                                    try: ops = json.loads(ops)
+                                    except: ops = None
+                                if isinstance(ops, list) and len(ops) >= 2:
+                                    p0 = float(ops[0]); p1 = float(ops[1])
+                                    _oc = md.get("outcomes")
+                                    if isinstance(_oc, str):
+                                        try: _oc = json.loads(_oc)
+                                        except: _oc = None
+                                    _up_idx = 0
+                                    if isinstance(_oc, list) and len(_oc) >= 2:
+                                        o0 = str(_oc[0]).lower().strip()
+                                        if o0 in ("no", "down", "below"): _up_idx = 1
+                                    if _up_idx == 0:
+                                        if p0 >= 0.95: won = (bs == "UP")
+                                        elif p1 >= 0.95: won = (bs == "DOWN")
+                                    else:
+                                        if p1 >= 0.95: won = (bs == "UP")
+                                        elif p0 >= 0.95: won = (bs == "DOWN")
+                except: pass
+                
+                if won is None:
+                    if now > expiry + timedelta(hours=1): won = False
+                    else: continue
+                
+                fill = float(p.get("fill_price") or 0.50)
+                payout = round(stake / fill, 4) if won else 0
+                c3 = get_db()
+                c3.run("UPDATE p30_live_trades SET status=:s,outcome=:o,resolved_at=:r,payout=:p,filled=TRUE WHERE id=:i",
+                    s="Won" if won else "Lost", o="WIN" if won else "LOSS",
+                    r=now.isoformat(), p=payout, i=p["id"])
+                c3.close()
+                resolved += 1
+                
+                if won:
+                    _p30_state["balance"] = round(_p30_state["balance"] + payout, 2)
+                    _p30_state["wins_today"] += 1
+                else:
+                    _p30_state["losses_today"] += 1
+                if _p30_state["balance"] > _p30_state["peak_balance"]:
+                    _p30_state["peak_balance"] = _p30_state["balance"]
+                
+                _pnl = "+${:.2f}".format(payout - stake) if won else "-${:.2f}".format(stake)
+                print("P3.0 #{} {}: {} {} | pool=${:.2f}".format(
+                    p["id"], "WIN" if won else "LOSS", p.get("asset",""), _pnl, _p30_state["balance"]))
+                
+            except Exception as _e:
+                print("P3.0 resolve error #{}: {}".format(p.get("id","?"), _e))
+        
+        return resolved
+    except Exception as _e:
+        print("P3.0 resolve outer error: {}".format(_e))
+        return 0
 
 def _poly_scan_loop():
     """Background thread for Polymarket scanning and resolving."""
@@ -24773,6 +24715,12 @@ def _poly_scan_loop():
                 print("P29CL LIVE resolved: {}".format(_p29cl_live_resolved))
         except Exception as e:
             print("P29CL LIVE resolve error: {}".format(e))
+        try:
+            _p30_resolved = _resolve_p30_live_trades()
+            if _p30_resolved:
+                print("P3.0 resolved: {}".format(_p30_resolved))
+        except Exception as e:
+            print("P3.0 resolve error: {}".format(e))
         try:
             _sv3_resolved = _resolve_sv3_trades()
             if _sv3_resolved:
@@ -25211,7 +25159,7 @@ def p29cl_page():
     """P2.9 Chainlink — Momentum paper bot dashboard."""
     try:
         conn = get_db()
-        rows = conn.run("SELECT * FROM p29cl_trades ORDER BY id DESC LIMIT 2000")
+        rows = conn.run("SELECT * FROM p29cl_trades ORDER BY id DESC LIMIT 1000")
         cols = [c['name'] for c in conn.columns]
         trades = [dict(zip(cols, r)) for r in rows]
         conn.close()
@@ -25347,7 +25295,7 @@ def p29cl_live_page():
     """P2.9CL LIVE — Real trading dashboard."""
     try:
         conn = get_db()
-        rows = conn.run("SELECT * FROM p29cl_live_trades ORDER BY id DESC LIMIT 2000")
+        rows = conn.run("SELECT * FROM p29cl_live_trades ORDER BY id DESC LIMIT 500")
         cols = [c['name'] for c in conn.columns]
         trades = [dict(zip(cols, r)) for r in rows]
         conn.close()
@@ -25454,7 +25402,6 @@ a{{color:#ff6b35}}
         statusc=status_color, status=status)
 
 
-@app.route("/app/poly-alpha3")
 def poly_alpha3_page():
     """Polymarket Alpha 3.0 — Pure P2.3 with Compounding."""
     try:
@@ -25577,6 +25524,119 @@ a{{color:#00d4aa}}
         pnlc, total_pnl, _poly_alpha3_state["peak_balance"],
         "{}T {}W {}L".format(_poly_alpha3_state["trades_today"], _poly_alpha3_state["wins_today"], _poly_alpha3_state["losses_today"]),
         tf_html, asset_html, trade_rows)
+
+
+
+@app.route("/app/p30-live")
+def p30_live_page():
+    """P3.0 LIVE — 12-Component Scoring Engine dashboard."""
+    try:
+        conn = get_db()
+        rows = conn.run("SELECT * FROM p30_live_trades ORDER BY id DESC LIMIT 1000")
+        cols = [c['name'] for c in conn.columns]
+        trades = [dict(zip(cols, r)) for r in rows]
+        conn.close()
+    except:
+        trades = []
+    resolved = [t for t in trades if t.get("outcome") in ("WIN", "LOSS")]
+    pending = [t for t in trades if t.get("outcome") == "PENDING"]
+    unfilled = [t for t in trades if t.get("outcome") == "UNFILLED"]
+    wins = sum(1 for t in resolved if t["outcome"] == "WIN")
+    losses_n = len(resolved) - wins
+    wr = round(wins / len(resolved) * 100, 1) if resolved else 0
+    pnl = sum(float(t.get("payout") or 0) - float(t.get("stake") or 0) if t["outcome"] == "WIN" else -float(t.get("stake") or 0) for t in resolved)
+    pnl = round(pnl, 2)
+    # By Asset
+    asset_stats = {}
+    for t in resolved:
+        a = t.get("asset", "?")
+        if a not in asset_stats: asset_stats[a] = {"w": 0, "l": 0, "pnl": 0}
+        if t["outcome"] == "WIN":
+            asset_stats[a]["w"] += 1; asset_stats[a]["pnl"] += float(t.get("payout") or 0) - float(t.get("stake") or 0)
+        else:
+            asset_stats[a]["l"] += 1; asset_stats[a]["pnl"] -= float(t.get("stake") or 0)
+    asset_html = ""
+    for a in sorted(asset_stats.keys()):
+        s = asset_stats[a]; tt = s["w"]+s["l"]; awr = round(s["w"]/tt*100,1) if tt else 0
+        asset_html += "<tr><td>{}</td><td>{}W/{}L</td><td>{:.1f}%</td><td>${:.2f}</td></tr>".format(a, s["w"], s["l"], awr, s["pnl"])
+    # By Confidence bucket
+    conf_stats = {}
+    for t in resolved:
+        c = int(t.get("confidence") or 0)
+        if c >= 13: bucket = "HIGH (13+)"
+        elif c >= 8: bucket = "MEDIUM (8-12)"
+        elif c >= 5: bucket = "LOW (5-7)"
+        else: bucket = "MINIMAL (1-4)"
+        if bucket not in conf_stats: conf_stats[bucket] = {"w": 0, "l": 0}
+        if t["outcome"] == "WIN": conf_stats[bucket]["w"] += 1
+        else: conf_stats[bucket]["l"] += 1
+    conf_html = ""
+    for c in ["HIGH (13+)", "MEDIUM (8-12)", "LOW (5-7)", "MINIMAL (1-4)"]:
+        s = conf_stats.get(c, {"w": 0, "l": 0}); tt = s["w"]+s["l"]
+        if tt == 0: continue
+        cwr = round(s["w"]/tt*100,1)
+        conf_html += "<tr><td>{}</td><td>{}W/{}L</td><td>{:.1f}%</td></tr>".format(c, s["w"], s["l"], cwr)
+    # Trade rows
+    trade_rows = ""
+    for t in trades[:100]:
+        oc = t.get("outcome", "PENDING")
+        icon = "✅" if oc == "WIN" else "❌" if oc == "LOSS" else "⏳" if oc == "PENDING" else "🚫"
+        pnl_t = ""
+        if oc == "WIN": pnl_t = "+${:.2f}".format(float(t.get("payout") or 0) - float(t.get("stake") or 0))
+        elif oc == "LOSS": pnl_t = "-${:.2f}".format(float(t.get("stake") or 0))
+        elif oc == "UNFILLED": pnl_t = "unfilled"
+        fired = str(t.get("fired_at", ""))[:16]
+        filled_tag = "✓" if t.get("filled") else "○"
+        trade_rows += "<tr><td>{}</td><td>{}</td><td>{}</td><td>${:.2f}</td><td>{}</td><td>{}</td><td>conf={} sc={}</td><td>{}</td></tr>".format(
+            icon, t.get("asset","?"), t.get("bet_side","?"), float(t.get("stake") or 0),
+            fired, filled_tag, t.get("confidence",0), t.get("score",0),
+            pnl_t)
+    status = "LIVE" if _p30_state["enabled"] else "STOPPED"
+    status_color = "#3fb950" if _p30_state["enabled"] else "#f85149"
+    return """<!DOCTYPE html><html><head><title>P3.0 Live</title>
+<meta http-equiv="refresh" content="60">
+<style>
+body{{font-family:'DM Sans',sans-serif;background:#0d1117;color:#c9d1d9;margin:0;padding:20px}}
+.nav{{display:flex;gap:10px;margin-bottom:20px}}
+.nav a{{color:#58a6ff;text-decoration:none;padding:8px 16px;border-radius:6px;background:#161b22}}
+.nav a.active{{background:#1f6feb;color:#fff}}
+.header{{display:flex;gap:30px;flex-wrap:wrap;margin-bottom:20px}}
+.card{{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:16px;min-width:120px}}
+.card .value{{font-size:24px;font-weight:700}}
+.card .label{{font-size:12px;color:#8b949e}}
+table{{width:100%;border-collapse:collapse;background:#161b22;border:1px solid #30363d;border-radius:8px;overflow:hidden}}
+th,td{{padding:8px 12px;text-align:left;border-bottom:1px solid #21262d;font-size:13px}}
+th{{background:#1c2128;color:#8b949e;font-weight:600}}
+h2{{color:#58a6ff;margin-top:24px}}
+.status{{display:inline-block;padding:4px 12px;border-radius:12px;font-weight:700;font-size:14px}}
+</style></head><body>
+<div class="nav">
+<a href="/app/p29cl">🧠 P2.9CL</a>
+<a href="/app/p30-live" class="active">🎯 P3.0 Live</a>
+</div>
+<h1>🎯 P3.0 Live — 12-Component Scoring Engine</h1>
+<p><span class="status" style="background:{sc};color:#fff">{st}</span> Candle patterns + indicators · All 6 assets · $2.50 flat · 15M</p>
+<div class="header">
+<div class="card"><div class="value">${bal:.2f}</div><div class="label">Pool</div></div>
+<div class="card"><div class="value">{wr:.1f}%</div><div class="label">Win Rate</div></div>
+<div class="card"><div class="value">{nt}</div><div class="label">Trades</div></div>
+<div class="card"><div class="value">${pnl:+.2f}</div><div class="label">P&L</div></div>
+<div class="card"><div class="value">{pend}</div><div class="label">Pending</div></div>
+<div class="card"><div class="value">{unfill}</div><div class="label">Unfilled</div></div>
+<div class="card"><div class="value">${peak:.2f}</div><div class="label">Peak</div></div>
+</div>
+<h2>By Confidence</h2>
+<table><tr><th>Level</th><th>Record</th><th>WR</th></tr>{conf_html}</table>
+<h2>By Asset</h2>
+<table><tr><th>Asset</th><th>Record</th><th>WR</th><th>P&L</th></tr>{asset_html}</table>
+<h2>Trades</h2>
+<table><tr><th></th><th>Asset</th><th>Side</th><th>Stake</th><th>Time</th><th>Fill</th><th>Score</th><th>P&L</th></tr>{trades}</table>
+<p style="color:#8b949e;margin-top:20px">P3.0 Live · 12-component scoring · $2.50 flat · Auto-refresh 60s</p>
+</body></html>""".format(
+        sc=status_color, st=status, bal=_p30_state["balance"], wr=wr,
+        nt=len(resolved), pnl=pnl, pend=len(pending), unfill=len(unfilled),
+        peak=_p30_state["peak_balance"],
+        conf_html=conf_html, asset_html=asset_html, trades=trade_rows)
 
 
 
