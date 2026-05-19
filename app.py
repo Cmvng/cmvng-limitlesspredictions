@@ -1243,9 +1243,9 @@ _p29cl_live_traded = set()
 
 _p30_state = {
     "enabled": True,
-    "balance": 100.0,
-    "peak_balance": 100.0,
-    "starting_balance": 100.0,
+    "balance": 75.0,
+    "peak_balance": 75.0,
+    "starting_balance": 75.0,
     "floor_balance": 10.0,
     "base_stake": 2.50,
     "trades_today": 0,
@@ -3228,6 +3228,7 @@ def _bot2_sniper_thread():
                                 print("P3.0 DB error {}: {}".format(_p30_asset, _p30_dbe))
                             
                             _p30_count += 1
+                            _p30_orders.append({"dir": _p30_dir, "asset": _p30_asset, "conf": _p30_conf, "score": _p30_score, "filled": _p30_filled})
                             _fs30 = "FILLED" if _p30_filled else "GTC"
                             print("P3.0: {} {} ${:.2f} @50c {} conf={} sc={:.1f} | pool=${:.2f}".format(
                                 _p30_dir, _p30_asset, _p30_stake, _fs30,
@@ -3240,6 +3241,19 @@ def _bot2_sniper_thread():
                         _save_bot_balance("p30_live", _p30_state)
                         print("P3.0: {} orders | ${:.2f} spent | pool=${:.2f}".format(
                             _p30_count, _p30_boundary_spent, _p30_state["balance"]))
+                        # Telegram summary
+                        try:
+                            _p30_tg_lines = []
+                            for _p30_o in _p30_orders:
+                                _p30_tg_lines.append("{} {} conf={} sc={:.1f} {}".format(
+                                    _p30_o.get("dir","?"), _p30_o.get("asset","?"),
+                                    _p30_o.get("conf",0), _p30_o.get("score",0),
+                                    "✅FILL" if _p30_o.get("filled") else "📋GTC"))
+                            send_telegram("🎯 <b>P3.0 LIVE</b>\n{} orders | ${:.2f} spent\n{}\nPool: ${:.2f}".format(
+                                _p30_count, _p30_boundary_spent,
+                                "\n".join(_p30_tg_lines),
+                                _p30_state["balance"]))
+                        except: pass
             except Exception as _p30_err:
                 print("P3.0 error: {}".format(_p30_err))
 
@@ -21878,6 +21892,11 @@ if SIGNALS_DB_URL:
         _p29cl_live_state["peak_balance"] = _saved_p29cl_live.get("peak_balance", _saved_p29cl_live["balance"])
         print("P29CL LIVE: restored ${:.2f} from DB".format(_p29cl_live_state["balance"]))
     _save_bot_balance("p29cl_live", _p29cl_live_state)
+    # P3.0 LIVE balance — force reset to $75 to match live account
+    _p30_state["balance"] = 75.0
+    _p30_state["peak_balance"] = 75.0
+    _save_bot_balance("p30_live", _p30_state)
+    print("P3.0 LIVE: ${:.2f} pool | $2.50 flat | conf>=1 | 6 assets".format(_p30_state["balance"]))
     print("P29CL LIVE: ${:.2f} pool | $2.50 flat | $5 max | $20/bnd cap | LIVE".format(
         _p29cl_live_state["balance"]))
     threading.Thread(target=_bot2_sniper_thread, daemon=True).start()
@@ -24624,6 +24643,12 @@ def _resolve_p30_live_trades():
                 _pnl = "+${:.2f}".format(payout - stake) if won else "-${:.2f}".format(stake)
                 print("P3.0 #{} {}: {} {} | pool=${:.2f}".format(
                     p["id"], "WIN" if won else "LOSS", p.get("asset",""), _pnl, _p30_state["balance"]))
+                try:
+                    _icon = "✅" if won else "❌"
+                    send_telegram("{} <b>P3.0</b> {} {} {}\nconf={} | Pool: ${:.2f}".format(
+                        _icon, p.get("asset",""), bs, _pnl,
+                        p.get("confidence",0), _p30_state["balance"]))
+                except: pass
                 
             except Exception as _e:
                 print("P3.0 resolve error #{}: {}".format(p.get("id","?"), _e))
