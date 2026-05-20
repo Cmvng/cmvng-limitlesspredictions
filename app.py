@@ -1256,7 +1256,7 @@ _p30_traded = set()
 _p30_fired_boundaries = set()
 _p30_token_map = {}
 
-P30_ASSETS = ["BTC", "ETH", "SOL", "XRP", "DOGE", "BNB"]
+P30_ASSETS = ["BTC", "ETH", "DOGE"]  # Top 3 by backtest WR: ETH 63.3%, BTC 61.8%, DOGE 58.5%
 P30_SLUGS = {
     "BTC": "btc-updown-15m-{}", "ETH": "eth-updown-15m-{}",
     "SOL": "sol-updown-15m-{}", "XRP": "xrp-updown-15m-{}",
