@@ -890,7 +890,7 @@ _bot31_state = {
 
 # Paper 2.2: Bot 2.1 strategy, 15M ONLY (paper only)
 _bot22_state = {
-    "enabled": True,
+    "enabled": False,  # DISABLED — P3.0-only test
     "balance": 20.0,
     "peak_balance": 20.0,
     "daily_loss": 0.0,
@@ -919,7 +919,7 @@ _bot32_state = {
 
 # Paper 2.3: P2.1 + Distance (LIVE trading on Limitless)
 _bot23_state = {
-    "enabled": True,
+    "enabled": False,  # DISABLED — P3.0-only test
     "balance": 20.0,
     "peak_balance": 20.0,
     "starting_balance": 20.0,
@@ -931,7 +931,7 @@ _bot23_state = {
 
 # Paper 3.3: P3.1 + Distance (LIVE trading on Limitless)
 _bot33_state = {
-    "enabled": True,
+    "enabled": False,  # DISABLED — P3.0-only test
     "balance": 20.0,
     "peak_balance": 20.0,
     "starting_balance": 20.0,
@@ -943,7 +943,7 @@ _bot33_state = {
 
 # ─── P2.4 and P3.4: 1H market bots with cheap entry strategy ───
 _bot24_state = {
-    "enabled": True,
+    "enabled": False,  # DISABLED — P3.0-only test
     "balance": 12.0,
     "peak_balance": 12.0,
     "starting_balance": 12.0,
@@ -954,7 +954,7 @@ _bot24_state = {
 }
 
 _bot34_state = {
-    "enabled": True,
+    "enabled": False,  # DISABLED — P3.0-only test
     "balance": 12.0,
     "peak_balance": 12.0,
     "starting_balance": 12.0,
@@ -1056,7 +1056,7 @@ _poly_live_p31 = {
 # POLYMARKET ALPHA — Strategy P (P2.3 engine on 5M + 15M)
 # ═══════════════════════════════════════════════════════════
 _poly_alpha_state = {
-    "enabled": True,
+    "enabled": False,  # DISABLED — P3.0-only test
     "balance": 70.0,
     "peak_balance": 70.0,
     "starting_balance": 70.0,
@@ -1139,7 +1139,7 @@ def _poly_alpha_load_recent_trades():
 # ═══════════════════════════════════════════════════════════
 
 _poly_alpha3_state = {
-    "enabled": True,
+    "enabled": False,  # DISABLED — P3.0-only test
     "balance": 60.0,
     "peak_balance": 60.0,
     "starting_balance": 60.0,
@@ -3143,6 +3143,10 @@ def _bot2_sniper_thread():
                     _p30_count = 0
                     _p30_boundary_spent = 0.0
                     _p30_orders = []
+                    _p30_diag = []  # diagnostic per-asset summary
+                    
+                    print("P3.0 boundary {} START | bal=${:.2f} assets={}".format(
+                        window_ts, _p30_state["balance"], P30_ASSETS))
                     
                     for _p30_asset in P30_ASSETS:
                         try:
@@ -3177,14 +3181,23 @@ def _bot2_sniper_thread():
                             # Compute P3.0 score
                             _p30_score, _p30_conf, _p30_dir, _p30_tag = _p30_compute_score(_p30_candles)
                             
-                            if _p30_dir is None:
-                                continue
-                            
                             # Apply per-asset confidence threshold (Session 26 backtest validated)
                             _p30_min_conf = P30_ASSET_THRESHOLDS.get(_p30_asset, P30_MIN_CONF)
-                            if _p30_conf < _p30_min_conf:
-                                # Skip silently — below this asset's threshold
+                            
+                            if _p30_dir is None:
+                                print("P3.0 {} SKIP: no direction (score={:.1f} conf={})".format(
+                                    _p30_asset, _p30_score, _p30_conf))
+                                _p30_diag.append("{}=no_dir".format(_p30_asset))
                                 continue
+                            
+                            if _p30_conf < _p30_min_conf:
+                                print("P3.0 {} SKIP: {} {} conf={} below threshold {}".format(
+                                    _p30_asset, _p30_dir, _p30_tag[:40], _p30_conf, _p30_min_conf))
+                                _p30_diag.append("{}={}@{}<{}".format(_p30_asset, _p30_dir, _p30_conf, _p30_min_conf))
+                                continue
+                            
+                            print("P3.0 {} SIGNAL: {} conf={} score={:.1f} (threshold={})".format(
+                                _p30_asset, _p30_dir, _p30_conf, _p30_score, _p30_min_conf))
                             
                             # Check balance
                             _p30_stake = _p30_state["base_stake"]
@@ -3349,6 +3362,9 @@ def _bot2_sniper_thread():
                                 "\n".join(_p30_tg_lines),
                                 _p30_state["balance"]))
                         except: pass
+                    else:
+                        print("P3.0 boundary {} END: 0 trades | {}".format(
+                            window_ts, " ".join(_p30_diag) if _p30_diag else "no assets evaluated"))
             except Exception as _p30_err:
                 print("P3.0 error: {}".format(_p30_err))
 
@@ -3378,10 +3394,10 @@ def _bot2_sniper_thread():
             _saved_pa4.get("balance", 0) if _saved_pa4 else 0))
     _poly_alpha4_state["starting_balance"] = 50.0
     _poly_alpha4_state["floor_balance"] = 10.0
-    _poly_alpha4_state["enabled"] = True
+    _poly_alpha4_state["enabled"] = False  # DISABLED — user did not approve
     _save_bot_balance("poly_alpha4", _poly_alpha4_state)
     
-    print("SNIPER A4 CHAINLINK: ${:.2f} pool | TV+SMA+BTC 2/3 | Chainlink T+0 | LIVE".format(
+    print("SNIPER A4 CHAINLINK: ${:.2f} pool | DISABLED — not trading".format(
         _poly_alpha4_state["balance"]))
     
     # ── A41 PAUSED — not trading on Polymarket until further notice ──
@@ -3489,7 +3505,7 @@ def _poly_alpha3_calc_stake(pool_balance):
 _poly_alpha41_state = {"balance": 130.00, "enabled": False}  # PAUSED — only Bot2 trades
 _sv21_paper_state = {"balance": 100.00}
 _poly_alpha4_state = {
-    "enabled": True,  # LIVE — original A4 with Chainlink-settled data
+    "enabled": False,  # DISABLED — user did not approve A4 trading
     "balance": 50.0,
     "peak_balance": 50.0,
     "starting_balance": 50.0,
@@ -5756,7 +5772,7 @@ def _resolve_poly_alpha4_trades():
 # ═══════════════════════════════════════════════════════════
 
 _limitless_sniper_state = {
-    "enabled": True,
+    "enabled": False,  # DISABLED — P3.0-only test
     "balance": 30.0,
     "peak_balance": 30.0,
     "starting_balance": 30.0,
@@ -21955,9 +21971,9 @@ if SIGNALS_DB_URL:
         print("SNIPER A4: restored ${:.2f} from DB".format(_poly_alpha4_state["balance"]))
     else:
         print("SNIPER A4: fresh start ${:.2f}".format(_poly_alpha4_state["balance"]))
-    _poly_alpha4_state["enabled"] = True
+    _poly_alpha4_state["enabled"] = False  # DISABLED — user did not approve
     _save_bot_balance("poly_alpha4", _poly_alpha4_state)
-    print("SNIPER A4 CHAINLINK: ${:.2f} pool | LIVE".format(_poly_alpha4_state["balance"]))
+    print("SNIPER A4 CHAINLINK: ${:.2f} pool | DISABLED".format(_poly_alpha4_state["balance"]))
     
     # ── SV2 PAPER init ──
     _saved_sv2 = _saved_balances.get("sv2_paper", {})
@@ -22017,8 +22033,8 @@ if SIGNALS_DB_URL:
         print("LMTS SNIPER: balance corrected to $24.00 (fake losses removed)")
     # ────────────────────────────────────────────────────────────
     _limitless_sniper_state["floor_balance"] = 5.0
-    _limitless_sniper_state["enabled"] = True
-    print("LMTS SNIPER: ${:.2f} pool (restored from DB) | P2.1+momentum | 1H | 50¢ | 2-tier".format(
+    _limitless_sniper_state["enabled"] = False  # DISABLED — P3.0-only test
+    print("LMTS SNIPER: ${:.2f} pool | DISABLED (P3.0-only test)".format(
         _limitless_sniper_state["balance"]))
     threading.Thread(target=_limitless_sniper_thread, daemon=True).start()
     print("LMTS SNIPER thread launched")
