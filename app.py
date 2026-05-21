@@ -3150,12 +3150,13 @@ def _bot2_sniper_thread():
                     
                     for _p30_asset in P30_ASSETS:
                         try:
-                            # ── FRESH FETCH (Session 26 fix) ──
-                            # Old code used prefetch from T-22s which included the
-                            # in-progress candle as the "last closed" candle. Now we
-                            # fetch fresh and drop the new in-progress candle so [-1]
-                            # is actually the just-closed candle.
+                            # ── FRESH FETCH with multi-source fallback ──
+                            # Binance is being geoblocked from EU-West (HTTP 418).
+                            # Fall back to Coinbase Exchange API (no geoblock).
                             _p30_candles = []
+                            _p30_src = "none"
+                            
+                            # Try Binance first
                             try:
                                 import requests as _p30_req
                                 _p30_sym = P30_BINANCE_MAP.get(_p30_asset)
@@ -3166,17 +3167,50 @@ def _bot2_sniper_thread():
                                         timeout=3)
                                     if _p30_kresp.status_code == 200:
                                         _p30_klines = _p30_kresp.json()
-                                        # Drop the last kline (just-started in-progress candle).
-                                        # klines[:-1] gives us all closed candles, [-1] = just closed.
                                         _p30_candles = [(float(k[1]), float(k[2]), float(k[3]), float(k[4])) for k in _p30_klines[:-1]]
+                                        _p30_src = "binance"
+                                    else:
+                                        print("P3.0 {} Binance HTTP {} — trying Coinbase".format(_p30_asset, _p30_kresp.status_code))
                             except Exception as _p30_fe:
-                                print("P3.0 fresh fetch error {}: {} — falling back to prefetch".format(_p30_asset, _p30_fe))
+                                print("P3.0 {} Binance error: {} — trying Coinbase".format(_p30_asset, _p30_fe))
                             
-                            # Fall back to prefetch if fresh fetch failed
+                            # Fall back to Coinbase if Binance failed
+                            if not _p30_candles:
+                                try:
+                                    _p30_cb_symbols = {"BTC": "BTC-USD", "ETH": "ETH-USD", "SOL": "SOL-USD",
+                                                       "XRP": "XRP-USD", "DOGE": "DOGE-USD"}
+                                    _p30_cb_sym = _p30_cb_symbols.get(_p30_asset)
+                                    if _p30_cb_sym:
+                                        _p30_cresp = _p30_req.get(
+                                            "https://api.exchange.coinbase.com/products/{}/candles".format(_p30_cb_sym),
+                                            params={"granularity": 900},
+                                            timeout=5,
+                                            headers={"User-Agent": "Mozilla/5.0"})
+                                        if _p30_cresp.status_code == 200:
+                                            # Coinbase returns [time, low, high, open, close, volume], newest first
+                                            _p30_craw = _p30_cresp.json()
+                                            _p30_craw.reverse()  # oldest first
+                                            # Drop last (potentially in-progress) candle
+                                            _p30_candles = [(float(c[3]), float(c[2]), float(c[1]), float(c[4])) for c in _p30_craw[:-1]]
+                                            _p30_src = "coinbase"
+                                        else:
+                                            print("P3.0 {} Coinbase HTTP {}".format(_p30_asset, _p30_cresp.status_code))
+                                except Exception as _p30_ce:
+                                    print("P3.0 {} Coinbase error: {}".format(_p30_asset, _p30_ce))
+                            
+                            # Last resort: P29CL prefetch
                             if not _p30_candles:
                                 _p30_candles = _p29cl_candle_prefetch.get(_p30_asset, [])
+                                if _p30_candles:
+                                    _p30_src = "prefetch"
+                            
                             if len(_p30_candles) < 50:
+                                print("P3.0 {} SKIP: only {} candles available (need 50) from {}".format(
+                                    _p30_asset, len(_p30_candles), _p30_src))
+                                _p30_diag.append("{}=no_data".format(_p30_asset))
                                 continue
+                            
+                            print("P3.0 {} data: {} candles from {}".format(_p30_asset, len(_p30_candles), _p30_src))
                             
                             # Compute P3.0 score
                             _p30_score, _p30_conf, _p30_dir, _p30_tag = _p30_compute_score(_p30_candles)
@@ -22003,11 +22037,19 @@ if SIGNALS_DB_URL:
         _p29cl_live_state["peak_balance"] = _saved_p29cl_live.get("peak_balance", _saved_p29cl_live["balance"])
         print("P29CL LIVE: restored ${:.2f} from DB".format(_p29cl_live_state["balance"]))
     _save_bot_balance("p29cl_live", _p29cl_live_state)
-    # P3.0 LIVE balance — force reset to $75 to match live account
-    _p30_state["balance"] = 75.0
-    _p30_state["peak_balance"] = 75.0
+    # P3.0 LIVE balance — restore from DB if present, else use hardcoded $20 default
+    _saved_p30 = _saved_balances.get("p30_live", {})
+    if _saved_p30 and _saved_p30.get("balance", 0) > 0:
+        _p30_state["balance"] = _saved_p30["balance"]
+        _p30_state["peak_balance"] = _saved_p30.get("peak_balance", _saved_p30["balance"])
+        print("P3.0 LIVE: restored ${:.2f} from DB".format(_p30_state["balance"]))
+    # If you want to override the DB value (e.g. for a fresh $20 test):
+    # set OVERRIDE_P30_BALANCE env var or edit the hardcoded value below
+    _p30_state["balance"] = 20.0  # $20 test override — REMOVE THIS LINE after first run to use DB value
+    _p30_state["peak_balance"] = 20.0
     _save_bot_balance("p30_live", _p30_state)
-    print("P3.0 LIVE: ${:.2f} pool | $2.50 flat | conf>=1 | 6 assets".format(_p30_state["balance"]))
+    print("P3.0 LIVE: ${:.2f} pool | $2.50 flat | per-asset conf | assets={}".format(
+        _p30_state["balance"], P30_ASSETS))
     print("P29CL LIVE: ${:.2f} pool | $2.50 flat | $5 max | $20/bnd cap | LIVE".format(
         _p29cl_live_state["balance"]))
     threading.Thread(target=_bot2_sniper_thread, daemon=True).start()
