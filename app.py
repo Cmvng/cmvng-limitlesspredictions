@@ -1242,12 +1242,12 @@ _p29cl_live_traded = set()
 # ═══════════════════════════════════════════════════════════════════════════
 
 _p30_state = {
-    "enabled": True,
-    "balance": 75.0,
-    "peak_balance": 75.0,
-    "starting_balance": 75.0,
-    "floor_balance": 10.0,
-    "base_stake": 2.50,
+    "enabled": True,  # LIVE — $20 test, BTC + ETH, FAK orders, per-asset thresholds
+    "balance": 20.0,
+    "peak_balance": 20.0,
+    "starting_balance": 20.0,
+    "floor_balance": 5.0,        # lowered from 10 — gives 6 trades of buffer on $20
+    "base_stake": 2.50,          # Polymarket minimum (5 shares at ~50c)
     "trades_today": 0,
     "wins_today": 0,
     "losses_today": 0,
@@ -1256,7 +1256,7 @@ _p30_traded = set()
 _p30_fired_boundaries = set()
 _p30_token_map = {}
 
-P30_ASSETS = ["BTC", "ETH", "DOGE"]  # Top 3 by backtest WR: ETH 63.3%, BTC 61.8%, DOGE 58.5%
+P30_ASSETS = ["BTC", "ETH"]  # SOL/DOGE removed — backtest shows neither hits 60% WR at any threshold
 P30_SLUGS = {
     "BTC": "btc-updown-15m-{}", "ETH": "eth-updown-15m-{}",
     "SOL": "sol-updown-15m-{}", "XRP": "xrp-updown-15m-{}",
@@ -1267,8 +1267,17 @@ P30_BINANCE_MAP = {
     "XRP": "XRPUSDT", "DOGE": "DOGEUSDT", "BNB": "BNBUSDT",
 }
 
-# Minimum confidence to trade (score magnitude)
-P30_MIN_CONF = 1
+# Per-asset confidence thresholds (Session 26 backtest, 41,202 trades total).
+# BTC conf>=15 → 1,344 trades at 60.0% WR
+# ETH conf>=13 → 2,428 trades at 60.5% WR
+# Combined: 3,772 trades at 60.3% WR (2.2x coverage vs strict filter)
+P30_ASSET_THRESHOLDS = {
+    "BTC": 15,
+    "ETH": 13,
+}
+
+# Minimum confidence — fallback for any asset not in P30_ASSET_THRESHOLDS
+P30_MIN_CONF = 16
 
 def _p30_compute_score(candles_list):
     """
@@ -1375,9 +1384,17 @@ def _p30_compute_score(candles_list):
     confidence = int(abs(score))
     direction = "DOWN" if score > 0 else "UP" if score < 0 else None
     
-    tag = "P30_{}_{}_c{}_bm{:.1f}_ma{}_rsi{:.0f}_bb{:.2f}_st{:.0f}_sc{:.1f}".format(
+    # Detect regime — exposed to caller for per-asset filtering
+    strong_uptrend   = (con >= 4 and cdir and ma_above >= 7)
+    strong_downtrend = (con >= 4 and not cdir and ma_above <= 2)
+    in_trend = strong_uptrend or strong_downtrend
+    
+    # Per-asset filtering happens in the CALLER, not here.
+    # See P30_ASSET_THRESHOLDS below for per-asset config.
+    
+    tag = "P30_{}_{}_c{}_bm{:.1f}_ma{}_rsi{:.0f}_bb{:.2f}_st{:.0f}_sc{:.1f}_trend{}".format(
         direction or "NONE", "G" if pg else "R",
-        con, bm, ma_above, rsi14, bb, stoch14, score)
+        con, bm, ma_above, rsi14, bb, stoch14, score, in_trend)
     
     return score, confidence, direction, tag
 
@@ -3129,15 +3146,44 @@ def _bot2_sniper_thread():
                     
                     for _p30_asset in P30_ASSETS:
                         try:
-                            # Get candle data from P29CL prefetch (already fetched at T-22s)
-                            _p30_candles = _p29cl_candle_prefetch.get(_p30_asset, [])
+                            # ── FRESH FETCH (Session 26 fix) ──
+                            # Old code used prefetch from T-22s which included the
+                            # in-progress candle as the "last closed" candle. Now we
+                            # fetch fresh and drop the new in-progress candle so [-1]
+                            # is actually the just-closed candle.
+                            _p30_candles = []
+                            try:
+                                import requests as _p30_req
+                                _p30_sym = P30_BINANCE_MAP.get(_p30_asset)
+                                if _p30_sym:
+                                    _p30_kresp = _p30_req.get(
+                                        "https://api.binance.com/api/v3/klines",
+                                        params={"symbol": _p30_sym, "interval": "15m", "limit": 100},
+                                        timeout=3)
+                                    if _p30_kresp.status_code == 200:
+                                        _p30_klines = _p30_kresp.json()
+                                        # Drop the last kline (just-started in-progress candle).
+                                        # klines[:-1] gives us all closed candles, [-1] = just closed.
+                                        _p30_candles = [(float(k[1]), float(k[2]), float(k[3]), float(k[4])) for k in _p30_klines[:-1]]
+                            except Exception as _p30_fe:
+                                print("P3.0 fresh fetch error {}: {} — falling back to prefetch".format(_p30_asset, _p30_fe))
+                            
+                            # Fall back to prefetch if fresh fetch failed
+                            if not _p30_candles:
+                                _p30_candles = _p29cl_candle_prefetch.get(_p30_asset, [])
                             if len(_p30_candles) < 50:
                                 continue
                             
                             # Compute P3.0 score
                             _p30_score, _p30_conf, _p30_dir, _p30_tag = _p30_compute_score(_p30_candles)
                             
-                            if _p30_dir is None or _p30_conf < P30_MIN_CONF:
+                            if _p30_dir is None:
+                                continue
+                            
+                            # Apply per-asset confidence threshold (Session 26 backtest validated)
+                            _p30_min_conf = P30_ASSET_THRESHOLDS.get(_p30_asset, P30_MIN_CONF)
+                            if _p30_conf < _p30_min_conf:
+                                # Skip silently — below this asset's threshold
                                 continue
                             
                             # Check balance
@@ -3167,32 +3213,81 @@ def _bot2_sniper_thread():
                             if not _p30_tid:
                                 continue
                             
-                            # Place order
-                            _p30_price = 0.50
+                            # ── ORDER PLACEMENT (Session 26 fix) ──
+                            # Old: place at fixed 0.50 as GTC → adverse selection
+                            # (orders only fill when market moves against us, then
+                            # sit forever filling at bad times).
+                            # New: fetch best ask, place FAK at best_ask + 1 tick.
+                            # FAK = Fill And Kill → matches what it can immediately,
+                            # kills the rest. No resting orders, no adverse fills.
+                            _p30_price = 0.50  # default (only used if order book fetch fails)
                             _p30_oid = None
                             _p30_filled = False
+                            _p30_fill_price_actual = 0.50
                             
                             try:
                                 from py_clob_client_v2 import Side as _P30Side, OrderArgs as _P30Args, OrderType as _P30OT
                                 _p30_client = _get_poly_client()
                                 if _p30_client:
+                                    # Fetch order book to get best ask
+                                    _p30_best_ask = None
+                                    try:
+                                        _p30_book = _p30_client.get_order_book(str(_p30_tid))
+                                        _p30_asks_raw = getattr(_p30_book, 'asks', None) or (_p30_book.get('asks', []) if isinstance(_p30_book, dict) else [])
+                                        if _p30_asks_raw:
+                                            # asks may be sorted ascending or descending; take the lowest
+                                            _p30_ask_prices = []
+                                            for _a in _p30_asks_raw:
+                                                _ap = float(getattr(_a, 'price', None) or _a.get('price', 0)) if hasattr(_a, 'price') or isinstance(_a, dict) else 0
+                                                if _ap > 0:
+                                                    _p30_ask_prices.append(_ap)
+                                            if _p30_ask_prices:
+                                                _p30_best_ask = min(_p30_ask_prices)
+                                    except Exception as _p30_be:
+                                        print("P3.0 {} order book error: {}".format(_p30_asset, _p30_be))
+                                    
+                                    if _p30_best_ask is None:
+                                        print("P3.0 {} no ask available — skip".format(_p30_asset))
+                                        continue
+                                    
+                                    # Skip if market already too lopsided
+                                    # (consensus very strong, our edge is gone)
+                                    if _p30_best_ask > 0.70 or _p30_best_ask < 0.30:
+                                        print("P3.0 {} ask {:.2f} too lopsided — skip".format(_p30_asset, _p30_best_ask))
+                                        continue
+                                    
+                                    # Place FAK at best_ask + 1 tick to ensure marketability
+                                    _p30_price = round(min(_p30_best_ask + 0.01, 0.99), 2)
                                     _p30_shares = round(_p30_stake / _p30_price, 4)
                                     _p30_args = _P30Args(token_id=str(_p30_tid), price=_p30_price, size=_p30_shares, side=_P30Side.BUY)
                                     _p30_signed = _p30_client.create_order(_p30_args)
-                                    _p30_resp = _p30_client.post_order(_p30_signed, _P30OT.GTC)
+                                    # FAK = Fill And Kill: take liquidity now, kill the rest
+                                    _p30_resp = _p30_client.post_order(_p30_signed, _P30OT.FAK)
                                     if _p30_resp:
                                         _p30_oid = _p30_resp.get("orderID") or _p30_resp.get("id")
                                         _p30_status = (_p30_resp.get("status") or "").upper()
                                         _p30_matched = float(_p30_resp.get("sizeMatched") or 0)
                                         _p30_filled = _p30_status in ("MATCHED", "FILLED") or _p30_matched > 0
-                                        print("P3.0 ORDER OK {}: oid={} status={} matched={}".format(
-                                            _p30_asset, str(_p30_oid)[:20], _p30_status, _p30_matched))
+                                        if _p30_filled:
+                                            _p30_fill_price_actual = _p30_best_ask
+                                        print("P3.0 ORDER {} {}: ask={:.2f} bid_price={:.2f} status={} matched={:.4f}".format(
+                                            "FILLED" if _p30_filled else "KILLED",
+                                            _p30_asset, _p30_best_ask, _p30_price, _p30_status, _p30_matched))
                                 else:
                                     print("P3.0 NO CLIENT: {} — order not placed".format(_p30_asset))
+                                    continue
                             except Exception as _p30_oe:
                                 print("P3.0 order error {}: {}".format(_p30_asset, _p30_oe))
+                                continue
                             
-                            # Deduct from balance
+                            # ── BALANCE BOOKKEEPING (Session 26 fix) ──
+                            # Old: deducted balance unconditionally even when GTC didn't fill.
+                            # Now: only deduct when actually filled. Unfilled FAK = no-op.
+                            if not _p30_filled:
+                                print("P3.0 {} FAK did not fill — no balance change, no DB row".format(_p30_asset))
+                                continue
+                            
+                            # Deduct from balance (only on fill)
                             _p30_state["balance"] = round(_p30_state["balance"] - _p30_stake, 2)
                             _p30_state["trades_today"] += 1
                             _p30_boundary_spent += _p30_stake
@@ -3215,7 +3310,7 @@ def _bot2_sniper_thread():
                                             'Pending', 'PENDING', :fa)""",
                                     mid=_p30_key,
                                     ttl="P3.0 {} {} 15M".format(_p30_asset, _p30_dir),
-                                    ast=_p30_asset, bs=_p30_dir, stk=_p30_stake, fp=_p30_price,
+                                    ast=_p30_asset, bs=_p30_dir, stk=_p30_stake, fp=_p30_fill_price_actual,
                                     pa=_p30_state["balance"],
                                     ind=_p30_tag,
                                     conf=_p30_conf, sc=round(_p30_score, 2),
