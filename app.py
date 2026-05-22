@@ -9114,24 +9114,38 @@ def _get_poly_client():
 
         # Set proxy if available (bypasses datacenter IP geoblock)
         if POLY_PROXY_URL:
+            # Set globally so ALL HTTP libraries pick it up — most reliable approach
+            # (py_clob_client_v2 may use internal session that doesn't respect client.session)
+            import os as _os
+            _os.environ["HTTPS_PROXY"] = POLY_PROXY_URL
+            _os.environ["HTTP_PROXY"] = POLY_PROXY_URL
+            _os.environ["https_proxy"] = POLY_PROXY_URL
+            _os.environ["http_proxy"] = POLY_PROXY_URL
+            
+            # Also set session attribute for explicit handling (belt + suspenders)
             import requests as _req
             session = _req.Session()
             session.proxies = {
                 "http": POLY_PROXY_URL,
                 "https": POLY_PROXY_URL,
             }
-            client.session = session
-            print("Polymarket proxy set: {}".format(POLY_PROXY_URL[:30]))
+            if hasattr(client, 'session'):
+                client.session = session
+            
+            print("Polymarket proxy set: {}...".format(POLY_PROXY_URL[:40]))
 
         _poly_clob_client = client
         print("Polymarket CLOB client initialized (type=2 funder={})".format(POLY_FUNDER_ADDRESS[:10]))
 
-        # Check geoblock status
+        # Check geoblock status THROUGH the proxy (verifies proxy is actually working)
         try:
             import requests as _greq
-            geo = _greq.get("https://polymarket.com/api/geoblock", timeout=10).json()
+            _geo_proxies = {"http": POLY_PROXY_URL, "https": POLY_PROXY_URL} if POLY_PROXY_URL else None
+            geo = _greq.get("https://polymarket.com/api/geoblock", proxies=_geo_proxies, timeout=10).json()
             print("Poly geoblock check: blocked={} ip={} country={} region={}".format(
                 geo.get("blocked"), geo.get("ip", "?")[:15], geo.get("country", "?"), geo.get("region", "?")))
+            if geo.get("blocked"):
+                print("⚠️  PROXY IS NOT WORKING — Polymarket sees blocked country. Orders will fail with 403.")
         except Exception as ge:
             print("Poly geoblock check failed: {}".format(ge))
 
