@@ -1271,9 +1271,11 @@ P30_BINANCE_MAP = {
 # BTC conf>=15 → 1,344 trades at 60.0% WR
 # ETH conf>=13 → 2,428 trades at 60.5% WR
 # Combined: 3,772 trades at 60.3% WR (2.2x coverage vs strict filter)
+# TEMPORARY: lowered from BTC=15/ETH=13 to force more frequent fires for proxy/FAK verification.
+# Restore to BTC=15/ETH=13 once we've confirmed proxy + FAK code works end-to-end.
 P30_ASSET_THRESHOLDS = {
-    "BTC": 15,
-    "ETH": 13,
+    "BTC": 10,
+    "ETH": 9,
 }
 
 # Minimum confidence — fallback for any asset not in P30_ASSET_THRESHOLDS
@@ -22123,6 +22125,31 @@ if SIGNALS_DB_URL:
         _p30_state["balance"], P30_ASSETS))
     print("P29CL LIVE: ${:.2f} pool | $2.50 flat | $5 max | $20/bnd cap | LIVE".format(
         _p29cl_live_state["balance"]))
+    
+    # ── FORCE Polymarket client init at startup to verify proxy fix BEFORE first signal ──
+    print("=" * 60)
+    print("STARTUP: forcing Polymarket client init to verify proxy fix")
+    print("=" * 60)
+    try:
+        _startup_client = _get_poly_client()
+        if _startup_client is not None:
+            print("STARTUP: Polymarket client successfully initialized")
+            # Inspect the httpx client to confirm proxy is mounted
+            try:
+                import py_clob_client_v2.http_helpers.helpers as _ph_test
+                _mounts = getattr(_ph_test._http_client, "_mounts", {})
+                if _mounts:
+                    print("STARTUP: httpx client has proxy mounts: {} entries (FIX IS APPLIED)".format(len(_mounts)))
+                else:
+                    print("STARTUP: httpx client has NO proxy mounts — orders will hit 403 (FIX NOT APPLIED)")
+            except Exception as _t_err:
+                print("STARTUP: proxy inspection error: {}".format(_t_err))
+        else:
+            print("STARTUP: Polymarket client init returned None (creds missing)")
+    except Exception as _si_err:
+        print("STARTUP: Polymarket client init exception: {}".format(_si_err))
+    print("=" * 60)
+    
     threading.Thread(target=_bot2_sniper_thread, daemon=True).start()
     print("BOT2 SNIPER thread launched")
     
