@@ -3275,7 +3275,7 @@ def _bot2_sniper_thread():
                             _p30_fill_price_actual = 0.50
                             
                             try:
-                                from py_clob_client_v2 import Side as _P30Side, OrderArgs as _P30Args, OrderType as _P30OT
+                                from py_clob_client_v2 import Side as _P30Side, MarketOrderArgs as _P30MOArgs, OrderType as _P30OT
                                 _p30_client = _get_poly_client()
                                 if _p30_client:
                                     # Fetch order book to get best ask
@@ -3305,11 +3305,19 @@ def _bot2_sniper_thread():
                                         print("P3.0 {} ask {:.2f} too lopsided — skip".format(_p30_asset, _p30_best_ask))
                                         continue
                                     
-                                    # Place FAK at best_ask + 1 tick to ensure marketability
+                                    # Use MarketOrderArgs for FAK orders (not OrderArgs which is for limit orders).
+                                    # Polymarket requires: maker_amount (USDC) max 2 decimals, taker_amount (shares) max 4.
+                                    # MarketOrderArgs uses `amount` directly as maker_amount, so rounding to 2 decimals
+                                    # avoids the "invalid amounts" 400 error we got with OrderArgs.
                                     _p30_price = round(min(_p30_best_ask + 0.01, 0.99), 2)
-                                    _p30_shares = round(_p30_stake / _p30_price, 4)
-                                    _p30_args = _P30Args(token_id=str(_p30_tid), price=_p30_price, size=_p30_shares, side=_P30Side.BUY)
-                                    _p30_signed = _p30_client.create_order(_p30_args)
+                                    _p30_amount = round(_p30_stake, 2)  # USDC stake — must be 2 decimals
+                                    _p30_args = _P30MOArgs(
+                                        token_id=str(_p30_tid),
+                                        amount=_p30_amount,
+                                        side=_P30Side.BUY,
+                                        price=_p30_price,
+                                    )
+                                    _p30_signed = _p30_client.create_market_order(_p30_args)
                                     # FAK = Fill And Kill: take liquidity now, kill the rest
                                     _p30_resp = _p30_client.post_order(_p30_signed, _P30OT.FAK)
                                     if _p30_resp:
@@ -3319,9 +3327,9 @@ def _bot2_sniper_thread():
                                         _p30_filled = _p30_status in ("MATCHED", "FILLED") or _p30_matched > 0
                                         if _p30_filled:
                                             _p30_fill_price_actual = _p30_best_ask
-                                        print("P3.0 ORDER {} {}: ask={:.2f} bid_price={:.2f} status={} matched={:.4f}".format(
+                                        print("P3.0 ORDER {} {}: ask={:.2f} max_price={:.2f} amount=${:.2f} status={} matched={:.4f}".format(
                                             "FILLED" if _p30_filled else "KILLED",
-                                            _p30_asset, _p30_best_ask, _p30_price, _p30_status, _p30_matched))
+                                            _p30_asset, _p30_best_ask, _p30_price, _p30_amount, _p30_status, _p30_matched))
                                 else:
                                     print("P3.0 NO CLIENT: {} — order not placed".format(_p30_asset))
                                     continue
