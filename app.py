@@ -9074,10 +9074,77 @@ def _get_poly_client():
         return _poly_clob_client
     if not _poly_has_creds():
         return None
+    
+    # ════ PROXY SETUP — MUST happen BEFORE py_clob_client_v2 is imported/used ════
+    if POLY_PROXY_URL:
+        import os as _os
+        # 1. Set env vars (catches httpx, urllib3, anything respecting standards)
+        _os.environ["HTTPS_PROXY"] = POLY_PROXY_URL
+        _os.environ["HTTP_PROXY"] = POLY_PROXY_URL
+        _os.environ["https_proxy"] = POLY_PROXY_URL
+        _os.environ["http_proxy"] = POLY_PROXY_URL
+        
+        # 2. Monkey-patch requests.Session.request to FORCE proxy on Polymarket URLs.
+        # This catches the case where py_clob_client_v2 has its own session that
+        # ignores env vars (e.g. session with trust_env=False or pre-created at import).
+        try:
+            import requests as _preq
+            if not getattr(_preq.Session, "_polymarket_proxy_patched", False):
+                _orig_session_request = _preq.Session.request
+                _proxy_dict = {"http": POLY_PROXY_URL, "https": POLY_PROXY_URL}
+                
+                def _patched_session_request(self, method, url, **kwargs):
+                    if "polymarket.com" in str(url) or "polymarket" in str(url).lower():
+                        kwargs["proxies"] = _proxy_dict
+                        kwargs.setdefault("timeout", 30)
+                    return _orig_session_request(self, method, url, **kwargs)
+                
+                _preq.Session.request = _patched_session_request
+                _preq.Session._polymarket_proxy_patched = True
+                print("Polymarket requests.Session monkey-patched for proxy")
+        except Exception as _pp_err:
+            print("Proxy monkey-patch warning: {}".format(_pp_err))
+        
+        print("Polymarket proxy ENV+PATCH applied BEFORE client init: {}...".format(POLY_PROXY_URL[:40]))
+    
     try:
         # Try V2 SDK first (post-migration)
         try:
             from py_clob_client_v2 import ClobClient, ApiCreds
+            
+            # ════ CRITICAL: REPLACE py_clob_client_v2's MODULE-LEVEL httpx CLIENT ════
+            # Verified by reading py_clob_client_v2/http_helpers/helpers.py:
+            #   Line 24: _http_client = httpx.Client(http2=True)
+            # This is a module-level singleton created at import time.
+            # httpx reads HTTPS_PROXY env var ONCE at instantiation, not on each request.
+            # So we must REPLACE the client with one configured to use the proxy.
+            if POLY_PROXY_URL:
+                try:
+                    import py_clob_client_v2.http_helpers.helpers as _ph_mod
+                    import httpx as _hx
+                    # Build new client with proxy (httpx 0.27 syntax: proxy=str)
+                    try:
+                        _new_client = _hx.Client(
+                            http2=True, 
+                            proxy=POLY_PROXY_URL, 
+                            timeout=30.0,
+                        )
+                    except TypeError:
+                        # Fallback for older httpx versions that use proxies= dict
+                        _new_client = _hx.Client(
+                            http2=True,
+                            proxies={"http://": POLY_PROXY_URL, "https://": POLY_PROXY_URL},
+                            timeout=30.0,
+                        )
+                    # Replace the module-level client — Python references are dynamic,
+                    # so all subsequent calls in request()/get()/post()/delete()/put()
+                    # will use this new client.
+                    _ph_mod._http_client = _new_client
+                    print("Polymarket internal httpx client REPLACED with proxy (the real fix)")
+                except Exception as _ph_err:
+                    print("WARNING: Failed to replace internal httpx client: {}".format(_ph_err))
+                    print("WARNING: Orders may still hit 403 — proxy not applied to library")
+            
             client = ClobClient(
                 host="https://clob.polymarket.com",
                 chain_id=137,
@@ -9112,27 +9179,17 @@ def _get_poly_client():
             _poly_clob_client = client
             print("Polymarket CLOB V1 client initialized (funder={})".format(POLY_FUNDER_ADDRESS[:10]))
 
-        # Set proxy if available (bypasses datacenter IP geoblock)
+        # Also set session attribute (belt + suspenders — works if library exposes it)
         if POLY_PROXY_URL:
-            # Set globally so ALL HTTP libraries pick it up — most reliable approach
-            # (py_clob_client_v2 may use internal session that doesn't respect client.session)
-            import os as _os
-            _os.environ["HTTPS_PROXY"] = POLY_PROXY_URL
-            _os.environ["HTTP_PROXY"] = POLY_PROXY_URL
-            _os.environ["https_proxy"] = POLY_PROXY_URL
-            _os.environ["http_proxy"] = POLY_PROXY_URL
-            
-            # Also set session attribute for explicit handling (belt + suspenders)
             import requests as _req
             session = _req.Session()
             session.proxies = {
                 "http": POLY_PROXY_URL,
                 "https": POLY_PROXY_URL,
             }
+            session.trust_env = True
             if hasattr(client, 'session'):
                 client.session = session
-            
-            print("Polymarket proxy set: {}...".format(POLY_PROXY_URL[:40]))
 
         _poly_clob_client = client
         print("Polymarket CLOB client initialized (type=2 funder={})".format(POLY_FUNDER_ADDRESS[:10]))
