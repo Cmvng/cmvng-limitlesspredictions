@@ -28608,7 +28608,30 @@ def _p40_claude_predict(asset, candles, memory):
         raw = _re.sub(r'^```(?:json)?\s*', '', raw)
         raw = _re.sub(r'\s*```$', '', raw)
         
-        pred = _json.loads(raw)
+        # Find the JSON object inside (in case Claude added prose)
+        json_match = _re.search(r'\{[^{}]*"direction"[^{}]*\}', raw, _re.DOTALL)
+        if json_match:
+            raw = json_match.group(0)
+        
+        if not raw:
+            print("[P4.0] {} empty response from API. Full data: {}".format(asset, str(data)[:300]))
+            return None
+        
+        try:
+            pred = _json.loads(raw)
+        except _json.JSONDecodeError as je:
+            print("[P4.0] {} JSON parse failed. Raw text: '{}'".format(asset, raw[:300]))
+            # Try to extract direction manually from the text
+            text_lower = raw.lower()
+            if '"direction":"up"' in text_lower or "'direction':'up'" in text_lower or "direction: up" in text_lower:
+                # Best-effort extraction
+                print("[P4.0] {} extracted UP from malformed response".format(asset))
+                pred = {"direction": "UP", "confidence": 5, "reasoning": "extracted from malformed", "pattern": "fallback"}
+            elif '"direction":"down"' in text_lower or "'direction':'down'" in text_lower or "direction: down" in text_lower:
+                print("[P4.0] {} extracted DOWN from malformed response".format(asset))
+                pred = {"direction": "DOWN", "confidence": 5, "reasoning": "extracted from malformed", "pattern": "fallback"}
+            else:
+                return None
         if pred.get("direction") not in ("UP", "DOWN"):
             print("[P4.0] {} invalid direction: {}".format(asset, pred))
             return None
