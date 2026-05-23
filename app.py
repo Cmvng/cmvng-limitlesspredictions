@@ -28402,7 +28402,7 @@ T+0 at 50¢. Win=$2.35, Loss=$2.50 (3% fee).
 
 
 ################################################################################
-# P4.0 INTEGRATION — Claude-powered prediction engine (devils-advocate v5)
+# P4.0 INTEGRATION — Claude-powered prediction engine (judgment-only v6)
 ################################################################################
 
 """
@@ -28661,43 +28661,34 @@ def _p40_build_prompt(asset, candles, memory):
             pattern_review.append("  {} -> {}W/{}L ({:.0f}%) {}".format(p, w, l, wr, tag))
     
     system_prompt = (
-"You read 15-minute crypto charts for " + asset + ". Predict whether the NEXT candle closes HIGHER or LOWER than the current close.\n\n"
-"You will receive the LAST 25 candles (about 6 hours of context). Use ALL 25 to understand the bigger picture.\n\n"
-"HOW TO READ:\n"
-"1. ZOOM OUT — look at all 25 candles. What's the overall structure (uptrend, downtrend, range, choppy)?\n"
-"2. FIND THE RECENT SIGNIFICANT MOVE — mega candle, range break, swing, reversal candle.\n"
-"3. ZOOM IN — how does the current moment fit in? (Just started, mid-extension, exhausting, post-climax?)\n"
-"4. ARGUE BOTH SIDES — before committing, build the strongest case for UP AND the strongest case for DOWN.\n"
-"5. WEIGH them — which side has more evidence? Which side does the pattern history (below) favor?\n"
-"6. COMMIT — make the call with calibrated confidence.\n\n"
-"CRITICAL RULE: You MUST argue both sides before committing. If one side has no plausible case, you are not looking hard enough.\n"
-"This protects against confirmation bias and forces honest analysis.\n\n"
-"COMMON PATTERNS:\n"
-"- Post-mega bounce: After mega red/green, next often reverses\n"
-"- Cascade continuation: 4+ same-color with growing bodies = trend continues\n"
-"- Exhaustion reversal: 5+ same-color with shrinking bodies / doji = reversal\n"
-"- Pullback after extension: Big move + small opposite candle = trend resumes\n"
-"- Range break: Tight consolidation breaks one way = continuation\n"
-"- Range fade: At top/bottom of established range, fade back to middle\n\n"
-"CONFIDENCE CALIBRATION:\n"
-"- 3-4: bull and bear cases roughly equal — genuinely unclear\n"
-"- 5-6: one case is mildly stronger\n"
-"- 7: clear winner, but the other side has merit\n"
-"- 8: strong setup, other side is weak\n"
-"- 9-10: extreme/textbook, other side is barely defensible (rare)\n"
-"If bull and bear cases feel equally strong, confidence MUST be 3-4.\n\n"
-"OUTPUT FORMAT (JSON, one object, NO text before/after):\n"
+"You are reading 15-minute crypto candles for " + asset + ".\n"
+"Your job: predict whether the NEXT candle closes HIGHER or LOWER than the current close.\n\n"
+"You will receive 25 recent candles plus your own track record. Read the chart yourself. "
+"Use your own judgment. Do not assume any particular pattern is correct — read what is actually there.\n\n"
+"BEFORE COMMITTING, argue both sides honestly:\n"
+"- bull_case: the strongest reason this could go UP\n"
+"- bear_case: the strongest reason this could go DOWN\n"
+"- which_wins: which case is actually stronger and why\n\n"
+"If one side has no plausible case, you are not looking hard enough.\n"
+"If both sides feel equally strong, you must say so — confidence 3-4.\n\n"
+"CONFIDENCE (be honest):\n"
+"3-4: genuinely unclear, both cases roughly equal\n"
+"5-6: one case is mildly stronger\n"
+"7: clear winner but the other side has merit\n"
+"8: strong setup, other side is weak\n"
+"9-10: extreme/obvious, other side is barely defensible (use rarely)\n\n"
+"OUTPUT: single JSON object, no text before or after.\n"
 "{\n"
-'  "structure": "uptrend|downtrend|range_tight|range_volatile|cascade_up|cascade_down|exhaustion|breakout",\n'
-'  "recent_move": "describe the most recent significant move in <80 chars",\n'
-'  "current_position": "where in the move are we? <60 chars",\n'
-'  "bull_case": "strongest argument for UP next candle, <100 chars",\n'
-'  "bear_case": "strongest argument for DOWN next candle, <100 chars",\n'
-'  "which_wins": "which case is stronger and why, <100 chars",\n'
+'  "structure": "your own description of what the market is doing in 1-2 words",\n'
+'  "recent_move": "describe the most recent meaningful move in <80 chars",\n'
+'  "current_position": "where the current candle sits relative to that move, <60 chars",\n'
+'  "bull_case": "<100 chars",\n'
+'  "bear_case": "<100 chars",\n'
+'  "which_wins": "<100 chars",\n'
 '  "direction": "UP" or "DOWN",\n'
 '  "confidence": 3-10,\n'
 '  "reasoning": "one-sentence summary <80 chars",\n'
-'  "pattern": "short_snake_case_label"\n'
+'  "pattern": "short_snake_case_label that describes the setup you are seeing"\n'
 "}"
 )
     
@@ -28710,12 +28701,7 @@ def _p40_build_prompt(asset, candles, memory):
         )
         if pattern_review:
             learning_section += "\nPATTERN PERFORMANCE:\n" + "\n".join(pattern_review) + "\n"
-        learning_section += (
-            "\nUse this history silently:\n"
-            "- Avoid patterns marked WEAK (they have been failing)\n"
-            "- Trust patterns marked STRONG (they have been working)\n"
-            "- Do not repeat the kind of setup that just lost\n"
-        )
+        learning_section += "\nThis is your own track record. Use it however you see fit.\n"
     
     user_prompt = (
         "ASSET: " + asset + "\n"
