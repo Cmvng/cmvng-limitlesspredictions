@@ -768,7 +768,9 @@ POLY_PROXY_URL     = os.environ.get("POLY_PROXY_URL", "")  # Optional: residenti
 
 # CRITICAL: Patch py_clob_client_v2's module-level httpx client to use proxy.
 # This MUST happen at import time, before any ClobClient is instantiated anywhere.
+_POLY_PROXY_PATCHED = False
 if POLY_PROXY_URL:
+    print("[STARTUP] Attempting to patch py_clob_client_v2 with proxy: {}...".format(POLY_PROXY_URL[:30]))
     try:
         import httpx as _early_httpx
         # Try to pre-import the helpers module so we can patch it
@@ -779,11 +781,17 @@ if POLY_PROXY_URL:
                 proxy=POLY_PROXY_URL,
                 timeout=30.0,
             )
-            print("[STARTUP] py_clob_client_v2._http_client patched with proxy {}".format(POLY_PROXY_URL[:30]))
-        except ImportError:
-            print("[STARTUP] py_clob_client_v2 not available - proxy patch deferred to client init")
+            _POLY_PROXY_PATCHED = True
+            print("[STARTUP] ✓ py_clob_client_v2._http_client patched with proxy {}".format(POLY_PROXY_URL[:30]))
+        except ImportError as _ie:
+            print("[STARTUP] ✗ py_clob_client_v2 not available at startup - {}".format(_ie))
+            print("[STARTUP] Proxy patch deferred to client init")
     except Exception as _pe:
-        print("[STARTUP] Proxy pre-patch failed: {}".format(_pe))
+        print("[STARTUP] ✗ Proxy pre-patch failed: {}".format(_pe))
+        import traceback as _tb
+        _tb.print_exc()
+else:
+    print("[STARTUP] No POLY_PROXY_URL set - orders will use direct connection (may be geoblocked)")
 
 
 LAGOS_TZ      = timezone(timedelta(hours=1))
@@ -1866,7 +1874,13 @@ def _bot2_sniper_thread():
     
     while True:
         try:
-            if not _bot2_sniper_state["enabled"] and not _p29cl_state["enabled"] and not _p30_state["enabled"]:
+            # P4.0 also needs the 15M candle prefetch — keep the loop alive if it's enabled.
+            # P40_CONFIG is defined later in the file, so use globals().get() for safe lookup.
+            _p40_enabled = globals().get("P40_CONFIG", {}).get("enabled", False)
+            if (not _bot2_sniper_state["enabled"]
+                and not _p29cl_state["enabled"]
+                and not _p30_state["enabled"]
+                and not _p40_enabled):
                 _time.sleep(30)
                 continue
             
