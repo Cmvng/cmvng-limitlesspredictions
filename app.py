@@ -1262,7 +1262,7 @@ _p29cl_live_traded = set()
 # ═══════════════════════════════════════════════════════════════════════════
 
 _p30_state = {
-    "enabled": True,
+    "enabled": False,  # DISABLED — documented losing performance (48.4% WR, $120→$1.23). Re-enable only after fix.
     "balance": 75.0,
     "peak_balance": 75.0,
     "starting_balance": 75.0,
