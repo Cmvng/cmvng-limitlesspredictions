@@ -28402,7 +28402,7 @@ T+0 at 50¢. Win=$2.35, Loss=$2.50 (3% fee).
 
 
 ################################################################################
-# P4.0 INTEGRATION — Claude-powered prediction engine (story-based v2)
+# P4.0 INTEGRATION — Claude-powered prediction engine (story-based v3)
 ################################################################################
 
 """
@@ -28647,29 +28647,22 @@ def _p40_build_prompt(asset, candles, memory):
             pattern_review.append("  {} -> {}W/{}L ({:.0f}%) {}".format(p, w, l, wr, tag))
     
     system_prompt = (
-"You read 15-minute crypto charts like a discretionary trader. "
-"For " + asset + ", predict whether the NEXT candle closes HIGHER or LOWER than the current candle close.\n\n"
-"HOW TO READ:\n"
-"1. Look at the last 5 candles. What story do they tell? (Cascade? Recovery bounce? Range chop? Breakout?)\n"
-"2. Find the most recent SIGNIFICANT move (mega candle, range break, reversal candle).\n"
-"3. Where are we in that move? (Just started, mid-extension, exhausting, post-climax bounce zone?)\n"
-"4. What is the most likely 15-minute next-frame story?\n"
-"5. Make the call.\n\n"
-"PATTERNS THAT WORK (when context fits):\n"
-"- Post-mega bounce: After a mega red/green, next candle often reverses\n"
-"- Cascade continuation: 4+ same-color candles with growing bodies = ride the trend\n"
-"- Exhaustion reversal: 5+ same-color candles with shrinking bodies / doji = reversal coming\n"
+"You read 15-minute crypto charts. For " + asset + ", predict whether the NEXT candle closes HIGHER or LOWER than the current candle close.\n\n"
+"HOW TO READ (silently, internally):\n"
+"1. Last 5 candles - what story? (Cascade? Bounce? Range? Breakout?)\n"
+"2. Most recent SIGNIFICANT move - mega candle, range break, reversal?\n"
+"3. Where are we in it? (Starting, mid-extension, exhausting, post-climax?)\n"
+"4. What is the most likely 15-min next-frame story?\n\n"
+"COMMON PATTERNS:\n"
+"- Post-mega bounce: After mega red/green, next often reverses\n"
+"- Cascade continuation: 4+ same-color with growing bodies = trend continues\n"
+"- Exhaustion reversal: 5+ same-color with shrinking bodies / doji = reversal\n"
 "- Pullback after extension: Big move + small opposite candle = trend resumes\n"
-"- Range break: Tight consolidation breaks one direction = continuation\n\n"
-"CONFIDENCE - BE HONEST:\n"
-"- 3-4: Genuinely unclear, chop, no story yet\n"
-"- 5-6: Some bias but not strong\n"
-"- 7: Clear story, decent setup\n"
-"- 8: Textbook pattern, high conviction\n"
-"- 9-10: Extreme/obvious (rare - use sparingly)\n"
-"DO NOT default to 7. If unclear, say so with lower confidence.\n\n"
-"OUTPUT - JSON ONLY:\n"
-'{"direction":"UP"|"DOWN","confidence":3-10,"reasoning":"the story in 1 sentence","pattern":"short_name"}'
+"- Range break: Tight consolidation breaks one way = continuation\n\n"
+"CONFIDENCE:\n"
+"3-4 = unclear/chop, 5-6 = mild bias, 7 = clear setup, 8 = textbook, 9-10 = extreme (rare)\n"
+"Calibrate honestly. Most setups are 5-7. Use 3-4 when genuinely uncertain.\n\n"
+"OUTPUT: ONE LINE OF JSON. NO TEXT BEFORE OR AFTER. NO MARKDOWN FENCES."
 )
     
     learning_section = ""
@@ -28682,11 +28675,10 @@ def _p40_build_prompt(asset, candles, memory):
         if pattern_review:
             learning_section += "\nPATTERN PERFORMANCE:\n" + "\n".join(pattern_review) + "\n"
         learning_section += (
-            "\nBefore predicting, briefly think:\n"
-            "- What kind of setup just LOST? Avoid repeating that error.\n"
-            "- What kind of setup just WON? Look for similar opportunities.\n"
-            "- Patterns marked WEAK have been failing - be skeptical of them.\n"
-            "- Patterns marked STRONG have been working - trust them when they appear.\n"
+            "\nUse this history silently:\n"
+            "- Avoid patterns marked WEAK (they have been failing)\n"
+            "- Trust patterns marked STRONG (they have been working)\n"
+            "- Do not repeat the kind of setup that just lost\n"
         )
     
     user_prompt = (
@@ -28695,7 +28687,10 @@ def _p40_build_prompt(asset, candles, memory):
         "LAST 25 CANDLES (15-min, oldest -> newest):\n"
         + "\n".join(candle_lines)
         + learning_section
-        + "\n\nRead the story. Predict the NEXT candle. JSON only."
+        + "\n\nRESPOND WITH ONE LINE OF JSON. NO PROSE. NO MARKDOWN. NO EXPLANATIONS BEFORE OR AFTER.\n"
+        + 'Format: {"direction":"UP","confidence":7,"reasoning":"the story in 1 short sentence","pattern":"short_name"}\n'
+        + 'Your reasoning field is where you put the story - keep it under 80 characters.\n'
+        + 'Begin your response with the opening brace {'
     )
     
     return system_prompt, user_prompt
@@ -28729,7 +28724,7 @@ def _p40_claude_predict(asset, candles, memory):
             },
             json={
                 "model": P40_CONFIG["model"],
-                "max_tokens": 400,
+                "max_tokens": 600,
                 "system": sys_p,
                 "messages": [{"role": "user", "content": user_p}]
             },
@@ -28748,7 +28743,11 @@ def _p40_claude_predict(asset, candles, memory):
         raw = _re.sub(r'\s*```$', '', raw)
         
         # Find the JSON object inside (in case Claude added prose)
+        # Try several patterns - simple, then more permissive
         json_match = _re.search(r'\{[^{}]*"direction"[^{}]*\}', raw, _re.DOTALL)
+        if not json_match:
+            # Maybe the JSON has nested braces or is at the end of prose - try greedy match from first { with "direction"
+            json_match = _re.search(r'\{[^{]*?"direction".*?\}', raw, _re.DOTALL)
         if json_match:
             raw = json_match.group(0)
         
@@ -28762,15 +28761,29 @@ def _p40_claude_predict(asset, candles, memory):
             print("[P4.0] {} JSON parse failed. Raw text: '{}'".format(asset, raw[:300]))
             # Try to extract direction manually from the text
             text_lower = raw.lower()
-            if '"direction":"up"' in text_lower or "'direction':'up'" in text_lower or "direction: up" in text_lower:
-                # Best-effort extraction
-                print("[P4.0] {} extracted UP from malformed response".format(asset))
-                pred = {"direction": "UP", "confidence": 5, "reasoning": "extracted from malformed", "pattern": "fallback"}
-            elif '"direction":"down"' in text_lower or "'direction':'down'" in text_lower or "direction: down" in text_lower:
-                print("[P4.0] {} extracted DOWN from malformed response".format(asset))
-                pred = {"direction": "DOWN", "confidence": 5, "reasoning": "extracted from malformed", "pattern": "fallback"}
-            else:
+            extracted_dir = None
+            if '"direction":"up"' in text_lower or "'direction':'up'" in text_lower or 'direction": "up"' in text_lower:
+                extracted_dir = "UP"
+            elif '"direction":"down"' in text_lower or "'direction':'down'" in text_lower or 'direction": "down"' in text_lower:
+                extracted_dir = "DOWN"
+            
+            if extracted_dir is None:
                 return None
+            
+            # Try to find a confidence number anywhere in the text
+            conf_match = _re.search(r'"confidence"\s*:\s*(\d+)', raw)
+            extracted_conf = int(conf_match.group(1)) if conf_match else 6
+            if not (1 <= extracted_conf <= 10):
+                extracted_conf = 6
+            
+            # Try to find a pattern
+            pat_match = _re.search(r'"pattern"\s*:\s*"([^"]+)"', raw)
+            extracted_pat = pat_match.group(1) if pat_match else "extracted"
+            
+            print("[P4.0] {} extracted {} c{} ({}) from malformed response".format(
+                asset, extracted_dir, extracted_conf, extracted_pat))
+            pred = {"direction": extracted_dir, "confidence": extracted_conf,
+                    "reasoning": "extracted from malformed prose", "pattern": extracted_pat}
         if pred.get("direction") not in ("UP", "DOWN"):
             print("[P4.0] {} invalid direction: {}".format(asset, pred))
             return None
