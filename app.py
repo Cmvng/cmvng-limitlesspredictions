@@ -766,6 +766,26 @@ POLY_API_PASSPHRASE = os.environ.get("POLY_API_PASSPHRASE", "")
 POLY_FUNDER_ADDRESS = os.environ.get("POLY_FUNDER_ADDRESS", "")
 POLY_PROXY_URL     = os.environ.get("POLY_PROXY_URL", "")  # Optional: residential proxy for geoblock bypass
 
+# CRITICAL: Patch py_clob_client_v2's module-level httpx client to use proxy.
+# This MUST happen at import time, before any ClobClient is instantiated anywhere.
+if POLY_PROXY_URL:
+    try:
+        import httpx as _early_httpx
+        # Try to pre-import the helpers module so we can patch it
+        try:
+            from py_clob_client_v2.http_helpers import helpers as _early_v2h
+            _early_v2h._http_client = _early_httpx.Client(
+                http2=True,
+                proxy=POLY_PROXY_URL,
+                timeout=30.0,
+            )
+            print("[STARTUP] py_clob_client_v2._http_client patched with proxy {}".format(POLY_PROXY_URL[:30]))
+        except ImportError:
+            print("[STARTUP] py_clob_client_v2 not available - proxy patch deferred to client init")
+    except Exception as _pe:
+        print("[STARTUP] Proxy pre-patch failed: {}".format(_pe))
+
+
 LAGOS_TZ      = timezone(timedelta(hours=1))
 LIMITLESS_API = "https://api.limitless.exchange"
 
@@ -8968,24 +8988,46 @@ def _get_poly_client():
             print("Polymarket CLOB V1 client initialized (funder={})".format(POLY_FUNDER_ADDRESS[:10]))
 
         # Set proxy if available (bypasses datacenter IP geoblock)
+        # CRITICAL: v2 SDK uses module-level httpx client, not session.proxies.
+        # Must monkey-patch the SDK's _http_client to actually route through proxy.
         if POLY_PROXY_URL:
-            import requests as _req
-            session = _req.Session()
-            session.proxies = {
-                "http": POLY_PROXY_URL,
-                "https": POLY_PROXY_URL,
-            }
-            client.session = session
-            print("Polymarket proxy set: {}".format(POLY_PROXY_URL[:30]))
+            try:
+                import httpx as _httpx
+                from py_clob_client_v2.http_helpers import helpers as _v2_helpers
+                # Replace the module-level httpx client with one that uses the proxy
+                _v2_helpers._http_client = _httpx.Client(
+                    http2=True,
+                    proxy=POLY_PROXY_URL,
+                    timeout=30.0,
+                )
+                print("Polymarket proxy INJECTED into httpx._http_client: {}".format(POLY_PROXY_URL[:30]))
+            except Exception as pe:
+                print("Polymarket proxy injection FAILED: {}".format(pe))
+                # Fall back to requests-session approach (works for v1)
+                try:
+                    import requests as _req
+                    session = _req.Session()
+                    session.proxies = {"http": POLY_PROXY_URL, "https": POLY_PROXY_URL}
+                    client.session = session
+                    print("Fell back to session.proxies (v1-style)")
+                except Exception as pe2:
+                    print("Session fallback also failed: {}".format(pe2))
 
         _poly_clob_client = client
         print("Polymarket CLOB client initialized (type=2 funder={})".format(POLY_FUNDER_ADDRESS[:10]))
 
-        # Check geoblock status
+        # Check geoblock status THROUGH the proxy (so we can see what Polymarket actually sees)
         try:
             import requests as _greq
-            geo = _greq.get("https://polymarket.com/api/geoblock", timeout=10).json()
-            print("Poly geoblock check: blocked={} ip={} country={} region={}".format(
+            _proxies = None
+            if POLY_PROXY_URL:
+                _proxies = {"http": POLY_PROXY_URL, "https": POLY_PROXY_URL}
+            geo = _greq.get(
+                "https://polymarket.com/api/geoblock",
+                timeout=15,
+                proxies=_proxies,
+            ).json()
+            print("Poly geoblock check (via proxy): blocked={} ip={} country={} region={}".format(
                 geo.get("blocked"), geo.get("ip", "?")[:15], geo.get("country", "?"), geo.get("region", "?")))
         except Exception as ge:
             print("Poly geoblock check failed: {}".format(ge))
@@ -28346,7 +28388,7 @@ T+0 at 50¢. Win=$2.35, Loss=$2.50 (3% fee).
 
 
 ################################################################################
-# P4.0 INTEGRATION — Claude-powered prediction engine
+# P4.0 INTEGRATION — Claude-powered prediction engine (story-based v2)
 ################################################################################
 
 """
@@ -28394,9 +28436,9 @@ P40_CONFIG = {
 
 # P4.0 own balance pool — separate from P3.0
 _p40_state = {
-    "balance": 20.0,
-    "starting_balance": 20.0,
-    "peak_balance": 20.0,
+    "balance": 50.0,
+    "starting_balance": 50.0,
+    "peak_balance": 50.0,
     "floor_balance": 5.0,
     "trades_today": 0,
     "wins_today": 0,
@@ -28465,15 +28507,32 @@ def _p40_create_table():
         existing = list(rows)
         if existing:
             r = existing[0]
-            _p40_state["balance"] = r[0]
-            _p40_state["peak_balance"] = r[1]
-            _p40_state["starting_balance"] = r[2]
-            _p40_state["floor_balance"] = r[3]
-            _p40_state["trades_today"] = r[4] or 0
-            _p40_state["wins_today"] = r[5] or 0
-            _p40_state["losses_today"] = r[6] or 0
-            print("[P4.0] Loaded existing balance: ${:.2f} (peak ${:.2f})".format(
-                _p40_state["balance"], _p40_state["peak_balance"]))
+            # ONE-TIME BALANCE UPGRADE: bump from $20 to $50 since shadow mode hasn't touched it.
+            # Only applies if current balance is still at the old default ($20.00).
+            if abs(float(r[0]) - 20.0) < 0.01 and abs(float(r[2]) - 20.0) < 0.01:
+                _db.run("""
+                    UPDATE p40_balance_state
+                    SET balance=50.0, peak_balance=50.0, starting_balance=50.0, updated_at=NOW()
+                    WHERE id=1
+                """)
+                _p40_state["balance"] = 50.0
+                _p40_state["peak_balance"] = 50.0
+                _p40_state["starting_balance"] = 50.0
+                _p40_state["floor_balance"] = r[3]
+                _p40_state["trades_today"] = r[4] or 0
+                _p40_state["wins_today"] = r[5] or 0
+                _p40_state["losses_today"] = r[6] or 0
+                print("[P4.0] BALANCE UPGRADED: $20.00 -> $50.00 (shadow-mode-only run, safe to bump)")
+            else:
+                _p40_state["balance"] = r[0]
+                _p40_state["peak_balance"] = r[1]
+                _p40_state["starting_balance"] = r[2]
+                _p40_state["floor_balance"] = r[3]
+                _p40_state["trades_today"] = r[4] or 0
+                _p40_state["wins_today"] = r[5] or 0
+                _p40_state["losses_today"] = r[6] or 0
+                print("[P4.0] Loaded existing balance: ${:.2f} (peak ${:.2f})".format(
+                    _p40_state["balance"], _p40_state["peak_balance"]))
         else:
             # Initialize
             _db.run("""
@@ -28510,57 +28569,123 @@ def _p40_save_balance():
 # ═════════════════════════════════════════════════════════════════════════════
 
 def _p40_build_prompt(asset, candles, memory):
-    candle_lines = []
-    for i, c in enumerate(candles[-100:]):
-        candle_lines.append("{:3}: O={:.1f} H={:.1f} L={:.1f} C={:.1f}".format(
-            i+1, c[0], c[1], c[2], c[3]))
+    """Story-based prompt that mimics manual chart reading.
     
+    Window: 25 candles (6 hours) - the actual context window used manually.
+    Memory: 15 predictions with pattern win/loss review for self-learning.
+    Confidence: explicitly calibrated, no default to 7.
+    """
+    from collections import Counter as _Counter
+    
+    # Last 25 candles with body size and color tags
+    candle_lines = []
+    for i, c in enumerate(candles[-25:]):
+        o, h, l, cl = c[0], c[1], c[2], c[3]
+        body = cl - o
+        body_abs = abs(body)
+        color = "G" if body > 0 else "R" if body < 0 else "-"
+        if body_abs < 5:
+            size = "doji"
+        elif body_abs < 30:
+            size = "small"
+        elif body_abs < 100:
+            size = "med"
+        elif body_abs < 300:
+            size = "big"
+        else:
+            size = "MEGA"
+        candle_lines.append("{:2}: O={:.1f} H={:.1f} L={:.1f} C={:.1f} body={:+.1f} {} {}".format(
+            i+1, o, h, l, cl, body, color, size))
+    
+    # Memory with full context - last 15 predictions
     memory_lines = []
     wins = 0; total = 0
-    for m in memory[-20:]:
-        outcome = m.get("outcome", "PENDING")
+    win_patterns = []
+    loss_patterns = []
+    for m in memory[-15:]:
+        outcome = m.get("outcome", "PEND")
+        direction = m.get("direction", "?")
+        conf = m.get("confidence", "?")
+        pattern = m.get("pattern", "") or "none"
+        reasoning = (m.get("reasoning") or "")[:60]
         if outcome == "WIN":
             wins += 1; total += 1
+            win_patterns.append(pattern)
         elif outcome == "LOSS":
             total += 1
-        memory_lines.append("  {} c{}: {} → {}".format(
-            m["direction"], m["confidence"], (m.get("reasoning") or "")[:50], outcome))
+            loss_patterns.append(pattern)
+        memory_lines.append("  {} c{} [{}]: {} -> {}".format(
+            direction, conf, pattern, reasoning, outcome))
     
     recent_wr = (wins / total * 100) if total else 0
     
-    system_prompt = ("You are an expert 15-minute crypto chart reader specializing in " + asset + ". "
-"Predict whether the NEXT candle will close HIGHER (UP) or LOWER (DOWN) than current close.\n\n"
-"RULES:\n"
-"1. Predict EVERY candle - never neutral\n"
-"2. Read context: cascade? range? reversal? where in the move?\n"
-"3. CASCADE TRAP: 4+ same-direction candles ACCELERATING → continuation likely. "
-"DECELERATING (last body shrinking) → reversal likely\n"
-"4. Isolated mega candles (>1.5x ATR) → bounce typical UNLESS accelerating cascade\n"
-"5. Doji at extremes (top of uptrend / bottom of downtrend) → reversal\n"
-"6. Pullback common after 3 same-direction candles\n"
-"7. Big counter-trend candles in trends often faded\n\n"
-"CONFIDENCE:\n"
-"- 1-5: Uncertain (skipped)\n"
-"- 6: Clear bias\n"
-"- 7: Strong setup\n"
-"- 8: Textbook high-conviction\n"
-"- 9-10: Extreme (rare)\n\n"
-"OUTPUT - ONLY this JSON, no markdown:\n"
-'{"direction":"UP"|"DOWN","confidence":1-10,"reasoning":"short","pattern":"short_name"}\n\n'
-"Learn from your recent mistakes shown below.")
+    # Pattern performance review
+    win_counter = _Counter(win_patterns)
+    loss_counter = _Counter(loss_patterns)
+    pattern_review = []
+    all_patterns = set(win_patterns + loss_patterns)
+    for p in sorted(all_patterns):
+        w = win_counter.get(p, 0)
+        l = loss_counter.get(p, 0)
+        if w + l >= 2:
+            wr = w * 100 / (w + l)
+            tag = "STRONG" if wr >= 70 else "WEAK" if wr <= 30 else ""
+            pattern_review.append("  {} -> {}W/{}L ({:.0f}%) {}".format(p, w, l, wr, tag))
+    
+    system_prompt = (
+"You read 15-minute crypto charts like a discretionary trader. "
+"For " + asset + ", predict whether the NEXT candle closes HIGHER or LOWER than the current candle close.\n\n"
+"HOW TO READ:\n"
+"1. Look at the last 5 candles. What story do they tell? (Cascade? Recovery bounce? Range chop? Breakout?)\n"
+"2. Find the most recent SIGNIFICANT move (mega candle, range break, reversal candle).\n"
+"3. Where are we in that move? (Just started, mid-extension, exhausting, post-climax bounce zone?)\n"
+"4. What is the most likely 15-minute next-frame story?\n"
+"5. Make the call.\n\n"
+"PATTERNS THAT WORK (when context fits):\n"
+"- Post-mega bounce: After a mega red/green, next candle often reverses\n"
+"- Cascade continuation: 4+ same-color candles with growing bodies = ride the trend\n"
+"- Exhaustion reversal: 5+ same-color candles with shrinking bodies / doji = reversal coming\n"
+"- Pullback after extension: Big move + small opposite candle = trend resumes\n"
+"- Range break: Tight consolidation breaks one direction = continuation\n\n"
+"CONFIDENCE - BE HONEST:\n"
+"- 3-4: Genuinely unclear, chop, no story yet\n"
+"- 5-6: Some bias but not strong\n"
+"- 7: Clear story, decent setup\n"
+"- 8: Textbook pattern, high conviction\n"
+"- 9-10: Extreme/obvious (rare - use sparingly)\n"
+"DO NOT default to 7. If unclear, say so with lower confidence.\n\n"
+"OUTPUT - JSON ONLY:\n"
+'{"direction":"UP"|"DOWN","confidence":3-10,"reasoning":"the story in 1 sentence","pattern":"short_name"}'
+)
+    
+    learning_section = ""
+    if memory_lines:
+        learning_section = (
+            "\n\nYOUR LAST " + str(len(memory_lines)) + " PREDICTIONS ON " + asset + " (oldest first):\n"
+            + "\n".join(memory_lines) + "\n"
+            + "Recent WR: " + "{:.1f}".format(recent_wr) + "% (" + str(wins) + "W/" + str(total - wins) + "L)\n"
+        )
+        if pattern_review:
+            learning_section += "\nPATTERN PERFORMANCE:\n" + "\n".join(pattern_review) + "\n"
+        learning_section += (
+            "\nBefore predicting, briefly think:\n"
+            "- What kind of setup just LOST? Avoid repeating that error.\n"
+            "- What kind of setup just WON? Look for similar opportunities.\n"
+            "- Patterns marked WEAK have been failing - be skeptical of them.\n"
+            "- Patterns marked STRONG have been working - trust them when they appear.\n"
+        )
     
     user_prompt = (
         "ASSET: " + asset + "\n"
         "CURRENT PRICE: $" + "{:,.1f}".format(candles[-1][3]) + "\n\n"
-        "LAST 100 CANDLES (15-min, oldest→newest):\n"
-        + "\n".join(candle_lines) + "\n\n"
-        "YOUR LAST 20 PREDICTIONS ON " + asset + ":\n"
-        + ("\n".join(memory_lines) if memory_lines else "  (none yet)") + "\n\n"
-        "Recent WR: " + "{:.1f}".format(recent_wr) + "% (" + str(wins) + "/" + str(total) + ")\n\n"
-        "Predict the NEXT candle. JSON only."
+        "LAST 25 CANDLES (15-min, oldest -> newest):\n"
+        + "\n".join(candle_lines)
+        + learning_section
+        + "\n\nRead the story. Predict the NEXT candle. JSON only."
     )
     
     return system_prompt, user_prompt
+
 
 
 def _p40_claude_predict(asset, candles, memory):
@@ -28574,7 +28699,7 @@ def _p40_claude_predict(asset, candles, memory):
     if not ANTHROPIC_KEY:
         print("[P4.0] {} no ANTHROPIC_KEY".format(asset))
         return None
-    if not candles or len(candles) < 50:
+    if not candles or len(candles) < 25:
         return None
     
     try:
@@ -28819,8 +28944,9 @@ def _p40_fire_loop():
                         _p40_traded_keys.add(trade_key)
                         continue
                     
-                    # Balance check (P4.0's OWN balance)
-                    if _p40_state["balance"] - P40_CONFIG["stake_usd"] < _p40_state["floor_balance"]:
+                    # Balance check (P4.0's OWN balance) — only enforce in LIVE mode.
+                    # Shadow mode doesn't move balance, so don't block prediction tracking.
+                    if not shadow and _p40_state["balance"] - P40_CONFIG["stake_usd"] < _p40_state["floor_balance"]:
                         msg = "balance ${:.2f} - ${:.2f} below floor ${:.2f}".format(
                             _p40_state["balance"], P40_CONFIG["stake_usd"], _p40_state["floor_balance"])
                         print("[P4.0] #{} {} SKIP — {}".format(pid, asset, msg))
@@ -28962,7 +29088,10 @@ def _p40_resolve_loop():
             if not P40_CONFIG["enabled"]:
                 _time.sleep(60); continue
             
-            cutoff = datetime.now(timezone.utc) - timedelta(minutes=16)
+            # Wait at least 31 min after anchor close so the prefetch cycle following
+            # the resolution candle has run. Reading earlier means klines[-1] is the
+            # in-progress candle from before the resolution actually closed.
+            cutoff = datetime.now(timezone.utc) - timedelta(minutes=31)
             
             _db = get_db()
             rows = _db.run("""
@@ -28979,28 +29108,54 @@ def _p40_resolve_loop():
                 
                 from datetime import datetime, timezone
                 now = datetime.now(timezone.utc)
+                # Defensive: some DB drivers return naive datetimes even from TIMESTAMPTZ columns
+                if candle_ts.tzinfo is None:
+                    candle_ts = candle_ts.replace(tzinfo=timezone.utc)
                 age_min = (now - candle_ts).total_seconds() / 60
                 
-                if age_min < 1:
+                if age_min < 31:
+                    # Resolution candle's actual close hasn't been captured by the prefetch yet
                     continue
                 
-                ptb_open = None; next_close = None
+                anchor_close = None; next_close = None
                 try:
                     candles = _p29cl_candle_prefetch.get(asset, [])
-                    if len(candles) >= 2:
-                        if 15 <= age_min < 35:
-                            ptb_open = candles[-2][3]
-                            next_close = candles[-1][3]
-                        elif 30 <= age_min < 50:
-                            ptb_open = candles[-3][3]
-                            next_close = candles[-2][3]
+                    # Index math (verified by simulation):
+                    #   age 30-44: anchor at -3, resolution at -2
+                    #   age 45-59: anchor at -4, resolution at -3
+                    #   age 60-74: anchor at -5, resolution at -4
+                    # Formula:  n = (age_min - 30) // 15
+                    #   anchor_idx     = -(n + 3)
+                    #   resolution_idx = -(n + 2)
+                    n = int((age_min - 30) // 15)
+                    anchor_idx     = -(n + 3)
+                    resolution_idx = -(n + 2)
+                    if len(candles) >= abs(anchor_idx):
+                        anchor_close = candles[anchor_idx][3]
+                        next_close   = candles[resolution_idx][3]
                 except Exception as ce:
                     print("[P4.0] Resolve lookup error #{}: {}".format(pid, ce))
                 
-                if ptb_open is None or next_close is None:
+                if anchor_close is None or next_close is None:
+                    # If we're past 90 min and still cannot resolve, give up
+                    if age_min > 90:
+                        try:
+                            _db = get_db()
+                            _db.run("""
+                                UPDATE p40_predictions
+                                SET outcome='UNRESOLVED', resolved_at=NOW()
+                                WHERE id=:i
+                            """, i=pid)
+                            _db.close()
+                            print("[P4.0] #{} ABANDONED at age {:.0f}min (no candles)".format(pid, age_min))
+                        except Exception:
+                            pass
                     continue
                 
-                actual_dir = "UP" if next_close > ptb_open else "DOWN" if next_close < ptb_open else "FLAT"
+                # ptb_open kept for DB column compatibility (it's actually the anchor close)
+                ptb_open = anchor_close
+                
+                actual_dir = "UP" if next_close > anchor_close else "DOWN" if next_close < anchor_close else "FLAT"
                 
                 if not fired or order_status == "UNFILLED":
                     outcome = "UNFILLED"
@@ -29174,13 +29329,13 @@ td{padding:4px 6px;border:1px solid #30363d}
             ac = "up" if actual == "UP" else "down" if actual == "DOWN" else ""
             mode = '<span class="gh">SHADOW</span>' if shadow else "LIVE"
             ts_s = ts.strftime("%m-%d %H:%M") if ts else ""
-            ba_s = "{:.3f}".format(ba) if ba else "-"
-            st_s = "${:.2f}".format(stake) if stake else "-"
-            fp_s = "{:.3f}".format(fill) if fill else "-"
-            pnl_s = "${:+.2f}".format(pnl) if pnl else "-"
-            po_s = "{:.1f}".format(po) if po else "-"
-            nc_s = "{:.1f}".format(nc) if nc else "-"
-            bal_s = "${:.2f}".format(bal) if bal else "-"
+            ba_s = "{:.3f}".format(ba) if ba is not None else "-"
+            st_s = "${:.2f}".format(stake) if stake is not None else "-"
+            fp_s = "{:.3f}".format(fill) if fill is not None else "-"
+            pnl_s = "${:+.2f}".format(pnl) if pnl is not None else "-"
+            po_s = "{:.1f}".format(po) if po is not None else "-"
+            nc_s = "{:.1f}".format(nc) if nc is not None else "-"
+            bal_s = "${:.2f}".format(bal) if bal is not None else "-"
             
             html += '<tr>'
             html += '<td>{}</td><td>{}</td><td>{}</td>'.format(pid, ts_s, asset)
