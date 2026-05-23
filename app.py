@@ -28402,7 +28402,7 @@ T+0 at 50¢. Win=$2.35, Loss=$2.50 (3% fee).
 
 
 ################################################################################
-# P4.0 INTEGRATION — Claude-powered prediction engine (story-based v3)
+# P4.0 INTEGRATION — Claude-powered prediction engine (devils-advocate v5)
 ################################################################################
 
 """
@@ -28477,6 +28477,12 @@ def _p40_create_table():
         confidence INTEGER NOT NULL,
         reasoning TEXT,
         pattern VARCHAR(50),
+        structure VARCHAR(30),
+        recent_move TEXT,
+        current_position TEXT,
+        bull_case TEXT,
+        bear_case TEXT,
+        which_wins TEXT,
         model VARCHAR(50),
         api_elapsed_ms INTEGER,
         best_ask FLOAT,
@@ -28499,6 +28505,14 @@ def _p40_create_table():
     CREATE INDEX IF NOT EXISTS idx_p40_asset_ts ON p40_predictions(asset, candle_close_ts DESC);
     CREATE INDEX IF NOT EXISTS idx_p40_unfired ON p40_predictions(candle_close_ts) WHERE fired = FALSE;
     CREATE INDEX IF NOT EXISTS idx_p40_unresolved ON p40_predictions(candle_close_ts) WHERE outcome IS NULL;
+    
+    -- Add new columns if they don't exist (for upgrading existing tables)
+    ALTER TABLE p40_predictions ADD COLUMN IF NOT EXISTS structure VARCHAR(30);
+    ALTER TABLE p40_predictions ADD COLUMN IF NOT EXISTS recent_move TEXT;
+    ALTER TABLE p40_predictions ADD COLUMN IF NOT EXISTS current_position TEXT;
+    ALTER TABLE p40_predictions ADD COLUMN IF NOT EXISTS bull_case TEXT;
+    ALTER TABLE p40_predictions ADD COLUMN IF NOT EXISTS bear_case TEXT;
+    ALTER TABLE p40_predictions ADD COLUMN IF NOT EXISTS which_wins TEXT;
     
     CREATE TABLE IF NOT EXISTS p40_balance_state (
         id INTEGER PRIMARY KEY DEFAULT 1,
@@ -28647,22 +28661,44 @@ def _p40_build_prompt(asset, candles, memory):
             pattern_review.append("  {} -> {}W/{}L ({:.0f}%) {}".format(p, w, l, wr, tag))
     
     system_prompt = (
-"You read 15-minute crypto charts. For " + asset + ", predict whether the NEXT candle closes HIGHER or LOWER than the current candle close.\n\n"
-"HOW TO READ (silently, internally):\n"
-"1. Last 5 candles - what story? (Cascade? Bounce? Range? Breakout?)\n"
-"2. Most recent SIGNIFICANT move - mega candle, range break, reversal?\n"
-"3. Where are we in it? (Starting, mid-extension, exhausting, post-climax?)\n"
-"4. What is the most likely 15-min next-frame story?\n\n"
+"You read 15-minute crypto charts for " + asset + ". Predict whether the NEXT candle closes HIGHER or LOWER than the current close.\n\n"
+"You will receive the LAST 25 candles (about 6 hours of context). Use ALL 25 to understand the bigger picture.\n\n"
+"HOW TO READ:\n"
+"1. ZOOM OUT — look at all 25 candles. What's the overall structure (uptrend, downtrend, range, choppy)?\n"
+"2. FIND THE RECENT SIGNIFICANT MOVE — mega candle, range break, swing, reversal candle.\n"
+"3. ZOOM IN — how does the current moment fit in? (Just started, mid-extension, exhausting, post-climax?)\n"
+"4. ARGUE BOTH SIDES — before committing, build the strongest case for UP AND the strongest case for DOWN.\n"
+"5. WEIGH them — which side has more evidence? Which side does the pattern history (below) favor?\n"
+"6. COMMIT — make the call with calibrated confidence.\n\n"
+"CRITICAL RULE: You MUST argue both sides before committing. If one side has no plausible case, you are not looking hard enough.\n"
+"This protects against confirmation bias and forces honest analysis.\n\n"
 "COMMON PATTERNS:\n"
 "- Post-mega bounce: After mega red/green, next often reverses\n"
 "- Cascade continuation: 4+ same-color with growing bodies = trend continues\n"
 "- Exhaustion reversal: 5+ same-color with shrinking bodies / doji = reversal\n"
 "- Pullback after extension: Big move + small opposite candle = trend resumes\n"
-"- Range break: Tight consolidation breaks one way = continuation\n\n"
-"CONFIDENCE:\n"
-"3-4 = unclear/chop, 5-6 = mild bias, 7 = clear setup, 8 = textbook, 9-10 = extreme (rare)\n"
-"Calibrate honestly. Most setups are 5-7. Use 3-4 when genuinely uncertain.\n\n"
-"OUTPUT: ONE LINE OF JSON. NO TEXT BEFORE OR AFTER. NO MARKDOWN FENCES."
+"- Range break: Tight consolidation breaks one way = continuation\n"
+"- Range fade: At top/bottom of established range, fade back to middle\n\n"
+"CONFIDENCE CALIBRATION:\n"
+"- 3-4: bull and bear cases roughly equal — genuinely unclear\n"
+"- 5-6: one case is mildly stronger\n"
+"- 7: clear winner, but the other side has merit\n"
+"- 8: strong setup, other side is weak\n"
+"- 9-10: extreme/textbook, other side is barely defensible (rare)\n"
+"If bull and bear cases feel equally strong, confidence MUST be 3-4.\n\n"
+"OUTPUT FORMAT (JSON, one object, NO text before/after):\n"
+"{\n"
+'  "structure": "uptrend|downtrend|range_tight|range_volatile|cascade_up|cascade_down|exhaustion|breakout",\n'
+'  "recent_move": "describe the most recent significant move in <80 chars",\n'
+'  "current_position": "where in the move are we? <60 chars",\n'
+'  "bull_case": "strongest argument for UP next candle, <100 chars",\n'
+'  "bear_case": "strongest argument for DOWN next candle, <100 chars",\n'
+'  "which_wins": "which case is stronger and why, <100 chars",\n'
+'  "direction": "UP" or "DOWN",\n'
+'  "confidence": 3-10,\n'
+'  "reasoning": "one-sentence summary <80 chars",\n'
+'  "pattern": "short_snake_case_label"\n'
+"}"
 )
     
     learning_section = ""
@@ -28687,10 +28723,9 @@ def _p40_build_prompt(asset, candles, memory):
         "LAST 25 CANDLES (15-min, oldest -> newest):\n"
         + "\n".join(candle_lines)
         + learning_section
-        + "\n\nRESPOND WITH ONE LINE OF JSON. NO PROSE. NO MARKDOWN. NO EXPLANATIONS BEFORE OR AFTER.\n"
-        + 'Format: {"direction":"UP","confidence":7,"reasoning":"the story in 1 short sentence","pattern":"short_name"}\n'
-        + 'Your reasoning field is where you put the story - keep it under 80 characters.\n'
-        + 'Begin your response with the opening brace {'
+        + "\n\nNow analyze. Build the bull case, build the bear case, decide which wins, then commit.\n"
+        + "OUTPUT: a single JSON object matching the format in the system prompt. NO text before or after.\n"
+        + "Begin your response with the opening brace {"
     )
     
     return system_prompt, user_prompt
@@ -28724,7 +28759,7 @@ def _p40_claude_predict(asset, candles, memory):
             },
             json={
                 "model": P40_CONFIG["model"],
-                "max_tokens": 600,
+                "max_tokens": 1000,
                 "system": sys_p,
                 "messages": [{"role": "user", "content": user_p}]
             },
@@ -28742,41 +28777,47 @@ def _p40_claude_predict(asset, candles, memory):
         raw = _re.sub(r'^```(?:json)?\s*', '', raw)
         raw = _re.sub(r'\s*```$', '', raw)
         
-        # Find the JSON object inside (in case Claude added prose)
-        # Try several patterns - simple, then more permissive
-        json_match = _re.search(r'\{[^{}]*"direction"[^{}]*\}', raw, _re.DOTALL)
-        if not json_match:
-            # Maybe the JSON has nested braces or is at the end of prose - try greedy match from first { with "direction"
-            json_match = _re.search(r'\{[^{]*?"direction".*?\}', raw, _re.DOTALL)
-        if json_match:
-            raw = json_match.group(0)
-        
-        if not raw:
-            print("[P4.0] {} empty response from API. Full data: {}".format(asset, str(data)[:300]))
-            return None
-        
+        # Try direct JSON parse first (Claude usually returns pure JSON now)
+        pred = None
         try:
             pred = _json.loads(raw)
-        except _json.JSONDecodeError as je:
+        except _json.JSONDecodeError:
+            # Claude added prose - find the JSON object
+            # Try non-greedy match first (cleaner if JSON has no nested objects)
+            json_match = _re.search(r'\{[^{}]*"direction"[^{}]*\}', raw, _re.DOTALL)
+            if not json_match:
+                # Greedy fallback - matches from first { with "direction" anywhere
+                json_match = _re.search(r'\{[^{]*?"direction".*?\}(?=\s*$|\s*\n|\s*[^,}])', raw, _re.DOTALL)
+            if not json_match:
+                # Last resort - match any { ... } that contains "direction"
+                for m in _re.finditer(r'\{[\s\S]*?\}', raw):
+                    if '"direction"' in m.group(0):
+                        json_match = m
+                        break
+            if json_match:
+                try:
+                    pred = _json.loads(json_match.group(0))
+                except _json.JSONDecodeError:
+                    pass
+        
+        if pred is None:
+            # Final fallback: regex-extract just direction + confidence from raw text
             print("[P4.0] {} JSON parse failed. Raw text: '{}'".format(asset, raw[:300]))
-            # Try to extract direction manually from the text
             text_lower = raw.lower()
             extracted_dir = None
-            if '"direction":"up"' in text_lower or "'direction':'up'" in text_lower or 'direction": "up"' in text_lower:
+            if '"direction":"up"' in text_lower or "'direction':'up'" in text_lower or 'direction": "up"' in text_lower or 'direction":"up"' in text_lower:
                 extracted_dir = "UP"
-            elif '"direction":"down"' in text_lower or "'direction':'down'" in text_lower or 'direction": "down"' in text_lower:
+            elif '"direction":"down"' in text_lower or "'direction':'down'" in text_lower or 'direction": "down"' in text_lower or 'direction":"down"' in text_lower:
                 extracted_dir = "DOWN"
             
             if extracted_dir is None:
                 return None
             
-            # Try to find a confidence number anywhere in the text
             conf_match = _re.search(r'"confidence"\s*:\s*(\d+)', raw)
             extracted_conf = int(conf_match.group(1)) if conf_match else 6
             if not (1 <= extracted_conf <= 10):
                 extracted_conf = 6
             
-            # Try to find a pattern
             pat_match = _re.search(r'"pattern"\s*:\s*"([^"]+)"', raw)
             extracted_pat = pat_match.group(1) if pat_match else "extracted"
             
@@ -28784,11 +28825,19 @@ def _p40_claude_predict(asset, candles, memory):
                 asset, extracted_dir, extracted_conf, extracted_pat))
             pred = {"direction": extracted_dir, "confidence": extracted_conf,
                     "reasoning": "extracted from malformed prose", "pattern": extracted_pat}
+        # Normalize direction to uppercase (Claude may slip and return "up" or "Up")
+        if pred.get("direction"):
+            pred["direction"] = str(pred["direction"]).upper().strip()
         if pred.get("direction") not in ("UP", "DOWN"):
             print("[P4.0] {} invalid direction: {}".format(asset, pred))
             return None
         
-        conf = int(pred.get("confidence", 0))
+        # Confidence might be returned as string or float - coerce robustly
+        try:
+            conf = int(float(pred.get("confidence", 0)))
+        except (ValueError, TypeError):
+            print("[P4.0] {} invalid conf (not numeric): {}".format(asset, pred.get("confidence")))
+            return None
         if not (1 <= conf <= 10):
             print("[P4.0] {} invalid conf: {}".format(asset, conf))
             return None
@@ -28884,22 +28933,37 @@ def _p40_predict_loop():
                         _db.run("""
                             INSERT INTO p40_predictions
                             (asset, candle_close_ts, direction, confidence, reasoning, pattern,
+                             structure, recent_move, current_position, bull_case, bear_case, which_wins,
                              model, api_elapsed_ms, shadow_mode)
-                            VALUES (:a, :cc, :d, :c, :r, :p, :m, :ms, :sh)
+                            VALUES (:a, :cc, :d, :c, :r, :p,
+                                    :st, :rm, :cp, :bull, :bear, :ww,
+                                    :m, :ms, :sh)
                         """,
                             a=asset, cc=nxt, d=pred["direction"], c=pred["confidence"],
                             r=(pred.get("reasoning") or "")[:200],
                             p=(pred.get("pattern") or "")[:50],
+                            st=(pred.get("structure") or "")[:30],
+                            rm=(pred.get("recent_move") or "")[:200],
+                            cp=(pred.get("current_position") or "")[:200],
+                            bull=(pred.get("bull_case") or "")[:300],
+                            bear=(pred.get("bear_case") or "")[:300],
+                            ww=(pred.get("which_wins") or "")[:300],
                             m=pred["model"], ms=pred["api_elapsed_ms"],
                             sh=P40_CONFIG["shadow_mode"])
                         _db.close()
                     except Exception as se:
                         print("[P4.0] Save error {}: {}".format(asset, se))
                     
-                    print("[P4.0] {} {} c{} ({}) '{}' [{}ms]".format(
+                    # Log richer output now that we have the full analysis
+                    print("[P4.0] {} {} c{} [{}/{}] '{}' [{}ms]".format(
                         asset, pred["direction"], pred["confidence"],
-                        pred.get("pattern", ""), (pred.get("reasoning") or "")[:40],
+                        pred.get("structure", "?"),
+                        pred.get("pattern", ""),
+                        (pred.get("reasoning") or "")[:50],
                         pred["api_elapsed_ms"]))
+                    print("  bull: {}".format((pred.get("bull_case") or "")[:120]))
+                    print("  bear: {}".format((pred.get("bear_case") or "")[:120]))
+                    print("  pick: {}".format((pred.get("which_wins") or "")[:120]))
                 
                 except Exception as e:
                     print("[P4.0] {} predict error: {}".format(asset, e))
@@ -29280,7 +29344,8 @@ def p40_live_dashboard():
         rows = _db.run("""
             SELECT id, asset, candle_close_ts, direction, confidence, reasoning, pattern,
                    fired, best_ask, stake, fill_price, outcome, pnl, shadow_mode,
-                   api_elapsed_ms, fire_reason, actual_direction, ptb_open, next_close, balance_after
+                   api_elapsed_ms, fire_reason, actual_direction, ptb_open, next_close, balance_after,
+                   structure, recent_move, current_position, bull_case, bear_case, which_wins
             FROM p40_predictions
             ORDER BY id DESC LIMIT 200
         """)
@@ -29320,7 +29385,31 @@ td{padding:4px 6px;border:1px solid #30363d}
 .bg{background:#238636;color:#fff}
 .bb{background:#1f6feb;color:#fff}
 .br{background:#da3633;color:#fff}
-</style></head><body>
+.analysis-row{display:none;background:#0d1117}
+.analysis-row td{padding:10px 14px;border-top:none}
+.analysis-grid{display:grid;grid-template-columns:90px 1fr;gap:6px 14px;font-size:11px;line-height:1.5}
+.analysis-grid .lbl{color:#58a6ff;font-weight:700;text-transform:uppercase;font-size:10px;letter-spacing:1px}
+.analysis-grid .val{color:#c9d1d9}
+.analysis-grid .val.bull{color:#3fb950}
+.analysis-grid .val.bear{color:#f85149}
+.expand-row{cursor:pointer}
+.expand-row:hover{background:#161b22}
+.exp-ind{color:#58a6ff;margin-right:4px}
+</style>
+<script>
+function toggleAnalysis(pid){
+  var row = document.getElementById('analysis-' + pid);
+  var ind = document.getElementById('ind-' + pid);
+  if (row.style.display === 'table-row') {
+    row.style.display = 'none';
+    ind.textContent = '+';
+  } else {
+    row.style.display = 'table-row';
+    ind.textContent = '−';
+  }
+}
+</script>
+</head><body>
 <h1>P4.0 Claude Predictions</h1>"""
         
         if P40_CONFIG["enabled"]:
@@ -29337,6 +29426,7 @@ td{padding:4px 6px;border:1px solid #30363d}
 <button class="btn bb" onclick="fetch('/api/p40/go_shadow',{method:'POST'}).then(()=>location.reload())">SHADOW</button>
 <button class="btn bg" onclick="if(confirm('Go LIVE? Real orders.')){fetch('/api/p40/go_live',{method:'POST'}).then(()=>location.reload())}">GO LIVE</button>
 </div>
+<div style="font-size:11px;color:#8b949e;margin:6px 0">Click any row to expand the full bull/bear analysis</div>
 <div class="stats">"""
         html += '<div class="stat"><div class="stat-l">P4.0 Balance</div><div class="stat-v" style="color:#58a6ff">' + "${:.2f}".format(_p40_state["balance"]) + '</div></div>'
         html += '<div class="stat"><div class="stat-l">Peak</div><div class="stat-v">' + "${:.2f}".format(_p40_state["peak_balance"]) + '</div></div>'
@@ -29347,10 +29437,19 @@ td{padding:4px 6px;border:1px solid #30363d}
         html += '<div class="stat"><div class="stat-l">W/L</div><div class="stat-v">' + "{}/{}".format(wins, losses) + '</div></div>'
         pc = "#3fb950" if live_pnl >= 0 else "#f85149"
         html += '<div class="stat"><div class="stat-l">Live P&L</div><div class="stat-v" style="color:' + pc + '">' + "${:+.2f}".format(live_pnl) + '</div></div>'
-        html += '</div><table><tr><th>#</th><th>Time</th><th>Asset</th><th>Pred</th><th>C</th><th>Pattern</th><th>Reasoning</th><th>Ask</th><th>$</th><th>Fill</th><th>Open</th><th>Close</th><th>Actual</th><th>Outcome</th><th>P&L</th><th>Bal</th><th>Mode</th><th>API</th><th>Reason</th></tr>'
+        html += '</div><table><tr><th></th><th>#</th><th>Time</th><th>Asset</th><th>Pred</th><th>C</th><th>Structure</th><th>Pattern</th><th>Reasoning</th><th>Ask</th><th>$</th><th>Fill</th><th>Open</th><th>Close</th><th>Actual</th><th>Outcome</th><th>P&L</th><th>Bal</th><th>Mode</th><th>API</th><th>Reason</th></tr>'
         
         for p in preds:
-            pid, asset, ts, direction, conf, reason, pattern, fired, ba, stake, fill, outcome, pnl, shadow, ms, fr, actual, po, nc, bal = p
+            (pid, asset, ts, direction, conf, reason, pattern, fired, ba, stake, fill,
+             outcome, pnl, shadow, ms, fr, actual, po, nc, bal,
+             structure, recent_move, current_position, bull_case, bear_case, which_wins) = p
+            
+            # Escape HTML in all Claude-generated text fields to prevent
+            # special characters (<, >, &) from breaking the dashboard
+            import html as _html
+            def _esc(s):
+                return _html.escape(str(s)) if s else ""
+            
             dc = "up" if direction == "UP" else "down"
             oc = "win" if outcome == "WIN" else "loss" if outcome == "LOSS" else "pend"
             ac = "up" if actual == "UP" else "down" if actual == "DOWN" else ""
@@ -29364,17 +29463,37 @@ td{padding:4px 6px;border:1px solid #30363d}
             nc_s = "{:.1f}".format(nc) if nc is not None else "-"
             bal_s = "${:.2f}".format(bal) if bal is not None else "-"
             
-            html += '<tr>'
-            html += '<td>{}</td><td>{}</td><td>{}</td>'.format(pid, ts_s, asset)
-            html += '<td class="{}">{}</td><td>{}</td>'.format(dc, direction, conf)
-            html += '<td>{}</td><td>{}</td>'.format((pattern or "")[:16], (reason or "")[:50])
+            # Main row - clickable to expand
+            html += '<tr class="expand-row" onclick="toggleAnalysis({})">'.format(pid)
+            html += '<td><span class="exp-ind" id="ind-{}">+</span></td>'.format(pid)
+            html += '<td>{}</td><td>{}</td><td>{}</td>'.format(pid, ts_s, _esc(asset))
+            html += '<td class="{}">{}</td><td>{}</td>'.format(dc, _esc(direction), conf)
+            html += '<td>{}</td>'.format(_esc((structure or "-")[:14]))
+            html += '<td>{}</td><td>{}</td>'.format(_esc((pattern or "")[:16]), _esc((reason or "")[:50]))
             html += '<td>{}</td><td>{}</td><td>{}</td>'.format(ba_s, st_s, fp_s)
             html += '<td>{}</td><td>{}</td>'.format(po_s, nc_s)
-            html += '<td class="{}">{}</td>'.format(ac, actual or "-")
-            html += '<td class="{}">{}</td>'.format(oc, outcome or "PEND")
+            html += '<td class="{}">{}</td>'.format(ac, _esc(actual or "-"))
+            html += '<td class="{}">{}</td>'.format(oc, _esc(outcome or "PEND"))
             html += '<td>{}</td><td>{}</td>'.format(pnl_s, bal_s)
-            html += '<td>{}</td><td>{}</td><td>{}</td>'.format(mode, ms or "", (fr or "")[:30])
+            html += '<td>{}</td><td>{}</td><td>{}</td>'.format(mode, ms or "", _esc((fr or "")[:30]))
             html += '</tr>'
+            
+            # Expandable analysis row
+            html += '<tr class="analysis-row" id="analysis-{}"><td colspan="21">'.format(pid)
+            html += '<div class="analysis-grid">'
+            if recent_move:
+                html += '<div class="lbl">Recent Move</div><div class="val">{}</div>'.format(_esc(recent_move))
+            if current_position:
+                html += '<div class="lbl">Position</div><div class="val">{}</div>'.format(_esc(current_position))
+            if bull_case:
+                html += '<div class="lbl">Bull Case</div><div class="val bull">{}</div>'.format(_esc(bull_case))
+            if bear_case:
+                html += '<div class="lbl">Bear Case</div><div class="val bear">{}</div>'.format(_esc(bear_case))
+            if which_wins:
+                html += '<div class="lbl">Pick</div><div class="val">{}</div>'.format(_esc(which_wins))
+            if not (recent_move or bull_case or bear_case):
+                html += '<div class="val gh">(no detailed analysis — prediction made with older prompt version)</div>'
+            html += '</div></td></tr>'
         
         html += '</table></body></html>'
         return html
