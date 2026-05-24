@@ -29614,7 +29614,7 @@ P50_CONFIG = {
     "enabled": False,
     "shadow_mode": True,
     "model": "claude-sonnet-4-5",
-    "assets": ["BTC", "ETH"],
+    "assets": ["BTC", "ETH", "SOL", "XRP"],
     "stake_usd": 2.50,
     # Entry timing
     "entry_delay_seconds": 120,     # Wait 2 min after boundary before first entry attempt
@@ -29838,9 +29838,13 @@ def _p50_signal_thread():
             
             secs_until = (nxt - now).total_seconds()
             
-            # Wake up 15s before boundary
-            if secs_until > 20:
-                _time.sleep(min(secs_until - 18, 60))
+            # Wake up 5s before boundary (not 15s)
+            # This ensures:
+            # 1. Candle prefetch (T-22s) has already populated
+            # 2. Indicator caches are fresh (updated at T-22s too)
+            # 3. P2.1 direction matches what A4 sees at T-0
+            if secs_until > 8:
+                _time.sleep(min(secs_until - 7, 60))
                 continue
             
             boundary_key = nxt.strftime("%Y%m%d_%H%M")
