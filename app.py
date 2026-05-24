@@ -28444,10 +28444,7 @@ P40_CONFIG = {
     "enabled": False,
     "shadow_mode": True,
     "model": "claude-sonnet-4-5",
-    "assets": ["BTC", "ETH"],
-    "lead_time_seconds": 15,
-    "memory_depth": 20,
-    "min_confidence_to_fire": 6,
+    "assets": ["BTC", "ETH", "SOL", "XRP"],
     "stake_usd": 2.50,
 }
 
@@ -28600,15 +28597,8 @@ def _p40_save_balance():
 # ═════════════════════════════════════════════════════════════════════════════
 
 def _p40_build_prompt(asset, candles, memory, ptb=None):
-    """Story-based prompt that mimics manual chart reading.
+    """P4.0 v2: Reactive prompt — Claude sees the candle FORMING and decides."""
     
-    Window: 25 candles (6 hours) - the actual context window used manually.
-    Memory: 15 predictions with pattern win/loss review for self-learning.
-    Confidence: explicitly calibrated, no default to 7.
-    """
-    from collections import Counter as _Counter
-    
-    # Last 25 candles with body size and color tags
     candle_lines = []
     for i, c in enumerate(candles[-25:]):
         o, h, l, cl = c[0], c[1], c[2], c[3]
@@ -28628,75 +28618,51 @@ def _p40_build_prompt(asset, candles, memory, ptb=None):
         candle_lines.append("{:2}: O={:.1f} H={:.1f} L={:.1f} C={:.1f} body={:+.1f} {} {}".format(
             i+1, o, h, l, cl, body, color, size))
     
-    # Memory with full context - last 15 predictions
-    memory_lines = []
-    wins = 0; total = 0
-    win_patterns = []
-    loss_patterns = []
-    for m in memory[-15:]:
-        outcome = m.get("outcome", "PEND")
-        direction = m.get("direction", "?")
-        conf = m.get("confidence", "?")
-        pattern = m.get("pattern", "") or "none"
-        reasoning = (m.get("reasoning") or "")[:60]
-        if outcome == "WIN":
-            wins += 1; total += 1
-            win_patterns.append(pattern)
-        elif outcome == "LOSS":
-            total += 1
-            loss_patterns.append(pattern)
-        memory_lines.append("  {} c{} [{}]: {} -> {}".format(
-            direction, conf, pattern, reasoning, outcome))
-    
-    recent_wr = (wins / total * 100) if total else 0
-    
-    # Pattern performance review
-    win_counter = _Counter(win_patterns)
-    loss_counter = _Counter(loss_patterns)
-    pattern_review = []
-    all_patterns = set(win_patterns + loss_patterns)
-    for p in sorted(all_patterns):
-        w = win_counter.get(p, 0)
-        l = loss_counter.get(p, 0)
-        if w + l >= 2:
-            wr = w * 100 / (w + l)
-            tag = "STRONG" if wr >= 70 else "WEAK" if wr <= 30 else ""
-            pattern_review.append("  {} -> {}W/{}L ({:.0f}%) {}".format(p, w, l, wr, tag))
+    current_price = candles[-1][3]
     
     system_prompt = (
-"You are a seasoned prediction market trader. You bet on whether crypto prices will close above or below specific reference levels in 15 minutes.\n\n"
-"You're shown 25 recent 15-minute candles and the current Polymarket reference price (PTB). The market settles based on whether price closes above or below that PTB at the next 15-minute boundary.\n\n"
-"Read the chart the way an experienced trader reads it. Not by running a checklist — by actually looking at what's happening. Where has price been? Where did buyers step in? Where did sellers cap moves? Has anything just changed?\n\n"
-"You know things experienced traders know:\n"
-"- Levels that have held multiple times tend to hold again — until they don't\n"
-"- Parabolic moves get retraced, but not always immediately\n"
-"- After 4-5 candles in one direction, the easy money has been made and a pause or bounce is more likely\n"
-"- A market that's been ranging will often keep ranging until something forces it to break\n"
-"- Round numbers and recent highs/lows act as gravity\n"
-"- Don't bet against a level that just held three times unless you see it actually breaking\n\n"
-"You're not required to bet. Most setups aren't worth trading. A good trader skips the chop and only steps in when the picture is clear enough to defend.\n\n"
+"You are watching a LIVE 15-minute crypto candle form on Polymarket.\n\n"
+"The market has a Price To Beat (PTB) — a reference price set at the start of the candle. "
+"The market settles based on whether price CLOSES above or below this PTB.\n\n"
+"You can see the current candle forming in real-time, plus 25 completed candles of history. "
+"Based on what you see RIGHT NOW — the price action, momentum, levels, where price is vs PTB — "
+"decide: will this candle close ABOVE or BELOW the PTB?\n\n"
+"Key things to watch:\n"
+"- Where is current price vs PTB? If price is $50 above PTB and trending up, ABOVE is likely\n"
+"- Did price just spike or dump? Spikes often retrace, dumps often bounce\n"
+"- Is there a clear trend in the last few candles? Trends tend to continue short-term\n"
+"- Is price at a level that's been tested multiple times? Those levels tend to hold\n"
+"- Has the candle been forming for a few minutes already? What direction is it building?\n\n"
+"If you can see a clear direction, call it. If the candle is genuinely undecided (doji, "
+"price right at PTB, no momentum either way), set should_trade=false and wait for more data.\n\n"
 "OUTPUT: single JSON object, no text before or after.\n"
 "{\n"
-'  "what_im_seeing": "describe the chart in your own words, what stands out, <200 chars",\n'
-'  "the_call": "ABOVE_PTB or BELOW_PTB - where you think it closes",\n'
-'  "why": "your one-sentence reasoning, <150 chars",\n'
-'  "should_trade": true or false - is this clear enough to bet on?\n'
+'  "what_im_seeing": "describe what the live candle is doing right now, <200 chars",\n'
+'  "the_call": "ABOVE_PTB or BELOW_PTB",\n'
+'  "why": "one sentence, <150 chars",\n'
+'  "should_trade": true or false - can you see a clear direction?\n'
 "}"
 )
     
-    # Memory removed — was causing regime-persistence bias.
-    # Each prediction now stands alone on the chart.
+    parts = []
+    parts.append("ASSET: {}".format(asset))
+    if ptb is not None:
+        parts.append("PTB (settlement reference): ${:,.2f}".format(ptb))
+        distance = current_price - ptb
+        parts.append("CURRENT PRICE: ${:,.2f} ({:+.2f} from PTB)".format(current_price, distance))
+    else:
+        parts.append("CURRENT PRICE: ${:,.2f}".format(current_price))
+    parts.append("")
+    parts.append("LAST 25 CANDLES (15-min, completed, oldest -> newest):")
+    parts.append("\n".join(candle_lines))
+    parts.append("")
+    parts.append("The last candle above is the most recently COMPLETED candle.")
+    parts.append("Current live price is ${:,.2f} — this is where the FORMING candle is right now.".format(current_price))
+    parts.append("")
+    parts.append("Will this candle close ABOVE or BELOW PTB?")
+    parts.append('Output the JSON. Begin with {')
     
-    user_prompt = (
-        "ASSET: " + asset + "\n"
-        "CURRENT BINANCE CLOSE: $" + "{:,.2f}".format(candles[-1][3]) + "\n"
-        "POLYMARKET PTB (settlement reference): $" + ("{:,.2f}".format(ptb) if ptb is not None else "unknown") + "\n\n"
-        "LAST 25 CANDLES (15-min, oldest -> newest):\n"
-        + "\n".join(candle_lines)
-        + "\n\nRead this chart. Decide if you'd actually bet on where it closes vs PTB in 15 minutes.\n"
-        + "If unclear or risky, set should_trade=false. Skipping is fine.\n"
-        + "Output the JSON. Begin with {"
-    )
+    user_prompt = "\n".join(parts)
     
     return system_prompt, user_prompt
 
@@ -28881,11 +28847,17 @@ def _p40_next_close():
 # PREDICT LOOP
 # ═════════════════════════════════════════════════════════════════════════════
 
+# ═════════════════════════════════════════════════════════════════════════════
+# P4.0 v2 — NEW REACTIVE PREDICT+FIRE LOOP (replaces both old loops)
+# ═════════════════════════════════════════════════════════════════════════════
+
 def _p40_predict_loop():
+    """P4.0 v2: Reactive entry — Claude watches the candle FORM, decides mid-candle,
+    places limit order at best odds. Checks every 2 min from T+0 to T+10."""
     import time as _time
-    from datetime import datetime, timezone
+    from datetime import datetime, timezone, timedelta
     
-    print("[P4.0] Predict loop started")
+    print("[P4.0] Reactive predict loop started (v2)")
     
     while True:
         try:
@@ -28893,41 +28865,113 @@ def _p40_predict_loop():
                 _time.sleep(30); continue
             
             now = datetime.now(timezone.utc)
-            nxt = _p40_next_close()
-            secs_until = (nxt - now).total_seconds()
-            lead = P40_CONFIG["lead_time_seconds"]
             
-            if secs_until > lead + 5:
-                _time.sleep(min(secs_until - lead - 2, 60))
+            # Find the CURRENT boundary (the one that just opened or is open now)
+            current_min = now.minute
+            boundary_min = (current_min // 15) * 15
+            current_boundary = now.replace(minute=boundary_min, second=0, microsecond=0)
+            
+            # How far into the current 15-min period are we?
+            secs_into_period = (now - current_boundary).total_seconds()
+            
+            # Only active from T+0 to T+10min (0 to 600 seconds)
+            if secs_into_period > 600:
+                # Past the entry window — sleep until next boundary
+                next_boundary = current_boundary + timedelta(minutes=15)
+                sleep_secs = (next_boundary - now).total_seconds()
+                _time.sleep(min(sleep_secs + 1, 60))
                 continue
             
-            key = nxt.isoformat()
-            if key in _p40_predicted_boundaries:
-                _time.sleep(2); continue
+            boundary_key = current_boundary.strftime("%Y%m%d_%H%M")
             
-            print("[P4.0] WAKE T-{}s for {}".format(int(secs_until), nxt))
-            _p40_predicted_boundaries.add(key)
+            # Check if we already traded this boundary
+            if boundary_key in _p40_traded_keys:
+                _time.sleep(30)
+                continue
+            
+            # Check if we already predicted and are waiting for fill
+            if boundary_key in _p40_predicted_boundaries:
+                _time.sleep(30)
+                continue
+            
+            # ── Time to check: every 2 minutes within the window ──
+            # Check at T+0, T+2, T+4, T+6, T+8, T+10
+            check_interval = 120  # 2 minutes
+            last_check_key = "_p40_last_check_{}".format(boundary_key)
+            last_check_time = getattr(_p40_predict_loop, '_last_checks', {}).get(boundary_key, 0)
+            
+            if _time.time() - last_check_time < check_interval and last_check_time > 0:
+                _time.sleep(10)
+                continue
+            
+            # Store last check time
+            if not hasattr(_p40_predict_loop, '_last_checks'):
+                _p40_predict_loop._last_checks = {}
+            _p40_predict_loop._last_checks[boundary_key] = _time.time()
+            
+            print("[P4.0] CHECK at T+{:.0f}s for boundary {} | checking {} assets".format(
+                secs_into_period, current_boundary.strftime("%H:%M"), len(P40_CONFIG["assets"])))
             
             for asset in P40_CONFIG["assets"]:
                 try:
+                    trade_key = "p40_{}_{}".format(asset, boundary_key)
+                    if trade_key in _p40_traded_keys:
+                        continue
+                    
+                    # Get candles (including the one currently forming)
                     raw = _p29cl_candle_prefetch.get(asset, [])
                     if len(raw) < 50:
                         print("[P4.0] {} insufficient candles ({})".format(asset, len(raw)))
                         continue
                     
                     candles = list(raw[-100:])
-                    memory = _p40_load_memory(asset, P40_CONFIG["memory_depth"])
                     
-                    # Look up the current Polymarket settlement reference (Chainlink price)
+                    # Get PTB (settlement reference for this boundary)
                     try:
                         ptb = _chainlink_prices.get(asset)
                     except Exception:
                         ptb = None
                     
-                    pred = _p40_claude_predict(asset, candles, memory, ptb)
+                    # Call Claude — reactive prompt (watching live candle)
+                    pred = _p40_claude_predict(asset, candles, [], ptb)
                     if pred is None:
                         continue
                     
+                    direction = pred.get("direction")
+                    should_trade = pred.get("should_trade", False)
+                    reasoning = (pred.get("reasoning") or pred.get("why") or "")[:200]
+                    elapsed = pred.get("api_elapsed_ms", 0)
+                    
+                    print("[P4.0] {} {} [{}] '{}' [{}ms] T+{:.0f}s".format(
+                        asset, direction, "TRADE" if should_trade else "WAIT",
+                        reasoning[:80], elapsed, secs_into_period))
+                    
+                    if not should_trade:
+                        # Claude says WAIT — not clear enough yet
+                        # Don't mark as traded — we'll check again in 2 min
+                        # But save to DB for tracking
+                        try:
+                            _db = get_db()
+                            _db.run("""
+                                INSERT INTO p40_predictions
+                                (asset, candle_close_ts, direction, confidence, reasoning, pattern,
+                                 model, api_elapsed_ms, shadow_mode, fired, fire_reason)
+                                VALUES (:a, :cc, :d, :c, :r, 'reactive_wait',
+                                        :m, :ms, :sh, TRUE, :fr)
+                            """, a=asset, cc=current_boundary + timedelta(minutes=15),
+                                d=direction, c=4, r=reasoning,
+                                m=pred.get("model", ""), ms=elapsed,
+                                sh=P40_CONFIG["shadow_mode"],
+                                fr="Claude wait at T+{:.0f}s".format(secs_into_period))
+                            _db.close()
+                        except Exception:
+                            pass
+                        continue
+                    
+                    # ── Claude says TRADE — place limit order ──
+                    _p40_traded_keys.add(trade_key)
+                    
+                    # Save prediction to DB
                     try:
                         _db = get_db()
                         _db.run("""
@@ -28935,46 +28979,179 @@ def _p40_predict_loop():
                             (asset, candle_close_ts, direction, confidence, reasoning, pattern,
                              structure, recent_move, current_position, bull_case, bear_case, which_wins,
                              model, api_elapsed_ms, shadow_mode)
-                            VALUES (:a, :cc, :d, :c, :r, :p,
+                            VALUES (:a, :cc, :d, :c, :r, 'reactive_fire',
                                     :st, :rm, :cp, :bull, :bear, :ww,
                                     :m, :ms, :sh)
                         """,
-                            a=asset, cc=nxt, d=pred["direction"], c=pred["confidence"],
-                            r=(pred.get("reasoning") or "")[:200],
-                            p=(pred.get("pattern") or "")[:50],
+                            a=asset, cc=current_boundary + timedelta(minutes=15),
+                            d=direction, c=7, r=reasoning,
                             st=(pred.get("structure") or "")[:30],
-                            rm=(pred.get("recent_move") or "")[:200],
+                            rm=(pred.get("recent_move") or pred.get("what_im_seeing") or "")[:200],
                             cp=(pred.get("current_position") or "")[:200],
                             bull=(pred.get("bull_case") or "")[:300],
                             bear=(pred.get("bear_case") or "")[:300],
-                            ww=(pred.get("which_wins") or "")[:300],
-                            m=pred["model"], ms=pred["api_elapsed_ms"],
+                            ww=(pred.get("which_wins") or pred.get("why") or "")[:300],
+                            m=pred.get("model", ""), ms=elapsed,
                             sh=P40_CONFIG["shadow_mode"])
+                        
+                        # Get the ID we just inserted
+                        pid_rows = _db.run("SELECT MAX(id) FROM p40_predictions WHERE asset=:a", a=asset)
+                        pid = list(pid_rows)[0][0]
                         _db.close()
                     except Exception as se:
                         print("[P4.0] Save error {}: {}".format(asset, se))
+                        pid = None
                     
-                    # Log Claude's read of the chart
-                    trade_flag = "TRADE" if pred.get("should_trade") else "SKIP"
-                    print("[P4.0] {} {} [{}] '{}' [{}ms]".format(
-                        asset, pred["direction"], trade_flag,
-                        (pred.get("reasoning") or "")[:80],
-                        pred["api_elapsed_ms"]))
-                    if pred.get("recent_move"):
-                        print("  saw:   {}".format(pred.get("recent_move", "")[:200]))
-                    if pred.get("why"):
-                        print("  why:   {}".format(pred.get("why", "")[:150]))
+                    # ── Place the order ──
+                    entry = _p29cl_token_map.get(asset)
+                    if not entry:
+                        print("[P4.0] {} no token entry — skip".format(asset))
+                        continue
+                    
+                    tid = entry.get("up_token") if direction == "UP" else entry.get("down_token")
+                    if not tid:
+                        print("[P4.0] {} no {} token".format(asset, direction))
+                        continue
+                    
+                    poly_client = _get_poly_client()
+                    if not poly_client:
+                        print("[P4.0] {} no poly client".format(asset))
+                        continue
+                    
+                    # Read order book
+                    best_ask = None
+                    try:
+                        book = poly_client.get_order_book(str(tid))
+                        asks_raw = book.get('asks', []) if isinstance(book, dict) else []
+                        if asks_raw:
+                            prices = [float(a.get('price', 0)) for a in asks_raw if float(a.get('price', 0)) > 0]
+                            if prices:
+                                best_ask = min(prices)
+                    except Exception as be:
+                        print("[P4.0] {} order book error: {}".format(asset, be))
+                    
+                    if best_ask is None:
+                        print("[P4.0] {} no ask available".format(asset))
+                        if pid:
+                            _db = get_db()
+                            _db.run("UPDATE p40_predictions SET fired=TRUE, fire_reason='no ask' WHERE id=:i", i=pid)
+                            _db.close()
+                        continue
+                    
+                    stake = P40_CONFIG["stake_usd"]
+                    
+                    # Place limit order 1c BELOW best ask (sit on book, wait for fill)
+                    limit_price = round(max(best_ask - 0.01, 0.01), 2)
+                    
+                    if P40_CONFIG["shadow_mode"]:
+                        print("[P4.0 SHADOW] {} {} at T+{:.0f}s — ask={:.0f}c limit={:.0f}c ${:.2f}".format(
+                            asset, direction, secs_into_period, best_ask*100, limit_price*100, stake))
+                        if pid:
+                            _db = get_db()
+                            _db.run("""
+                                UPDATE p40_predictions
+                                SET fired=TRUE, fire_reason='shadow_fire',
+                                    best_ask=:ba, stake=:s, order_status='SHADOW',
+                                    fill_price=:fp
+                                WHERE id=:i
+                            """, ba=best_ask, s=stake, fp=limit_price, i=pid)
+                            _db.close()
+                        
+                        try:
+                            send_telegram(
+                                "🔍 <b>P4.0 SHADOW</b>\n"
+                                "{} {} @ {:.0f}c (limit {:.0f}c) ${:.2f}\n"
+                                "T+{:.0f}s | {}\n"
+                                "Balance: ${:.2f}".format(
+                                    asset, direction, best_ask*100, limit_price*100, stake,
+                                    secs_into_period, reasoning[:80],
+                                    _p40_state["balance"]))
+                        except Exception:
+                            pass
+                        continue
+                    
+                    # ── LIVE ORDER ──
+                    # Balance check
+                    if _p40_state["balance"] - stake < _p40_state["floor_balance"]:
+                        print("[P4.0] {} balance too low ${:.2f}".format(asset, _p40_state["balance"]))
+                        if pid:
+                            _db = get_db()
+                            _db.run("UPDATE p40_predictions SET fired=TRUE, fire_reason='low balance' WHERE id=:i", i=pid)
+                            _db.close()
+                        continue
+                    
+                    print("[P4.0 LIVE] {} {} at T+{:.0f}s — ask={:.0f}c limit={:.0f}c ${:.2f}".format(
+                        asset, direction, secs_into_period, best_ask*100, limit_price*100, stake))
+                    
+                    from py_clob_client_v2 import Side as _Side, OrderArgs as _OArgs, OrderType as _OT
+                    
+                    shares = int(stake / limit_price)
+                    if shares < 1:
+                        print("[P4.0] {} shares < 1 at {:.2f}c".format(asset, limit_price*100))
+                        continue
+                    
+                    order_args = _OArgs(
+                        token_id=str(tid),
+                        price=limit_price,
+                        size=float(shares),
+                        side=_Side.BUY,
+                    )
+                    signed = poly_client.create_order(order_args)
+                    resp = poly_client.post_order(signed, _OT.GTC)
+                    
+                    oid = None; status = "FAILED"; fill_price = None
+                    if resp:
+                        oid = resp.get("orderID") or resp.get("id")
+                        st = (resp.get("status") or "").upper()
+                        matched = float(resp.get("sizeMatched") or 0)
+                        if st in ("MATCHED", "FILLED") or matched > 0:
+                            fill_price = limit_price
+                            status = "FILLED"
+                            _p40_state["balance"] = round(_p40_state["balance"] - stake, 2)
+                            _p40_state["trades_today"] += 1
+                            _p40_save_balance()
+                        else:
+                            status = "POSTED"  # GTC order sitting on book
+                    
+                    if pid:
+                        _db = get_db()
+                        _db.run("""
+                            UPDATE p40_predictions
+                            SET fired=TRUE, fire_reason='fired',
+                                best_ask=:ba, stake=:s,
+                                polymarket_order_id=:o, order_status=:st, fill_price=:fp,
+                                balance_after=:bal
+                            WHERE id=:i
+                        """, ba=best_ask, s=stake, o=oid, st=status, fp=fill_price,
+                            bal=_p40_state["balance"], i=pid)
+                        _db.close()
+                    
+                    emoji = "🎯" if status == "FILLED" else "📋" if status == "POSTED" else "⚠️"
+                    print("[P4.0] {} {} {} — {} fill={} bal=${:.2f}".format(
+                        asset, direction, status, emoji, fill_price, _p40_state["balance"]))
+                    
+                    try:
+                        send_telegram(
+                            "{} <b>P4.0 LIVE {}</b>\n"
+                            "{} {} @ {:.0f}c (limit {:.0f}c) ${:.2f}\n"
+                            "T+{:.0f}s | {}\n"
+                            "Balance: ${:.2f}".format(
+                                emoji, status,
+                                asset, direction, best_ask*100, limit_price*100, stake,
+                                secs_into_period, reasoning[:80],
+                                _p40_state["balance"]))
+                    except Exception:
+                        pass
                 
                 except Exception as e:
-                    print("[P4.0] {} predict error: {}".format(asset, e))
+                    print("[P4.0] {} reactive error: {}".format(asset, e))
                     import traceback; traceback.print_exc()
             
-            if len(_p40_predicted_boundaries) > 100:
-                keep = sorted(_p40_predicted_boundaries)[-50:]
-                _p40_predicted_boundaries.clear()
-                _p40_predicted_boundaries.update(keep)
+            # Clean up old check times
+            if hasattr(_p40_predict_loop, '_last_checks') and len(_p40_predict_loop._last_checks) > 50:
+                _p40_predict_loop._last_checks = {}
             
-            _time.sleep(max(2, secs_until + 2))
+            _time.sleep(10)
         
         except Exception as e:
             print("[P4.0] Predict loop error: {}".format(e))
@@ -28982,212 +29159,15 @@ def _p40_predict_loop():
             _time.sleep(10)
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# FIRE LOOP
-# ═════════════════════════════════════════════════════════════════════════════
-
 def _p40_fire_loop():
+    """P4.0 v2: Fire loop is now a no-op — predict loop handles everything."""
     import time as _time
-    from datetime import datetime, timezone, timedelta
-    
-    print("[P4.0] Fire loop started")
-    
+    print("[P4.0] Fire loop started (v2 — predict loop handles entry)")
     while True:
-        try:
-            if not P40_CONFIG["enabled"]:
-                _time.sleep(30); continue
-            
-            now = datetime.now(timezone.utc)
-            
-            _db = get_db()
-            rows = _db.run("""
-                SELECT id, asset, candle_close_ts, direction, confidence, reasoning, pattern, shadow_mode
-                FROM p40_predictions
-                WHERE fired=FALSE AND outcome IS NULL
-                  AND candle_close_ts <= :now AND candle_close_ts > :stale
-                ORDER BY candle_close_ts LIMIT 10
-            """, now=now, stale=now - timedelta(minutes=5))
-            pending = list(rows)
-            _db.close()
-            
-            if not pending:
-                _time.sleep(2); continue
-            
-            for r in pending:
-                pid, asset, ts, direction, conf, reasoning, pattern, shadow = r
-                
-                window_ts = ts.replace(tzinfo=None).isoformat()
-                trade_key = "p40_{}_{}".format(asset, window_ts)
-                if trade_key in _p40_traded_keys:
-                    _db = get_db()
-                    _db.run("UPDATE p40_predictions SET fired=TRUE, fire_reason='dedup' WHERE id=:i", i=pid)
-                    _db.close()
-                    continue
-                
-                try:
-                    # should_trade filter — Claude decides if the setup is worth firing.
-                    # confidence=4 means Claude returned should_trade=false; 7 means true.
-                    if conf < P40_CONFIG["min_confidence_to_fire"]:
-                        msg = "Claude declined: should_trade=false"
-                        print("[P4.0] #{} {} {} SKIP — {}".format(pid, asset, direction, msg))
-                        _db = get_db()
-                        _db.run("UPDATE p40_predictions SET fired=TRUE, fire_reason=:fr WHERE id=:i", fr=msg, i=pid)
-                        _db.close()
-                        _p40_traded_keys.add(trade_key)
-                        continue
-                    
-                    # Balance check (P4.0's OWN balance) — only enforce in LIVE mode.
-                    # Shadow mode doesn't move balance, so don't block prediction tracking.
-                    if not shadow and _p40_state["balance"] - P40_CONFIG["stake_usd"] < _p40_state["floor_balance"]:
-                        msg = "balance ${:.2f} - ${:.2f} below floor ${:.2f}".format(
-                            _p40_state["balance"], P40_CONFIG["stake_usd"], _p40_state["floor_balance"])
-                        print("[P4.0] #{} {} SKIP — {}".format(pid, asset, msg))
-                        _db = get_db()
-                        _db.run("UPDATE p40_predictions SET fired=TRUE, fire_reason=:fr WHERE id=:i", fr=msg, i=pid)
-                        _db.close()
-                        continue
-                    
-                    # Token lookup — use the shared market data, but not P3.0's state
-                    entry = _p29cl_token_map.get(asset)
-                    if not entry:
-                        msg = "no token entry"
-                        print("[P4.0] #{} {} SKIP — {}".format(pid, asset, msg))
-                        _db = get_db()
-                        _db.run("UPDATE p40_predictions SET fired=TRUE, fire_reason=:fr WHERE id=:i", fr=msg, i=pid)
-                        _db.close()
-                        continue
-                    
-                    tid = entry.get("up_token") if direction == "UP" else entry.get("down_token")
-                    if not tid:
-                        msg = "no {} token".format(direction)
-                        _db = get_db()
-                        _db.run("UPDATE p40_predictions SET fired=TRUE, fire_reason=:fr WHERE id=:i", fr=msg, i=pid)
-                        _db.close()
-                        continue
-                    
-                    poly_client = _get_poly_client()
-                    if not poly_client:
-                        print("[P4.0] #{} no poly client, retry next loop".format(pid))
-                        continue
-                    
-                    best_ask = None
-                    try:
-                        book = poly_client.get_order_book(str(tid))
-                        asks_raw = getattr(book, 'asks', None) or (book.get('asks', []) if isinstance(book, dict) else [])
-                        if asks_raw:
-                            prices = []
-                            for a in asks_raw:
-                                ap = float(getattr(a, 'price', None) or a.get('price', 0)) if hasattr(a, 'price') or isinstance(a, dict) else 0
-                                if ap > 0:
-                                    prices.append(ap)
-                            if prices:
-                                best_ask = min(prices)
-                    except Exception as be:
-                        print("[P4.0] #{} {} order book error: {}".format(pid, asset, be))
-                    
-                    if best_ask is None:
-                        msg = "no ask available"
-                        _db = get_db()
-                        _db.run("UPDATE p40_predictions SET fired=TRUE, fire_reason=:fr WHERE id=:i", fr=msg, i=pid)
-                        _db.close()
-                        continue
-                    
-                    stake = P40_CONFIG["stake_usd"]
-                    
-                    # SHADOW MODE
-                    if shadow:
-                        print("[P4.0 SHADOW] #{} {} {} c{} WOULD FIRE — ask={:.3f} ${:.2f}".format(
-                            pid, asset, direction, conf, best_ask, stake))
-                        _db = get_db()
-                        _db.run("""
-                            UPDATE p40_predictions
-                            SET fired=TRUE, fire_reason='shadow_fire',
-                                best_ask=:ba, stake=:s, order_status='SHADOW'
-                            WHERE id=:i
-                        """, ba=best_ask, s=stake, i=pid)
-                        _db.close()
-                        _p40_traded_keys.add(trade_key)
-                        continue
-                    
-                    # LIVE
-                    print("[P4.0 LIVE] #{} {} {} c{} FIRING — ask={:.3f} ${:.2f}".format(
-                        pid, asset, direction, conf, best_ask, stake))
-                    
-                    from py_clob_client_v2 import Side as _Side, MarketOrderArgs as _MOA, OrderType as _OT
-                    
-                    max_price = round(min(best_ask + 0.01, 0.99), 2)
-                    amount = round(stake, 2)
-                    args = _MOA(token_id=str(tid), amount=amount, side=_Side.BUY, price=max_price)
-                    signed = poly_client.create_market_order(args)
-                    resp = poly_client.post_order(signed, _OT.FAK)
-                    
-                    oid = None; status = "FAILED"; fill_price = None
-                    if resp:
-                        oid = resp.get("orderID") or resp.get("id")
-                        st = (resp.get("status") or "").upper()
-                        matched = float(resp.get("sizeMatched") or 0)
-                        filled = (st in ("MATCHED", "FILLED") or matched > 0)
-                        if filled:
-                            fill_price = best_ask
-                            status = "FILLED"
-                            # Debit P4.0's OWN balance
-                            _p40_state["balance"] = round(_p40_state["balance"] - stake, 2)
-                            _p40_state["trades_today"] += 1
-                            _p40_save_balance()
-                        else:
-                            status = "UNFILLED"
-                    
-                    _db = get_db()
-                    _db.run("""
-                        UPDATE p40_predictions
-                        SET fired=TRUE, fire_reason='fired',
-                            best_ask=:ba, stake=:s,
-                            polymarket_order_id=:o, order_status=:st, fill_price=:fp,
-                            balance_after=:bal
-                        WHERE id=:i
-                    """, ba=best_ask, s=stake, o=oid, st=status, fp=fill_price,
-                        bal=_p40_state["balance"], i=pid)
-                    _db.close()
-                    _p40_traded_keys.add(trade_key)
-                    
-                    print("[P4.0] #{} {} ORDER {} fill={} bal=${:.2f}".format(
-                        pid, asset, status, fill_price, _p40_state["balance"]))
-                    
-                    # Telegram alert on live fill
-                    try:
-                        if status == "FILLED":
-                            send_telegram(
-                                "🎯 <b>P4.0 LIVE FIRE</b>\n"
-                                "{} {} @ {:.2f}c stake ${:.2f}\n"
-                                "Reasoning: {}\n"
-                                "Balance: ${:.2f}".format(
-                                    asset, direction, fill_price * 100, stake,
-                                    (reasoning or "")[:120],
-                                    _p40_state["balance"]
-                                )
-                            )
-                        else:
-                            send_telegram(
-                                "⚠️ <b>P4.0 UNFILLED</b>\n"
-                                "{} {} @ {:.2f}c — order did not match\n"
-                                "Balance: ${:.2f}".format(
-                                    asset, direction, best_ask * 100,
-                                    _p40_state["balance"]
-                                )
-                            )
-                    except Exception as te:
-                        print("[P4.0] Telegram send error: {}".format(te))
-                
-                except Exception as e:
-                    print("[P4.0] Fire error #{}: {}".format(pid, e))
-                    import traceback; traceback.print_exc()
-            
-            _time.sleep(1)
-        
-        except Exception as e:
-            print("[P4.0] Fire loop error: {}".format(e))
-            import traceback; traceback.print_exc()
-            _time.sleep(5)
+        _time.sleep(300)  # Just stay alive, do nothing
+
+
+
 
 
 # ═════════════════════════════════════════════════════════════════════════════
