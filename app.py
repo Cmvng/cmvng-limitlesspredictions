@@ -7337,6 +7337,7 @@ def send_telegram(message):
         "ALPHA", "Alpha", "alpha",           # All Alpha trade/resolution messages (Limitless + Poly)
         "POLY",                              # Polymarket Alpha notifications
         "SNIPER", "Sniper", "LMTS",                  # Sniper Alpha 4.0 notifications
+        "P4.0", "P40",                       # P4.0 Claude-powered prediction engine
         "Auto-trading", "Kill switch",        # System control alerts
         "Auto-redeemed", "Redeemed",          # Redemption confirmations
         "Bot v4", "LIVE",                     # Startup message
@@ -28402,7 +28403,7 @@ T+0 at 50¢. Win=$2.35, Loss=$2.50 (3% fee).
 
 
 ################################################################################
-# P4.0 INTEGRATION — Claude-powered prediction engine (no-memory v7)
+# P4.0 INTEGRATION — Claude as seasoned prediction market trader (v8)
 ################################################################################
 
 """
@@ -28596,7 +28597,7 @@ def _p40_save_balance():
 # CLAUDE PROMPT — same approach we used manually
 # ═════════════════════════════════════════════════════════════════════════════
 
-def _p40_build_prompt(asset, candles, memory):
+def _p40_build_prompt(asset, candles, memory, ptb=None):
     """Story-based prompt that mimics manual chart reading.
     
     Window: 25 candles (6 hours) - the actual context window used manually.
@@ -28661,58 +28662,45 @@ def _p40_build_prompt(asset, candles, memory):
             pattern_review.append("  {} -> {}W/{}L ({:.0f}%) {}".format(p, w, l, wr, tag))
     
     system_prompt = (
-"You are reading 15-minute crypto candles for " + asset + ".\n"
-"Your job: predict whether the NEXT candle closes HIGHER or LOWER than the current close.\n\n"
-"You will receive 25 recent candles plus your own track record. Read the chart yourself. "
-"Use your own judgment. Do not assume any particular pattern is correct — read what is actually there.\n\n"
-"BEFORE COMMITTING, argue both sides honestly:\n"
-"- bull_case: the strongest reason this could go UP\n"
-"- bear_case: the strongest reason this could go DOWN\n"
-"- which_wins: which case is actually stronger and why\n\n"
-"If one side has no plausible case, you are not looking hard enough.\n"
-"If both sides feel equally strong, you must say so — confidence 3-4.\n\n"
-"CONFIDENCE (be honest):\n"
-"3-4: genuinely unclear, both cases roughly equal\n"
-"5-6: one case is mildly stronger\n"
-"7: clear winner but the other side has merit\n"
-"8: strong setup, other side is weak\n"
-"9-10: extreme/obvious, other side is barely defensible (use rarely)\n\n"
+"You are a seasoned prediction market trader. You bet on whether crypto prices will close above or below specific reference levels in 15 minutes.\n\n"
+"You're shown 25 recent 15-minute candles and the current Polymarket reference price (PTB). The market settles based on whether price closes above or below that PTB at the next 15-minute boundary.\n\n"
+"Read the chart the way an experienced trader reads it. Not by running a checklist — by actually looking at what's happening. Where has price been? Where did buyers step in? Where did sellers cap moves? Has anything just changed?\n\n"
+"You know things experienced traders know:\n"
+"- Levels that have held multiple times tend to hold again — until they don't\n"
+"- Parabolic moves get retraced, but not always immediately\n"
+"- After 4-5 candles in one direction, the easy money has been made and a pause or bounce is more likely\n"
+"- A market that's been ranging will often keep ranging until something forces it to break\n"
+"- Round numbers and recent highs/lows act as gravity\n"
+"- Don't bet against a level that just held three times unless you see it actually breaking\n\n"
+"You're not required to bet. Most setups aren't worth trading. A good trader skips the chop and only steps in when the picture is clear enough to defend.\n\n"
 "OUTPUT: single JSON object, no text before or after.\n"
 "{\n"
-'  "structure": "your own description of what the market is doing in 1-2 words",\n'
-'  "recent_move": "describe the most recent meaningful move in <80 chars",\n'
-'  "current_position": "where the current candle sits relative to that move, <60 chars",\n'
-'  "bull_case": "<100 chars",\n'
-'  "bear_case": "<100 chars",\n'
-'  "which_wins": "<100 chars",\n'
-'  "direction": "UP" or "DOWN",\n'
-'  "confidence": 3-10,\n'
-'  "reasoning": "one-sentence summary <80 chars",\n'
-'  "pattern": "short_snake_case_label that describes the setup you are seeing"\n'
+'  "what_im_seeing": "describe the chart in your own words, what stands out, <200 chars",\n'
+'  "the_call": "ABOVE_PTB or BELOW_PTB - where you think it closes",\n'
+'  "why": "your one-sentence reasoning, <150 chars",\n'
+'  "should_trade": true or false - is this clear enough to bet on?\n'
 "}"
 )
     
-    # Memory section REMOVED — was causing regime-persistence bias.
-    # Showing recent wins anchored Claude to keep predicting the same direction even
-    # after the market regime had changed. Each prediction now stands alone on the chart.
-    learning_section = ""
+    # Memory removed — was causing regime-persistence bias.
+    # Each prediction now stands alone on the chart.
     
     user_prompt = (
         "ASSET: " + asset + "\n"
-        "CURRENT PRICE: $" + "{:,.1f}".format(candles[-1][3]) + "\n\n"
+        "CURRENT BINANCE CLOSE: $" + "{:,.2f}".format(candles[-1][3]) + "\n"
+        "POLYMARKET PTB (settlement reference): $" + ("{:,.2f}".format(ptb) if ptb is not None else "unknown") + "\n\n"
         "LAST 25 CANDLES (15-min, oldest -> newest):\n"
         + "\n".join(candle_lines)
-        + "\n\nRead this chart fresh. You have no history — only what you see in these 25 candles.\n"
-        + "Build the bull case, build the bear case, decide which wins, then commit.\n"
-        + "OUTPUT: a single JSON object matching the format in the system prompt. NO text before or after.\n"
-        + "Begin your response with the opening brace {"
+        + "\n\nRead this chart. Decide if you'd actually bet on where it closes vs PTB in 15 minutes.\n"
+        + "If unclear or risky, set should_trade=false. Skipping is fine.\n"
+        + "Output the JSON. Begin with {"
     )
     
     return system_prompt, user_prompt
 
 
 
-def _p40_claude_predict(asset, candles, memory):
+def _p40_claude_predict(asset, candles, memory, ptb=None):
     """Calls Claude API via requests (mirrors analyze_match_with_claude pattern)."""
     import json as _json
     import time as _time
@@ -28727,7 +28715,7 @@ def _p40_claude_predict(asset, candles, memory):
         return None
     
     try:
-        sys_p, user_p = _p40_build_prompt(asset, candles, memory)
+        sys_p, user_p = _p40_build_prompt(asset, candles, memory, ptb)
         
         t0 = _time.time()
         r = _req.post(
@@ -28805,24 +28793,48 @@ def _p40_claude_predict(asset, candles, memory):
                 asset, extracted_dir, extracted_conf, extracted_pat))
             pred = {"direction": extracted_dir, "confidence": extracted_conf,
                     "reasoning": "extracted from malformed prose", "pattern": extracted_pat}
-        # Normalize direction to uppercase (Claude may slip and return "up" or "Up")
-        if pred.get("direction"):
-            pred["direction"] = str(pred["direction"]).upper().strip()
+        # Normalize the new field names (the_call, should_trade) and translate them
+        # to the old internal field names (direction, confidence) so the rest of the
+        # bot continues to work without changes.
+        
+        # Translate the_call -> direction
+        call = pred.get("the_call") or pred.get("call") or pred.get("direction")
+        if call:
+            call = str(call).upper().strip()
+            # Strip common prefixes/wrappers
+            if "ABOVE" in call:
+                pred["direction"] = "UP"   # above PTB = UP token on Polymarket
+            elif "BELOW" in call:
+                pred["direction"] = "DOWN"
+            elif call in ("UP", "DOWN"):
+                pred["direction"] = call
+            else:
+                print("[P4.0] {} unrecognized call: {}".format(asset, call))
+                return None
         if pred.get("direction") not in ("UP", "DOWN"):
             print("[P4.0] {} invalid direction: {}".format(asset, pred))
             return None
         
-        # Confidence might be returned as string or float - coerce robustly
-        try:
-            conf = int(float(pred.get("confidence", 0)))
-        except (ValueError, TypeError):
-            print("[P4.0] {} invalid conf (not numeric): {}".format(asset, pred.get("confidence")))
-            return None
-        if not (1 <= conf <= 10):
-            print("[P4.0] {} invalid conf: {}".format(asset, conf))
-            return None
+        # should_trade is the new boolean — Claude decides whether to fire.
+        # If field is missing, default to True (fire it) to be safe.
+        should_trade = pred.get("should_trade")
+        if isinstance(should_trade, str):
+            should_trade = should_trade.lower() in ("true", "yes", "1")
+        if should_trade is None:
+            should_trade = True
+        pred["should_trade"] = bool(should_trade)
         
-        pred["confidence"] = conf
+        # Set a synthetic confidence value so old code paths (DB column, dashboard, etc.)
+        # still have something to store. should_trade=True -> 7, False -> 4.
+        # This is purely for backward compatibility with stored data.
+        pred["confidence"] = 7 if pred["should_trade"] else 4
+        
+        # Use 'why' as reasoning if present, fall back to old field
+        if pred.get("why") and not pred.get("reasoning"):
+            pred["reasoning"] = pred["why"]
+        if pred.get("what_im_seeing") and not pred.get("recent_move"):
+            pred["recent_move"] = pred["what_im_seeing"]
+        
         pred["api_elapsed_ms"] = elapsed_ms
         pred["model"] = P40_CONFIG["model"]
         return pred
@@ -28904,7 +28916,13 @@ def _p40_predict_loop():
                     candles = list(raw[-100:])
                     memory = _p40_load_memory(asset, P40_CONFIG["memory_depth"])
                     
-                    pred = _p40_claude_predict(asset, candles, memory)
+                    # Look up the current Polymarket settlement reference (Chainlink price)
+                    try:
+                        ptb = _chainlink_prices.get(asset)
+                    except Exception:
+                        ptb = None
+                    
+                    pred = _p40_claude_predict(asset, candles, memory, ptb)
                     if pred is None:
                         continue
                     
@@ -28934,16 +28952,16 @@ def _p40_predict_loop():
                     except Exception as se:
                         print("[P4.0] Save error {}: {}".format(asset, se))
                     
-                    # Log richer output now that we have the full analysis
-                    print("[P4.0] {} {} c{} [{}/{}] '{}' [{}ms]".format(
-                        asset, pred["direction"], pred["confidence"],
-                        pred.get("structure", "?"),
-                        pred.get("pattern", ""),
-                        (pred.get("reasoning") or "")[:50],
+                    # Log Claude's read of the chart
+                    trade_flag = "TRADE" if pred.get("should_trade") else "SKIP"
+                    print("[P4.0] {} {} [{}] '{}' [{}ms]".format(
+                        asset, pred["direction"], trade_flag,
+                        (pred.get("reasoning") or "")[:80],
                         pred["api_elapsed_ms"]))
-                    print("  bull: {}".format((pred.get("bull_case") or "")[:120]))
-                    print("  bear: {}".format((pred.get("bear_case") or "")[:120]))
-                    print("  pick: {}".format((pred.get("which_wins") or "")[:120]))
+                    if pred.get("recent_move"):
+                        print("  saw:   {}".format(pred.get("recent_move", "")[:200]))
+                    if pred.get("why"):
+                        print("  why:   {}".format(pred.get("why", "")[:150]))
                 
                 except Exception as e:
                     print("[P4.0] {} predict error: {}".format(asset, e))
@@ -29005,10 +29023,11 @@ def _p40_fire_loop():
                     continue
                 
                 try:
-                    # Confidence filter
+                    # should_trade filter — Claude decides if the setup is worth firing.
+                    # confidence=4 means Claude returned should_trade=false; 7 means true.
                     if conf < P40_CONFIG["min_confidence_to_fire"]:
-                        msg = "conf {} < min {}".format(conf, P40_CONFIG["min_confidence_to_fire"])
-                        print("[P4.0] #{} {} {} c{} SKIP — {}".format(pid, asset, direction, conf, msg))
+                        msg = "Claude declined: should_trade=false"
+                        print("[P4.0] #{} {} {} SKIP — {}".format(pid, asset, direction, msg))
                         _db = get_db()
                         _db.run("UPDATE p40_predictions SET fired=TRUE, fire_reason=:fr WHERE id=:i", fr=msg, i=pid)
                         _db.close()
@@ -29131,6 +29150,31 @@ def _p40_fire_loop():
                     
                     print("[P4.0] #{} {} ORDER {} fill={} bal=${:.2f}".format(
                         pid, asset, status, fill_price, _p40_state["balance"]))
+                    
+                    # Telegram alert on live fill
+                    try:
+                        if status == "FILLED":
+                            send_telegram(
+                                "🎯 <b>P4.0 LIVE FIRE</b>\n"
+                                "{} {} @ {:.2f}c stake ${:.2f}\n"
+                                "Reasoning: {}\n"
+                                "Balance: ${:.2f}".format(
+                                    asset, direction, fill_price * 100, stake,
+                                    (reasoning or "")[:120],
+                                    _p40_state["balance"]
+                                )
+                            )
+                        else:
+                            send_telegram(
+                                "⚠️ <b>P4.0 UNFILLED</b>\n"
+                                "{} {} @ {:.2f}c — order did not match\n"
+                                "Balance: ${:.2f}".format(
+                                    asset, direction, best_ask * 100,
+                                    _p40_state["balance"]
+                                )
+                            )
+                    except Exception as te:
+                        print("[P4.0] Telegram send error: {}".format(te))
                 
                 except Exception as e:
                     print("[P4.0] Fire error #{}: {}".format(pid, e))
@@ -29267,6 +29311,22 @@ def _p40_resolve_loop():
                     print("[P4.0] Resolved #{} {} {}: ${:.1f}→${:.1f} actual={} → {} ${:+.2f} bal=${:.2f}".format(
                         pid, asset, direction, ptb_open, next_close, actual_dir, outcome,
                         pnl, _p40_state["balance"]))
+                    
+                    # Telegram alert on LIVE resolution only (skip shadow to avoid spam)
+                    if not shadow and order_status != "SHADOW" and outcome in ("WIN", "LOSS"):
+                        try:
+                            emoji = "✅" if outcome == "WIN" else "❌"
+                            send_telegram(
+                                "{} <b>P4.0 {}</b>\n"
+                                "{} {}: ${:.1f} → ${:.1f} ({})\n"
+                                "P&L: ${:+.2f}  |  Balance: ${:.2f}".format(
+                                    emoji, outcome,
+                                    asset, direction, ptb_open, next_close, actual_dir,
+                                    pnl, _p40_state["balance"]
+                                )
+                            )
+                        except Exception as te:
+                            print("[P4.0] Telegram resolve error: {}".format(te))
                 except Exception as ue:
                     print("[P4.0] Resolve update error #{}: {}".format(pid, ue))
             
@@ -29302,21 +29362,41 @@ def p40_status_endpoint():
 @app.route("/api/p40/enable", methods=["POST"])
 def p40_enable_endpoint():
     P40_CONFIG["enabled"] = True
+    mode = "SHADOW" if P40_CONFIG["shadow_mode"] else "LIVE"
+    try:
+        send_telegram("🟢 <b>P4.0 ENABLED</b> ({})\nBalance: ${:.2f}".format(
+            mode, _p40_state["balance"]))
+    except Exception:
+        pass
     return {"enabled": True, "shadow_mode": P40_CONFIG["shadow_mode"]}
 
 @app.route("/api/p40/disable", methods=["POST"])
 def p40_disable_endpoint():
     P40_CONFIG["enabled"] = False
+    try:
+        send_telegram("🔴 <b>P4.0 DISABLED</b>\nBalance: ${:.2f}".format(_p40_state["balance"]))
+    except Exception:
+        pass
     return {"enabled": False}
 
 @app.route("/api/p40/go_live", methods=["POST"])
 def p40_go_live_endpoint():
     P40_CONFIG["shadow_mode"] = False
+    try:
+        send_telegram("⚡ <b>P4.0 LIVE MODE</b>\nReal orders on Polymarket.\nBalance: ${:.2f}".format(
+            _p40_state["balance"]))
+    except Exception:
+        pass
     return {"shadow_mode": False, "message": "P4.0 IS NOW LIVE"}
 
 @app.route("/api/p40/go_shadow", methods=["POST"])
 def p40_go_shadow_endpoint():
     P40_CONFIG["shadow_mode"] = True
+    try:
+        send_telegram("🌑 <b>P4.0 SHADOW MODE</b>\nPaper only, no real orders.\nBalance: ${:.2f}".format(
+            _p40_state["balance"]))
+    except Exception:
+        pass
     return {"shadow_mode": True}
 
 
