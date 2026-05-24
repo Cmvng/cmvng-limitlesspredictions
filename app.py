@@ -29822,12 +29822,20 @@ def _p50_signal_thread():
     from datetime import datetime, timezone, timedelta
     
     print("[P5.0] Signal thread started")
+    _p50_first_loop = True
     
     while True:
         try:
             if not P50_CONFIG["enabled"]:
+                if _p50_first_loop:
+                    print("[P5.0] Signal thread: waiting for ENABLE (currently disabled)")
+                    _p50_first_loop = False
                 _time.sleep(60)
                 continue
+            
+            if _p50_first_loop:
+                print("[P5.0] Signal thread: ENABLED, entering main loop")
+                _p50_first_loop = False
             
             now = datetime.now(timezone.utc)
             # Next 15M boundary
@@ -30690,7 +30698,10 @@ def _p50_start():
     """Initialize P5.0 and start threads."""
     import threading
     
-    _p50_init_db()
+    try:
+        _p50_init_db()
+    except Exception as e:
+        print("[P5.0] DB init failed (will retry later): {}".format(e))
     
     # Restore balance from DB
     try:
@@ -30703,15 +30714,22 @@ def _p50_start():
             _p50_state["peak_balance"] = saved[0][1]
             print("[P5.0] Balance restored: ${:.2f} (peak ${:.2f})".format(
                 _p50_state["balance"], _p50_state["peak_balance"]))
-    except Exception:
-        pass
+    except Exception as e:
+        print("[P5.0] Balance restore failed: {}".format(e))
     
-    # Start threads
-    threading.Thread(target=_p50_signal_thread, daemon=True, name="p50-signal").start()
-    threading.Thread(target=_p50_entry_thread, daemon=True, name="p50-entry").start()
-    threading.Thread(target=_p50_resolve_loop, daemon=True, name="p50-resolve").start()
+    # Start threads — ALWAYS, even if DB init failed
+    try:
+        threading.Thread(target=_p50_signal_thread, daemon=True, name="p50-signal").start()
+        print("[P5.0] Signal thread started")
+        threading.Thread(target=_p50_entry_thread, daemon=True, name="p50-entry").start()
+        print("[P5.0] Entry thread started")
+        threading.Thread(target=_p50_resolve_loop, daemon=True, name="p50-resolve").start()
+        print("[P5.0] Resolve thread started")
+    except Exception as e:
+        print("[P5.0] CRITICAL — thread start failed: {}".format(e))
+        import traceback; traceback.print_exc()
     
-    print("[P5.0] All threads started (enabled={}, shadow={}, balance=${:.2f})".format(
+    print("[P5.0] Startup complete (enabled={}, shadow={}, balance=${:.2f})".format(
         P50_CONFIG["enabled"], P50_CONFIG["shadow_mode"], _p50_state["balance"]))
 
 
