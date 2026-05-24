@@ -1874,13 +1874,14 @@ def _bot2_sniper_thread():
     
     while True:
         try:
-            # P4.0 also needs the 15M candle prefetch — keep the loop alive if it's enabled.
-            # P40_CONFIG is defined later in the file, so use globals().get() for safe lookup.
+            # P4.0 and P5.0 also need the 15M candle prefetch — keep the loop alive if enabled.
             _p40_enabled = globals().get("P40_CONFIG", {}).get("enabled", False)
+            _p50_enabled = globals().get("P50_CONFIG", {}).get("enabled", False)
             if (not _bot2_sniper_state["enabled"]
                 and not _p29cl_state["enabled"]
                 and not _p30_state["enabled"]
-                and not _p40_enabled):
+                and not _p40_enabled
+                and not _p50_enabled):
                 _time.sleep(30)
                 continue
             
