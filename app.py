@@ -29695,18 +29695,22 @@ def _p50_build_confirmation_prompt(asset, candles, ptb, p21_direction, p21_confi
     distance = current_price - ptb if ptb else 0
     dist_str = "${:+.2f}".format(distance) if ptb else "unknown"
     
-    user_prompt = (
-        "ASSET: {}\n".format(asset) +
-        "P2.1 SIGNAL: {} (confidence: {}, indicators: {})\n".format(
-            p21_direction, p21_confidence, p21_indicators) +
-        "PTB (settlement reference): ${:,.2f}\n".format(ptb) if ptb else "" +
-        "CURRENT PRICE: ${:,.2f} ({} from PTB)\n\n".format(current_price, dist_str) +
-        "LAST 25 CANDLES (15-min, oldest -> newest):\n" +
-        "\n".join(candle_lines) +
-        "\n\nDoes the chart support P2.1's {} call? Look for specific reasons to reject. "
-        "If nothing jumps out, confirm.\n"
-        "Output JSON. Begin with {{".format(p21_direction)
-    )
+    parts = []
+    parts.append("ASSET: {}".format(asset))
+    parts.append("P2.1 SIGNAL: {} (confidence: {}, indicators: {})".format(
+        p21_direction, p21_confidence, p21_indicators))
+    if ptb:
+        parts.append("PTB (settlement reference): ${:,.2f}".format(ptb))
+    parts.append("CURRENT PRICE: ${:,.2f} ({} from PTB)".format(current_price, dist_str))
+    parts.append("")
+    parts.append("LAST 25 CANDLES (15-min, oldest -> newest):")
+    parts.append("\n".join(candle_lines))
+    parts.append("")
+    parts.append("Does the chart support P2.1's {} call? Look for specific reasons to reject. "
+                 "If nothing jumps out, confirm.".format(p21_direction))
+    parts.append('Output JSON. Begin with {')
+    
+    user_prompt = "\n".join(parts)
     
     return system_prompt, user_prompt
 
@@ -29721,32 +29725,49 @@ def _p50_claude_confirm(asset, candles, ptb, p21_direction, p21_confidence, p21_
     import time as _time
     import requests as _req
     import re as _re
+    import os as _os
     import traceback as _tb
     
     if not candles or len(candles) < 25:
+        print("[P5.0] {} Claude skip: only {} candles".format(asset, len(candles) if candles else 0))
+        return None
+    
+    # Check API key
+    try:
+        api_key = ANTHROPIC_KEY
+    except NameError:
+        api_key = globals().get("ANTHROPIC_KEY") or _os.environ.get("ANTHROPIC_API_KEY")
+    
+    if not api_key:
+        print("[P5.0] {} ERROR: no ANTHROPIC_KEY available".format(asset))
         return None
     
     try:
         sys_p, user_p = _p50_build_confirmation_prompt(
             asset, candles, ptb, p21_direction, p21_confidence, p21_indicators)
         
+        print("[P5.0] {} sending API request ({} candles, ptb={})...".format(
+            asset, len(candles), ptb))
+        
         t0 = _time.time()
         r = _req.post(
             "https://api.anthropic.com/v1/messages",
             headers={
-                "x-api-key": ANTHROPIC_KEY,
+                "x-api-key": api_key,
                 "anthropic-version": "2023-06-01",
                 "content-type": "application/json"
             },
             json={
                 "model": P50_CONFIG["model"],
-                "max_tokens": 200,  # Very short response needed
+                "max_tokens": 200,
                 "messages": [{"role": "user", "content": user_p}],
                 "system": sys_p
             },
             timeout=30
         )
         elapsed_ms = int((_time.time() - t0) * 1000)
+        
+        print("[P5.0] {} API responded: HTTP {} in {}ms".format(asset, r.status_code, elapsed_ms))
         
         if r.status_code != 200:
             print("[P5.0] {} API HTTP {}: {}".format(asset, r.status_code, r.text[:200]))
@@ -29895,11 +29916,12 @@ def _p50_signal_thread():
                         ptb = None
                     
                     # ── Step 3: Ask Claude to confirm or reject ──
+                    print("[P5.0] {} calling Claude API...".format(asset))
                     claude_result = _p50_claude_confirm(
                         asset, candles, ptb, p21_dir_label, p21_confidence, ind_str)
                     
                     if claude_result is None:
-                        print("[P5.0] {} Claude failed to respond — skip".format(asset))
+                        print("[P5.0] {} Claude returned None — skip".format(asset))
                         continue
                     
                     decision = claude_result["decision"]
@@ -30530,12 +30552,13 @@ def p50_disable_endpoint():
 @app.route("/api/p50/go_live", methods=["POST"])
 def p50_go_live_endpoint():
     P50_CONFIG["shadow_mode"] = False
+    P50_CONFIG["enabled"] = True  # GO LIVE also enables
     try:
         send_telegram("⚡ <b>P5.0 LIVE MODE</b>\nP2.1 + Claude confirmed + delayed entry\nBalance: ${:.2f}".format(
             _p50_state["balance"]))
     except Exception:
         pass
-    return {"shadow_mode": False, "message": "P5.0 IS NOW LIVE"}
+    return {"shadow_mode": False, "enabled": True, "message": "P5.0 IS NOW LIVE"}
 
 @app.route("/api/p50/go_shadow", methods=["POST"])
 def p50_go_shadow_endpoint():
