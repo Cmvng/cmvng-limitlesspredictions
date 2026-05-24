@@ -7338,6 +7338,7 @@ def send_telegram(message):
         "POLY",                              # Polymarket Alpha notifications
         "SNIPER", "Sniper", "LMTS",                  # Sniper Alpha 4.0 notifications
         "P4.0", "P40",                       # P4.0 Claude-powered prediction engine
+        "P5.0", "P50",                       # P5.0 P2.1 + Claude confirmed
         "Auto-trading", "Kill switch",        # System control alerts
         "Auto-redeemed", "Redeemed",          # Redemption confirmations
         "Bot v4", "LIVE",                     # Startup message
@@ -29581,6 +29582,1132 @@ if ANTHROPIC_KEY:
         P40_CONFIG["enabled"], P40_CONFIG["shadow_mode"], _p40_state["balance"]))
 else:
     print("[P4.0] ANTHROPIC_API_KEY not set — threads NOT started")
+
+
+
+
+################################################################################
+# P5.0 — P2.1 Direction + Claude Confirmation + Delayed Entry
+################################################################################
+
+"""
+═══════════════════════════════════════════════════════════════════════════════
+P5.0 — P2.1 Direction + Claude Confirmation + Smart Entry
+═══════════════════════════════════════════════════════════════════════════════
+
+Architecture:
+  1. P2.1 generates direction (TV + SMA + BTC majority vote) — proven 59.2% WR
+  2. Claude reads 25 candles + PTB + P2.1's call — confirms or rejects
+  3. Only fire when both agree
+  4. Wait for good odds (delayed entry, not T-0 scramble)
+
+Claude's role: NOT predicting direction. Just answering "does the chart
+support P2.1's call right now?" — catching the 40% of P2.1 losers where
+the chart clearly contradicts the signal.
+"""
+
+# ═════════════════════════════════════════════════════════════════════════════
+# P5.0 CONFIG & STATE
+# ═════════════════════════════════════════════════════════════════════════════
+
+P50_CONFIG = {
+    "enabled": False,
+    "shadow_mode": True,
+    "model": "claude-sonnet-4-5",
+    "assets": ["BTC", "ETH"],
+    "stake_usd": 2.50,
+    # Entry timing
+    "entry_delay_seconds": 120,     # Wait 2 min after boundary before first entry attempt
+    "entry_window_seconds": 300,    # Give up trying to enter after 5 min
+    "max_entry_odds": 0.55,         # Don't buy if our side is already > 55c
+    "ideal_entry_odds": 0.45,       # Best entry zone: our side at 35-45c
+}
+
+_p50_state = {
+    "balance": 50.0,
+    "starting_balance": 50.0,
+    "peak_balance": 50.0,
+    "floor_balance": 5.0,
+    "trades_today": 0,
+    "wins_today": 0,
+    "losses_today": 0,
+}
+
+_p50_predicted_boundaries = set()
+_p50_traded_keys = set()
+_p50_pending_signals = {}  # {boundary_ts: {asset: {direction, claude_confirmed, ...}}}
+
+
+def _p50_save_balance():
+    try:
+        _db = get_db()
+        _db.run("""
+            INSERT INTO p50_balance_state (balance, peak_balance, updated_at)
+            VALUES (:b, :p, NOW())
+        """, b=_p50_state["balance"], p=_p50_state["peak_balance"])
+        _db.close()
+    except Exception:
+        pass
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# CLAUDE CONFIRMATION PROMPT
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _p50_build_confirmation_prompt(asset, candles, ptb, p21_direction, p21_confidence, p21_indicators):
+    """Build the prompt where Claude confirms or rejects P2.1's signal."""
+    
+    # Format candles
+    candle_lines = []
+    for i, c in enumerate(candles[-25:], 1):
+        o, h, l, cl = c[0], c[1], c[2], c[3]
+        body = cl - o
+        size = "mega" if abs(body) > (h - l) * 0.7 and abs(body) > 0 else \
+               "small" if abs(body) < (h - l) * 0.3 else "normal"
+        color = "G" if body >= 0 else "R"
+        candle_lines.append("{}: O={:.1f} H={:.1f} L={:.1f} C={:.1f} body={:+.1f} {} {}".format(
+            i, o, h, l, cl, body, color, size))
+    
+    system_prompt = (
+"You are a seasoned prediction market trader reviewing a trade setup.\n\n"
+"A mechanical trading system (P2.1) has generated a signal based on technical indicators. "
+"P2.1 has a proven 59.2% win rate across 5,751 trades. Its direction calls are reliable.\n\n"
+"Your job is NOT to predict direction — P2.1 already did that. Your job is to look at the "
+"chart and decide: is there anything that makes THIS SPECIFIC setup a bad trade?\n\n"
+"You are looking for reasons to REJECT, not reasons to confirm. If the chart looks normal "
+"for this kind of trade, confirm it. Only reject if you see something specific that "
+"contradicts the signal:\n"
+"- A level that has been tested and held multiple times AGAINST the predicted direction\n"
+"- Clear exhaustion after an extended move in the predicted direction\n"
+"- A parabolic spike that's likely to retrace\n"
+"- Price trapped at a boundary with no momentum\n\n"
+"If you don't see a clear reason to reject, CONFIRM. P2.1 has earned the benefit of the doubt "
+"with its track record. Don't overthink it.\n\n"
+"OUTPUT: single JSON object, no text before or after.\n"
+"{\n"
+'  "decision": "CONFIRM" or "REJECT",\n'
+'  "reason": "one sentence, <100 chars"\n'
+"}"
+)
+    
+    current_price = candles[-1][3]
+    distance = current_price - ptb if ptb else 0
+    dist_str = "${:+.2f}".format(distance) if ptb else "unknown"
+    
+    user_prompt = (
+        "ASSET: {}\n".format(asset) +
+        "P2.1 SIGNAL: {} (confidence: {}, indicators: {})\n".format(
+            p21_direction, p21_confidence, p21_indicators) +
+        "PTB (settlement reference): ${:,.2f}\n".format(ptb) if ptb else "" +
+        "CURRENT PRICE: ${:,.2f} ({} from PTB)\n\n".format(current_price, dist_str) +
+        "LAST 25 CANDLES (15-min, oldest -> newest):\n" +
+        "\n".join(candle_lines) +
+        "\n\nDoes the chart support P2.1's {} call? Look for specific reasons to reject. "
+        "If nothing jumps out, confirm.\n"
+        "Output JSON. Begin with {{".format(p21_direction)
+    )
+    
+    return system_prompt, user_prompt
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# CLAUDE API CALL
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _p50_claude_confirm(asset, candles, ptb, p21_direction, p21_confidence, p21_indicators):
+    """Ask Claude to confirm or reject P2.1's signal."""
+    import json as _json
+    import time as _time
+    import requests as _req
+    import re as _re
+    import traceback as _tb
+    
+    if not candles or len(candles) < 25:
+        return None
+    
+    try:
+        sys_p, user_p = _p50_build_confirmation_prompt(
+            asset, candles, ptb, p21_direction, p21_confidence, p21_indicators)
+        
+        t0 = _time.time()
+        r = _req.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": ANTHROPIC_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json"
+            },
+            json={
+                "model": P50_CONFIG["model"],
+                "max_tokens": 200,  # Very short response needed
+                "messages": [{"role": "user", "content": user_p}],
+                "system": sys_p
+            },
+            timeout=30
+        )
+        elapsed_ms = int((_time.time() - t0) * 1000)
+        
+        if r.status_code != 200:
+            print("[P5.0] {} API HTTP {}: {}".format(asset, r.status_code, r.text[:200]))
+            return None
+        
+        data = r.json()
+        raw = ""
+        for block in data.get("content", []):
+            if block.get("type") == "text":
+                raw += block.get("text", "")
+        
+        raw = raw.strip()
+        # Strip markdown fences
+        raw = _re.sub(r'^```(?:json)?\s*', '', raw)
+        raw = _re.sub(r'\s*```$', '', raw)
+        
+        # Parse JSON
+        result = None
+        try:
+            result = _json.loads(raw)
+        except _json.JSONDecodeError:
+            # Try regex extraction
+            json_match = _re.search(r'\{[^{}]*"decision"[^{}]*\}', raw, _re.DOTALL)
+            if json_match:
+                try:
+                    result = _json.loads(json_match.group(0))
+                except _json.JSONDecodeError:
+                    pass
+        
+        if result is None:
+            # Fallback: look for CONFIRM or REJECT in raw text
+            upper = raw.upper()
+            if "CONFIRM" in upper:
+                result = {"decision": "CONFIRM", "reason": "extracted from prose"}
+            elif "REJECT" in upper:
+                result = {"decision": "REJECT", "reason": "extracted from prose"}
+            else:
+                print("[P5.0] {} could not parse Claude response: {}".format(asset, raw[:200]))
+                return None
+        
+        decision = str(result.get("decision", "")).upper().strip()
+        if decision not in ("CONFIRM", "REJECT"):
+            # Try to interpret
+            if "CONF" in decision:
+                decision = "CONFIRM"
+            elif "REJ" in decision:
+                decision = "REJECT"
+            else:
+                print("[P5.0] {} unrecognized decision: {}".format(asset, decision))
+                return None
+        
+        reason = result.get("reason", "")
+        
+        return {
+            "decision": decision,
+            "reason": reason,
+            "api_elapsed_ms": elapsed_ms,
+        }
+    
+    except Exception as e:
+        print("[P5.0] {} Claude error: {}".format(asset, e))
+        import traceback; traceback.print_exc()
+        return None
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# SIGNAL GENERATION THREAD — runs at T-15s before each boundary
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _p50_signal_thread():
+    """Generate P2.1 + Claude confirmed signals before each boundary."""
+    import time as _time
+    from datetime import datetime, timezone, timedelta
+    
+    print("[P5.0] Signal thread started")
+    
+    while True:
+        try:
+            if not P50_CONFIG["enabled"]:
+                _time.sleep(60)
+                continue
+            
+            now = datetime.now(timezone.utc)
+            # Next 15M boundary
+            nm = ((now.minute // 15) + 1) * 15
+            if nm >= 60:
+                nxt = now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+            else:
+                nxt = now.replace(minute=nm, second=0, microsecond=0)
+            
+            secs_until = (nxt - now).total_seconds()
+            
+            # Wake up 15s before boundary
+            if secs_until > 20:
+                _time.sleep(min(secs_until - 18, 60))
+                continue
+            
+            boundary_key = nxt.strftime("%Y%m%d_%H%M")
+            if boundary_key in _p50_predicted_boundaries:
+                _time.sleep(5)
+                continue
+            
+            _p50_predicted_boundaries.add(boundary_key)
+            
+            for asset in P50_CONFIG["assets"]:
+                try:
+                    # ── Step 1: Get P2.1 direction ──
+                    p21_result = _sniper_get_direction(asset, "15m")
+                    if p21_result is None or p21_result[0] is None:
+                        print("[P5.0] {} P2.1 no signal — skip".format(asset))
+                        continue
+                    
+                    p21_direction, signals_agree, ind_str, p21_confidence = p21_result
+                    p21_dir_label = "UP" if p21_direction == "BUY" else "DOWN"
+                    
+                    print("[P5.0] {} P2.1 says {} ({}, {}/{})".format(
+                        asset, p21_dir_label, p21_confidence, signals_agree, 3))
+                    
+                    # ── Step 2: Get candles and PTB ──
+                    raw_candles = _p29cl_candle_prefetch.get(asset, [])
+                    if len(raw_candles) < 50:
+                        print("[P5.0] {} insufficient candles ({})".format(asset, len(raw_candles)))
+                        continue
+                    
+                    candles = list(raw_candles[-100:])
+                    
+                    try:
+                        ptb = _chainlink_prices.get(asset)
+                    except Exception:
+                        ptb = None
+                    
+                    # ── Step 3: Ask Claude to confirm or reject ──
+                    claude_result = _p50_claude_confirm(
+                        asset, candles, ptb, p21_dir_label, p21_confidence, ind_str)
+                    
+                    if claude_result is None:
+                        print("[P5.0] {} Claude failed to respond — skip".format(asset))
+                        continue
+                    
+                    decision = claude_result["decision"]
+                    reason = claude_result["reason"]
+                    elapsed = claude_result["api_elapsed_ms"]
+                    
+                    print("[P5.0] {} Claude: {} — '{}' [{}ms]".format(
+                        asset, decision, reason[:80], elapsed))
+                    
+                    # ── Step 4: Save to DB ──
+                    try:
+                        _db = get_db()
+                        _db.run("""
+                            INSERT INTO p50_signals
+                            (asset, boundary_ts, p21_direction, p21_confidence, p21_indicators,
+                             claude_decision, claude_reason, claude_elapsed_ms,
+                             ptb_at_signal, price_at_signal, shadow_mode)
+                            VALUES (:a, :bt, :pd, :pc, :pi,
+                                    :cd, :cr, :ce,
+                                    :ptb, :pr, :sh)
+                        """, a=asset, bt=nxt, pd=p21_dir_label, pc=p21_confidence, pi=ind_str,
+                            cd=decision, cr=reason, ce=elapsed,
+                            ptb=ptb, pr=candles[-1][3] if candles else None,
+                            sh=P50_CONFIG["shadow_mode"])
+                        _db.close()
+                    except Exception as e:
+                        print("[P5.0] {} save error: {}".format(asset, e))
+                    
+                    # ── Step 5: Queue for entry if confirmed ──
+                    if decision == "CONFIRM":
+                        if boundary_key not in _p50_pending_signals:
+                            _p50_pending_signals[boundary_key] = {}
+                        
+                        _p50_pending_signals[boundary_key][asset] = {
+                            "direction": p21_dir_label,
+                            "p21_confidence": p21_confidence,
+                            "p21_indicators": ind_str,
+                            "claude_reason": reason,
+                            "ptb": ptb,
+                            "boundary_ts": nxt,
+                            "queued_at": datetime.now(timezone.utc),
+                        }
+                        
+                        # Telegram alert for confirmed signal
+                        try:
+                            mode = "SHADOW" if P50_CONFIG["shadow_mode"] else "LIVE"
+                            send_telegram(
+                                "🔍 <b>P5.0 CONFIRMED</b> [{}]\n"
+                                "{} {} (P2.1: {}, Claude: ✓)\n"
+                                "Reason: {}\n"
+                                "Waiting for entry...".format(
+                                    mode, asset, p21_dir_label, p21_confidence,
+                                    reason[:100]))
+                        except Exception:
+                            pass
+                    else:
+                        # Telegram for rejections (less noisy)
+                        print("[P5.0] {} REJECTED — Claude says: {}".format(asset, reason[:80]))
+                        try:
+                            send_telegram(
+                                "⛔ <b>P5.0 REJECTED</b>\n"
+                                "{} {} — Claude: {}\n"
+                                "P2.1 signal overridden".format(
+                                    asset, p21_dir_label, reason[:100]))
+                        except Exception:
+                            pass
+                
+                except Exception as e:
+                    print("[P5.0] {} signal error: {}".format(asset, e))
+                    import traceback; traceback.print_exc()
+            
+            # Cleanup old boundaries
+            if len(_p50_predicted_boundaries) > 100:
+                keep = sorted(_p50_predicted_boundaries)[-50:]
+                _p50_predicted_boundaries.clear()
+                _p50_predicted_boundaries.update(keep)
+            
+        except Exception as e:
+            print("[P5.0] Signal thread error: {}".format(e))
+            import traceback; traceback.print_exc()
+            _time.sleep(10)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# ENTRY THREAD — watches for good odds after Claude confirms
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _p50_entry_thread():
+    """Watch confirmed signals and enter at good odds."""
+    import time as _time
+    from datetime import datetime, timezone, timedelta
+    
+    print("[P5.0] Entry thread started")
+    
+    while True:
+        try:
+            if not P50_CONFIG["enabled"]:
+                _time.sleep(30)
+                continue
+            
+            now = datetime.now(timezone.utc)
+            
+            # Process pending signals
+            keys_to_remove = []
+            
+            for boundary_key, assets in list(_p50_pending_signals.items()):
+                for asset, signal in list(assets.items()):
+                    boundary_ts = signal["boundary_ts"]
+                    queued_at = signal.get("queued_at", boundary_ts)
+                    
+                    # Ensure timezone-aware comparison
+                    if boundary_ts.tzinfo is None:
+                        boundary_ts = boundary_ts.replace(tzinfo=timezone.utc)
+                    
+                    secs_since_boundary = (now - boundary_ts).total_seconds()
+                    
+                    # Not yet at boundary — wait
+                    if secs_since_boundary < 0:
+                        continue
+                    
+                    # Too late — entry window closed
+                    if secs_since_boundary > P50_CONFIG["entry_window_seconds"]:
+                        print("[P5.0] {} entry window expired ({:.0f}s) — skip".format(
+                            asset, secs_since_boundary))
+                        
+                        # Save as expired
+                        try:
+                            _db = get_db()
+                            _db.run("""
+                                UPDATE p50_signals SET entry_status='EXPIRED'
+                                WHERE asset=:a AND boundary_ts=:bt AND entry_status IS NULL
+                            """, a=asset, bt=boundary_ts)
+                            _db.close()
+                        except Exception:
+                            pass
+                        
+                        del assets[asset]
+                        continue
+                    
+                    # In the delay period — wait before first attempt
+                    if secs_since_boundary < P50_CONFIG["entry_delay_seconds"]:
+                        continue
+                    
+                    # ── Ready to look for entry ──
+                    direction = signal["direction"]
+                    trade_key = "p50_{}_{}".format(asset, boundary_key)
+                    
+                    if trade_key in _p50_traded_keys:
+                        del assets[asset]
+                        continue
+                    
+                    # Find the current market and check odds
+                    try:
+                        # Look up the active 15M market for this asset + direction
+                        market_info = _p50_find_active_market(asset, boundary_ts)
+                        
+                        if market_info is None:
+                            # No market found yet — try again next cycle
+                            continue
+                        
+                        # Pick the right token and odds for our direction
+                        if direction == "UP":
+                            token_id = market_info["up_token"]
+                            current_odds = market_info["up_odds"]
+                        else:
+                            token_id = market_info["down_token"]
+                            current_odds = market_info["down_odds"]
+                        
+                        market_id = market_info["market_id"]
+                        
+                        if current_odds is None:
+                            continue
+                        
+                        # Check if odds are favorable
+                        # Max odds tied to signal strength:
+                        #   HIGH (3/3 indicators agree) + Claude confirm → worth paying up to 65c
+                        #   MEDIUM (2/3 agree) + Claude confirm → only enter cheap, max 55c
+                        p21_conf = signal.get("p21_confidence", "MEDIUM")
+                        if p21_conf == "HIGH":
+                            max_odds = 0.65
+                        else:
+                            max_odds = P50_CONFIG["max_entry_odds"]  # 0.55
+                        
+                        if current_odds > max_odds:
+                            # Too expensive — price already moved our way
+                            # Wait and see if it comes back, or skip if near end of window
+                            if secs_since_boundary > P50_CONFIG["entry_window_seconds"] - 60:
+                                print("[P5.0] {} odds too high ({:.0f}c > {:.0f}c max) — skip".format(
+                                    asset, current_odds * 100, max_odds * 100))
+                                del assets[asset]
+                            continue
+                        
+                        # ── FIRE ──
+                        stake = P50_CONFIG["stake_usd"]
+                        
+                        # Balance check
+                        if not P50_CONFIG["shadow_mode"]:
+                            if _p50_state["balance"] - stake < _p50_state["floor_balance"]:
+                                print("[P5.0] {} balance too low (${:.2f}) — skip".format(
+                                    asset, _p50_state["balance"]))
+                                del assets[asset]
+                                continue
+                        
+                        print("[P5.0] {} {} ENTRY at {:.0f}c (waited {:.0f}s) — P2.1:{} Claude:✓".format(
+                            asset, direction, current_odds * 100, secs_since_boundary,
+                            signal["p21_confidence"]))
+                        
+                        if P50_CONFIG["shadow_mode"]:
+                            # Shadow mode — just log
+                            print("[P5.0 SHADOW] {} {} WOULD FIRE at {:.0f}c ${:.2f}".format(
+                                asset, direction, current_odds * 100, stake))
+                            
+                            try:
+                                _db = get_db()
+                                _db.run("""
+                                    UPDATE p50_signals
+                                    SET entry_status='SHADOW_FIRE', entry_odds=:eo,
+                                        entry_delay_secs=:ds, stake=:st
+                                    WHERE asset=:a AND boundary_ts=:bt AND entry_status IS NULL
+                                """, eo=current_odds, ds=int(secs_since_boundary),
+                                    st=stake, a=asset, bt=boundary_ts)
+                                _db.close()
+                            except Exception:
+                                pass
+                        else:
+                            # LIVE — place real order using Polymarket CLOB client
+                            bet_side_label = "UP" if direction == "UP" else "DOWN"
+                            
+                            try:
+                                _p50_client = _get_poly_client()
+                                if _p50_client:
+                                    from py_clob_client_v2 import Side as _P50Side, OrderArgs as _P50Args, OrderType as _P50OT
+                                    
+                                    # Place limit at best ask + 1c buffer
+                                    # This ensures fill while keeping price controlled
+                                    # Polymarket fills at-or-below limit, so if real ask
+                                    # is 42c and we limit at 43c, we fill at 42c
+                                    _p50_fill_price = round(min(current_odds + 0.01, 0.60), 2)
+                                    _p50_shares = int(stake / _p50_fill_price)
+                                    _p50_actual_cost = round(_p50_shares * _p50_fill_price, 2)
+                                    
+                                    if _p50_shares >= 1:
+                                        _p50_order_args = _P50Args(
+                                            token_id=str(token_id),
+                                            price=_p50_fill_price,
+                                            size=float(_p50_shares),
+                                            side=_P50Side.BUY,
+                                        )
+                                        _p50_signed = _p50_client.create_order(_p50_order_args)
+                                        resp = _p50_client.post_order(_p50_signed, _P50OT.GTC)
+                                    else:
+                                        resp = None
+                                else:
+                                    resp = None
+                                
+                                fill_price = None
+                                status = "UNFILLED"
+                                oid = None
+                                
+                                if resp:
+                                    oid = resp.get("orderID") or resp.get("id")
+                                    st = (resp.get("status") or "").upper()
+                                    matched = float(resp.get("sizeMatched") or 0)
+                                    if st in ("MATCHED", "FILLED") or matched > 0:
+                                        fill_price = current_odds
+                                        status = "FILLED"
+                                        _p50_state["balance"] = round(
+                                            _p50_state["balance"] - stake, 2)
+                                        _p50_state["trades_today"] += 1
+                                        _p50_save_balance()
+                                
+                                _db = get_db()
+                                _db.run("""
+                                    UPDATE p50_signals
+                                    SET entry_status=:es, entry_odds=:eo, fill_price=:fp,
+                                        entry_delay_secs=:ds, stake=:st, order_id=:oid,
+                                        balance_after=:bal
+                                    WHERE asset=:a AND boundary_ts=:bt AND entry_status IS NULL
+                                """, es=status, eo=current_odds, fp=fill_price,
+                                    ds=int(secs_since_boundary), st=stake, oid=oid,
+                                    bal=_p50_state["balance"],
+                                    a=asset, bt=boundary_ts)
+                                _db.close()
+                                
+                                print("[P5.0] {} ORDER {} fill={} bal=${:.2f}".format(
+                                    asset, status, fill_price, _p50_state["balance"]))
+                                
+                                # Telegram
+                                try:
+                                    if status == "FILLED":
+                                        send_telegram(
+                                            "🎯 <b>P5.0 LIVE FIRE</b>\n"
+                                            "{} {} @ {:.0f}c ${:.2f}\n"
+                                            "P2.1: {} | Claude: ✓\n"
+                                            "Entry delay: {:.0f}s\n"
+                                            "Reason: {}\n"
+                                            "Balance: ${:.2f}".format(
+                                                asset, direction, current_odds * 100, stake,
+                                                signal["p21_confidence"],
+                                                secs_since_boundary,
+                                                signal["claude_reason"][:80],
+                                                _p50_state["balance"]))
+                                    else:
+                                        send_telegram(
+                                            "⚠️ <b>P5.0 UNFILLED</b>\n"
+                                            "{} {} — order didn't match".format(
+                                                asset, direction))
+                                except Exception:
+                                    pass
+                                    
+                            except Exception as oe:
+                                print("[P5.0] {} order error: {}".format(asset, oe))
+                                import traceback; traceback.print_exc()
+                        
+                        _p50_traded_keys.add(trade_key)
+                        del assets[asset]
+                    
+                    except Exception as e:
+                        print("[P5.0] {} entry check error: {}".format(asset, e))
+                        import traceback; traceback.print_exc()
+                
+                # Clean up empty boundary entries
+                if not assets:
+                    keys_to_remove.append(boundary_key)
+            
+            for k in keys_to_remove:
+                _p50_pending_signals.pop(k, None)
+            
+            # Clean up old traded keys
+            if len(_p50_traded_keys) > 200:
+                _p50_traded_keys.clear()
+            
+            _time.sleep(10)  # Check every 10 seconds for entry opportunities
+        
+        except Exception as e:
+            print("[P5.0] Entry thread error: {}".format(e))
+            import traceback; traceback.print_exc()
+            _time.sleep(10)
+
+
+def _p50_find_active_market(asset, boundary_ts):
+    """Find the active 15M Polymarket market for this asset.
+    Uses the existing _p29cl_token_map populated by the prefetch thread.
+    Returns {up_token, down_token, up_odds, down_odds, market_id} or None.
+    """
+    # _p29cl_token_map is indexed by asset name ("BTC", "ETH")
+    # and contains {"up_token": "...", "down_token": "...", "slug": "..."}
+    entry = _p29cl_token_map.get(asset)
+    if not entry or not isinstance(entry, dict):
+        return None
+    
+    up_token = entry.get("up_token")
+    down_token = entry.get("down_token")
+    
+    if not up_token or not down_token:
+        return None
+    
+    # Get current odds from order book
+    best_ask_up = None
+    best_ask_down = None
+    
+    try:
+        _p50_ob_client = _get_poly_client()
+        if _p50_ob_client:
+            try:
+                book_up = _p50_ob_client.get_order_book(str(up_token))
+                if book_up and book_up.get("asks"):
+                    asks = [float(a.get("price", 0)) for a in book_up["asks"] if float(a.get("price", 0)) > 0]
+                    if asks:
+                        best_ask_up = min(asks)
+            except Exception:
+                pass
+            
+            try:
+                book_down = _p50_ob_client.get_order_book(str(down_token))
+                if book_down and book_down.get("asks"):
+                    asks = [float(a.get("price", 0)) for a in book_down["asks"] if float(a.get("price", 0)) > 0]
+                    if asks:
+                        best_ask_down = min(asks)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    
+    if best_ask_up is None and best_ask_down is None:
+        return None
+    
+    return {
+        "up_token": up_token,
+        "down_token": down_token,
+        "up_odds": best_ask_up,
+        "down_odds": best_ask_down,
+        "market_id": entry.get("slug", ""),
+    }
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# RESOLVE LOOP
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _p50_resolve_loop():
+    """Resolve P5.0 trades by checking actual chainlink close vs PTB."""
+    import time as _time
+    from datetime import datetime, timezone, timedelta
+    
+    print("[P5.0] Resolve loop started")
+    
+    while True:
+        try:
+            if not P50_CONFIG["enabled"]:
+                _time.sleep(60)
+                continue
+            
+            cutoff = datetime.now(timezone.utc) - timedelta(minutes=31)
+            
+            _db = get_db()
+            rows = _db.run("""
+                SELECT id, asset, boundary_ts, p21_direction, entry_status,
+                       stake, fill_price, shadow_mode, ptb_at_signal
+                FROM p50_signals
+                WHERE outcome IS NULL
+                  AND entry_status IN ('FILLED', 'SHADOW_FIRE')
+                  AND boundary_ts < :cutoff
+                ORDER BY id LIMIT 20
+            """, cutoff=cutoff)
+            unresolved = list(rows)
+            _db.close()
+            
+            for r in unresolved:
+                pid, asset, boundary_ts, direction, entry_status, stake, fill_price, shadow, ptb = r
+                
+                now = datetime.now(timezone.utc)
+                if boundary_ts.tzinfo is None:
+                    boundary_ts = boundary_ts.replace(tzinfo=timezone.utc)
+                age_min = (now - boundary_ts).total_seconds() / 60
+                
+                if age_min < 31:
+                    continue
+                
+                # Look up the close price for the resolution candle
+                anchor_close = None
+                next_close = None
+                try:
+                    candles = _p29cl_candle_prefetch.get(asset, [])
+                    n = int((age_min - 30) // 15)
+                    anchor_idx = -(n + 3)
+                    resolution_idx = -(n + 2)
+                    if len(candles) >= abs(anchor_idx):
+                        anchor_close = candles[anchor_idx][3]
+                        next_close = candles[resolution_idx][3]
+                except Exception as ce:
+                    print("[P5.0] Resolve lookup error #{}: {}".format(pid, ce))
+                
+                if anchor_close is None or next_close is None:
+                    if age_min > 90:
+                        try:
+                            _db = get_db()
+                            _db.run("""
+                                UPDATE p50_signals SET outcome='UNRESOLVED', resolved_at=NOW()
+                                WHERE id=:i
+                            """, i=pid)
+                            _db.close()
+                            print("[P5.0] #{} ABANDONED at age {:.0f}min".format(pid, age_min))
+                        except Exception:
+                            pass
+                    continue
+                
+                actual_dir = "UP" if next_close > anchor_close else "DOWN"
+                won = (direction == actual_dir)
+                
+                if shadow or entry_status == "SHADOW_FIRE":
+                    outcome = "WIN" if won else "LOSS"
+                    pnl = 0.0
+                else:
+                    safe_stake = stake if stake is not None else 2.50
+                    safe_fill = fill_price if fill_price is not None else 0.50
+                    if won:
+                        shares = safe_stake / safe_fill
+                        pnl = round(shares - safe_stake, 2)
+                        _p50_state["balance"] = round(_p50_state["balance"] + shares, 2)
+                        _p50_state["wins_today"] += 1
+                        if _p50_state["balance"] > _p50_state["peak_balance"]:
+                            _p50_state["peak_balance"] = _p50_state["balance"]
+                    else:
+                        pnl = -safe_stake
+                        _p50_state["losses_today"] += 1
+                    outcome = "WIN" if won else "LOSS"
+                    _p50_save_balance()
+                
+                try:
+                    _db = get_db()
+                    _db.run("""
+                        UPDATE p50_signals
+                        SET anchor_close=:ac, resolution_close=:rc, actual_direction=:ad,
+                            outcome=:o, pnl=:p, balance_after=:bal, resolved_at=NOW()
+                        WHERE id=:i
+                    """, ac=anchor_close, rc=next_close, ad=actual_dir, o=outcome,
+                        p=pnl, bal=_p50_state["balance"], i=pid)
+                    _db.close()
+                    
+                    print("[P5.0] #{} {} {}: ${:.1f}→${:.1f} actual={} → {} ${:+.2f} bal=${:.2f}".format(
+                        pid, asset, direction, anchor_close, next_close, actual_dir, outcome,
+                        pnl, _p50_state["balance"]))
+                    
+                    # Telegram on live resolution
+                    if not shadow and entry_status != "SHADOW_FIRE" and outcome in ("WIN", "LOSS"):
+                        try:
+                            emoji = "✅" if outcome == "WIN" else "❌"
+                            send_telegram(
+                                "{} <b>P5.0 {}</b>\n"
+                                "{} {}: ${:.1f} → ${:.1f}\n"
+                                "P&L: ${:+.2f} | Balance: ${:.2f}".format(
+                                    emoji, outcome,
+                                    asset, direction, anchor_close, next_close,
+                                    pnl, _p50_state["balance"]))
+                        except Exception:
+                            pass
+                
+                except Exception as ue:
+                    print("[P5.0] Resolve error #{}: {}".format(pid, ue))
+            
+            _time.sleep(60)
+        
+        except Exception as e:
+            print("[P5.0] Resolve loop error: {}".format(e))
+            _time.sleep(60)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# DB SCHEMA
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _p50_init_db():
+    """Create P5.0 tables."""
+    try:
+        _db = get_db()
+        _db.run("""
+            CREATE TABLE IF NOT EXISTS p50_signals (
+                id SERIAL PRIMARY KEY,
+                asset VARCHAR(10),
+                boundary_ts TIMESTAMPTZ,
+                
+                -- P2.1 signal
+                p21_direction VARCHAR(10),
+                p21_confidence VARCHAR(20),
+                p21_indicators TEXT,
+                
+                -- Claude confirmation
+                claude_decision VARCHAR(10),
+                claude_reason TEXT,
+                claude_elapsed_ms INTEGER,
+                
+                -- Market state at signal time
+                ptb_at_signal FLOAT,
+                price_at_signal FLOAT,
+                
+                -- Entry execution
+                entry_status VARCHAR(20),  -- CONFIRMED/REJECTED/SHADOW_FIRE/FILLED/UNFILLED/EXPIRED
+                entry_odds FLOAT,
+                fill_price FLOAT,
+                entry_delay_secs INTEGER,
+                stake FLOAT,
+                order_id TEXT,
+                
+                -- Resolution
+                anchor_close FLOAT,
+                resolution_close FLOAT,
+                actual_direction VARCHAR(10),
+                outcome VARCHAR(10),  -- WIN/LOSS/UNRESOLVED
+                pnl FLOAT,
+                balance_after FLOAT,
+                resolved_at TIMESTAMPTZ,
+                
+                shadow_mode BOOLEAN DEFAULT TRUE,
+                created_at TIMESTAMPTZ DEFAULT NOW()
+            )
+        """)
+        _db.run("""
+            CREATE TABLE IF NOT EXISTS p50_balance_state (
+                id SERIAL PRIMARY KEY,
+                balance FLOAT,
+                peak_balance FLOAT,
+                updated_at TIMESTAMPTZ DEFAULT NOW()
+            )
+        """)
+        _db.close()
+        print("[P5.0] DB tables ready")
+    except Exception as e:
+        print("[P5.0] DB init error: {}".format(e))
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# FLASK ENDPOINTS
+# ═════════════════════════════════════════════════════════════════════════════
+
+@app.route("/api/p50/status")
+def p50_status_endpoint():
+    return {
+        "enabled": P50_CONFIG["enabled"],
+        "shadow_mode": P50_CONFIG["shadow_mode"],
+        "balance": _p50_state["balance"],
+        "peak_balance": _p50_state["peak_balance"],
+        "trades_today": _p50_state["trades_today"],
+        "wins_today": _p50_state["wins_today"],
+        "losses_today": _p50_state["losses_today"],
+    }
+
+@app.route("/api/p50/enable", methods=["POST"])
+def p50_enable_endpoint():
+    P50_CONFIG["enabled"] = True
+    mode = "SHADOW" if P50_CONFIG["shadow_mode"] else "LIVE"
+    try:
+        send_telegram("🟢 <b>P5.0 ENABLED</b> ({})\nP2.1 + Claude confirmed\nBalance: ${:.2f}".format(
+            mode, _p50_state["balance"]))
+    except Exception:
+        pass
+    return {"enabled": True, "shadow_mode": P50_CONFIG["shadow_mode"]}
+
+@app.route("/api/p50/disable", methods=["POST"])
+def p50_disable_endpoint():
+    P50_CONFIG["enabled"] = False
+    try:
+        send_telegram("🔴 <b>P5.0 DISABLED</b>\nBalance: ${:.2f}".format(_p50_state["balance"]))
+    except Exception:
+        pass
+    return {"enabled": False}
+
+@app.route("/api/p50/go_live", methods=["POST"])
+def p50_go_live_endpoint():
+    P50_CONFIG["shadow_mode"] = False
+    try:
+        send_telegram("⚡ <b>P5.0 LIVE MODE</b>\nP2.1 + Claude confirmed + delayed entry\nBalance: ${:.2f}".format(
+            _p50_state["balance"]))
+    except Exception:
+        pass
+    return {"shadow_mode": False, "message": "P5.0 IS NOW LIVE"}
+
+@app.route("/api/p50/go_shadow", methods=["POST"])
+def p50_go_shadow_endpoint():
+    P50_CONFIG["shadow_mode"] = True
+    try:
+        send_telegram("🌑 <b>P5.0 SHADOW MODE</b>\nPaper only\nBalance: ${:.2f}".format(
+            _p50_state["balance"]))
+    except Exception:
+        pass
+    return {"shadow_mode": True}
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# DASHBOARD
+# ═════════════════════════════════════════════════════════════════════════════
+
+@app.route("/app/p50-live")
+def p50_live_dashboard():
+    try:
+        _db = get_db()
+        rows = _db.run("""
+            SELECT id, asset, boundary_ts, p21_direction, p21_confidence, p21_indicators,
+                   claude_decision, claude_reason, claude_elapsed_ms,
+                   ptb_at_signal, price_at_signal,
+                   entry_status, entry_odds, fill_price, entry_delay_secs, stake,
+                   anchor_close, resolution_close, actual_direction,
+                   outcome, pnl, balance_after, shadow_mode
+            FROM p50_signals
+            ORDER BY id DESC LIMIT 200
+        """)
+        signals = list(rows)
+        _db.close()
+        
+        import html as _html
+        
+        # Compute stats
+        total = len(signals)
+        resolved = [(s[19], s[20]) for s in signals if s[19] in ("WIN", "LOSS")]
+        wins = sum(1 for o, _ in resolved if o == "WIN")
+        losses = sum(1 for o, _ in resolved if o == "LOSS")
+        wr = (wins * 100 / (wins + losses)) if (wins + losses) > 0 else 0
+        confirmed = sum(1 for s in signals if s[6] == "CONFIRM")
+        rejected = sum(1 for s in signals if s[6] == "REJECT")
+        live_pnl = sum(p for _, p in resolved if p is not None and not signals[0][22])
+        
+        mode_class = "shadow" if P50_CONFIG["shadow_mode"] else "live"
+        mode_text = "SHADOW MODE" if P50_CONFIG["shadow_mode"] else "LIVE"
+        
+        html = """<!DOCTYPE html><html><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>P5.0 Live</title>
+<style>
+body{background:#0d1117;color:#c9d1d9;font:13px/1.4 'JetBrains Mono',monospace;margin:0;padding:12px}
+h2{color:#58a6ff;margin:0 0 8px}
+.stats{display:flex;gap:16px;flex-wrap:wrap;margin-bottom:12px}
+.stat{background:#161b22;padding:8px 14px;border-radius:6px;text-align:center}
+.stat .val{font-size:20px;font-weight:700;color:#58a6ff}
+.stat .lbl{font-size:10px;color:#8b949e;text-transform:uppercase}
+.controls{margin:8px 0 12px}
+.btn{padding:6px 14px;border:none;border-radius:4px;cursor:pointer;font-size:12px;margin:2px}
+.btn-green{background:#238636;color:#fff}
+.btn-red{background:#da3633;color:#fff}
+.btn-yellow{background:#d29922;color:#fff}
+.btn-blue{background:#1f6feb;color:#fff}
+table{width:100%;border-collapse:collapse;font-size:11px}
+th{background:#161b22;color:#8b949e;padding:6px 4px;text-align:left;position:sticky;top:0}
+td{padding:5px 4px;border-bottom:1px solid #21262d}
+.win{color:#3fb950}.loss{color:#f85149}.pend{color:#d29922}
+.confirm{color:#3fb950;font-weight:700}.reject{color:#f85149;font-weight:700}
+.up{color:#3fb950}.down{color:#f85149}
+.gh{color:#8b949e}
+.shadow{color:#8b949e;font-style:italic}
+.live-banner{background:#da3633;color:#fff;padding:6px 12px;border-radius:4px;margin-bottom:8px;font-weight:700}
+.shadow-banner{background:#1f6feb;color:#fff;padding:6px 12px;border-radius:4px;margin-bottom:8px}
+</style>
+<script>
+function p50(action){fetch('/api/p50/'+action,{method:'POST'}).then(()=>location.reload())}
+</script></head><body>
+<h2>P5.0 — P2.1 + Claude Confirmed</h2>
+"""
+        
+        if P50_CONFIG["shadow_mode"]:
+            html += '<div class="shadow-banner">SHADOW MODE — logging only, NO orders</div>'
+        else:
+            html += '<div class="live-banner">LIVE — real orders on Polymarket</div>'
+        
+        html += '<div class="controls">'
+        html += '<button class="btn btn-green" onclick="p50(\'enable\')">ENABLE</button>'
+        html += '<button class="btn btn-red" onclick="p50(\'disable\')">DISABLE</button>'
+        html += '<button class="btn btn-blue" onclick="p50(\'go_shadow\')">SHADOW</button>'
+        html += '<button class="btn btn-yellow" onclick="p50(\'go_live\')">GO LIVE</button>'
+        html += '</div>'
+        
+        html += '<div class="stats">'
+        html += '<div class="stat"><div class="val">${:.2f}</div><div class="lbl">Balance</div></div>'.format(
+            _p50_state["balance"])
+        html += '<div class="stat"><div class="val">${:.2f}</div><div class="lbl">Peak</div></div>'.format(
+            _p50_state["peak_balance"])
+        html += '<div class="stat"><div class="val">{}</div><div class="lbl">Total</div></div>'.format(total)
+        html += '<div class="stat"><div class="val">{}</div><div class="lbl">Confirmed</div></div>'.format(confirmed)
+        html += '<div class="stat"><div class="val">{}</div><div class="lbl">Rejected</div></div>'.format(rejected)
+        html += '<div class="stat"><div class="val">{:.1f}%</div><div class="lbl">WR (fired)</div></div>'.format(wr)
+        html += '<div class="stat"><div class="val">{}W/{}L</div><div class="lbl">Record</div></div>'.format(wins, losses)
+        html += '</div>'
+        
+        html += '<table><tr>'
+        html += '<th>#</th><th>Time</th><th>Asset</th><th>P2.1</th><th>Conf</th>'
+        html += '<th>Claude</th><th>Reason</th><th>Entry</th><th>Odds</th><th>Delay</th>'
+        html += '<th>Open</th><th>Close</th><th>Actual</th><th>Result</th><th>P&L</th><th>Bal</th>'
+        html += '<th>Mode</th><th>ms</th></tr>'
+        
+        for s in signals:
+            (pid, asset, ts, p21_dir, p21_conf, p21_ind,
+             claude_dec, claude_reason, claude_ms,
+             ptb, price,
+             entry_status, entry_odds, fill_price, delay, stake,
+             anchor, resolution, actual,
+             outcome, pnl, bal, shadow) = s
+            
+            dc = "up" if p21_dir == "UP" else "down"
+            claude_cls = "confirm" if claude_dec == "CONFIRM" else "reject" if claude_dec == "REJECT" else ""
+            oc = "win" if outcome == "WIN" else "loss" if outcome == "LOSS" else "pend"
+            ac = "up" if actual == "UP" else "down" if actual == "DOWN" else ""
+            
+            ts_s = ts.strftime("%m-%d %H:%M") if ts else ""
+            odds_s = "{:.0f}c".format(entry_odds * 100) if entry_odds else "-"
+            delay_s = "{}s".format(delay) if delay else "-"
+            anchor_s = "${:.1f}".format(anchor) if anchor else "-"
+            res_s = "${:.1f}".format(resolution) if resolution else "-"
+            pnl_s = "${:+.2f}".format(pnl) if pnl is not None else "-"
+            bal_s = "${:.2f}".format(bal) if bal else "-"
+            mode_s = '<span class="gh">SHADOW</span>' if shadow else "LIVE"
+            entry_s = _html.escape(str(entry_status or "-")[:12])
+            reason_s = _html.escape(str(claude_reason or "")[:60])
+            
+            html += '<tr>'
+            html += '<td>{}</td><td>{}</td><td>{}</td>'.format(pid, ts_s, _html.escape(str(asset)))
+            html += '<td class="{}">{}</td><td>{}</td>'.format(dc, p21_dir, p21_conf or "-")
+            html += '<td class="{}">{}</td><td>{}</td>'.format(claude_cls, claude_dec or "-", reason_s)
+            html += '<td>{}</td><td>{}</td><td>{}</td>'.format(entry_s, odds_s, delay_s)
+            html += '<td>{}</td><td>{}</td>'.format(anchor_s, res_s)
+            html += '<td class="{}">{}</td>'.format(ac, actual or "-")
+            html += '<td class="{}">{}</td>'.format(oc, outcome or "PEND")
+            html += '<td>{}</td><td>{}</td>'.format(pnl_s, bal_s)
+            html += '<td>{}</td><td>{}</td>'.format(mode_s, claude_ms or "-")
+            html += '</tr>'
+        
+        html += '</table></body></html>'
+        return html
+    
+    except Exception as e:
+        return "P5.0 dashboard error: {}".format(e), 500
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# STARTUP
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _p50_start():
+    """Initialize P5.0 and start threads."""
+    import threading
+    
+    _p50_init_db()
+    
+    # Restore balance from DB
+    try:
+        _db = get_db()
+        rows = _db.run("SELECT balance, peak_balance FROM p50_balance_state ORDER BY id DESC LIMIT 1")
+        saved = list(rows)
+        _db.close()
+        if saved:
+            _p50_state["balance"] = saved[0][0]
+            _p50_state["peak_balance"] = saved[0][1]
+            print("[P5.0] Balance restored: ${:.2f} (peak ${:.2f})".format(
+                _p50_state["balance"], _p50_state["peak_balance"]))
+    except Exception:
+        pass
+    
+    # Start threads
+    threading.Thread(target=_p50_signal_thread, daemon=True, name="p50-signal").start()
+    threading.Thread(target=_p50_entry_thread, daemon=True, name="p50-entry").start()
+    threading.Thread(target=_p50_resolve_loop, daemon=True, name="p50-resolve").start()
+    
+    print("[P5.0] All threads started (enabled={}, shadow={}, balance=${:.2f})".format(
+        P50_CONFIG["enabled"], P50_CONFIG["shadow_mode"], _p50_state["balance"]))
+
+
+# Auto-start
+_p50_start()
 
 
 if __name__ == "__main__":
