@@ -29838,14 +29838,18 @@ def _p50_signal_thread():
             
             secs_until = (nxt - now).total_seconds()
             
-            # Wake up 5s before boundary (not 15s)
-            # This ensures:
-            # 1. Candle prefetch (T-22s) has already populated
-            # 2. Indicator caches are fresh (updated at T-22s too)
-            # 3. P2.1 direction matches what A4 sees at T-0
+            # Wake up 5s before boundary
             if secs_until > 8:
-                _time.sleep(min(secs_until - 7, 60))
+                sleep_time = min(secs_until - 7, 60)
+                # Heartbeat every ~60s so we know the thread is alive
+                if int(_time.time()) % 120 < 5:
+                    print("[P5.0] Signal thread alive | next boundary in {:.0f}s | enabled={}".format(
+                        secs_until, P50_CONFIG["enabled"]))
+                _time.sleep(sleep_time)
                 continue
+            
+            print("[P5.0] WAKE for boundary {} (T-{:.0f}s)".format(
+                nxt.strftime("%H:%M"), secs_until))
             
             boundary_key = nxt.strftime("%Y%m%d_%H%M")
             if boundary_key in _p50_predicted_boundaries:
