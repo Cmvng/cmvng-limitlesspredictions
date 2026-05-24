@@ -28599,24 +28599,36 @@ def _p40_save_balance():
 def _p40_build_prompt(asset, candles, memory, ptb=None):
     """P4.0 v2: Reactive prompt — Claude sees the candle FORMING and decides."""
     
-    candle_lines = []
-    for i, c in enumerate(candles[-25:]):
+    # Older candles (1-20): compact context for levels/structure
+    context_lines = []
+    for i, c in enumerate(candles[-25:-5]):
+        o, h, l, cl = c[0], c[1], c[2], c[3]
+        body = cl - o
+        color = "G" if body > 0 else "R" if body < 0 else "-"
+        context_lines.append("{:2}: O={:.1f} H={:.1f} L={:.1f} C={:.1f} {:+.1f} {}".format(
+            i+1, o, h, l, cl, body, color))
+    
+    # Last 5 candles: detailed — this is what matters most
+    recent_lines = []
+    for i, c in enumerate(candles[-5:]):
         o, h, l, cl = c[0], c[1], c[2], c[3]
         body = cl - o
         body_abs = abs(body)
-        color = "G" if body > 0 else "R" if body < 0 else "-"
+        wick_up = h - max(o, cl)
+        wick_down = min(o, cl) - l
+        color = "GREEN" if body > 0 else "RED" if body < 0 else "DOJI"
         if body_abs < 5:
             size = "doji"
         elif body_abs < 30:
             size = "small"
         elif body_abs < 100:
-            size = "med"
+            size = "medium"
         elif body_abs < 300:
             size = "big"
         else:
             size = "MEGA"
-        candle_lines.append("{:2}: O={:.1f} H={:.1f} L={:.1f} C={:.1f} body={:+.1f} {} {}".format(
-            i+1, o, h, l, cl, body, color, size))
+        recent_lines.append("  >>  {}: O={:.1f} H={:.1f} L={:.1f} C={:.1f} | body={:+.1f} ({} {}) | upper_wick={:.1f} lower_wick={:.1f}".format(
+            i+21, o, h, l, cl, body, color, size, wick_up, wick_down))
     
     current_price = candles[-1][3]
     
@@ -28624,9 +28636,10 @@ def _p40_build_prompt(asset, candles, memory, ptb=None):
 "You are watching a LIVE 15-minute crypto candle form on Polymarket.\n\n"
 "The market has a Price To Beat (PTB) — a reference price set at the start of the candle. "
 "The market settles based on whether price CLOSES above or below this PTB.\n\n"
-"You can see the current candle forming in real-time, plus 25 completed candles of history. "
-"Based on what you see RIGHT NOW — the price action, momentum, levels, where price is vs PTB — "
-"decide: will this candle close ABOVE or BELOW the PTB?\n\n"
+"You can see 25 completed candles. The LAST 5 CANDLES are the most important — they show "
+"what's happening RIGHT NOW. The older 20 candles are context for levels and structure.\n\n"
+"FOCUS ON THE LAST 4-6 CANDLES. What direction are they building? Where is momentum? "
+"Is there a level being tested? Is the current move continuing or exhausting?\n\n"
 "LESSONS FROM 15,000+ BACKTESTED TRADES ON THIS EXACT MARKET:\n"
 "1. Bounces off tested support levels are real — if price bounced hard off a low and is making "
 "higher lows, do NOT call DOWN. The bounce usually holds 2-3 candles minimum.\n"
@@ -28646,12 +28659,12 @@ def _p40_build_prompt(asset, candles, memory, ptb=None):
 "9. The BIGGEST mistake from backtesting: calling the same direction for hours during a regime "
 "change. If you've been calling DOWN and price keeps going UP, stop calling DOWN. "
 "Adapt to what the chart shows NOW, not what it showed 2 hours ago.\n\n"
-"Based on these lessons and what you see in the chart:\n"
+"Based on these lessons and what you see in the LAST 5 CANDLES:\n"
 "- If the direction is clear, call it and set should_trade=true\n"
 "- If genuinely unclear (near PTB, no momentum, doji), set should_trade=false and wait\n\n"
 "OUTPUT: single JSON object, no text before or after.\n"
 "{\n"
-'  "what_im_seeing": "describe what the live candle is doing right now, <200 chars",\n'
+'  "what_im_seeing": "describe what the last 5 candles show, <200 chars",\n'
 '  "the_call": "ABOVE_PTB or BELOW_PTB",\n'
 '  "why": "one sentence, <150 chars",\n'
 '  "should_trade": true or false - can you see a clear direction?\n'
@@ -28663,18 +28676,20 @@ def _p40_build_prompt(asset, candles, memory, ptb=None):
     if ptb is not None:
         parts.append("PTB (settlement reference): ${:,.2f}".format(ptb))
         distance = current_price - ptb
-        parts.append("CURRENT PRICE: ${:,.2f} ({:+.2f} from PTB)".format(current_price, distance))
+        parts.append("CURRENT LIVE PRICE: ${:,.2f} ({:+.2f} from PTB)".format(current_price, distance))
     else:
-        parts.append("CURRENT PRICE: ${:,.2f}".format(current_price))
+        parts.append("CURRENT LIVE PRICE: ${:,.2f}".format(current_price))
     parts.append("")
-    parts.append("LAST 25 CANDLES (15-min, completed, oldest -> newest):")
-    parts.append("\n".join(candle_lines))
+    parts.append("OLDER CANDLES (context for levels/structure):")
+    parts.append("\n".join(context_lines))
     parts.append("")
-    parts.append("The last candle above is the most recently COMPLETED candle.")
-    parts.append("Current live price is ${:,.2f} — this is where the FORMING candle is right now.".format(current_price))
+    parts.append("=== LAST 5 CANDLES (FOCUS HERE — this is the current action) ===")
+    parts.append("\n".join(recent_lines))
     parts.append("")
-    parts.append("Will this candle close ABOVE or BELOW PTB?")
+    parts.append("Will this candle close ABOVE or BELOW PTB? Focus on the last 5 candles.")
     parts.append('Output the JSON. Begin with {')
+    
+    user_prompt = "\n".join(parts)
     
     user_prompt = "\n".join(parts)
     
@@ -28888,43 +28903,30 @@ def _p40_predict_loop():
             # How far into the current 15-min period are we?
             secs_into_period = (now - current_boundary).total_seconds()
             
-            # Only active from T+0 to T+10min (0 to 600 seconds)
-            if secs_into_period > 600:
-                # Past the entry window — sleep until next boundary
-                next_boundary = current_boundary + timedelta(minutes=15)
-                sleep_secs = (next_boundary - now).total_seconds()
-                _time.sleep(min(sleep_secs + 1, 60))
+            # Only check ONCE at T+5min (first 5-min candle closed)
+            # Before T+4:30 — too early, wait
+            # After T+5:30 — already checked or missed window  
+            if secs_into_period < 270 or secs_into_period > 330:
+                if secs_into_period < 270:
+                    _time.sleep(min(270 - secs_into_period, 30))
+                else:
+                    # Past check window — sleep until next boundary
+                    next_boundary = current_boundary + timedelta(minutes=15)
+                    sleep_secs = (next_boundary - now).total_seconds()
+                    _time.sleep(min(sleep_secs + 1, 60))
                 continue
             
             boundary_key = current_boundary.strftime("%Y%m%d_%H%M")
             
-            # Check if we already traded this boundary
-            if boundary_key in _p40_traded_keys:
+            # Already processed this boundary
+            if boundary_key in _p40_traded_keys or boundary_key in _p40_predicted_boundaries:
                 _time.sleep(30)
                 continue
             
-            # Check if we already predicted and are waiting for fill
-            if boundary_key in _p40_predicted_boundaries:
-                _time.sleep(30)
-                continue
+            _p40_predicted_boundaries.add(boundary_key)
             
-            # ── Time to check: every 2 minutes within the window ──
-            # Check at T+0, T+2, T+4, T+6, T+8, T+10
-            check_interval = 120  # 2 minutes
-            last_check_key = "_p40_last_check_{}".format(boundary_key)
-            last_check_time = getattr(_p40_predict_loop, '_last_checks', {}).get(boundary_key, 0)
-            
-            if _time.time() - last_check_time < check_interval and last_check_time > 0:
-                _time.sleep(10)
-                continue
-            
-            # Store last check time
-            if not hasattr(_p40_predict_loop, '_last_checks'):
-                _p40_predict_loop._last_checks = {}
-            _p40_predict_loop._last_checks[boundary_key] = _time.time()
-            
-            print("[P4.0] CHECK at T+{:.0f}s for boundary {} | checking {} assets".format(
-                secs_into_period, current_boundary.strftime("%H:%M"), len(P40_CONFIG["assets"])))
+            print("[P4.0] CHECK at T+{:.0f}s for boundary {}".format(
+                secs_into_period, current_boundary.strftime("%H:%M")))
             
             for asset in P40_CONFIG["assets"]:
                 try:
@@ -28940,11 +28942,21 @@ def _p40_predict_loop():
                     
                     candles = list(raw[-100:])
                     
-                    # Get PTB (settlement reference for this boundary)
+                    # Get REAL PTB — the actual settlement reference locked at boundary open
+                    # _chainlink_ptb["BTC_15M"] = (window_end_epoch, price)
+                    # This is what Polymarket uses to settle, NOT the live streaming price
                     try:
-                        ptb = _chainlink_prices.get(asset)
+                        ptb_key = "{}_15M".format(asset)
+                        ptb_entry = _chainlink_ptb.get(ptb_key)
+                        ptb = ptb_entry[1] if ptb_entry else None
                     except Exception:
                         ptb = None
+                    
+                    # Also get current live price for comparison
+                    try:
+                        current_live = _chainlink_prices.get(asset)
+                    except Exception:
+                        current_live = None
                     
                     # Call Claude — reactive prompt (watching live candle)
                     pred = _p40_claude_predict(asset, candles, [], ptb)
