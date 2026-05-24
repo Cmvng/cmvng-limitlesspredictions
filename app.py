@@ -28886,7 +28886,7 @@ def _p40_predict_loop():
     import time as _time
     from datetime import datetime, timezone, timedelta
     
-    print("[P4.0] Reactive predict loop started (v2)")
+    print("[P4.0] Reactive predict loop started (v2 — single check at T+5min)")
     
     while True:
         try:
@@ -28894,6 +28894,13 @@ def _p40_predict_loop():
                 _time.sleep(30); continue
             
             now = datetime.now(timezone.utc)
+            
+            # Heartbeat every ~2 min
+            if int(_time.time()) % 120 < 5:
+                current_min = now.minute
+                boundary_min = (current_min // 15) * 15
+                secs_in = (now.minute - boundary_min) * 60 + now.second
+                print("[P4.0] alive | T+{:.0f}s in period | enabled={}".format(secs_in, P40_CONFIG["enabled"]))
             
             # Find the CURRENT boundary (the one that just opened or is open now)
             current_min = now.minute
@@ -28904,28 +28911,30 @@ def _p40_predict_loop():
             secs_into_period = (now - current_boundary).total_seconds()
             
             # Only check ONCE at T+5min (first 5-min candle closed)
-            # Before T+4:30 — too early, wait
-            # After T+5:30 — already checked or missed window  
-            if secs_into_period < 270 or secs_into_period > 330:
-                if secs_into_period < 270:
-                    _time.sleep(min(270 - secs_into_period, 30))
-                else:
-                    # Past check window — sleep until next boundary
-                    next_boundary = current_boundary + timedelta(minutes=15)
-                    sleep_secs = (next_boundary - now).total_seconds()
-                    _time.sleep(min(sleep_secs + 1, 60))
+            if secs_into_period < 270:
+                _time.sleep(min(270 - secs_into_period, 30))
+                continue
+            
+            if secs_into_period > 330:
+                next_boundary = current_boundary + timedelta(minutes=15)
+                sleep_secs = (next_boundary - now).total_seconds()
+                _time.sleep(min(sleep_secs + 1, 60))
                 continue
             
             boundary_key = current_boundary.strftime("%Y%m%d_%H%M")
             
             # Already processed this boundary
-            if boundary_key in _p40_traded_keys or boundary_key in _p40_predicted_boundaries:
+            if boundary_key in _p40_predicted_boundaries:
+                _time.sleep(30)
+                continue
+            
+            if boundary_key in _p40_traded_keys:
                 _time.sleep(30)
                 continue
             
             _p40_predicted_boundaries.add(boundary_key)
             
-            print("[P4.0] CHECK at T+{:.0f}s for boundary {}".format(
+            print("[P4.0] CHECK at T+{:.0f}s for boundary {} (window 270-330s)".format(
                 secs_into_period, current_boundary.strftime("%H:%M")))
             
             for asset in P40_CONFIG["assets"]:
