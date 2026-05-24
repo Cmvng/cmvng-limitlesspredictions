@@ -28402,7 +28402,7 @@ T+0 at 50¢. Win=$2.35, Loss=$2.50 (3% fee).
 
 
 ################################################################################
-# P4.0 INTEGRATION — Claude-powered prediction engine (judgment-only v6)
+# P4.0 INTEGRATION — Claude-powered prediction engine (no-memory v7)
 ################################################################################
 
 """
@@ -28692,24 +28692,18 @@ def _p40_build_prompt(asset, candles, memory):
 "}"
 )
     
+    # Memory section REMOVED — was causing regime-persistence bias.
+    # Showing recent wins anchored Claude to keep predicting the same direction even
+    # after the market regime had changed. Each prediction now stands alone on the chart.
     learning_section = ""
-    if memory_lines:
-        learning_section = (
-            "\n\nYOUR LAST " + str(len(memory_lines)) + " PREDICTIONS ON " + asset + " (oldest first):\n"
-            + "\n".join(memory_lines) + "\n"
-            + "Recent WR: " + "{:.1f}".format(recent_wr) + "% (" + str(wins) + "W/" + str(total - wins) + "L)\n"
-        )
-        if pattern_review:
-            learning_section += "\nPATTERN PERFORMANCE:\n" + "\n".join(pattern_review) + "\n"
-        learning_section += "\nThis is your own track record. Use it however you see fit.\n"
     
     user_prompt = (
         "ASSET: " + asset + "\n"
         "CURRENT PRICE: $" + "{:,.1f}".format(candles[-1][3]) + "\n\n"
         "LAST 25 CANDLES (15-min, oldest -> newest):\n"
         + "\n".join(candle_lines)
-        + learning_section
-        + "\n\nNow analyze. Build the bull case, build the bear case, decide which wins, then commit.\n"
+        + "\n\nRead this chart fresh. You have no history — only what you see in these 25 candles.\n"
+        + "Build the bull case, build the bear case, decide which wins, then commit.\n"
         + "OUTPUT: a single JSON object matching the format in the system prompt. NO text before or after.\n"
         + "Begin your response with the opening brace {"
     )
@@ -29241,17 +29235,20 @@ def _p40_resolve_loop():
                     outcome = "WIN" if direction == actual_dir else "LOSS"
                     pnl = 0.0  # no real money in shadow
                 else:
+                    # Coerce None values to safe defaults to avoid TypeError on subtraction
+                    safe_stake = stake if stake is not None else 2.50
+                    safe_fill = fill_price if fill_price is not None else 0.50
                     won = (direction == actual_dir)
                     if won:
-                        shares = (stake or 2.50) / (fill_price or 0.50)
-                        pnl = round(shares - stake, 2)
+                        shares = safe_stake / safe_fill
+                        pnl = round(shares - safe_stake, 2)
                         # Credit P4.0's OWN balance with full payout
                         _p40_state["balance"] = round(_p40_state["balance"] + shares, 2)
                         _p40_state["wins_today"] += 1
                         if _p40_state["balance"] > _p40_state["peak_balance"]:
                             _p40_state["peak_balance"] = _p40_state["balance"]
                     else:
-                        pnl = -(stake or 2.50)
+                        pnl = -safe_stake
                         _p40_state["losses_today"] += 1
                     outcome = "WIN" if won else "LOSS"
                     _p40_save_balance()
