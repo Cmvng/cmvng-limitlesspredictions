@@ -29015,6 +29015,7 @@ def _p40_predict_loop():
                             if _p40_r.status_code == 200:
                                 _p40_raw = _p40_r.json()
                                 candles = [(float(k[1]), float(k[2]), float(k[3]), float(k[4])) for k in _p40_raw]
+                                candles = candles[:-1]  # Drop the forming candle — only completed ones
                                 print("[P4.0] {} fetched {} fresh candles from Binance".format(asset, len(candles)))
                     except Exception as fe:
                         print("[P4.0] {} Binance fetch failed: {}".format(asset, fe))
