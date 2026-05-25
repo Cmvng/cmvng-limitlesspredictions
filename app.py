@@ -28984,9 +28984,9 @@ def _p40_predict_loop():
                 _time.sleep(5)
                 continue
             
-            # Wait for exact boundary
+            # Wait for exact boundary + 3 seconds (Binance needs time to finalize the candle)
             now2 = datetime.now(timezone.utc)
-            wait = (nxt - now2).total_seconds()
+            wait = (nxt - now2).total_seconds() + 3
             if wait > 0:
                 _time.sleep(wait)
             
@@ -29015,7 +29015,10 @@ def _p40_predict_loop():
                             if _p40_r.status_code == 200:
                                 _p40_raw = _p40_r.json()
                                 candles = [(float(k[1]), float(k[2]), float(k[3]), float(k[4])) for k in _p40_raw]
-                                candles = candles[:-1]  # Drop the forming candle — only completed ones
+                                # At T+3s, Binance returns completed candles + the 3-second-old forming candle
+                                # Drop the forming candle (last one) — it has only 3 seconds of noise
+                                # The just-closed candle is now second-to-last — which is what we want
+                                candles = candles[:-1]
                                 print("[P4.0] {} fetched {} fresh candles from Binance".format(asset, len(candles)))
                     except Exception as fe:
                         print("[P4.0] {} Binance fetch failed: {}".format(asset, fe))
