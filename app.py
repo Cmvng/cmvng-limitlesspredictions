@@ -29057,7 +29057,7 @@ def _p40_predict_loop():
                     
                     print("[P4.0] {} {} [{}] '{}' [{}ms] T+{:.0f}s".format(
                         asset, direction, "TRADE" if should_trade else "WAIT",
-                        reasoning[:80], elapsed, secs_into_period))
+                        reasoning[:80], elapsed, 0))
                     
                     if not should_trade:
                         # Claude says WAIT — not clear enough yet
@@ -29075,7 +29075,7 @@ def _p40_predict_loop():
                                 d=direction, c=4, r=reasoning,
                                 m=pred.get("model", ""), ms=elapsed,
                                 sh=P40_CONFIG["shadow_mode"],
-                                fr="Claude wait at T+{:.0f}s".format(secs_into_period))
+                                fr="Claude wait at T+{:.0f}s".format(0))
                             _db.close()
                         except Exception:
                             pass
@@ -29177,7 +29177,7 @@ def _p40_predict_loop():
                                 "T+{:.0f}s | {}\n"
                                 "Balance: ${:.2f}".format(
                                     asset, direction, best_ask*100, limit_price*100, stake,
-                                    secs_into_period, reasoning[:80],
+                                    0, reasoning[:80],
                                     _p40_state["balance"]))
                         except Exception:
                             pass
@@ -29251,7 +29251,7 @@ def _p40_predict_loop():
                             "Balance: ${:.2f}".format(
                                 emoji, status,
                                 asset, direction, best_ask*100, limit_price*100, stake,
-                                secs_into_period, reasoning[:80],
+                                0, reasoning[:80],
                                 _p40_state["balance"]))
                     except Exception:
                         pass
