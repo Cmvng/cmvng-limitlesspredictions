@@ -28444,7 +28444,7 @@ P40_CONFIG = {
     "enabled": False,
     "shadow_mode": True,
     "model": "claude-sonnet-4-5",
-    "assets": ["BTC", "ETH", "SOL", "XRP"],
+    "assets": ["BTC", "ETH"],
     "stake_usd": 2.50,
 }
 
@@ -28715,9 +28715,9 @@ def _p40_build_prompt(asset, candles, memory, ptb=None):
 "4. Doji sequences near the open price = coin flip. Set should_trade=false.\n"
 "5. Strong engulfing patterns are the highest-conviction signals.\n"
 "6. If current candle (forming) is already well above/below open with strong body, trust the direction.\n\n"
-"YOU ARE CHECKING AT T+5 MINUTES. The candle has been forming for 5 minutes with 10 minutes left.\n"
-"The current price tells you where the candle is RIGHT NOW. The structure of the last 5 candles tells you\n"
-"whether momentum supports this direction continuing to the close.\n\n"
+"YOU ARE PREDICTING THE NEXT CANDLE. The candle has NOT started yet.\n"
+"Study the last 5 completed candles. What patterns do you see? What direction does the\n"
+"structure suggest for the NEXT candle? Will it close GREEN or RED?\n\n"
 "OUTPUT: single JSON object, no text before or after.\n"
 "{\n"
 '  "candle_structure": "describe what the last 5 candle patterns show, <200 chars",\n'
@@ -28734,14 +28734,8 @@ def _p40_build_prompt(asset, candles, memory, ptb=None):
     parts.append("")
     
     if ptb is not None:
-        parts.append("THIS CANDLE OPENED AT: ${:,.2f} (this is the Price To Beat / PTB)".format(ptb))
-        distance = current_price - ptb
-        if distance >= 0:
-            parts.append("CURRENT PRICE: ${:,.2f} — candle is currently GREEN by ${:.2f}".format(
-                current_price, distance))
-        else:
-            parts.append("CURRENT PRICE: ${:,.2f} — candle is currently RED by ${:.2f}".format(
-                current_price, abs(distance)))
+        parts.append("LAST CANDLE CLOSED AT: ${:,.2f} (next candle will open near this price)".format(ptb))
+        parts.append("CURRENT PRICE: ${:,.2f}".format(current_price))
     else:
         parts.append("CURRENT PRICE: ${:,.2f}".format(current_price))
     
@@ -28754,8 +28748,8 @@ def _p40_build_prompt(asset, candles, memory, ptb=None):
     parts.append("")
     parts.append("MOMENTUM: " + momentum_summary)
     parts.append("")
-    parts.append("QUESTION: Will this candle CLOSE above its open (GREEN) or below its open (RED)?")
-    parts.append("Study the candle structures above. What are they telling you?")
+    parts.append("QUESTION: Will the NEXT 15-minute candle close GREEN (above its open) or RED (below its open)?")
+    parts.append("Study the last 5 candle structures. What pattern are they forming? What comes next?")
     parts.append('Output the JSON. Begin with {')
     
     user_prompt = "\n".join(parts)
@@ -28968,40 +28962,35 @@ def _p40_predict_loop():
                 secs_in = (now.minute - boundary_min) * 60 + now.second
                 print("[P4.0] alive | T+{:.0f}s in period | enabled={}".format(secs_in, P40_CONFIG["enabled"]))
             
-            # Find the CURRENT boundary (the one that just opened or is open now)
-            current_min = now.minute
-            boundary_min = (current_min // 15) * 15
-            current_boundary = now.replace(minute=boundary_min, second=0, microsecond=0)
+            # Check at T-15s before boundary (predict BEFORE candle opens)
+            # Find next boundary
+            nm = ((now.minute // 15) + 1) * 15
+            if nm >= 60:
+                nxt = now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+            else:
+                nxt = now.replace(minute=nm, second=0, microsecond=0)
             
-            # How far into the current 15-min period are we?
-            secs_into_period = (now - current_boundary).total_seconds()
+            secs_until = (nxt - now).total_seconds()
             
-            # Only check ONCE at T+5min (first 5-min candle closed)
-            if secs_into_period < 270:
-                _time.sleep(min(270 - secs_into_period, 30))
+            if secs_until > 20:
+                _time.sleep(min(secs_until - 18, 30))
                 continue
             
-            if secs_into_period > 330:
-                next_boundary = current_boundary + timedelta(minutes=15)
-                sleep_secs = (next_boundary - now).total_seconds()
-                _time.sleep(min(sleep_secs + 1, 60))
-                continue
-            
-            boundary_key = current_boundary.strftime("%Y%m%d_%H%M")
+            boundary_key = nxt.strftime("%Y%m%d_%H%M")
             
             # Already processed this boundary
             if boundary_key in _p40_predicted_boundaries:
-                _time.sleep(30)
+                _time.sleep(5)
                 continue
             
             if boundary_key in _p40_traded_keys:
-                _time.sleep(30)
+                _time.sleep(5)
                 continue
             
             _p40_predicted_boundaries.add(boundary_key)
             
-            print("[P4.0] CHECK at T+{:.0f}s for boundary {} (window 270-330s)".format(
-                secs_into_period, current_boundary.strftime("%H:%M")))
+            print("[P4.0] CHECK at T-{:.0f}s for boundary {} | reading candle structure".format(
+                secs_until, nxt.strftime("%H:%M")))
             
             for asset in P40_CONFIG["assets"]:
                 try:
@@ -29059,7 +29048,7 @@ def _p40_predict_loop():
                                  model, api_elapsed_ms, shadow_mode, fired, fire_reason)
                                 VALUES (:a, :cc, :d, :c, :r, 'reactive_wait',
                                         :m, :ms, :sh, TRUE, :fr)
-                            """, a=asset, cc=current_boundary + timedelta(minutes=15),
+                            """, a=asset, cc=nxt + timedelta(minutes=15),
                                 d=direction, c=4, r=reasoning,
                                 m=pred.get("model", ""), ms=elapsed,
                                 sh=P40_CONFIG["shadow_mode"],
@@ -29084,7 +29073,7 @@ def _p40_predict_loop():
                                     :st, :rm, :cp, :bull, :bear, :ww,
                                     :m, :ms, :sh)
                         """,
-                            a=asset, cc=current_boundary + timedelta(minutes=15),
+                            a=asset, cc=nxt + timedelta(minutes=15),
                             d=direction, c=7, r=reasoning,
                             st=(pred.get("structure") or "")[:30],
                             rm=(pred.get("recent_move") or pred.get("what_im_seeing") or "")[:200],
@@ -29141,12 +29130,12 @@ def _p40_predict_loop():
                     
                     stake = P40_CONFIG["stake_usd"]
                     
-                    # Place limit order 1c BELOW best ask (sit on book, wait for fill)
-                    limit_price = round(max(best_ask - 0.01, 0.01), 2)
+                    # Place at 50c flat — market opens at ~50/50
+                    limit_price = 0.50
                     
                     if P40_CONFIG["shadow_mode"]:
-                        print("[P4.0 SHADOW] {} {} at T+{:.0f}s — ask={:.0f}c limit={:.0f}c ${:.2f}".format(
-                            asset, direction, secs_into_period, best_ask*100, limit_price*100, stake))
+                        print("[P4.0 SHADOW] {} {} — 50c ${:.2f}".format(
+                            asset, direction, stake))
                         if pid:
                             _db = get_db()
                             _db.run("""
@@ -29181,8 +29170,8 @@ def _p40_predict_loop():
                             _db.close()
                         continue
                     
-                    print("[P4.0 LIVE] {} {} at T+{:.0f}s — ask={:.0f}c limit={:.0f}c ${:.2f}".format(
-                        asset, direction, secs_into_period, best_ask*100, limit_price*100, stake))
+                    print("[P4.0 LIVE] {} {} — 50c ${:.2f}".format(
+                        asset, direction, stake))
                     
                     from py_clob_client_v2 import Side as _Side, OrderArgs as _OArgs, OrderType as _OT
                     
