@@ -28865,10 +28865,10 @@ def _p40_claude_predict(asset, candles, memory, ptb=None):
         if call:
             call = str(call).upper().strip()
             # Strip common prefixes/wrappers
-            if "ABOVE" in call:
-                pred["direction"] = "UP"   # above PTB = UP token on Polymarket
-            elif "BELOW" in call:
-                pred["direction"] = "DOWN"
+            if "ABOVE" in call or "GREEN" in call:
+                pred["direction"] = "UP"   # above PTB / green candle = UP token
+            elif "BELOW" in call or "RED" in call:
+                pred["direction"] = "DOWN"  # below PTB / red candle = DOWN token
             elif call in ("UP", "DOWN"):
                 pred["direction"] = call
             else:
