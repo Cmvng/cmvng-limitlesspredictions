@@ -28597,104 +28597,170 @@ def _p40_save_balance():
 # ═════════════════════════════════════════════════════════════════════════════
 
 def _p40_build_prompt(asset, candles, memory, ptb=None):
-    """P4.0 v2: Reactive prompt — Claude sees the candle FORMING and decides."""
+    """P4.0 v3: Correct PTB framing + candle structure analysis."""
     
-    # Older candles (1-20): compact context for levels/structure
+    # ── Format older candles (1-20): compact context ──
     context_lines = []
     for i, c in enumerate(candles[-25:-5]):
         o, h, l, cl = c[0], c[1], c[2], c[3]
         body = cl - o
-        color = "G" if body > 0 else "R" if body < 0 else "-"
-        context_lines.append("{:2}: O={:.1f} H={:.1f} L={:.1f} C={:.1f} {:+.1f} {}".format(
-            i+1, o, h, l, cl, body, color))
+        color = "GREEN" if body > 0 else "RED" if body < 0 else "DOJI"
+        context_lines.append("{:2}: O={:.2f} H={:.2f} L={:.2f} C={:.2f} {} {:+.2f}".format(
+            i+1, o, h, l, cl, color, body))
     
-    # Last 5 candles: detailed — this is what matters most
+    # ── Analyze last 5 candles with full structure ──
+    recent_candles = candles[-5:]
     recent_lines = []
-    for i, c in enumerate(candles[-5:]):
+    
+    for i, c in enumerate(recent_candles):
         o, h, l, cl = c[0], c[1], c[2], c[3]
         body = cl - o
         body_abs = abs(body)
-        wick_up = h - max(o, cl)
-        wick_down = min(o, cl) - l
+        full_range = h - l if h != l else 0.001
+        upper_wick = h - max(o, cl)
+        lower_wick = min(o, cl) - l
+        body_pct = (body_abs / full_range) * 100 if full_range > 0 else 0
+        
         color = "GREEN" if body > 0 else "RED" if body < 0 else "DOJI"
-        if body_abs < 5:
-            size = "doji"
-        elif body_abs < 30:
-            size = "small"
-        elif body_abs < 100:
-            size = "medium"
-        elif body_abs < 300:
-            size = "big"
-        else:
-            size = "MEGA"
-        recent_lines.append("  >>  {}: O={:.1f} H={:.1f} L={:.1f} C={:.1f} | body={:+.1f} ({} {}) | upper_wick={:.1f} lower_wick={:.1f}".format(
-            i+21, o, h, l, cl, body, color, size, wick_up, wick_down))
+        
+        # Detect candle pattern
+        pattern = ""
+        if body_abs < full_range * 0.1:
+            pattern = "DOJI (indecision, no conviction either way)"
+        elif body > 0 and lower_wick > body_abs * 2 and upper_wick < body_abs * 0.5:
+            pattern = "HAMMER (buyers rejected the low, bullish reversal signal)"
+        elif body < 0 and lower_wick > body_abs * 2 and upper_wick < body_abs * 0.5:
+            pattern = "HAMMER (buyers stepped in despite red close, potential reversal)"
+        elif body > 0 and upper_wick > body_abs * 2 and lower_wick < body_abs * 0.5:
+            pattern = "SHOOTING STAR (sellers rejected the high, bearish signal)"
+        elif body < 0 and upper_wick > body_abs * 2 and lower_wick < body_abs * 0.5:
+            pattern = "SHOOTING STAR (failed to hold highs, bearish)"
+        elif body_pct > 70 and body > 0:
+            pattern = "STRONG GREEN (buyers in full control, closed near high)"
+        elif body_pct > 70 and body < 0:
+            pattern = "STRONG RED (sellers in full control, closed near low)"
+        elif body > 0 and cl >= h - (full_range * 0.1):
+            pattern = "CLOSE NEAR HIGH (bullish conviction, buyers held into close)"
+        elif body < 0 and cl <= l + (full_range * 0.1):
+            pattern = "CLOSE NEAR LOW (bearish conviction, sellers held into close)"
+        elif body > 0:
+            pattern = "GREEN (mild bullish)"
+        elif body < 0:
+            pattern = "RED (mild bearish)"
+        
+        # Check engulfing
+        if i > 0:
+            prev = recent_candles[i-1]
+            prev_body = prev[3] - prev[0]
+            if body > 0 and prev_body < 0 and body_abs > abs(prev_body) and o <= prev[3]:
+                pattern += " + BULLISH ENGULFING (swallowed previous red candle)"
+            elif body < 0 and prev_body > 0 and body_abs > abs(prev_body) and o >= prev[3]:
+                pattern += " + BEARISH ENGULFING (swallowed previous green candle)"
+        
+        recent_lines.append(
+            "  >> CANDLE {}: O={:.2f} H={:.2f} L={:.2f} C={:.2f}\n"
+            "     Body: {:+.2f} ({}) | Upper wick: {:.2f} | Lower wick: {:.2f} | Body fills {:.0f}% of range\n"
+            "     Pattern: {}".format(
+                i+21, o, h, l, cl,
+                body, color, upper_wick, lower_wick, body_pct,
+                pattern))
+    
+    # ── Momentum summary of last 5 ──
+    green_count = sum(1 for c in recent_candles if c[3] > c[0])
+    red_count = sum(1 for c in recent_candles if c[3] < c[0])
+    
+    closes = [c[3] for c in recent_candles]
+    rising_closes = sum(1 for i in range(1, len(closes)) if closes[i] > closes[i-1])
+    falling_closes = sum(1 for i in range(1, len(closes)) if closes[i] < closes[i-1])
+    
+    # Did last candle close near its high or low?
+    last = recent_candles[-1]
+    last_range = last[1] - last[2] if last[1] != last[2] else 0.001
+    last_close_position = (last[3] - last[2]) / last_range * 100
+    
+    momentum_summary = "Last 5 candles: {} green, {} red. ".format(green_count, red_count)
+    momentum_summary += "Closes trending: {} rising, {} falling. ".format(rising_closes, falling_closes)
+    momentum_summary += "Last candle closed at {:.0f}% of its range (0%=low, 100%=high).".format(last_close_position)
     
     current_price = candles[-1][3]
     
+    # ── System prompt ──
     system_prompt = (
-"You are watching a LIVE 15-minute crypto candle form on Polymarket.\n\n"
-"The market has a Price To Beat (PTB) — a reference price set at the start of the candle. "
-"The market settles based on whether price CLOSES above or below this PTB.\n\n"
-"You can see 25 completed candles. The LAST 5 CANDLES are the most important — they show "
-"what's happening RIGHT NOW. The older 20 candles are context for levels and structure.\n\n"
-"FOCUS ON THE LAST 4-6 CANDLES. What direction are they building? Where is momentum? "
-"Is there a level being tested? Is the current move continuing or exhausting?\n\n"
-"LESSONS FROM 15,000+ BACKTESTED TRADES ON THIS EXACT MARKET:\n"
-"1. Bounces off tested support levels are real — if price bounced hard off a low and is making "
-"higher lows, do NOT call DOWN. The bounce usually holds 2-3 candles minimum.\n"
-"2. After a parabolic drop ($500+ BTC, $30+ ETH), the recovery bounce is real. Don't keep "
-"calling DOWN after a crash — the first bounce holds.\n"
-"3. After 4+ candles in one direction, expect CONSOLIDATION not reversal. The move is done "
-"but price usually chops sideways before reversing — don't rush to call the opposite direction.\n"
-"4. Price very close to PTB (BTC within $30, ETH within $3, SOL within $0.30) = coin flip. "
-"Set should_trade=false. Only trade when there's clear distance AND momentum.\n"
-"5. Tight ranges and doji candles near PTB = no edge. Skip these. The winning trades come "
-"from clear directional setups, not chop.\n"
-"6. A strong trend with 3+ candles the same color usually continues for at least one more. "
-"Don't try to call the top/bottom of a clean trend.\n"
-"7. XRP and DOGE are more predictable than BTC on 15-min timeframes. BTC has the least edge.\n"
-"8. If the current candle's price is already well beyond PTB with strong momentum, trust the "
-"direction — don't overthink a reversal that hasn't started.\n"
-"9. The BIGGEST mistake from backtesting: calling the same direction for hours during a regime "
-"change. If you've been calling DOWN and price keeps going UP, stop calling DOWN. "
-"Adapt to what the chart shows NOW, not what it showed 2 hours ago.\n\n"
-"Based on these lessons and what you see in the LAST 5 CANDLES:\n"
-"- If the direction is clear, call it and set should_trade=true\n"
-"- If genuinely unclear (near PTB, no momentum, doji), set should_trade=false and wait\n\n"
+"You are a candle structure analyst for 15-minute Polymarket crypto prediction markets.\n\n"
+"HOW THIS MARKET WORKS:\n"
+"- At the start of each 15-minute window, Polymarket records the Chainlink price. "
+"This is called the 'Price To Beat' (PTB). The PTB is simply the CANDLE OPEN PRICE.\n"
+"- The market resolves UP if the Chainlink price at the END of the window is >= the PTB (candle closes GREEN or flat).\n"
+"- The market resolves DOWN if the end price is < the PTB (candle closes RED).\n"
+"- In simple terms: YOU ARE PREDICTING WHETHER THE CURRENT 15-MINUTE CANDLE WILL CLOSE GREEN OR RED.\n\n"
+"HOW TO READ CANDLE STRUCTURE:\n"
+"Study the LAST 5 CANDLES carefully. Each candle tells a story:\n"
+"- BODY SIZE: Large body = strong conviction. Small body = indecision.\n"
+"- BODY COLOR: Green = buyers won. Red = sellers won.\n"
+"- UPPER WICK: Long upper wick = sellers rejected the high. Price tried to go up but got pushed back.\n"
+"- LOWER WICK: Long lower wick = buyers defended the low. Price tried to drop but got bought up.\n"
+"- CLOSE POSITION: Close near high = buyers in control at end. Close near low = sellers in control.\n\n"
+"KEY PATTERNS TO LOOK FOR:\n"
+"- HAMMER (small body + long lower wick): Reversal signal. Buyers stepped in hard. Next candle often green.\n"
+"- SHOOTING STAR (small body + long upper wick): Top rejection. Sellers stepped in. Next candle often red.\n"
+"- ENGULFING (current candle swallows previous): Strong momentum shift in the engulfing direction.\n"
+"- DOJI (tiny body): Pure indecision. Could go either way. Usually skip unless other signals are clear.\n"
+"- 3+ SAME COLOR: Trend continuation likely BUT check if the bodies are getting smaller (exhaustion).\n"
+"- CLOSE NEAR HIGH after green: Bullish momentum carries into next candle.\n"
+"- CLOSE NEAR LOW after red: Bearish momentum carries into next candle.\n\n"
+"CRITICAL RULES FROM 15,000+ BACKTESTED TRADES:\n"
+"1. After a strong bounce off support (hammer + green follow-through), next candle usually continues up.\n"
+"2. After a parabolic drop, the first recovery candle is real. Don't call red immediately after a crash.\n"
+"3. After 4+ same-color candles, bodies shrinking = exhaustion. Expect consolidation, not immediate reversal.\n"
+"4. Doji sequences near the open price = coin flip. Set should_trade=false.\n"
+"5. Strong engulfing patterns are the highest-conviction signals.\n"
+"6. If current candle (forming) is already well above/below open with strong body, trust the direction.\n\n"
+"YOU ARE CHECKING AT T+5 MINUTES. The candle has been forming for 5 minutes with 10 minutes left.\n"
+"The current price tells you where the candle is RIGHT NOW. The structure of the last 5 candles tells you\n"
+"whether momentum supports this direction continuing to the close.\n\n"
 "OUTPUT: single JSON object, no text before or after.\n"
 "{\n"
-'  "what_im_seeing": "describe what the last 5 candles show, <200 chars",\n'
-'  "the_call": "ABOVE_PTB or BELOW_PTB",\n'
-'  "why": "one sentence, <150 chars",\n'
-'  "should_trade": true or false - can you see a clear direction?\n'
+'  "candle_structure": "describe what the last 5 candle patterns show, <200 chars",\n'
+'  "current_candle": "is the forming candle currently green or red and by how much",\n'
+'  "the_call": "GREEN (close above open/PTB) or RED (close below open/PTB)",\n'
+'  "why": "which candle pattern or structure supports this call, <150 chars",\n'
+'  "should_trade": true or false\n'
 "}"
 )
     
+    # ── User prompt ──
     parts = []
     parts.append("ASSET: {}".format(asset))
-    if ptb is not None:
-        parts.append("PTB (settlement reference): ${:,.2f}".format(ptb))
-        distance = current_price - ptb
-        parts.append("CURRENT LIVE PRICE: ${:,.2f} ({:+.2f} from PTB)".format(current_price, distance))
-    else:
-        parts.append("CURRENT LIVE PRICE: ${:,.2f}".format(current_price))
     parts.append("")
-    parts.append("OLDER CANDLES (context for levels/structure):")
+    
+    if ptb is not None:
+        parts.append("THIS CANDLE OPENED AT: ${:,.2f} (this is the Price To Beat / PTB)".format(ptb))
+        distance = current_price - ptb
+        if distance >= 0:
+            parts.append("CURRENT PRICE: ${:,.2f} — candle is currently GREEN by ${:.2f}".format(
+                current_price, distance))
+        else:
+            parts.append("CURRENT PRICE: ${:,.2f} — candle is currently RED by ${:.2f}".format(
+                current_price, abs(distance)))
+    else:
+        parts.append("CURRENT PRICE: ${:,.2f}".format(current_price))
+    
+    parts.append("")
+    parts.append("OLDER CANDLES (context for levels and trend):")
     parts.append("\n".join(context_lines))
     parts.append("")
-    parts.append("=== LAST 5 CANDLES (FOCUS HERE — this is the current action) ===")
+    parts.append("=== LAST 5 COMPLETED CANDLES (STUDY THESE CAREFULLY) ===")
     parts.append("\n".join(recent_lines))
     parts.append("")
-    parts.append("Will this candle close ABOVE or BELOW PTB? Focus on the last 5 candles.")
+    parts.append("MOMENTUM: " + momentum_summary)
+    parts.append("")
+    parts.append("QUESTION: Will this candle CLOSE above its open (GREEN) or below its open (RED)?")
+    parts.append("Study the candle structures above. What are they telling you?")
     parts.append('Output the JSON. Begin with {')
     
     user_prompt = "\n".join(parts)
     
-    user_prompt = "\n".join(parts)
-    
     return system_prompt, user_prompt
-
 
 
 def _p40_claude_predict(asset, candles, memory, ptb=None):
