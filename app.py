@@ -28715,7 +28715,8 @@ def _p40_build_prompt(asset, candles, memory, ptb=None):
 "4. Doji sequences near the open price = coin flip. Set should_trade=false.\n"
 "5. Strong engulfing patterns are the highest-conviction signals.\n"
 "6. If current candle (forming) is already well above/below open with strong body, trust the direction.\n\n"
-"YOU ARE PREDICTING THE NEXT CANDLE. The candle has NOT started yet.\n"
+"YOU ARE PREDICTING THE NEXT CANDLE. The previous candle JUST closed seconds ago.\n"
+"The last candle in the data below is the FRESHEST data — it just completed.\n"
 "Study the last 5 completed candles. What patterns do you see? What direction does the\n"
 "structure suggest for the NEXT candle? Will it close GREEN or RED?\n\n"
 "OUTPUT: single JSON object, no text before or after.\n"
@@ -28734,7 +28735,7 @@ def _p40_build_prompt(asset, candles, memory, ptb=None):
     parts.append("")
     
     if ptb is not None:
-        parts.append("LAST CANDLE CLOSED AT: ${:,.2f} (next candle will open near this price)".format(ptb))
+        parts.append("JUST-CLOSED CANDLE ended at: ${:,.2f} (next candle opens here)".format(ptb))
         parts.append("CURRENT PRICE: ${:,.2f}".format(current_price))
     else:
         parts.append("CURRENT PRICE: ${:,.2f}".format(current_price))
@@ -28962,7 +28963,7 @@ def _p40_predict_loop():
                 secs_in = (now.minute - boundary_min) * 60 + now.second
                 print("[P4.0] alive | T+{:.0f}s in period | enabled={}".format(secs_in, P40_CONFIG["enabled"]))
             
-            # Check at T-15s before boundary (predict BEFORE candle opens)
+            # Pre-load candles at T-5s, fire Claude instantly at T+0
             # Find next boundary
             nm = ((now.minute // 15) + 1) * 15
             if nm >= 60:
@@ -28972,25 +28973,27 @@ def _p40_predict_loop():
             
             secs_until = (nxt - now).total_seconds()
             
-            if secs_until > 20:
-                _time.sleep(min(secs_until - 18, 30))
+            # Sleep until T-3s
+            if secs_until > 5:
+                _time.sleep(min(secs_until - 4, 30))
                 continue
             
             boundary_key = nxt.strftime("%Y%m%d_%H%M")
             
-            # Already processed this boundary
-            if boundary_key in _p40_predicted_boundaries:
+            if boundary_key in _p40_predicted_boundaries or boundary_key in _p40_traded_keys:
                 _time.sleep(5)
                 continue
             
-            if boundary_key in _p40_traded_keys:
-                _time.sleep(5)
-                continue
+            # Wait for exact boundary
+            now2 = datetime.now(timezone.utc)
+            wait = (nxt - now2).total_seconds()
+            if wait > 0:
+                _time.sleep(wait)
             
             _p40_predicted_boundaries.add(boundary_key)
             
-            print("[P4.0] CHECK at T-{:.0f}s for boundary {} | reading candle structure".format(
-                secs_until, nxt.strftime("%H:%M")))
+            print("[P4.0] FIRE at boundary {} | candle just closed".format(
+                nxt.strftime("%H:%M")))
             
             for asset in P40_CONFIG["assets"]:
                 try:
@@ -28998,13 +29001,33 @@ def _p40_predict_loop():
                     if trade_key in _p40_traded_keys:
                         continue
                     
-                    # Get candles (including the one currently forming)
-                    raw = _p29cl_candle_prefetch.get(asset, [])
-                    if len(raw) < 50:
-                        print("[P4.0] {} insufficient candles ({})".format(asset, len(raw)))
-                        continue
+                    # Fetch FRESH candles directly from Binance — not from prefetch cache
+                    # The prefetch ran at T-22s and is missing the just-closed candle
+                    import requests as _p40_req
+                    candles = None
+                    try:
+                        _p40_symbol = {"BTC": "BTCUSDT", "ETH": "ETHUSDT", "SOL": "SOLUSDT", "XRP": "XRPUSDT"}.get(asset)
+                        if _p40_symbol:
+                            _p40_r = _p40_req.get(
+                                "https://api.binance.com/api/v3/klines",
+                                params={"symbol": _p40_symbol, "interval": "15m", "limit": 100},
+                                timeout=5)
+                            if _p40_r.status_code == 200:
+                                _p40_raw = _p40_r.json()
+                                candles = [(float(k[1]), float(k[2]), float(k[3]), float(k[4])) for k in _p40_raw]
+                                print("[P4.0] {} fetched {} fresh candles from Binance".format(asset, len(candles)))
+                    except Exception as fe:
+                        print("[P4.0] {} Binance fetch failed: {}".format(asset, fe))
                     
-                    candles = list(raw[-100:])
+                    # Fallback to prefetch if Binance fails
+                    if not candles or len(candles) < 25:
+                        raw = _p29cl_candle_prefetch.get(asset, [])
+                        if len(raw) >= 50:
+                            candles = list(raw[-100:])
+                            print("[P4.0] {} using prefetch cache ({} candles)".format(asset, len(candles)))
+                        else:
+                            print("[P4.0] {} insufficient candles".format(asset))
+                            continue
                     
                     # Get REAL PTB — the actual settlement reference locked at boundary open
                     # _chainlink_ptb["BTC_15M"] = (window_end_epoch, price)
