@@ -847,12 +847,22 @@ def _v2_analyze_structure(candles):
     avg_move = sum(moves) / len(moves) if moves else 0
     max_move = max(moves) if moves else 0
 
-    if avg_move > 0 and max_move > avg_move * 2.0:
-        grind_type = "spike"
-    elif avg_move > 0 and max_move < avg_move * 1.5:
-        grind_type = "steady"
-    else:
+    if avg_move > 0 and len(moves) >= 3:
+        # Spec: "if any 5-min move > 2x average move → spike"
+        # For 1M candles: single 1M candle being 2x avg is normal noise
+        # Spike = one move drove MOST of the total distance (aggressive pump)
+        total_distance = abs(candles[-1]["c"] - candles[0]["o"])
+        if total_distance > 0 and max_move > total_distance * 0.5:
+            # One single candle moved more than half the total distance = pump
+            grind_type = "spike"
+        elif max_move < avg_move * 1.5:
+            grind_type = "steady"
+        else:
+            grind_type = "choppy"
+    elif avg_move > 0:
         grind_type = "choppy"
+    else:
+        grind_type = "steady"
 
     # Direction determination — per spec: HH>=2 AND HL>=2 = clean trend
     # No weak fallbacks — if structure isn't clean, it's FLAT (skip)
@@ -1766,6 +1776,7 @@ def _v2_resolve_trades():
 
 # Track active trades per boundary to avoid duplicates
 _v2_active_boundaries = {}  # {"BTC_1H_1748390400": True, ...}
+_fill_failures = {}  # Track consecutive 404s per order for expiry
 FLAT_STAKE = 3.00  # $3 flat per confirmed entry
 
 def _v2_scan_timeframe(timeframe):
@@ -2258,6 +2269,24 @@ def _v2_fill_checker():
                     time.sleep(0.35)
 
                 if not current_ask:
+                    # Track consecutive failures — expire after 3
+                    fail_key = "fail_{}".format(o["id"])
+                    _fill_failures[fail_key] = _fill_failures.get(fail_key, 0) + 1
+                    if _fill_failures[fail_key] >= 3:
+                        # Token is dead — expire the order
+                        try:
+                            conn2 = get_db()
+                            conn2.run("""
+                                UPDATE v2_paper_trades SET order_status = 'EXPIRED', status = 'RESOLVED',
+                                outcome = 'EXPIRED', resolved_at = NOW()
+                                WHERE id = :tid
+                            """, tid=o["id"])
+                            conn2.close()
+                            del _fill_failures[fail_key]
+                            print("[V2] EXPIRED (dead token): {} {} {}".format(
+                                o["timeframe"], o["asset"], o["direction"]))
+                        except:
+                            pass
                     continue
 
                 limit = o.get("limit_price", 0) or 0
