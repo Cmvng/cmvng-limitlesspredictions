@@ -1779,21 +1779,30 @@ def _v2_scan_timeframe(timeframe):
                     # Fetch intra-period candles from Binance
                     intra_candles = _fetch_binance_candles(asset, interval=intra_interval, limit=30)
                     if not intra_candles or len(intra_candles) < 3:
+                        print("[V2] SKIP {} {} {} — no candles from Binance ({})".format(
+                            tf_label, asset, platform[:4], intra_interval))
                         continue
 
                     # Filter to THIS period only
                     period_candles = [c for c in intra_candles if c["t"] >= boundary_ts * 1000]
                     if len(period_candles) < min_intra_candles:
+                        print("[V2] SKIP {} {} {} — only {} candles in period (need {})".format(
+                            tf_label, asset, platform[:4], len(period_candles), min_intra_candles))
                         continue
 
                     # Previous completed candle
                     prev_candles = _fetch_binance_candles(asset, interval=prev_interval, limit=5)
                     if not prev_candles or len(prev_candles) < 2:
+                        print("[V2] SKIP {} {} {} — no prev candles".format(tf_label, asset, platform[:4]))
                         continue
                     prev_candle = _v2_analyze_prev_candle(prev_candles[-2])
 
                     # Structure analysis
                     structure = _v2_analyze_structure(period_candles)
+                    if not structure:
+                        print("[V2] SKIP {} {} {} — structure analysis returned None".format(
+                            tf_label, asset, platform[:4]))
+                        continue
 
                     # Volatility
                     current_range = max(c["h"] for c in period_candles) - min(c["l"] for c in period_candles)
@@ -1824,6 +1833,8 @@ def _v2_scan_timeframe(timeframe):
                     )
 
                     if not should or not confidence or confidence < min_confidence:
+                        print("[V2] REJECT {} {} {} — conf={} reason={}".format(
+                            tf_label, asset, platform[:4], confidence, reason[:80] if reason else "none"))
                         continue
 
                     # Get REAL book ask from order book
