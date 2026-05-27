@@ -848,9 +848,9 @@ def _v2_analyze_structure(candles):
     avg_move = sum(moves) / len(moves) if moves else 0
     max_move = max(moves) if moves else 0
 
-    if avg_move > 0 and max_move > avg_move * 2.5:
+    if avg_move > 0 and max_move > avg_move * 5.0:
         grind_type = "spike"
-    elif avg_move > 0 and max_move < avg_move * 1.5:
+    elif avg_move > 0 and max_move < avg_move * 2.0:
         grind_type = "steady"
     else:
         grind_type = "choppy"
@@ -987,8 +987,8 @@ def _v2_should_enter(structure, prev_candle, volatility_label, vol_safe,
     if not vol_safe:
         return False, None, 0, "Volatility too high — skip"
 
-    if grind_type == "spike":
-        return False, None, 0, "Spike detected — reversal risk"
+    # Spike is a warning, not a block — will reduce confidence later
+    spike_penalty = -15 if grind_type == "spike" else 0
 
     if not structure:
         return False, None, 0, "No structure data"
@@ -1056,6 +1056,11 @@ def _v2_should_enter(structure, prev_candle, volatility_label, vol_safe,
             confidence += 5
             reason += " | Steady"
 
+        # Apply spike penalty
+        confidence += spike_penalty
+        if spike_penalty:
+            reason += " | Spike penalty"
+
         return confidence >= 50, "UP", confidence, reason
 
     elif struct_dir == "DOWN":
@@ -1098,6 +1103,11 @@ def _v2_should_enter(structure, prev_candle, volatility_label, vol_safe,
         if grind_type == "steady":
             confidence += 5
             reason += " | Steady"
+
+        # Apply spike penalty
+        confidence += spike_penalty
+        if spike_penalty:
+            reason += " | Spike penalty"
 
         return confidence >= 50, "DOWN", confidence, reason
 
@@ -1312,9 +1322,8 @@ def _v2_record_paper_trade(platform, timeframe, asset, direction, ptb,
 
 def _v2_get_live_odds(market_data, direction):
     """Read live price from Polymarket CLOB using get_price().
-    NOTE: get_order_book() is BROKEN (returns stale 0.01/0.99 — GitHub Issue #180).
-    get_price(token_id, side="BUY") returns the correct live ask price.
-    Returns odds as percentage (e.g. 72.0 for 72c) or None."""
+    NOTE: get_order_book() is BROKEN (GitHub Issue #180). Use get_price() instead.
+    Single call — fast fail on 404 (expired market) or timeout."""
     client = _get_poly_client()
     if not client or not market_data:
         return None
@@ -1324,11 +1333,8 @@ def _v2_get_live_odds(market_data, direction):
         if not token:
             return None
 
-        # get_price returns the best available price for the given side
-        # BUY side = best ask (price to buy), SELL side = best bid (price to sell)
+        # Single call — BUY side = best ask (what we'd pay to buy)
         buy_price = None
-        sell_price = None
-
         try:
             buy_result = client.get_price(str(token), side="BUY")
             if buy_result:
@@ -1337,52 +1343,20 @@ def _v2_get_live_odds(market_data, direction):
                 elif isinstance(buy_result, (int, float, str)):
                     buy_price = float(buy_result)
         except Exception as e:
-            print("[V2] POLY get_price BUY error: {}".format(e))
+            err_str = str(e)
+            if "404" in err_str or "No orderbook" in err_str:
+                # Market expired — don't log spam, just return None
+                return None
+            if "timed out" in err_str.lower() or "timeout" in err_str.lower():
+                return None
+            print("[V2] POLY price error: {}".format(err_str[:80]))
+            return None
 
-        try:
-            sell_result = client.get_price(str(token), side="SELL")
-            if sell_result:
-                if isinstance(sell_result, dict):
-                    sell_price = float(sell_result.get("price", 0))
-                elif isinstance(sell_result, (int, float, str)):
-                    sell_price = float(sell_result)
-        except:
-            pass
-
-        # Also get midpoint for reference
-        mid = None
-        try:
-            mid_result = client.get_midpoint(str(token))
-            if mid_result:
-                if isinstance(mid_result, dict):
-                    mid = float(mid_result.get("mid", 0))
-                elif isinstance(mid_result, (int, float, str)):
-                    mid = float(mid_result)
-        except:
-            pass
-
-        # Log for debugging
-        asset = market_data.get("asset", "?")
-        tf = market_data.get("timeframe", "?")
-        slug = market_data.get("slug", "?")[:40]
-        tok_snippet = str(token)[:12] + "..." + str(token)[-6:]
-        print("[V2] POLY PRICE {} {} {} | slug={} | tok={} | buy={} sell={} mid={}".format(
-            asset, tf, direction, slug, tok_snippet,
-            "{:.4f}".format(buy_price) if buy_price else "None",
-            "{:.4f}".format(sell_price) if sell_price else "None",
-            "{:.4f}".format(mid) if mid else "None"))
-
-        # Return the BUY price (best ask) as percentage
         if buy_price and 0.01 <= buy_price <= 0.99:
+            asset = market_data.get("asset", "?")
+            tf = market_data.get("timeframe", "?")
+            print("[V2] POLY PRICE {} {} {} = {:.0f}c".format(asset, tf, direction, buy_price * 100))
             return round(buy_price * 100, 1)
-
-        # Fallback to midpoint
-        if mid and 0.01 <= mid <= 0.99:
-            return round(mid * 100, 1)
-
-        # Fallback to sell price (best bid)
-        if sell_price and 0.01 <= sell_price <= 0.99:
-            return round(sell_price * 100, 1)
 
     except Exception as e:
         print("[V2] Poly price error: {}".format(e))
