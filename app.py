@@ -550,8 +550,11 @@ def _poly_parse_market(market, timeframe_hint=None):
             timeframe = "5M"
         elif "-1h-" in slug_lower or "-1h" in slug_lower or "hourly" in slug_lower:
             timeframe = "1H"
-        elif "up-or-down-on-" in slug_lower or "daily" in slug_lower:
-            # Daily markets: "bitcoin-up-or-down-on-may-4-2026"
+        # Detect 1H from "up-or-down-{month}-{day}" format (no -5m/-15m suffix)
+        elif "up-or-down-" in slug_lower and "-updown-" not in slug_lower and "up-or-down-on-" not in slug_lower:
+            timeframe = "1H"
+        # Daily: "bitcoin-up-or-down-on-may-27"
+        elif "up-or-down-on-" in slug_lower:
             timeframe = "DAILY"
         if not timeframe:
             created = market.get("createdAt") or ""
@@ -562,7 +565,7 @@ def _poly_parse_market(market, timeframe_hint=None):
                     if 55 <= dur <= 65: timeframe = "1H"
                     elif 13 <= dur <= 17: timeframe = "15M"
                     elif 4 <= dur <= 6: timeframe = "5M"
-                    elif dur > 300: timeframe = "DAILY"  # > 5 hours = daily
+                    elif dur > 600: timeframe = "DAILY"
                 except:
                     pass
         if not timeframe and timeframe_hint:
@@ -690,15 +693,22 @@ def _poly_fetch_markets():
             ws = (current_ts // tf_sec) * tf_sec
             slugs.append("{}-updown-{}-{}".format(asset_slug, tf_slug, ws))
         _1h_name = _1h_full_names.get(asset_slug, asset_slug)
+        # 1H slug: "bitcoin-up-or-down-may-27-10pm-et" (no year)
+        slugs.append("{}-up-or-down-{}-{}-{}{}-et".format(
+            _1h_name, _1h_mo, _1h_dy, _1h_h12, _1h_ap))
+        # 1H with year fallback
         slugs.append("{}-up-or-down-{}-{}-{}-{}{}-et".format(
             _1h_name, _1h_mo, _1h_dy, _1h_yr, _1h_h12, _1h_ap))
-        # Daily slug: "bitcoin-up-or-down-on-may-27-2026"
+        # Daily slug: "bitcoin-up-or-down-on-may-27" (no year)
+        slugs.append("{}-up-or-down-on-{}-{}".format(
+            _1h_name, _1h_mo, _1h_dy))
+        # Daily with year fallback
         slugs.append("{}-up-or-down-on-{}-{}-{}".format(
             _1h_name, _1h_mo, _1h_dy, _1h_yr))
 
         for s in slugs:
-            _is_1h = "-up-or-down-" in s and "-on-" not in s
             _is_daily = "-up-or-down-on-" in s
+            _is_1h = "-up-or-down-" in s and not _is_daily
             tf_hint = "DAILY" if _is_daily else "1H" if _is_1h else None
             for url in ["{}/events/slug/{}".format(POLY_GAMMA_API, s),
                         "{}/events".format(POLY_GAMMA_API)]:
@@ -1219,56 +1229,81 @@ def _v2_record_paper_trade(platform, timeframe, asset, direction, ptb,
 # ═══════════════════════════════════════════════════════════
 
 def _v2_get_live_odds(market_data, direction):
-    """Read live order book from Polymarket CLOB.
-    Returns dict with {ask, bid, mid, spread} or None.
-    Logs the full book state for debugging."""
+    """Read live price from Polymarket CLOB using get_price().
+    NOTE: get_order_book() is BROKEN (returns stale 0.01/0.99 — GitHub Issue #180).
+    get_price(token_id, side="BUY") returns the correct live ask price.
+    Returns odds as percentage (e.g. 72.0 for 72c) or None."""
     client = _get_poly_client()
     if not client or not market_data:
         return None
 
     try:
-        # For UP direction: read the UP token book (asks = price to buy UP)
-        # For DOWN direction: read the DOWN token book (asks = price to buy DOWN)
         token = market_data.get("up_token") if direction == "UP" else market_data.get("down_token")
         if not token:
             return None
 
-        book = client.get_order_book(str(token))
-        if not book:
-            print("[V2] POLY BOOK: empty for token {}...{}".format(str(token)[:8], str(token)[-8:]))
-            return None
+        # get_price returns the best available price for the given side
+        # BUY side = best ask (price to buy), SELL side = best bid (price to sell)
+        buy_price = None
+        sell_price = None
 
-        asks = book.get("asks", [])
-        bids = book.get("bids", [])
+        try:
+            buy_result = client.get_price(str(token), side="BUY")
+            if buy_result:
+                if isinstance(buy_result, dict):
+                    buy_price = float(buy_result.get("price", 0))
+                elif isinstance(buy_result, (int, float, str)):
+                    buy_price = float(buy_result)
+        except Exception as e:
+            print("[V2] POLY get_price BUY error: {}".format(e))
 
-        best_ask = float(asks[0]["price"]) if asks else None
-        best_bid = float(bids[0]["price"]) if bids else None
-        mid = book.get("mid") or book.get("midpoint")
-        if mid:
-            mid = float(mid)
-        elif best_ask and best_bid:
-            mid = (best_ask + best_bid) / 2
+        try:
+            sell_result = client.get_price(str(token), side="SELL")
+            if sell_result:
+                if isinstance(sell_result, dict):
+                    sell_price = float(sell_result.get("price", 0))
+                elif isinstance(sell_result, (int, float, str)):
+                    sell_price = float(sell_result)
+        except:
+            pass
+
+        # Also get midpoint for reference
+        mid = None
+        try:
+            mid_result = client.get_midpoint(str(token))
+            if mid_result:
+                if isinstance(mid_result, dict):
+                    mid = float(mid_result.get("mid", 0))
+                elif isinstance(mid_result, (int, float, str)):
+                    mid = float(mid_result)
+        except:
+            pass
 
         # Log for debugging
         asset = market_data.get("asset", "?")
         tf = market_data.get("timeframe", "?")
-        print("[V2] POLY BOOK {} {} {}: ask={} bid={} mid={} asks_depth={} bids_depth={}".format(
-            asset, tf, direction,
-            "{:.2f}".format(best_ask) if best_ask else "None",
-            "{:.2f}".format(best_bid) if best_bid else "None",
-            "{:.2f}".format(mid) if mid else "None",
-            len(asks), len(bids)))
+        slug = market_data.get("slug", "?")[:40]
+        tok_snippet = str(token)[:12] + "..." + str(token)[-6:]
+        print("[V2] POLY PRICE {} {} {} | slug={} | tok={} | buy={} sell={} mid={}".format(
+            asset, tf, direction, slug, tok_snippet,
+            "{:.4f}".format(buy_price) if buy_price else "None",
+            "{:.4f}".format(sell_price) if sell_price else "None",
+            "{:.4f}".format(mid) if mid else "None"))
 
-        # Return the best ask as percentage
-        if best_ask and 0.01 <= best_ask <= 0.99:
-            return round(best_ask * 100, 1)
+        # Return the BUY price (best ask) as percentage
+        if buy_price and 0.01 <= buy_price <= 0.99:
+            return round(buy_price * 100, 1)
 
-        # If no asks, try midpoint
+        # Fallback to midpoint
         if mid and 0.01 <= mid <= 0.99:
             return round(mid * 100, 1)
 
+        # Fallback to sell price (best bid)
+        if sell_price and 0.01 <= sell_price <= 0.99:
+            return round(sell_price * 100, 1)
+
     except Exception as e:
-        print("[V2] Poly order book error: {}".format(e))
+        print("[V2] Poly price error: {}".format(e))
     return None
 
 
@@ -1397,44 +1432,52 @@ def _limitless_get_orderbook_odds(slug, direction):
         if not book:
             return None
 
+        asks = book.get("asks", [])
+        bids = book.get("bids", [])
+        mid = book.get("adjustedMidpoint")
+        ltp = book.get("lastTradePrice")
+
+        best_ask = float(asks[0].get("price", 0)) if asks else None
+        best_bid = float(bids[0].get("price", 0)) if bids else None
+
+        print("[LMTS] BOOK {} {} | ask={} bid={} mid={} ltp={} depth={}a/{}b".format(
+            slug[:30], direction,
+            "{:.4f}".format(best_ask) if best_ask else "None",
+            "{:.4f}".format(best_bid) if best_bid else "None",
+            "{:.4f}".format(float(mid)) if mid else "None",
+            "{:.4f}".format(float(ltp)) if ltp else "None",
+            len(asks), len(bids)))
+
         # For UP/YES direction, read the asks (price to buy YES shares)
         # For DOWN/NO direction, we buy NO shares
         # Limitless: asks = sell orders for YES, bids = buy orders for YES
         # To buy YES: we take the best ask
         # To buy NO: equivalent to selling YES at best bid, OR 1 - best_ask for NO
         if direction == "UP":
-            asks = book.get("asks", [])
-            if asks and len(asks) > 0:
-                best_ask = float(asks[0].get("price", 0))
-                if 0.01 <= best_ask <= 0.99:
-                    return round(best_ask * 100, 1)
+            if best_ask and 0.01 <= best_ask <= 0.99:
+                return round(best_ask * 100, 1)
         else:
             # DOWN = buy NO shares. Price of NO = 1 - price of YES
-            # Best way: look at adjustedMidpoint or calculate from asks
-            asks = book.get("asks", [])
-            if asks and len(asks) > 0:
-                best_yes_ask = float(asks[0].get("price", 0))
-                no_price = 1.0 - best_yes_ask
+            if best_ask and 0.01 <= best_ask <= 0.99:
+                no_price = 1.0 - best_ask
                 if 0.01 <= no_price <= 0.99:
                     return round(no_price * 100, 1)
 
         # Fallback to midpoint
-        mid = book.get("adjustedMidpoint")
         if mid:
-            mid = float(mid)
+            mid_f = float(mid)
             if direction == "UP":
-                return round(mid * 100, 1)
+                return round(mid_f * 100, 1)
             else:
-                return round((1.0 - mid) * 100, 1)
+                return round((1.0 - mid_f) * 100, 1)
 
         # Last trade price as final fallback
-        ltp = book.get("lastTradePrice")
         if ltp:
-            ltp = float(ltp)
+            ltp_f = float(ltp)
             if direction == "UP":
-                return round(ltp * 100, 1)
+                return round(ltp_f * 100, 1)
             else:
-                return round((1.0 - ltp) * 100, 1)
+                return round((1.0 - ltp_f) * 100, 1)
 
     except Exception as e:
         print("[LMTS] Orderbook error {}: {}".format(slug, e))
@@ -1726,9 +1769,7 @@ def _v2_scan_timeframe(timeframe):
                 if asset in lmts_tf:
                     platforms_to_try.append(("limitless", lmts_tf[asset]))
                 if not platforms_to_try:
-                    # No market found on either platform — skip with Binance-only analysis
-                    # Still record on polymarket with no market link for tracking
-                    platforms_to_try.append(("polymarket", None))
+                    continue  # No market on either platform — skip
 
                 for platform, market_data in platforms_to_try:
                     boundary_key = "{}_{}_{}_{}".format(asset, tf_label, platform[:4], boundary_ts)
@@ -2053,6 +2094,9 @@ def _v2_fill_checker():
                     "timeframe": o.get("timeframe", ""),
                 }
                 current_ask = _v2_get_odds(o["platform"], market_data, o["direction"])
+                # Respect Limitless rate limits (300ms between calls)
+                if o["platform"] == "limitless":
+                    time.sleep(0.35)
 
                 if not current_ask:
                     continue
