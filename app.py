@@ -1156,20 +1156,65 @@ def _v2_market_url(platform, market_data=None, asset=None, timeframe=None):
 # V2 HEDGE LOGIC
 # ═══════════════════════════════════════════════════════════
 
-def _v2_check_hedge(trade, current_structure):
+def _v2_check_hedge(trade, current_structure, candles=None, ptb=None):
     """Check if an open trade should be hedged.
-    Hedge when structure breaks: trend was UP but now seeing LH+LL."""
+    HEDGE ONLY when there's strong evidence of reversal — not noise.
+    
+    Requirements for hedge:
+    1. Structure must show DOMINANT opposing signals (LH >= 3 AND LL >= 2 for UP trades)
+    2. Price must have crossed back through PTB against the trade direction
+    3. The grind type must NOT be choppy (choppy = no real trend either way)
+    """
     if not trade or not current_structure:
         return False, None
 
     direction = trade.get("direction")
+    hh = current_structure.get("hh_count", 0)
+    hl = current_structure.get("hl_count", 0)
+    lh = current_structure.get("lh_count", 0)
+    ll = current_structure.get("ll_count", 0)
+    grind = current_structure.get("grind_type", "")
+
+    # Don't hedge in choppy markets — no clear reversal, just noise
+    if grind == "choppy":
+        return False, None
+
     if direction == "UP":
-        # Structure break: lower highs + lower lows forming
-        if current_structure["lh_count"] >= 1 and current_structure["ll_count"] >= 1:
-            return True, "Structure break — LH/LL forming against UP position"
+        # Need STRONG reversal: multiple lower highs AND lower lows
+        # AND the opposing signals must dominate (more LH/LL than HH/HL)
+        if lh >= 3 and ll >= 2 and lh > hh and ll > hl:
+            reason = "Strong reversal: LH={} LL={} dominate HH={} HL={} | {}".format(lh, ll, hh, hl, grind)
+            
+            # Extra confirmation: price crossed back below PTB
+            if candles and ptb and ptb > 0:
+                current_price = candles[-1]["c"]
+                if current_price < ptb:
+                    reason += " | Price below PTB"
+                    return True, reason
+                else:
+                    # Structure says reversal but price still above PTB — not confirmed yet
+                    return False, None
+            
+            # No PTB data — rely on structure alone but be strict
+            if lh >= 4 and ll >= 3:
+                return True, reason
+            return False, None
+
     elif direction == "DOWN":
-        if current_structure["hh_count"] >= 1 and current_structure["hl_count"] >= 1:
-            return True, "Structure break — HH/HL forming against DOWN position"
+        if hh >= 3 and hl >= 2 and hh > lh and hl > ll:
+            reason = "Strong reversal: HH={} HL={} dominate LH={} LL={} | {}".format(hh, hl, lh, ll, grind)
+            
+            if candles and ptb and ptb > 0:
+                current_price = candles[-1]["c"]
+                if current_price > ptb:
+                    reason += " | Price above PTB"
+                    return True, reason
+                else:
+                    return False, None
+            
+            if hh >= 4 and hl >= 3:
+                return True, reason
+            return False, None
 
     return False, None
 
@@ -1996,6 +2041,7 @@ def _v2_monitor_thread():
                        stake, fired_at, hedged, market_id, slug, condition_id,
                        up_token, down_token
                 FROM v2_paper_trades WHERE status = 'OPEN' AND hedged = FALSE
+                AND (order_status = 'FILLED' OR order_status IS NULL)
             """)
             cols = ["id", "platform", "timeframe", "asset", "direction", "ptb",
                     "entry_odds", "stake", "fired_at", "hedged", "market_id",
@@ -2014,7 +2060,10 @@ def _v2_monitor_thread():
                     continue
 
                 structure = _v2_analyze_structure(candles[-10:])
-                should_hedge, hedge_reason = _v2_check_hedge(t, structure)
+                
+                # Get current price and PTB for hedge confirmation
+                current_ptb = t.get("ptb")
+                should_hedge, hedge_reason = _v2_check_hedge(t, structure, candles, current_ptb)
 
                 if not should_hedge:
                     continue
