@@ -773,9 +773,8 @@ def _poly_get_baseline(parsed, price=None):
 # ═══════════════════════════════════════════════════════════
 
 def _v2_session_filter(utc_hour):
-    """Return session label and whether it's safe to trade.
-    AVOID: London/US crossover 12-15 UTC, Peak US 13-17 UTC, Peak Asia 23-02 UTC.
-    PREFER: Late US/early Asian 17-23 UTC, Early morning 4-11 UTC."""
+    """Return session label and safety. For paper trading, ALL sessions are safe.
+    Labels are used for confidence adjustments, not hard blocks."""
     if 4 <= utc_hour <= 11:
         return "EARLY_MORNING", True
     elif 17 <= utc_hour <= 22:
@@ -783,11 +782,11 @@ def _v2_session_filter(utc_hour):
     elif 11 <= utc_hour < 12:
         return "PRE_LONDON", True
     elif 12 <= utc_hour <= 15:
-        return "LONDON_US_CROSS", False
+        return "LONDON_US_CROSS", True  # Paper: allow trading, track results
     elif 15 < utc_hour < 17:
-        return "LATE_US", False
+        return "LATE_US", True
     elif 23 <= utc_hour or utc_hour < 2:
-        return "PEAK_ASIA", False
+        return "PEAK_ASIA", True
     else:
         return "TRANSITION", True
 
@@ -857,14 +856,34 @@ def _v2_analyze_structure(candles):
         grind_type = "choppy"
 
     # Direction determination
+    # Strong: clean trend with no opposing signals
     if hh_count >= 2 and hl_count >= 2 and lh_count == 0 and ll_count == 0:
         direction = "UP"
     elif ll_count >= 2 and lh_count >= 2 and hh_count == 0 and hl_count == 0:
         direction = "DOWN"
+    # Moderate: majority signals in one direction
     elif hh_count >= 2 and hl_count >= 1:
         direction = "UP"
     elif ll_count >= 2 and lh_count >= 1:
         direction = "DOWN"
+    # Weak but valid: at least 1 HH+HL with no opposing
+    elif hh_count >= 1 and hl_count >= 1 and ll_count == 0:
+        direction = "UP"
+    elif ll_count >= 1 and lh_count >= 1 and hh_count == 0:
+        direction = "DOWN"
+    # Minimal: just dominant count with no contradiction
+    elif hh_count >= 1 and lh_count == 0:
+        direction = "UP"
+    elif ll_count >= 1 and hh_count == 0:
+        direction = "DOWN"
+    # Fallback: use overall price direction (last vs first candle)
+    elif len(candles) >= 2:
+        if candles[-1]["c"] > candles[0]["o"]:
+            direction = "UP"
+        elif candles[-1]["c"] < candles[0]["o"]:
+            direction = "DOWN"
+        else:
+            direction = "FLAT"
     else:
         direction = "FLAT"
 
@@ -989,80 +1008,98 @@ def _v2_should_enter(structure, prev_candle, volatility_label, vol_safe,
     ll = structure["ll_count"]
 
     if struct_dir == "UP":
-        # Bullish: need HH+HL, previous candle green/strong, price above PTB
-        if hh < 2 or hl < 1:
-            return False, None, 0, "Weak bullish structure (HH={} HL={})".format(hh, hl)
+        # Confidence based on structure strength + prev candle alignment
+        # Strong structure: HH>=2 + HL>=2
+        # Moderate: HH>=1 + HL>=1
+        # Weak: just direction detected from price trend
+        if hh >= 2 and hl >= 2:
+            struct_strength = "STRONG"
+        elif hh >= 1 and hl >= 1:
+            struct_strength = "MODERATE"
+        else:
+            struct_strength = "WEAK"
 
-        if prev_candle["strength"] in ("STRONG_BEAR", "MILD_BEAR"):
-            # Previous red but structure up = possible reversal continuation — lower confidence
-            if hh >= 3 and hl >= 3:
+        # Base confidence from prev candle + structure
+        if prev_candle["strength"] == "STRONG_BULL":
+            confidence = 90 if struct_strength == "STRONG" else 80 if struct_strength == "MODERATE" else 70
+            reason = "Prev strong green + {} structure".format(struct_strength)
+        elif prev_candle["strength"] == "MILD_BULL":
+            confidence = 80 if struct_strength == "STRONG" else 70 if struct_strength == "MODERATE" else 60
+            reason = "Prev mild green + {} structure".format(struct_strength)
+        elif prev_candle["strength"] == "DOJI":
+            confidence = 65 if struct_strength == "STRONG" else 55 if struct_strength == "MODERATE" else 50
+            reason = "Prev doji + {} UP structure".format(struct_strength)
+        elif prev_candle["strength"] in ("STRONG_BEAR", "MILD_BEAR"):
+            # Prev candle against structure — only proceed if structure is strong
+            if struct_strength == "STRONG":
                 confidence = 60
                 reason = "Structure UP despite prev red — strong HH/HL overrides"
+            elif struct_strength == "MODERATE":
+                confidence = 50
+                reason = "Moderate UP structure vs prev red — low confidence"
             else:
-                return False, None, 0, "Prev candle bearish, structure not strong enough"
-        elif prev_candle["strength"] == "STRONG_BULL":
-            confidence = 90
-            reason = "Prev strong green + clean HH/HL structure"
-        elif prev_candle["strength"] == "MILD_BULL":
-            confidence = 75
-            reason = "Prev mild green + HH/HL structure"
-        elif prev_candle["strength"] == "DOJI":
-            confidence = 55
-            reason = "Prev doji + structure UP — cautious"
+                return False, None, 0, "Weak UP + prev bearish — skip"
         else:
-            confidence = 70
-            reason = "Structure UP + prev candle aligned"
+            confidence = 70 if struct_strength == "STRONG" else 60 if struct_strength == "MODERATE" else 55
+            reason = "Structure UP ({}) + prev candle neutral".format(struct_strength)
 
-        # PTB must be above for UP trades
+        # PTB adjustment
         if ptb_meaningful and ptb_direction == "BELOW":
-            confidence -= 15
-            reason += " | Price below PTB — risky"
+            confidence -= 10
+            reason += " | Below PTB"
         elif ptb_meaningful and ptb_direction == "ABOVE":
             confidence += 5
-            reason += " | Price above PTB — good"
+            reason += " | Above PTB"
 
         # Grind bonus
         if grind_type == "steady":
             confidence += 5
-            reason += " | Steady grind"
+            reason += " | Steady"
 
-        return confidence >= 60, "UP", confidence, reason
+        return confidence >= 50, "UP", confidence, reason
 
     elif struct_dir == "DOWN":
-        if ll < 2 or lh < 1:
-            return False, None, 0, "Weak bearish structure (LL={} LH={})".format(ll, lh)
+        if ll >= 2 and lh >= 2:
+            struct_strength = "STRONG"
+        elif ll >= 1 and lh >= 1:
+            struct_strength = "MODERATE"
+        else:
+            struct_strength = "WEAK"
 
-        if prev_candle["strength"] in ("STRONG_BULL", "MILD_BULL"):
-            if ll >= 3 and lh >= 3:
+        if prev_candle["strength"] == "STRONG_BEAR":
+            confidence = 90 if struct_strength == "STRONG" else 80 if struct_strength == "MODERATE" else 70
+            reason = "Prev strong red + {} structure".format(struct_strength)
+        elif prev_candle["strength"] == "MILD_BEAR":
+            confidence = 80 if struct_strength == "STRONG" else 70 if struct_strength == "MODERATE" else 60
+            reason = "Prev mild red + {} structure".format(struct_strength)
+        elif prev_candle["strength"] == "DOJI":
+            confidence = 65 if struct_strength == "STRONG" else 55 if struct_strength == "MODERATE" else 50
+            reason = "Prev doji + {} DOWN structure".format(struct_strength)
+        elif prev_candle["strength"] in ("STRONG_BULL", "MILD_BULL"):
+            if struct_strength == "STRONG":
                 confidence = 60
                 reason = "Structure DOWN despite prev green — strong LL/LH overrides"
+            elif struct_strength == "MODERATE":
+                confidence = 50
+                reason = "Moderate DOWN structure vs prev green — low confidence"
             else:
-                return False, None, 0, "Prev candle bullish, structure not strong enough"
-        elif prev_candle["strength"] == "STRONG_BEAR":
-            confidence = 90
-            reason = "Prev strong red + clean LL/LH structure"
-        elif prev_candle["strength"] == "MILD_BEAR":
-            confidence = 75
-            reason = "Prev mild red + LL/LH structure"
-        elif prev_candle["strength"] == "DOJI":
-            confidence = 55
-            reason = "Prev doji + structure DOWN — cautious"
+                return False, None, 0, "Weak DOWN + prev bullish — skip"
         else:
-            confidence = 70
-            reason = "Structure DOWN + prev candle aligned"
+            confidence = 70 if struct_strength == "STRONG" else 60 if struct_strength == "MODERATE" else 55
+            reason = "Structure DOWN ({}) + prev candle neutral".format(struct_strength)
 
         if ptb_meaningful and ptb_direction == "ABOVE":
-            confidence -= 15
-            reason += " | Price above PTB — risky for DOWN"
+            confidence -= 10
+            reason += " | Above PTB"
         elif ptb_meaningful and ptb_direction == "BELOW":
             confidence += 5
-            reason += " | Price below PTB — good for DOWN"
+            reason += " | Below PTB"
 
         if grind_type == "steady":
             confidence += 5
-            reason += " | Steady grind"
+            reason += " | Steady"
 
-        return confidence >= 60, "DOWN", confidence, reason
+        return confidence >= 50, "DOWN", confidence, reason
 
     return False, None, 0, "No clear signal"
 
@@ -1696,7 +1733,7 @@ def _v2_scan_timeframe(timeframe):
         intra_interval = "5m"
         prev_interval = "1h"
         min_intra_candles = 3
-        min_confidence = 60
+        min_confidence = 50      # Paper: lower threshold to collect data
         boundary_secs = 3600
         poly_tf_filter = "1H"
         scan_sleep = 120
@@ -1704,7 +1741,7 @@ def _v2_scan_timeframe(timeframe):
         intra_interval = "1m"
         prev_interval = "15m"
         min_intra_candles = 3
-        min_confidence = 75
+        min_confidence = 55      # Paper: slightly higher for 15M noise
         boundary_secs = 900
         poly_tf_filter = "15M"
         scan_sleep = 60
@@ -1712,7 +1749,7 @@ def _v2_scan_timeframe(timeframe):
         intra_interval = "1h"
         prev_interval = "1d"
         min_intra_candles = 3
-        min_confidence = 60
+        min_confidence = 50      # Paper: collect all daily signals
         boundary_secs = 86400
         poly_tf_filter = "DAILY"
         scan_sleep = 600  # Check every 10 minutes
