@@ -1604,7 +1604,11 @@ def _v2_calc_limit_price(book_ask, confidence):
 # ═══════════════════════════════════════════════════════════
 
 def _v2_resolve_trades():
-    """Check all OPEN paper trades and resolve them if the market has closed."""
+    """Resolve paper trades by checking the ACTUAL platform outcome.
+    Polymarket: Gamma API outcomePrices → [1.0, 0.0] = UP won, [0.0, 1.0] = DOWN won
+    Limitless: GET /markets/{slug} → check resolution status
+    Falls back to Binance price vs PTB if platform check fails."""
+    import requests as req
     try:
         conn = get_db()
         rows = conn.run("""
@@ -1640,31 +1644,92 @@ def _v2_resolve_trades():
                 if (now - fired).total_seconds() / 60 < min_age:
                     continue
 
-            # Get close price from Chainlink or Binance
             asset = t["asset"]
-            close_price = _get_binance_price(asset)
-            if not close_price:
-                continue
+            slug = t.get("slug", "")
+            platform = t["platform"]
+            actual = None
 
-            ptb = t.get("ptb")
-            if not ptb or ptb <= 0:
-                continue
+            # METHOD 1: Check platform for actual resolution
+            if platform == "polymarket" and slug:
+                try:
+                    # Query Gamma API for the market by slug
+                    r = req.get("{}/markets".format(POLY_GAMMA_API),
+                                params={"slug": slug}, timeout=8)
+                    if r.status_code == 200:
+                        markets = r.json()
+                        market = markets[0] if isinstance(markets, list) and markets else markets if isinstance(markets, dict) else None
+                        if market:
+                            closed = market.get("closed", False)
+                            if closed:
+                                outcome_prices = market.get("outcomePrices")
+                                if isinstance(outcome_prices, str):
+                                    try: outcome_prices = json.loads(outcome_prices)
+                                    except: outcome_prices = None
+                                if isinstance(outcome_prices, list) and len(outcome_prices) >= 2:
+                                    # Check outcome ordering
+                                    outcomes_raw = market.get("outcomes")
+                                    if isinstance(outcomes_raw, str):
+                                        try: outcomes_raw = json.loads(outcomes_raw)
+                                        except: outcomes_raw = None
+                                    up_idx = 0
+                                    if isinstance(outcomes_raw, list) and len(outcomes_raw) >= 2:
+                                        o0 = str(outcomes_raw[0]).lower().strip()
+                                        if o0 in ("no", "down", "below"):
+                                            up_idx = 1
+                                    up_price = float(outcome_prices[up_idx])
+                                    if up_price > 0.9:
+                                        actual = "UP"
+                                    elif up_price < 0.1:
+                                        actual = "DOWN"
+                                    else:
+                                        actual = None  # Not clearly resolved yet
+                            else:
+                                continue  # Market not closed yet
+                except Exception as e:
+                    print("[V2] Poly resolve check error {}: {}".format(slug[:30], e))
 
-            # Determine actual result
-            if close_price > ptb:
-                actual = "UP"
-            elif close_price < ptb:
-                actual = "DOWN"
-            else:
-                actual = "FLAT"
+            elif platform == "limitless" and slug:
+                try:
+                    r = req.get("{}/markets/{}".format(LIMITLESS_API, slug), timeout=8)
+                    if r.status_code == 200:
+                        market = r.json()
+                        status = market.get("status", "")
+                        if status in ("resolved", "closed"):
+                            winner = market.get("winningOutcome") or market.get("winner") or ""
+                            if str(winner).lower() in ("yes", "up", "above", "0"):
+                                actual = "UP"
+                            elif str(winner).lower() in ("no", "down", "below", "1"):
+                                actual = "DOWN"
+                            else:
+                                # Try outcomePrices
+                                op = market.get("outcomePrices") or market.get("prices")
+                                if isinstance(op, list) and len(op) >= 2:
+                                    if float(op[0]) > 0.9: actual = "UP"
+                                    elif float(op[0]) < 0.1: actual = "DOWN"
+                        else:
+                            continue  # Not resolved yet
+                except Exception as e:
+                    print("[V2] Limitless resolve check error {}: {}".format(slug[:30], e))
+
+            # METHOD 2: Fallback — Binance price vs PTB (only if platform check failed)
+            if not actual:
+                close_price = _get_binance_price(asset)
+                ptb = t.get("ptb")
+                if not close_price or not ptb or ptb <= 0:
+                    continue
+                if close_price > ptb:
+                    actual = "UP"
+                elif close_price < ptb:
+                    actual = "DOWN"
+                else:
+                    actual = "FLAT"
 
             direction = t["direction"]
             entry_odds = t.get("entry_odds", 50) or 50
-            stake = t.get("stake", 2.50) or 2.50
+            stake = t.get("stake", 3.0) or 3.0
 
             # Calculate P&L
             if actual == direction:
-                # Won: payout = stake / (odds/100) - stake
                 odds_decimal = entry_odds / 100
                 payout = (stake / odds_decimal) - stake if odds_decimal > 0 else 0
                 outcome = "WIN"
@@ -1680,7 +1745,7 @@ def _v2_resolve_trades():
             if t.get("hedged") and t.get("hedge_odds"):
                 hedge_odds = t["hedge_odds"]
                 hedge_dir = t.get("hedge_direction")
-                hedge_stake = stake * 0.5  # hedge at half stake
+                hedge_stake = stake * 0.5
                 if actual == hedge_dir:
                     hedge_pnl = (hedge_stake / (hedge_odds / 100)) - hedge_stake
                 else:
@@ -1690,7 +1755,6 @@ def _v2_resolve_trades():
                 hedge_pnl = 0
 
             # Update balance
-            platform = t["platform"]
             bal = _v2_balances.get(platform, {})
             bal["balance"] = bal.get("balance", 100) + pnl
             if outcome == "WIN":
@@ -1710,7 +1774,7 @@ def _v2_resolve_trades():
                     pnl = :pnl, balance_after = :bal, hedge_pnl = :hpnl,
                     status = :st, resolved_at = NOW()
                     WHERE id = :tid
-                """, cp=close_price, ar=actual, oc=outcome,
+                """, cp=_get_binance_price(asset), ar=actual, oc=outcome,
                     pnl=round(pnl, 4), bal=round(bal["balance"], 2),
                     hpnl=round(hedge_pnl, 4) if hedge_pnl else None,
                     st="RESOLVED", tid=t["id"])
@@ -1719,11 +1783,10 @@ def _v2_resolve_trades():
             except Exception as e:
                 print("[V2] Resolve update error: {}".format(e))
 
-            # Telegram notification
             emoji = "✅" if outcome == "WIN" else "❌"
             send_telegram("{} V2 {} {} {} {} @ {:.0f}c → {} | P&L ${:+.2f} | Bal ${:.2f}".format(
                 emoji, t["timeframe"], asset, direction,
-                t["platform"][:4].upper(), entry_odds, outcome,
+                platform[:4].upper(), entry_odds, outcome,
                 pnl, bal["balance"]))
 
         return resolved
@@ -1742,9 +1805,11 @@ FLAT_STAKE = 3.00  # $3 flat per confirmed entry
 
 def _v2_scan_timeframe(timeframe):
     """Core scanning logic shared by 1H, 15M, and DAILY watchers.
-    Scans BOTH Polymarket and Limitless. Enters whenever confidence is high, at ANY odds."""
+    Scans BOTH Polymarket and Limitless.
+    SELECTIVE: only enters the best 2 trades per scan cycle, ranked by confidence."""
 
     ASSETS = ["BTC", "ETH", "SOL", "XRP", "DOGE", "BNB"]
+    MAX_ENTRIES_PER_SCAN = 2  # Only the best 2 trades per cycle
     tf_label = timeframe
 
     # Timeframe-specific config
@@ -1816,6 +1881,9 @@ def _v2_scan_timeframe(timeframe):
                     tf_label, ",".join(poly_assets) or "none", ",".join(lmts_assets) or "none"))
             else:
                 print("[V2] {} scan: no markets found on either platform".format(tf_label))
+
+            # Collect candidates, then enter only the best
+            _scan_candidates = []
 
             for asset in ASSETS:
                 # Try both platforms for this asset
@@ -1893,10 +1961,49 @@ def _v2_scan_timeframe(timeframe):
                             tf_label, asset, platform[:4], confidence, reason[:80] if reason else "none"))
                         continue
 
+                    # Collect as candidate — don't enter yet
+                    _scan_candidates.append({
+                        "asset": asset, "platform": platform, "market_data": market_data,
+                        "direction": direction, "confidence": confidence, "reason": reason,
+                        "structure": structure, "prev_candle": prev_candle,
+                        "prev_str": "{} body={:.0f}%".format(
+                            prev_candle["strength"], prev_candle["body_pct"] * 100) if prev_candle else "",
+                        "ptb": ptb, "price": price, "session_label": session_label,
+                        "vol_label": vol_label, "boundary_key": boundary_key,
+                    })
+
+            # === SELECTIVITY: Rank candidates by confidence, enter only the best ===
+            if _scan_candidates:
+                # Sort by confidence descending
+                _scan_candidates.sort(key=lambda c: c.get("confidence", 0), reverse=True)
+                entered = 0
+
+                for cand in _scan_candidates:
+                    if entered >= MAX_ENTRIES_PER_SCAN:
+                        break
+
+                    asset = cand["asset"]
+                    platform = cand["platform"]
+                    market_data = cand["market_data"]
+                    direction = cand["direction"]
+                    confidence = cand["confidence"]
+                    reason = cand["reason"]
+                    structure = cand["structure"]
+                    prev_candle = cand["prev_candle"]
+                    prev_str = cand["prev_str"]
+                    ptb = cand["ptb"]
+                    price = cand["price"]
+                    session_label = cand["session_label"]
+                    vol_label = cand["vol_label"]
+                    boundary_key = cand["boundary_key"]
+
+                    if boundary_key in _v2_active_boundaries:
+                        continue
+
                     # Get REAL book ask from order book
                     book_ask = _v2_get_odds(platform, market_data, direction)
 
-                    # Calculate limit price — we don't buy at the ask
+                    # Calculate limit price
                     if book_ask:
                         limit_price, should_place = _v2_calc_limit_price(book_ask, confidence)
                         if not should_place:
@@ -1904,17 +2011,12 @@ def _v2_scan_timeframe(timeframe):
                                 tf_label, asset, direction, book_ask, confidence))
                             continue
                     else:
-                        # No book data — place at confidence-based estimate
                         limit_price = max(65, min(85, 60 + confidence * 0.25))
                         book_ask = None
 
-                    # Record as PENDING limit order — the fill checker will
-                    # check each cycle if the ask has come down to our limit
-                    entry_odds = limit_price  # Our limit IS our entry price
+                    entry_odds = limit_price
 
                     # Build entry note
-                    prev_str = "{} body={:.0f}%".format(
-                        prev_candle["strength"], prev_candle["body_pct"] * 100) if prev_candle else ""
                     note = _v2_build_entry_note(
                         asset, tf_label, direction, prev_candle, structure,
                         ptb, price, session_label, vol_label, confidence)
@@ -1967,14 +2069,19 @@ def _v2_scan_timeframe(timeframe):
                         continue
 
                     _v2_active_boundaries[boundary_key] = True
+                    entered += 1
 
                     url_str = "\n🔗 {}".format(market_url) if market_url else ""
                     send_telegram(
                         "📋 V2 LIMIT {} {} {} {} @ {:.0f}c (book {:.0f}c)\n"
-                        "Conf {} | ${:.2f} | PENDING fill{}".format(
+                        "Conf {} | ${:.2f} | BEST {}/{}{}".format(
                             platform[:4].upper(), tf_label, asset, direction,
                             limit_price, book_ask or 0, confidence,
-                            FLAT_STAKE, url_str))
+                            FLAT_STAKE, entered, len(_scan_candidates), url_str))
+
+                if _scan_candidates:
+                    print("[V2] {} scan: {} candidates, entered {}".format(
+                        tf_label, len(_scan_candidates), entered))
 
             time.sleep(scan_sleep)
 
