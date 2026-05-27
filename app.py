@@ -773,20 +773,19 @@ def _poly_get_baseline(parsed, price=None):
 # ═══════════════════════════════════════════════════════════
 
 def _v2_session_filter(utc_hour):
-    """Return session label and safety. For paper trading, ALL sessions are safe.
-    Labels are used for confidence adjustments, not hard blocks."""
+    """Return session label and whether it's safe to trade.
+    Per spec: AVOID London/US crossover, Peak US, Peak Asia.
+    PREFER: Late US/early Asian, Early morning."""
     if 4 <= utc_hour <= 11:
         return "EARLY_MORNING", True
     elif 17 <= utc_hour <= 22:
         return "LATE_US_ASIA", True
     elif 11 <= utc_hour < 12:
         return "PRE_LONDON", True
-    elif 12 <= utc_hour <= 15:
-        return "LONDON_US_CROSS", True  # Paper: allow trading, track results
-    elif 15 < utc_hour < 17:
-        return "LATE_US", True
-    elif 23 <= utc_hour or utc_hour < 2:
-        return "PEAK_ASIA", True
+    elif 12 <= utc_hour <= 17:
+        return "US_SESSION", False  # London/US cross + Peak US — SKIP
+    elif 23 <= utc_hour or utc_hour < 4:
+        return "PEAK_ASIA", False  # Peak Asia — SKIP
     else:
         return "TRANSITION", True
 
@@ -848,42 +847,23 @@ def _v2_analyze_structure(candles):
     avg_move = sum(moves) / len(moves) if moves else 0
     max_move = max(moves) if moves else 0
 
-    if avg_move > 0 and max_move > avg_move * 5.0:
+    if avg_move > 0 and max_move > avg_move * 2.0:
         grind_type = "spike"
-    elif avg_move > 0 and max_move < avg_move * 2.0:
+    elif avg_move > 0 and max_move < avg_move * 1.5:
         grind_type = "steady"
     else:
         grind_type = "choppy"
 
-    # Direction determination
-    # Strong: clean trend with no opposing signals
+    # Direction determination — per spec: HH>=2 AND HL>=2 = clean trend
+    # No weak fallbacks — if structure isn't clean, it's FLAT (skip)
     if hh_count >= 2 and hl_count >= 2 and lh_count == 0 and ll_count == 0:
         direction = "UP"
     elif ll_count >= 2 and lh_count >= 2 and hh_count == 0 and hl_count == 0:
         direction = "DOWN"
-    # Moderate: majority signals in one direction
-    elif hh_count >= 2 and hl_count >= 1:
+    elif hh_count >= 2 and hl_count >= 2 and hh_count > lh_count:
         direction = "UP"
-    elif ll_count >= 2 and lh_count >= 1:
+    elif ll_count >= 2 and lh_count >= 2 and ll_count > hh_count:
         direction = "DOWN"
-    # Weak but valid: at least 1 HH+HL with no opposing
-    elif hh_count >= 1 and hl_count >= 1 and ll_count == 0:
-        direction = "UP"
-    elif ll_count >= 1 and lh_count >= 1 and hh_count == 0:
-        direction = "DOWN"
-    # Minimal: just dominant count with no contradiction
-    elif hh_count >= 1 and lh_count == 0:
-        direction = "UP"
-    elif ll_count >= 1 and hh_count == 0:
-        direction = "DOWN"
-    # Fallback: use overall price direction (last vs first candle)
-    elif len(candles) >= 2:
-        if candles[-1]["c"] > candles[0]["o"]:
-            direction = "UP"
-        elif candles[-1]["c"] < candles[0]["o"]:
-            direction = "DOWN"
-        else:
-            direction = "FLAT"
     else:
         direction = "FLAT"
 
@@ -978,17 +958,28 @@ def _v2_ptb_distance(price, ptb, asset):
 def _v2_should_enter(structure, prev_candle, volatility_label, vol_safe,
                      session_safe, ptb_meaningful, ptb_direction, grind_type,
                      timeframe="1H"):
-    """Master entry decision. Returns (should_trade, direction, confidence, reason)."""
+    """Master entry decision — follows spec EXACTLY.
+    
+    Per spec, a SAFE entry requires ALL of:
+    1. Previous candle was GREEN/strong (for UP) or RED/strong (for DOWN)
+    2. Current candle making HH>=2 and HL>=2 (clean trend)
+    3. No aggressive pump spikes (these reverse)
+    4. Price meaningfully above PTB (for UP) or below (for DOWN)
+    5. Quiet market conditions (not volatile session)
+    
+    If ANY reversal sign → SKIP."""
 
-    # Hard filters — SKIP if any fail
-    if not session_safe:
+    # Hard filter: session
+    if not session_safe and timeframe != "DAILY":
         return False, None, 0, "Volatile session — skip"
 
+    # Hard filter: volatility
     if not vol_safe:
         return False, None, 0, "Volatility too high — skip"
 
-    # Spike is a warning, not a block — will reduce confidence later
-    spike_penalty = -15 if grind_type == "spike" else 0
+    # Hard filter: spike = SKIP (spec says aggressive pump = DANGEROUS)
+    if grind_type == "spike":
+        return False, None, 0, "Spike detected — dangerous, skip"
 
     if not structure:
         return False, None, 0, "No structure data"
@@ -996,120 +987,113 @@ def _v2_should_enter(structure, prev_candle, volatility_label, vol_safe,
     if not prev_candle:
         return False, None, 0, "No previous candle data"
 
-    # Direction from structure
     struct_dir = structure["direction"]
     if struct_dir == "FLAT":
-        return False, None, 0, "No clear direction — choppy"
+        return False, None, 0, "No clean trend — choppy around PTB"
 
-    # Validate structure + prev candle alignment
     hh = structure["hh_count"]
     hl = structure["hl_count"]
     lh = structure["lh_count"]
     ll = structure["ll_count"]
 
     if struct_dir == "UP":
-        # Confidence based on structure strength + prev candle alignment
-        # Strong structure: HH>=2 + HL>=2
-        # Moderate: HH>=1 + HL>=1
-        # Weak: just direction detected from price trend
-        if hh >= 2 and hl >= 2:
-            struct_strength = "STRONG"
-        elif hh >= 1 and hl >= 1:
-            struct_strength = "MODERATE"
-        else:
-            struct_strength = "WEAK"
+        # Spec: previous candle must be GREEN
+        if prev_candle["strength"] in ("STRONG_BEAR", "MILD_BEAR"):
+            return False, None, 0, "Prev candle RED — no bullish bias, skip"
 
-        # Base confidence from prev candle + structure
-        if prev_candle["strength"] == "STRONG_BULL":
-            confidence = 90 if struct_strength == "STRONG" else 80 if struct_strength == "MODERATE" else 70
-            reason = "Prev strong green + {} structure".format(struct_strength)
-        elif prev_candle["strength"] == "MILD_BULL":
-            confidence = 80 if struct_strength == "STRONG" else 70 if struct_strength == "MODERATE" else 60
-            reason = "Prev mild green + {} structure".format(struct_strength)
-        elif prev_candle["strength"] == "DOJI":
-            confidence = 65 if struct_strength == "STRONG" else 55 if struct_strength == "MODERATE" else 50
-            reason = "Prev doji + {} UP structure".format(struct_strength)
-        elif prev_candle["strength"] in ("STRONG_BEAR", "MILD_BEAR"):
-            # Prev candle against structure — only proceed if structure is strong
-            if struct_strength == "STRONG":
-                confidence = 60
-                reason = "Structure UP despite prev red — strong HH/HL overrides"
-            elif struct_strength == "MODERATE":
-                confidence = 50
-                reason = "Moderate UP structure vs prev red — low confidence"
-            else:
-                return False, None, 0, "Weak UP + prev bearish — skip"
-        else:
-            confidence = 70 if struct_strength == "STRONG" else 60 if struct_strength == "MODERATE" else 55
-            reason = "Structure UP ({}) + prev candle neutral".format(struct_strength)
+        # Spec: HH>=2 AND HL>=2 = clean trend
+        if hh < 2 or hl < 2:
+            return False, None, 0, "Structure not clean (HH={} HL={}) — need 2+2".format(hh, hl)
 
-        # PTB adjustment
+        # Spec: any reversal signs = skip
+        if lh >= 1:
+            return False, None, 0, "Lower high forming (LH={}) — momentum fading, skip".format(lh)
+
+        # Spec: price must be meaningfully above PTB
         if ptb_meaningful and ptb_direction == "BELOW":
-            confidence -= 10
-            reason += " | Below PTB"
-        elif ptb_meaningful and ptb_direction == "ABOVE":
+            return False, None, 0, "Price below PTB — chopping, skip"
+
+        # All checks passed — calculate confidence
+        if prev_candle["strength"] == "STRONG_BULL" and grind_type == "steady":
+            confidence = 95
+            reason = "Strong green prev + clean HH/HL + steady grind"
+        elif prev_candle["strength"] == "STRONG_BULL":
+            confidence = 90
+            reason = "Strong green prev + clean HH/HL structure"
+        elif prev_candle["strength"] == "MILD_BULL" and grind_type == "steady":
+            confidence = 85
+            reason = "Mild green prev + clean HH/HL + steady grind"
+        elif prev_candle["strength"] == "MILD_BULL":
+            confidence = 80
+            reason = "Mild green prev + clean HH/HL structure"
+        elif prev_candle["strength"] == "DOJI":
+            # Doji = indecision — only enter if structure is very strong
+            if hh >= 3 and hl >= 3 and grind_type == "steady":
+                confidence = 70
+                reason = "Prev doji BUT very strong structure (HH={} HL={}) + steady".format(hh, hl)
+            else:
+                return False, None, 0, "Prev doji + not enough structure to override"
+        else:
+            confidence = 80
+            reason = "Green prev + clean structure"
+
+        # PTB above = extra confidence
+        if ptb_meaningful and ptb_direction == "ABOVE":
             confidence += 5
-            reason += " | Above PTB"
+            reason += " | Well above PTB"
 
-        # Grind bonus
-        if grind_type == "steady":
+        # Extra HH/HL = bonus
+        if hh >= 3 and hl >= 3:
             confidence += 5
-            reason += " | Steady"
+            reason += " | Strong HH={} HL={}".format(hh, hl)
 
-        # Apply spike penalty
-        confidence += spike_penalty
-        if spike_penalty:
-            reason += " | Spike penalty"
-
-        return confidence >= 50, "UP", confidence, reason
+        return True, "UP", min(confidence, 99), reason
 
     elif struct_dir == "DOWN":
-        if ll >= 2 and lh >= 2:
-            struct_strength = "STRONG"
-        elif ll >= 1 and lh >= 1:
-            struct_strength = "MODERATE"
-        else:
-            struct_strength = "WEAK"
+        # Spec: previous candle must be RED for DOWN
+        if prev_candle["strength"] in ("STRONG_BULL", "MILD_BULL"):
+            return False, None, 0, "Prev candle GREEN — no bearish bias, skip"
 
-        if prev_candle["strength"] == "STRONG_BEAR":
-            confidence = 90 if struct_strength == "STRONG" else 80 if struct_strength == "MODERATE" else 70
-            reason = "Prev strong red + {} structure".format(struct_strength)
-        elif prev_candle["strength"] == "MILD_BEAR":
-            confidence = 80 if struct_strength == "STRONG" else 70 if struct_strength == "MODERATE" else 60
-            reason = "Prev mild red + {} structure".format(struct_strength)
-        elif prev_candle["strength"] == "DOJI":
-            confidence = 65 if struct_strength == "STRONG" else 55 if struct_strength == "MODERATE" else 50
-            reason = "Prev doji + {} DOWN structure".format(struct_strength)
-        elif prev_candle["strength"] in ("STRONG_BULL", "MILD_BULL"):
-            if struct_strength == "STRONG":
-                confidence = 60
-                reason = "Structure DOWN despite prev green — strong LL/LH overrides"
-            elif struct_strength == "MODERATE":
-                confidence = 50
-                reason = "Moderate DOWN structure vs prev green — low confidence"
-            else:
-                return False, None, 0, "Weak DOWN + prev bullish — skip"
-        else:
-            confidence = 70 if struct_strength == "STRONG" else 60 if struct_strength == "MODERATE" else 55
-            reason = "Structure DOWN ({}) + prev candle neutral".format(struct_strength)
+        if ll < 2 or lh < 2:
+            return False, None, 0, "Structure not clean (LL={} LH={}) — need 2+2".format(ll, lh)
+
+        if hl >= 1:
+            return False, None, 0, "Higher low forming (HL={}) — momentum fading, skip".format(hl)
 
         if ptb_meaningful and ptb_direction == "ABOVE":
-            confidence -= 10
-            reason += " | Above PTB"
-        elif ptb_meaningful and ptb_direction == "BELOW":
+            return False, None, 0, "Price above PTB — chopping, skip"
+
+        if prev_candle["strength"] == "STRONG_BEAR" and grind_type == "steady":
+            confidence = 95
+            reason = "Strong red prev + clean LL/LH + steady grind"
+        elif prev_candle["strength"] == "STRONG_BEAR":
+            confidence = 90
+            reason = "Strong red prev + clean LL/LH structure"
+        elif prev_candle["strength"] == "MILD_BEAR" and grind_type == "steady":
+            confidence = 85
+            reason = "Mild red prev + clean LL/LH + steady grind"
+        elif prev_candle["strength"] == "MILD_BEAR":
+            confidence = 80
+            reason = "Mild red prev + clean LL/LH structure"
+        elif prev_candle["strength"] == "DOJI":
+            if ll >= 3 and lh >= 3 and grind_type == "steady":
+                confidence = 70
+                reason = "Prev doji BUT very strong structure (LL={} LH={}) + steady".format(ll, lh)
+            else:
+                return False, None, 0, "Prev doji + not enough structure to override"
+        else:
+            confidence = 80
+            reason = "Red prev + clean structure"
+
+        if ptb_meaningful and ptb_direction == "BELOW":
             confidence += 5
-            reason += " | Below PTB"
+            reason += " | Well below PTB"
 
-        if grind_type == "steady":
+        if ll >= 3 and lh >= 3:
             confidence += 5
-            reason += " | Steady"
+            reason += " | Strong LL={} LH={}".format(ll, lh)
 
-        # Apply spike penalty
-        confidence += spike_penalty
-        if spike_penalty:
-            reason += " | Spike penalty"
-
-        return confidence >= 50, "DOWN", confidence, reason
+        return True, "DOWN", min(confidence, 99), reason
 
     return False, None, 0, "No clear signal"
 
@@ -1552,49 +1536,30 @@ def _v2_get_odds(platform, market_data, direction):
 
 
 def _v2_calc_limit_price(book_ask, confidence):
-    """Calculate limit order price based on book state and confidence.
-    We place a limit slightly below the ask — any small dip fills us.
-
-    At high odds (90c+): limit just 0.5-1.5c below ask — queue for any dip
-    At medium odds (70-90c): limit 2-5c below ask — want some discount
-    At low odds (<70c): limit 5-8c below — need real edge
-
-    Returns (limit_price_cents, should_place) or (None, False)."""
+    """Calculate limit order price. Per spec: typical entry 70-90c.
+    Place limit slightly below ask to get filled on any dip.
+    Minimum limit: 65c — below that there's not enough confirmation."""
 
     if not book_ask or book_ask <= 0:
         return None, False
 
-    # Below 50c means the market favors the other side — skip
-    if book_ask < 50:
+    # Below 65c means the market isn't confirming this direction — skip
+    if book_ask < 65:
         return None, False
 
-    # High odds (90c+): practically confirmed, just queue slightly below
+    # Place limit 0.5-2c below ask depending on confidence
     if book_ask >= 90:
-        # At 99c → limit 97.5c. At 93c → limit 91.5c. At 90c → limit 88.5c.
-        limit = book_ask - 1.5
-        if confidence >= 85:
-            limit = book_ask - 0.5  # Very confident, barely undercut
-        elif confidence >= 75:
-            limit = book_ask - 1.0
-
-    # Medium odds (70-90c): want a small discount
-    elif book_ask >= 70:
-        limit = book_ask - 3
-        if confidence >= 85:
-            limit = book_ask - 2
-        elif confidence >= 75:
-            limit = book_ask - 2.5
-
-    # Lower odds (50-70c): want meaningful discount
+        # Very high odds — limit just barely below
+        limit = book_ask - 0.5 if confidence >= 85 else book_ask - 1.0
+    elif book_ask >= 75:
+        # Good range — small undercut
+        limit = book_ask - 1.0 if confidence >= 85 else book_ask - 2.0
     else:
-        limit = book_ask - 5
-        if confidence >= 85:
-            limit = book_ask - 3
-        elif confidence >= 75:
-            limit = book_ask - 4
+        # 65-75c range — slightly more undercut
+        limit = book_ask - 2.0 if confidence >= 85 else book_ask - 3.0
 
-    # Floor at 50c — below that there's no real edge
-    limit = max(50, limit)
+    # Floor at 65c
+    limit = max(65, limit)
 
     return round(limit, 1), True
 
@@ -1812,31 +1777,39 @@ def _v2_scan_timeframe(timeframe):
     MAX_ENTRIES_PER_SCAN = 2  # Only the best 2 trades per cycle
     tf_label = timeframe
 
-    # Timeframe-specific config
+    # Timeframe-specific config — per spec timing
     if tf_label == "1H":
         intra_interval = "5m"
         prev_interval = "1h"
-        min_intra_candles = 3
-        min_confidence = 50      # Paper: lower threshold to collect data
+        min_intra_candles = 6       # Need 6+ 5M candles (30+ min of data)
+        min_confidence = 70         # Spec: 70c+ average entry = 70+ confidence
         boundary_secs = 3600
         poly_tf_filter = "1H"
         scan_sleep = 120
+        # Spec: check at T+45min (wait for candle to form)
+        entry_window_start = 2700   # T+45min = 2700 seconds into the hour
+        entry_window_end = 3540     # T+59min = stop 60s before close
     elif tf_label == "15M":
         intra_interval = "1m"
         prev_interval = "15m"
-        min_intra_candles = 3
-        min_confidence = 55      # Paper: slightly higher for 15M noise
+        min_intra_candles = 5       # Need 5+ 1M candles
+        min_confidence = 70         # Spec: only obvious setups
         boundary_secs = 900
         poly_tf_filter = "15M"
         scan_sleep = 60
+        # Spec: check at T+5 to T+10
+        entry_window_start = 300    # T+5min
+        entry_window_end = 840      # T+14min (stop 60s before close)
     else:  # DAILY
         intra_interval = "1h"
         prev_interval = "1d"
-        min_intra_candles = 3
-        min_confidence = 50      # Paper: collect all daily signals
+        min_intra_candles = 6       # Need 6+ hours of data
+        min_confidence = 80         # Spec: 85c+ average entry = 80+ confidence
         boundary_secs = 86400
         poly_tf_filter = "DAILY"
-        scan_sleep = 600  # Check every 10 minutes
+        scan_sleep = 1800           # Check every 30 min per spec
+        entry_window_start = 0      # Handled by quiet hours check below
+        entry_window_end = 86400
 
     while True:
         try:
@@ -1847,20 +1820,27 @@ def _v2_scan_timeframe(timeframe):
                 # Daily boundary = midnight UTC
                 boundary_ts = int(now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
                 secs_into_period = now_ts - boundary_ts
-                # Need at least 3 hours of data for daily
-                if secs_into_period < 10800:
-                    time.sleep(max(60, 10800 - secs_into_period))
+                # Spec: check 3-6 hours before close during quiet hours
+                # Quiet hours: 17-22 UTC or 4-11 UTC
+                h = now.hour
+                is_quiet = (17 <= h <= 22) or (4 <= h <= 11)
+                if not is_quiet:
+                    time.sleep(600)
+                    continue
+                # Need at least 6 hours of data
+                if secs_into_period < 21600:
+                    time.sleep(max(60, 21600 - secs_into_period))
                     continue
             else:
                 boundary_ts = (now_ts // boundary_secs) * boundary_secs
                 secs_into_period = now_ts - boundary_ts
-                min_secs = 300 if tf_label == "1H" else 120
-                if secs_into_period < min_secs:
-                    time.sleep(min_secs - secs_into_period + 5)
+                # Spec: only enter within the entry window
+                if secs_into_period < entry_window_start:
+                    time.sleep(entry_window_start - secs_into_period + 5)
                     continue
-                remaining = boundary_secs - secs_into_period
-                if remaining < 60:
-                    time.sleep(remaining + 5)
+                if secs_into_period > entry_window_end:
+                    # Past the window — wait for next period
+                    time.sleep(boundary_secs - secs_into_period + 5)
                     continue
 
             # Session filter
@@ -2007,12 +1987,13 @@ def _v2_scan_timeframe(timeframe):
                     if book_ask:
                         limit_price, should_place = _v2_calc_limit_price(book_ask, confidence)
                         if not should_place:
-                            print("[V2] {} {} {} — book_ask={:.0f}c, no edge at conf {}".format(
-                                tf_label, asset, direction, book_ask, confidence))
+                            print("[V2] {} {} {} — book_ask={:.0f}c, below 65c minimum".format(
+                                tf_label, asset, direction, book_ask))
                             continue
                     else:
-                        limit_price = max(65, min(85, 60 + confidence * 0.25))
-                        book_ask = None
+                        # No book data = can't confirm odds = skip
+                        print("[V2] {} {} {} — no book data, skip".format(tf_label, asset, direction))
+                        continue
 
                     entry_odds = limit_price
 
@@ -2281,7 +2262,10 @@ def _v2_fill_checker():
 
                 limit = o.get("limit_price", 0) or 0
 
-                # FILL if current ask <= our limit price
+                # FILL if current ask <= our limit price AND ask is sane (>= 10c)
+                # Below 10c means stale/dead market data — not a real fill
+                if current_ask < 10:
+                    continue
                 if current_ask <= limit:
                     try:
                         conn2 = get_db()
