@@ -153,12 +153,32 @@ def init_db():
             fired_at        TIMESTAMPTZ DEFAULT NOW(),
             resolved_at     TIMESTAMPTZ,
             confidence      TEXT,
-            market_url      TEXT
+            market_url      TEXT,
+            limit_price     REAL,
+            book_ask        REAL,
+            filled_at       TIMESTAMPTZ,
+            order_status    TEXT DEFAULT 'FILLED'
         )
     """)
-    # Add market_url column if missing (migration for existing DBs)
+    # Migrations for existing DBs
     try:
         conn.run("ALTER TABLE v2_paper_trades ADD COLUMN IF NOT EXISTS market_url TEXT")
+    except:
+        pass
+    try:
+        conn.run("ALTER TABLE v2_paper_trades ADD COLUMN IF NOT EXISTS limit_price REAL")
+    except:
+        pass
+    try:
+        conn.run("ALTER TABLE v2_paper_trades ADD COLUMN IF NOT EXISTS book_ask REAL")
+    except:
+        pass
+    try:
+        conn.run("ALTER TABLE v2_paper_trades ADD COLUMN IF NOT EXISTS filled_at TIMESTAMPTZ")
+    except:
+        pass
+    try:
+        conn.run("ALTER TABLE v2_paper_trades ADD COLUMN IF NOT EXISTS order_status TEXT DEFAULT 'FILLED'")
     except:
         pass
     # v2 balance tracking
@@ -530,6 +550,9 @@ def _poly_parse_market(market, timeframe_hint=None):
             timeframe = "5M"
         elif "-1h-" in slug_lower or "-1h" in slug_lower or "hourly" in slug_lower:
             timeframe = "1H"
+        elif "up-or-down-on-" in slug_lower or "daily" in slug_lower:
+            # Daily markets: "bitcoin-up-or-down-on-may-4-2026"
+            timeframe = "DAILY"
         if not timeframe:
             created = market.get("createdAt") or ""
             if created and exp_ts:
@@ -539,6 +562,7 @@ def _poly_parse_market(market, timeframe_hint=None):
                     if 55 <= dur <= 65: timeframe = "1H"
                     elif 13 <= dur <= 17: timeframe = "15M"
                     elif 4 <= dur <= 6: timeframe = "5M"
+                    elif dur > 300: timeframe = "DAILY"  # > 5 hours = daily
                 except:
                     pass
         if not timeframe and timeframe_hint:
@@ -668,9 +692,14 @@ def _poly_fetch_markets():
         _1h_name = _1h_full_names.get(asset_slug, asset_slug)
         slugs.append("{}-up-or-down-{}-{}-{}-{}{}-et".format(
             _1h_name, _1h_mo, _1h_dy, _1h_yr, _1h_h12, _1h_ap))
+        # Daily slug: "bitcoin-up-or-down-on-may-27-2026"
+        slugs.append("{}-up-or-down-on-{}-{}-{}".format(
+            _1h_name, _1h_mo, _1h_dy, _1h_yr))
 
         for s in slugs:
-            _is_1h = "-up-or-down-" in s
+            _is_1h = "-up-or-down-" in s and "-on-" not in s
+            _is_daily = "-up-or-down-on-" in s
+            tf_hint = "DAILY" if _is_daily else "1H" if _is_1h else None
             for url in ["{}/events/slug/{}".format(POLY_GAMMA_API, s),
                         "{}/events".format(POLY_GAMMA_API)]:
                 try:
@@ -684,7 +713,7 @@ def _poly_fetch_markets():
                         elif isinstance(data, dict):
                             em = data.get("markets", [])
                         for m in em:
-                            parsed = _poly_parse_market(m, timeframe_hint="1H" if _is_1h else None)
+                            parsed = _poly_parse_market(m, timeframe_hint=tf_hint)
                             if parsed:
                                 markets.append(parsed)
                         if em: break
@@ -1190,20 +1219,54 @@ def _v2_record_paper_trade(platform, timeframe, asset, direction, ptb,
 # ═══════════════════════════════════════════════════════════
 
 def _v2_get_live_odds(market_data, direction):
-    """Read live order book to get REAL ask price for paper trading accuracy.
-    Returns odds as percentage (e.g. 72.0 for 72c) or None."""
+    """Read live order book from Polymarket CLOB.
+    Returns dict with {ask, bid, mid, spread} or None.
+    Logs the full book state for debugging."""
     client = _get_poly_client()
     if not client or not market_data:
         return None
 
     try:
+        # For UP direction: read the UP token book (asks = price to buy UP)
+        # For DOWN direction: read the DOWN token book (asks = price to buy DOWN)
         token = market_data.get("up_token") if direction == "UP" else market_data.get("down_token")
         if not token:
             return None
+
         book = client.get_order_book(str(token))
-        if book and book.get("asks") and len(book["asks"]) > 0:
-            best_ask = float(book["asks"][0]["price"])
+        if not book:
+            print("[V2] POLY BOOK: empty for token {}...{}".format(str(token)[:8], str(token)[-8:]))
+            return None
+
+        asks = book.get("asks", [])
+        bids = book.get("bids", [])
+
+        best_ask = float(asks[0]["price"]) if asks else None
+        best_bid = float(bids[0]["price"]) if bids else None
+        mid = book.get("mid") or book.get("midpoint")
+        if mid:
+            mid = float(mid)
+        elif best_ask and best_bid:
+            mid = (best_ask + best_bid) / 2
+
+        # Log for debugging
+        asset = market_data.get("asset", "?")
+        tf = market_data.get("timeframe", "?")
+        print("[V2] POLY BOOK {} {} {}: ask={} bid={} mid={} asks_depth={} bids_depth={}".format(
+            asset, tf, direction,
+            "{:.2f}".format(best_ask) if best_ask else "None",
+            "{:.2f}".format(best_bid) if best_bid else "None",
+            "{:.2f}".format(mid) if mid else "None",
+            len(asks), len(bids)))
+
+        # Return the best ask as percentage
+        if best_ask and 0.01 <= best_ask <= 0.99:
             return round(best_ask * 100, 1)
+
+        # If no asks, try midpoint
+        if mid and 0.01 <= mid <= 0.99:
+            return round(mid * 100, 1)
+
     except Exception as e:
         print("[V2] Poly order book error: {}".format(e))
     return None
@@ -1389,6 +1452,54 @@ def _v2_get_odds(platform, market_data, direction):
     return None
 
 
+def _v2_calc_limit_price(book_ask, confidence):
+    """Calculate limit order price based on book state and confidence.
+    We place a limit slightly below the ask — any small dip fills us.
+
+    At high odds (90c+): limit just 0.5-1.5c below ask — queue for any dip
+    At medium odds (70-90c): limit 2-5c below ask — want some discount
+    At low odds (<70c): limit 5-8c below — need real edge
+
+    Returns (limit_price_cents, should_place) or (None, False)."""
+
+    if not book_ask or book_ask <= 0:
+        return None, False
+
+    # Below 50c means the market favors the other side — skip
+    if book_ask < 50:
+        return None, False
+
+    # High odds (90c+): practically confirmed, just queue slightly below
+    if book_ask >= 90:
+        # At 99c → limit 97.5c. At 93c → limit 91.5c. At 90c → limit 88.5c.
+        limit = book_ask - 1.5
+        if confidence >= 85:
+            limit = book_ask - 0.5  # Very confident, barely undercut
+        elif confidence >= 75:
+            limit = book_ask - 1.0
+
+    # Medium odds (70-90c): want a small discount
+    elif book_ask >= 70:
+        limit = book_ask - 3
+        if confidence >= 85:
+            limit = book_ask - 2
+        elif confidence >= 75:
+            limit = book_ask - 2.5
+
+    # Lower odds (50-70c): want meaningful discount
+    else:
+        limit = book_ask - 5
+        if confidence >= 85:
+            limit = book_ask - 3
+        elif confidence >= 75:
+            limit = book_ask - 4
+
+    # Floor at 50c — below that there's no real edge
+    limit = max(50, limit)
+
+    return round(limit, 1), True
+
+
 # ═══════════════════════════════════════════════════════════
 # V2 RESOLUTION — Check outcomes of paper trades
 # ═══════════════════════════════════════════════════════════
@@ -1401,6 +1512,7 @@ def _v2_resolve_trades():
             SELECT id, platform, timeframe, asset, direction, ptb, entry_odds,
                    stake, market_id, slug, fired_at, hedged, hedge_odds, hedge_direction
             FROM v2_paper_trades WHERE status = 'OPEN'
+            AND (order_status = 'FILLED' OR order_status IS NULL)
         """)
         cols = ["id", "platform", "timeframe", "asset", "direction", "ptb",
                 "entry_odds", "stake", "market_id", "slug", "fired_at",
@@ -1597,6 +1709,15 @@ def _v2_scan_timeframe(timeframe):
             lmts_markets = _limitless_fetch_markets()
             lmts_tf = {m["asset"]: m for m in (lmts_markets or []) if m.get("timeframe") == tf_label}
 
+            # Log what was found for this timeframe
+            poly_assets = sorted(poly_tf.keys()) if poly_tf else []
+            lmts_assets = sorted(lmts_tf.keys()) if lmts_tf else []
+            if poly_assets or lmts_assets:
+                print("[V2] {} scan: POLY={} LMTS={}".format(
+                    tf_label, ",".join(poly_assets) or "none", ",".join(lmts_assets) or "none"))
+            else:
+                print("[V2] {} scan: no markets found on either platform".format(tf_label))
+
             for asset in ASSETS:
                 # Try both platforms for this asset
                 platforms_to_try = []
@@ -1664,10 +1785,24 @@ def _v2_scan_timeframe(timeframe):
                     if not should or not confidence or confidence < min_confidence:
                         continue
 
-                    # Get REAL odds from the right order book
-                    entry_odds = _v2_get_odds(platform, market_data, direction)
-                    if not entry_odds:
-                        entry_odds = 50.0
+                    # Get REAL book ask from order book
+                    book_ask = _v2_get_odds(platform, market_data, direction)
+
+                    # Calculate limit price — we don't buy at the ask
+                    if book_ask:
+                        limit_price, should_place = _v2_calc_limit_price(book_ask, confidence)
+                        if not should_place:
+                            print("[V2] {} {} {} — book_ask={:.0f}c, no edge at conf {}".format(
+                                tf_label, asset, direction, book_ask, confidence))
+                            continue
+                    else:
+                        # No book data — place at confidence-based estimate
+                        limit_price = max(65, min(85, 60 + confidence * 0.25))
+                        book_ask = None
+
+                    # Record as PENDING limit order — the fill checker will
+                    # check each cycle if the ask has come down to our limit
+                    entry_odds = limit_price  # Our limit IS our entry price
 
                     # Build entry note
                     prev_str = "{} body={:.0f}%".format(
@@ -1675,27 +1810,63 @@ def _v2_scan_timeframe(timeframe):
                     note = _v2_build_entry_note(
                         asset, tf_label, direction, prev_candle, structure,
                         ptb, price, session_label, vol_label, confidence)
+                    if book_ask:
+                        note += " | Book: {:.0f}c → Limit: {:.0f}c".format(book_ask, limit_price)
 
-                    # Record paper trade
-                    _v2_record_paper_trade(
-                        platform=platform, timeframe=tf_label,
-                        asset=asset, direction=direction, ptb=ptb,
-                        entry_odds=entry_odds, stake=FLAT_STAKE, entry_note=note,
-                        structure=structure, session_label=session_label,
-                        volatility_label=vol_label, prev_candle_str=prev_str,
-                        market_data=market_data, confidence=confidence)
+                    # Record paper trade as PENDING
+                    market_url = _v2_market_url(platform, market_data, asset, tf_label)
+                    try:
+                        conn = get_db()
+                        conn.run("""
+                            INSERT INTO v2_paper_trades (
+                                platform, timeframe, asset, direction, ptb, entry_odds,
+                                entry_price, stake, entry_note, hh_count, hl_count, ll_count, lh_count,
+                                grind_rate, ptb_distance, session_label, volatility,
+                                prev_candle, market_id, slug, condition_id,
+                                up_token, down_token, confidence, market_url,
+                                limit_price, book_ask, order_status, status
+                            ) VALUES (
+                                :plat, :tf, :asset, :dir, :ptb, :odds,
+                                :price, :stake, :note, :hh, :hl, :ll, :lh,
+                                :grind, :ptb_dist, :sess, :vol,
+                                :prev, :mid, :slug, :cid,
+                                :up_tok, :dn_tok, :conf, :murl,
+                                :lim, :bask, 'PENDING', 'OPEN'
+                            )
+                        """,
+                            plat=platform, tf=tf_label, asset=asset, dir=direction,
+                            ptb=ptb, odds=entry_odds, price=price,
+                            stake=FLAT_STAKE, note=note,
+                            hh=structure.get("hh_count", 0) if structure else 0,
+                            hl=structure.get("hl_count", 0) if structure else 0,
+                            ll=structure.get("ll_count", 0) if structure else 0,
+                            lh=structure.get("lh_count", 0) if structure else 0,
+                            grind=structure.get("grind_type", "") if structure else "",
+                            ptb_dist=0, sess=session_label, vol=vol_label,
+                            prev=prev_str or "",
+                            mid=market_data.get("market_id", "") if market_data else "",
+                            slug=market_data.get("slug", "") if market_data else "",
+                            cid=market_data.get("condition_id", "") if market_data else "",
+                            up_tok=market_data.get("up_token", "") if market_data else "",
+                            dn_tok=market_data.get("down_token", "") if market_data else "",
+                            conf=str(confidence) if confidence else "",
+                            murl=market_url,
+                            lim=limit_price, bask=book_ask,
+                        )
+                        conn.close()
+                    except Exception as e:
+                        print("[V2] Record PENDING error: {}".format(e))
+                        continue
 
                     _v2_active_boundaries[boundary_key] = True
 
-                    market_url = _v2_market_url(platform, market_data, asset, tf_label)
                     url_str = "\n🔗 {}".format(market_url) if market_url else ""
-
                     send_telegram(
-                        "📊 V2 {} {} {} {} @ {:.0f}c | Conf {} | ${:.2f}\n"
-                        "📝 {}{}".format(
+                        "📋 V2 LIMIT {} {} {} {} @ {:.0f}c (book {:.0f}c)\n"
+                        "Conf {} | ${:.2f} | PENDING fill{}".format(
                             platform[:4].upper(), tf_label, asset, direction,
-                            entry_odds, confidence, FLAT_STAKE,
-                            reason[:100], url_str))
+                            limit_price, book_ask or 0, confidence,
+                            FLAT_STAKE, url_str))
 
             time.sleep(scan_sleep)
 
@@ -1824,6 +1995,99 @@ def _v2_resolve_loop():
         time.sleep(60)
 
 
+def _v2_fill_checker():
+    """Check PENDING limit orders — fill them if the book ask has dropped
+    to our limit price or below. Expire them if the market period has ended."""
+    print("[V2] Fill checker started")
+
+    while True:
+        try:
+            conn = get_db()
+            rows = conn.run("""
+                SELECT id, platform, timeframe, asset, direction, limit_price,
+                       market_id, slug, condition_id, up_token, down_token,
+                       fired_at
+                FROM v2_paper_trades
+                WHERE order_status = 'PENDING' AND status = 'OPEN'
+            """)
+            cols = ["id", "platform", "timeframe", "asset", "direction", "limit_price",
+                    "market_id", "slug", "condition_id", "up_token", "down_token", "fired_at"]
+            orders = [dict(zip(cols, r)) for r in rows]
+            conn.close()
+
+            for o in orders:
+                # Check if market period has expired (order should expire unfilled)
+                if o.get("fired_at"):
+                    fired = o["fired_at"]
+                    if isinstance(fired, str):
+                        try: fired = datetime.fromisoformat(fired.replace("Z", "+00:00"))
+                        except: continue
+                    if not fired.tzinfo:
+                        fired = fired.replace(tzinfo=timezone.utc)
+                    now = datetime.now(timezone.utc)
+                    tf = o["timeframe"]
+                    max_age = {"15M": 15, "1H": 60, "DAILY": 1440}.get(tf, 60)
+                    if (now - fired).total_seconds() / 60 > max_age:
+                        # Expired unfilled — cancel the order
+                        try:
+                            conn2 = get_db()
+                            conn2.run("""
+                                UPDATE v2_paper_trades SET order_status = 'EXPIRED', status = 'RESOLVED',
+                                outcome = 'EXPIRED', resolved_at = NOW()
+                                WHERE id = :tid
+                            """, tid=o["id"])
+                            conn2.close()
+                            print("[V2] EXPIRED unfilled: {} {} {}".format(o["timeframe"], o["asset"], o["direction"]))
+                        except:
+                            pass
+                        continue
+
+                # Check current book ask
+                market_data = {
+                    "up_token": o.get("up_token", ""),
+                    "down_token": o.get("down_token", ""),
+                    "slug": o.get("slug", ""),
+                    "condition_id": o.get("condition_id", ""),
+                    "market_id": o.get("market_id", ""),
+                    "asset": o.get("asset", ""),
+                    "timeframe": o.get("timeframe", ""),
+                }
+                current_ask = _v2_get_odds(o["platform"], market_data, o["direction"])
+
+                if not current_ask:
+                    continue
+
+                limit = o.get("limit_price", 0) or 0
+
+                # FILL if current ask <= our limit price
+                if current_ask <= limit:
+                    try:
+                        conn2 = get_db()
+                        conn2.run("""
+                            UPDATE v2_paper_trades SET
+                            order_status = 'FILLED', entry_odds = :odds,
+                            book_ask = :bask, filled_at = NOW()
+                            WHERE id = :tid
+                        """, odds=current_ask, bask=current_ask, tid=o["id"])
+                        conn2.close()
+                        print("[V2] FILLED: {} {} {} @ {:.0f}c (limit was {:.0f}c)".format(
+                            o["timeframe"], o["asset"], o["direction"], current_ask, limit))
+
+                        send_telegram(
+                            "✅ V2 FILLED {} {} {} @ {:.0f}c (limit {:.0f}c)\n"
+                            "${:.2f} stake now active".format(
+                                o["timeframe"], o["asset"], o["direction"],
+                                current_ask, limit, FLAT_STAKE))
+                    except Exception as e:
+                        print("[V2] Fill update error: {}".format(e))
+
+            time.sleep(30)  # Check fills every 30 seconds
+
+        except Exception as e:
+            print("[V2] Fill checker error: {}".format(e))
+            time.sleep(30)
+
+
 def _v2_cleanup_loop():
     """Clean up old boundary keys every hour."""
     while True:
@@ -1935,12 +2199,12 @@ def _v2_dashboard_html(platform, trades, bal):
     # Trade table
     h += '<table><thead><tr>'
     h += '<th>#</th><th>Time</th><th>TF</th><th>Asset</th><th>Dir</th>'
-    h += '<th>Odds</th><th>Conf</th><th>PTB</th><th>Result</th>'
+    h += '<th>Limit</th><th>Ask</th><th>Fill</th><th>Conf</th><th>PTB</th><th>Result</th>'
     h += '<th>P&L</th><th>Bal</th><th>Hedge</th><th>Market</th><th>Note</th>'
     h += '</tr></thead><tbody>'
 
     if not trades:
-        h += '<tr><td colspan="14" class="empty">No trades yet — watchers are scanning...</td></tr>'
+        h += '<tr><td colspan="16" class="empty">No trades yet — watchers are scanning...</td></tr>'
     else:
         for t in trades:
             tid = t.get("id", "")
@@ -1956,8 +2220,23 @@ def _v2_dashboard_html(platform, trades, bal):
             asset = t.get("asset", "")
             direction = t.get("direction", "")
             dir_cls = "up" if direction == "UP" else "down"
-            odds = t.get("entry_odds")
-            odds_str = "{:.0f}c".format(odds) if odds else "-"
+            limit_p = t.get("limit_price")
+            limit_str = "{:.0f}c".format(limit_p) if limit_p else "-"
+            book_a = t.get("book_ask")
+            ask_str = "{:.0f}c".format(book_a) if book_a else "-"
+            order_st = t.get("order_status", "FILLED") or "FILLED"
+            if order_st == "FILLED":
+                fill_cls = "win"
+                fill_str = "FILLED"
+            elif order_st == "PENDING":
+                fill_cls = "pend"
+                fill_str = "PENDING"
+            elif order_st == "EXPIRED":
+                fill_cls = "loss"
+                fill_str = "EXPIRED"
+            else:
+                fill_cls = ""
+                fill_str = order_st
             conf = t.get("confidence", "")
             conf_val = int(conf) if conf and str(conf).isdigit() else 0
             conf_cls = "conf-high" if conf_val >= 80 else "conf-med" if conf_val >= 65 else "conf-low"
@@ -1982,7 +2261,8 @@ def _v2_dashboard_html(platform, trades, bal):
             h += '<tr>'
             h += '<td>{}</td><td>{}</td><td>{}</td><td>{}</td>'.format(tid, fired_str, tf, asset)
             h += '<td class="{}">{}</td>'.format(dir_cls, direction)
-            h += '<td>{}</td><td class="{}">{}</td><td>{}</td>'.format(odds_str, conf_cls, conf, ptb_str)
+            h += '<td>{}</td><td>{}</td><td class="{}">{}</td>'.format(limit_str, ask_str, fill_cls, fill_str)
+            h += '<td class="{}">{}</td><td>{}</td>'.format(conf_cls, conf, ptb_str)
             h += '<td class="{}">{}</td>'.format(oc_cls, outcome)
             h += '<td>{}</td><td>{}</td><td>{}</td><td>{}</td>'.format(pnl_str, bal_str, hedge_str, link_str)
             h += '<td class="note-cell" title="{}">{}</td>'.format(note, note[:60])
@@ -2183,6 +2463,7 @@ threading.Thread(target=_v2_fifteen_min_watcher, daemon=True, name="v2-15m").sta
 threading.Thread(target=_v2_daily_watcher, daemon=True, name="v2-daily").start()
 threading.Thread(target=_v2_monitor_thread, daemon=True, name="v2-monitor").start()
 threading.Thread(target=_v2_resolve_loop, daemon=True, name="v2-resolve").start()
+threading.Thread(target=_v2_fill_checker, daemon=True, name="v2-fills").start()
 threading.Thread(target=_v2_cleanup_loop, daemon=True, name="v2-cleanup").start()
 
 print("[V2] All threads launched — engine running")
