@@ -3233,6 +3233,7 @@ def _sports_fetch_polymarket_sports(match_pairs=None):
         }
 
     # Step 2: Fetch active soccer markets by tag_id
+    # NOTE: tag_id=1 returns ALL sports, so we filter for soccer keywords
     if _sports_poly_soccer_tag_id:
         try:
             r = _sports_req.get("{}/markets".format(POLY_GAMMA_API),
@@ -3243,10 +3244,22 @@ def _sports_fetch_polymarket_sports(match_pairs=None):
             if r.status_code == 200:
                 data = r.json() if isinstance(r.json(), list) else []
                 for m in data:
+                    smt_val = (m.get("sportsMarketType", "") or "").lower()
+                    q = (m.get("question", "") or "").lower()
+                    # Exclude non-soccer
+                    if any(x in smt_val for x in ["tennis", "map_handicap", "esport",
+                                                    "round_handicap", "nba", "nfl",
+                                                    "nhl", "mlb", "mma", "ufc",
+                                                    "set_totals", "game_handicap"]):
+                        continue
+                    if any(x in q for x in ["tennis", "map handicap", "esport",
+                                             "sets o/u", "total sets",
+                                             "round handicap", "nba", "nfl"]):
+                        continue
                     parsed = _parse_market(m)
                     if parsed:
                         markets.append(parsed)
-                print("[SPORTS] Poly tag_id markets: {}".format(len(markets)))
+                print("[SPORTS] Poly tag_id markets: {} (after soccer filter)".format(len(markets)))
         except Exception as e:
             print("[SPORTS] Poly tag_id fetch error: {}".format(e))
 
@@ -3619,7 +3632,11 @@ def _sports_scan_and_alert():
 
     print("[SPORTS] {} matches with 2+ sites, {} total to search".format(
         multi_source_count, len(match_pairs)))
-    poly_markets = _sports_fetch_polymarket_sports(match_pairs=match_pairs[:20])
+    # Put multi-source matches first in the search queue
+    multi_pairs = [(md["home"], md["away"]) for md in matches.values() if md.get("unique_sites", 0) >= 2]
+    single_pairs = [(md["home"], md["away"]) for md in matches.values() if md.get("unique_sites", 0) < 2]
+    search_pairs = multi_pairs + single_pairs
+    poly_markets = _sports_fetch_polymarket_sports(match_pairs=search_pairs[:30])
     lmts_markets = _sports_fetch_limitless_sports()
     all_markets = poly_markets + lmts_markets
     print("[SPORTS] Total sports markets: {} (Poly: {}, Limitless: {})".format(
@@ -3636,15 +3653,12 @@ def _sports_scan_and_alert():
 
     # 4. Match predictions to markets and score
     alerts_sent = 0
+    matched_count = 0
     for key, match_data in matches.items():
         home = match_data["home"]
         away = match_data["away"]
         preds = match_data["predictions"]
-
-        # Only process matches with 2+ sources
         sources = set(p["source"] for p in preds)
-        if len(sources) < 2:
-            continue
 
         # Extract insights
         insights = _sports_extract_insights(preds, home, away)
@@ -3654,8 +3668,30 @@ def _sports_scan_and_alert():
         for market in all_markets:
             mq = (market.get("question", "") + " " + market.get("title", "")).lower()
             if _sports_match_teams(home, away, mq):
+                matched_count += 1
+
+                # Single source without a score prediction is too weak — skip
+                if len(sources) == 1:
+                    has_score = any(p.get("score") for p in preds)
+                    if not has_score:
+                        continue
+
                 # Score this pick
                 pick_score, reasons = _sports_score_pick(insights, market)
+
+                # Multi-source bonus
+                if len(sources) >= 2:
+                    pick_score += 15
+                    reasons.append("{} prediction sites".format(len(sources)))
+                elif len(sources) == 1:
+                    pick_score += 5
+                    reasons.append("1 site with score prediction")
+
+                # Log first 5 matches for debugging
+                if matched_count <= 5:
+                    print("[SPORTS] MATCH: {} vs {} ↔ '{}' — score={} reasons={}".format(
+                        home, away, market.get("question", "")[:50],
+                        pick_score, ", ".join(reasons[:3])))
 
                 if pick_score >= SPORTS_MIN_SCORE:
                     # Build alert message
@@ -3692,7 +3728,8 @@ def _sports_scan_and_alert():
                     print("[SPORTS] ALERT: {} vs {} — score {}/100 on {}".format(
                         home, away, pick_score, market.get("platform", "?")))
 
-    print("[SPORTS] Scan complete — {} alerts sent".format(alerts_sent))
+    print("[SPORTS] Scan complete — {} predictions matched to markets, {} alerts sent".format(
+        matched_count, alerts_sent))
 
 
 def _sports_scanner_thread():
