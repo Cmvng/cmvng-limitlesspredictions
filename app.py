@@ -2655,7 +2655,7 @@ from bs4 import BeautifulSoup
 import re as _sports_re
 
 SPORTS_SCAN_INTERVAL = 21600  # 6 hours between full scans
-SPORTS_MIN_SCORE = 70         # Minimum score to alert
+SPORTS_MIN_SCORE = 30         # Lower for testing — raise to 70 once validated
 SPORTS_SOURCES = [
     "footballpredictions.com",
     "footballpredictions.net",
@@ -3348,11 +3348,22 @@ def _sports_scan_and_alert():
         print("[SPORTS] Sample match {}: '{}' vs '{}' ({} sources)".format(
             i+1, key[0], key[1], len(md["predictions"])))
 
-    # 3. Fetch markets — pass match pairs so Polymarket searches for specific matches
-    match_pairs = [(md["home"], md["away"]) for key, md in matches.items()
-                   if len(set(p["source"] for p in md["predictions"])) >= 2]
-    print("[SPORTS] Searching Polymarket for {} matches with 2+ sources".format(len(match_pairs)))
-    poly_markets = _sports_fetch_polymarket_sports(match_pairs=match_pairs)
+    # 3. Fetch markets — search for matches with predictions
+    # Count unique SITES per match (not prediction count)
+    match_pairs = []
+    multi_source_count = 0
+    for key, md in matches.items():
+        unique_sites = set(p["source"] for p in md["predictions"])
+        md["unique_sites"] = len(unique_sites)
+        if len(unique_sites) >= 2:
+            multi_source_count += 1
+        # Include all matches that have at least 1 prediction source
+        # (lower threshold for testing — raise to 2 once we have more working scrapers)
+        match_pairs.append((md["home"], md["away"]))
+
+    print("[SPORTS] {} matches with 2+ sites, {} total to search".format(
+        multi_source_count, len(match_pairs)))
+    poly_markets = _sports_fetch_polymarket_sports(match_pairs=match_pairs[:20])
     lmts_markets = _sports_fetch_limitless_sports()
     all_markets = poly_markets + lmts_markets
     print("[SPORTS] Total sports markets: {} (Poly: {}, Limitless: {})".format(
