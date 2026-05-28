@@ -5064,17 +5064,21 @@ def sb_search_event(home_team, away_team):
                     mkts = ev.get("markets") or ev.get("marketList") or []
                     if mkts:
                         _SB_MARKET_CACHE[eid] = mkts
-                        # One-time dump of real market structure (to confirm field names)
+                        # One-time dump of UNIQUE market types (to map the
+                        # ones still missing: double chance, corners, cards)
                         if not _SB_STRUCT_LOGGED[0]:
                             _SB_STRUCT_LOGGED[0] = True
-                            for mk in mkts[:8]:
+                            seen_desc = set()
+                            for mk in mkts:
+                                desc = (mk.get("desc") or mk.get("name") or mk.get("marketName") or "")
+                                if desc in seen_desc:
+                                    continue
+                                seen_desc.add(desc)
                                 ocs = mk.get("outcomes") or mk.get("outcome") or []
                                 oc_str = " ; ".join("{}={}".format(
                                     o.get("id"), (o.get("desc") or o.get("name") or "")) for o in ocs[:4])
                                 print("[SB-STRUCT] id={} desc='{}' spec='{}' | {}".format(
-                                    mk.get("id"),
-                                    mk.get("desc") or mk.get("name") or mk.get("marketName"),
-                                    mk.get("specifier", ""), oc_str))
+                                    mk.get("id"), desc, mk.get("specifier", ""), oc_str))
                     print("[SB] matched {} vs {} -> {} ({} inline markets)".format(
                         home_team, away_team, eid, len(mkts)))
                     return eid
@@ -5281,11 +5285,11 @@ def sb_create_code(selections):
     resp = _sb_post(url, {"selections": selections}, diag=True)
     if not resp:
         return None
-    if str(resp.get("message", "")).lower() == "success":
-        return resp.get("data", {}).get("code")
-    # Some deployments use bizCode
-    if resp.get("bizCode") == 10000:
-        return resp.get("data", {}).get("shareCode") or resp.get("data", {}).get("code")
+    # SportyBet success: message="Success" / bizCode=10000, code lives in data.shareCode
+    ok = str(resp.get("message", "")).lower() == "success" or resp.get("bizCode") == 10000
+    if ok:
+        data = resp.get("data", {}) or {}
+        return data.get("shareCode") or data.get("code") or data.get("shareURL", "").split("shareCode=")[-1] or None
     return None
 
 
