@@ -5174,19 +5174,19 @@ def _outcome_matches_draw(desc, home, away):
 
 # Mapping: engine market_type -> (sb_market_name_keywords, specifier_value, outcome_desc_matcher)
 SB_MARKET_MAP = {
-    "home_win":            (["1x2", "match result", "3way", "1 x 2"], None, "home"),
-    "away_win":            (["1x2", "match result", "3way", "1 x 2"], None, "away"),
-    "draw":                (["1x2", "match result", "3way", "1 x 2"], None, "draw"),
+    "home_win":            (["1x2"], None, "home"),
+    "away_win":            (["1x2"], None, "away"),
+    "draw":                (["1x2"], None, "draw"),
     "double_chance_1X":    (["double chance"], None, "1X"),
     "double_chance_X2":    (["double chance"], None, "X2"),
-    "over_0.5":            (["total", "over/under", "goals over/under"], "0.5", "over"),
-    "over_1.5":            (["total", "over/under", "goals over/under"], "1.5", "over"),
-    "over_2.5":            (["total", "over/under", "goals over/under"], "2.5", "over"),
-    "over_3.5":            (["total", "over/under", "goals over/under"], "3.5", "over"),
-    "under_2.5":           (["total", "over/under", "goals over/under"], "2.5", "under"),
-    "under_3.5":           (["total", "over/under", "goals over/under"], "3.5", "under"),
-    "btts_yes":            (["both teams to score", "gg/ng", "both teams"], None, "yes"),
-    "btts_no":             (["both teams to score", "gg/ng", "both teams"], None, "no"),
+    "over_0.5":            (["over/under"], "0.5", "over"),
+    "over_1.5":            (["over/under"], "1.5", "over"),
+    "over_2.5":            (["over/under"], "2.5", "over"),
+    "over_3.5":            (["over/under"], "3.5", "over"),
+    "under_2.5":           (["over/under"], "2.5", "under"),
+    "under_3.5":           (["over/under"], "3.5", "under"),
+    "btts_yes":            (["gg/ng", "both teams to score"], None, "yes"),
+    "btts_no":             (["gg/ng", "both teams to score"], None, "no"),
     "corners_over_7.5":    (["corner"], "7.5", "over"),
     "corners_over_8.5":    (["corner"], "8.5", "over"),
     "corners_over_9.5":    (["corner"], "9.5", "over"),
@@ -5221,13 +5221,22 @@ def sb_map_pick_to_selection(pick, markets):
         d = d.strip().lower()
         return d in ("draw", "x", "tie") or "draw" in d
 
+    # Corners/cards markets use substring matching (names vary, e.g. "Total
+    # Corners"); the core markets require an EXACT name to avoid grabbing
+    # variant markets like "Monza Over/Under" or "1st Half - 1X2".
+    use_substring = mt.startswith("corners") or mt.startswith("cards")
+
     for market in markets:
         m_name = (market.get("desc") or market.get("name")
-                  or market.get("marketName") or "").lower()
+                  or market.get("marketName") or "").lower().strip()
         m_specifier = market.get("specifier") or ""
 
-        if not any(kw in m_name for kw in name_keywords):
-            continue
+        if use_substring:
+            if not any(kw in m_name for kw in name_keywords):
+                continue
+        else:
+            if m_name not in name_keywords:
+                continue
         if want_specifier and want_specifier not in str(m_specifier) \
            and want_specifier not in m_name:
             continue
@@ -5244,13 +5253,15 @@ def sb_map_pick_to_selection(pick, markets):
             elif outcome_kind == "draw":
                 matched = is_draw(od)
             elif outcome_kind == "1X":
+                # SportyBet: "Home or Draw" (id 9)
                 nd = od.replace(" ", "").replace("/", "")
-                matched = nd in ("1x", "1ordraw", "homeordraw") or \
-                          (is_home(od) and "draw" in od) or "home/draw" in od
+                matched = ("draw" in od and ("home" in od or is_home(od))) or \
+                          nd in ("1x", "1ordraw", "homeordraw")
             elif outcome_kind == "X2":
+                # SportyBet: "Draw or Away" (id 11)
                 nd = od.replace(" ", "").replace("/", "")
-                matched = nd in ("x2", "2ordraw", "awayordraw") or \
-                          (is_away(od) and "draw" in od) or "draw/away" in od
+                matched = ("draw" in od and ("away" in od or is_away(od))) or \
+                          nd in ("x2", "2ordraw", "awayordraw", "draworaway")
             elif outcome_kind == "over":
                 matched = "over" in od or od.startswith("o ") or od == "o"
             elif outcome_kind == "under":
@@ -5533,7 +5544,7 @@ def _fb_fmt_kickoff(ts):
     if not ts:
         return ""
     try:
-        dt = _dt.datetime.utcfromtimestamp(int(ts) / 1000) + _dt.timedelta(hours=1)
+        dt = _dt.datetime.fromtimestamp(int(ts) / 1000, _dt.timezone.utc) + _dt.timedelta(hours=1)
         return dt.strftime("%a %H:%M")
     except Exception:
         return ""
