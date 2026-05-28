@@ -3545,13 +3545,15 @@ def _sports_extract_insights(predictions, home, away):
 
 
 def _sports_score_pick(insights, market):
-    """Score a potential pick from 0-100."""
+    """Score a potential pick from 0-100.
+    Scoring philosophy: a specific score prediction (e.g. PSG 2-1 Arsenal)
+    from even ONE site is useful if it aligns with the market type."""
     score = 0
     reasons = []
-    n_preds = len(insights["sources"])  # Total prediction count (may include duplicates)
+    n_preds = len(insights["sources"])
     unique_sources = len(set(insights["sources"]))
 
-    # Consensus strength — multi-source (max 30)
+    # 1. Multi-source consensus bonus (max 30)
     if unique_sources >= 4:
         score += 30
         reasons.append("4+ sites agree")
@@ -3561,40 +3563,47 @@ def _sports_score_pick(insights, market):
     elif unique_sources >= 2:
         score += 10
         reasons.append("2 sites agree")
-    # Single source gets base points from score predictions below
 
-    # Score predictions support the pick (max 15)
-    if insights["scores"]:
-        score += min(len(insights["scores"]) * 5, 15)
-        reasons.append("{} score predictions".format(len(insights["scores"])))
+    # 2. Score predictions (max 20) — specific score predictions are high-value signals
+    n_scores = len(insights["scores"])
+    if n_scores >= 3:
+        score += 20
+        reasons.append("{} score predictions".format(n_scores))
+    elif n_scores >= 1:
+        score += 15
+        reasons.append("{} score prediction{}".format(n_scores, "s" if n_scores > 1 else ""))
 
-    # Goals data supports (max 15)
+    # 3. Goals alignment with market (max 15)
+    mq = market.get("question", "").lower()
     if insights["total_goals_predicted"]:
         avg = sum(insights["total_goals_predicted"]) / len(insights["total_goals_predicted"])
-        if avg > 2.5 and "over" in market.get("question", "").lower():
+        if avg > 2.5 and ("over" in mq or "o/u" in mq):
             score += 15
-            reasons.append("Avg predicted goals: {:.1f}".format(avg))
-        elif avg < 2.5 and "under" in market.get("question", "").lower():
+            reasons.append("Goals avg {:.1f} (over)".format(avg))
+        elif avg <= 2.5 and "under" in mq:
             score += 15
-            reasons.append("Avg predicted goals: {:.1f}".format(avg))
+            reasons.append("Goals avg {:.1f} (under)".format(avg))
         elif avg > 2.0:
             score += 8
             reasons.append("Goals avg {:.1f}".format(avg))
 
-    # Winner consensus matches market (max 15)
-    mq = market.get("question", "").lower()
+    # 4. Winner consensus matches market (max 15)
     if insights["consensus_winner"]:
         winner_norm = _sports_normalize_team(insights["consensus_winner"])
-        if any(w in mq for w in winner_norm.split() if len(w) > 3):
+        winner_words = [w for w in winner_norm.split() if len(w) > 3]
+        if any(w in mq for w in winner_words):
             score += 15
-            reasons.append("{} consensus winner".format(insights["consensus_winner"]))
+            reasons.append("{} predicted winner".format(insights["consensus_winner"]))
 
-    # BTTS consensus (max 10)
-    if insights["consensus_btts"] == "YES" and "both" in mq and "score" in mq:
+    # 5. BTTS consensus (max 10)
+    if insights["consensus_btts"] == "YES" and ("both" in mq and "score" in mq):
         score += 10
         reasons.append("BTTS YES consensus")
+    elif insights["consensus_btts"] == "NO" and ("both" in mq and "score" in mq):
+        score += 5
+        reasons.append("BTTS NO consensus")
 
-    # Forebet probability (max 15)
+    # 6. Forebet probability (max 15)
     for p in [pred for pred in insights.get("_raw_preds", []) if pred.get("prob_home")]:
         max_prob = max(p.get("prob_home", 0) or 0, p.get("prob_away", 0) or 0)
         if max_prob > 70:
@@ -3706,12 +3715,17 @@ def _sports_scan_and_alert():
             if _sports_match_teams(home, away, mq):
                 matched_count += 1
 
-                # Deduplicate — same game slug with same market type shouldn't alert twice
+                # Deduplicate — same match + same market type shouldn't alert twice
+                # e.g. "Will Switzerland win?" and "Will Jordan win?" are both moneyline for same game
                 mslug = market.get("slug", "")
                 smt = market.get("sports_market_type", "") or "general"
-                # Normalize slug for dedup: sort team codes so home/away swap doesn't matter
-                slug_parts = mslug.replace("-", " ").split()
-                alert_key = (tuple(sorted(slug_parts)), smt)
+                # Extract game identifier from slug: typically "league-team1-team2-date"
+                # e.g. "fif-che-jor-2026-05-30-will-switzerland-win" → game="2026-05-30"
+                date_match = _sports_re.search(r'(\d{4}-\d{2}-\d{2})', mslug)
+                game_date = date_match.group(1) if date_match else ""
+                # Dedup key: (match_key, market_type, game_date)
+                # match_key (home/away) is already the outer loop key
+                alert_key = (key, smt, game_date)
                 if alert_key in seen_alert_keys:
                     continue
                 seen_alert_keys.add(alert_key)
