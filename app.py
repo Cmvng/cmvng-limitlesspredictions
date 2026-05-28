@@ -2643,11 +2643,14 @@ def v2_prices():
 
 
 # ═══════════════════════════════════════════════════════════
-# SPORTS PREDICTION MODULE — Football Consensus Scanner
+# SPORTS PREDICTION MODULE — Football Consensus Scanner v2
 # ═══════════════════════════════════════════════════════════
-# Scrapes prediction sites, finds consensus, matches against
-# Polymarket/Limitless markets, scores picks, sends Telegram alerts.
-# No Claude — purely mechanical scoring.
+# Scrapes prediction sites (league-specific pages for overlap),
+# finds consensus, matches against Polymarket sports markets,
+# scores picks, sends Telegram alerts.
+# v2 fixes: correct Polymarket API (/public-search, /sports metadata,
+#   /markets?tag_id + sports_market_types), league-targeted scraping,
+#   robust score/probability parsing.
 # ═══════════════════════════════════════════════════════════
 
 import requests as _sports_req
@@ -2658,10 +2661,41 @@ SPORTS_SCAN_INTERVAL = 21600  # 6 hours between full scans
 SPORTS_MIN_SCORE = 30         # Lower for testing — raise to 70 once validated
 SPORTS_SOURCES = [
     "footballpredictions.com",
-    "footballpredictions.net",
     "forebet.com",
-    "predictz.com",
+    "footballpredictions.net",
 ]
+
+# League pages that BOTH FP.com and Forebet cover — ensures overlap
+_SPORTS_LEAGUES = {
+    "epl": {
+        "fp": "https://footballpredictions.com/premier-league-predictions/",
+        "forebet": "https://www.forebet.com/en/football-predictions/england/premier-league",
+    },
+    "la_liga": {
+        "fp": "https://footballpredictions.com/la-liga-predictions/",
+        "forebet": "https://www.forebet.com/en/football-predictions/spain/la-liga",
+    },
+    "serie_a": {
+        "fp": "https://footballpredictions.com/serie-a-predictions/",
+        "forebet": "https://www.forebet.com/en/football-predictions/italy/serie-a",
+    },
+    "bundesliga": {
+        "fp": "https://footballpredictions.com/bundesliga-predictions/",
+        "forebet": "https://www.forebet.com/en/football-predictions/germany/bundesliga",
+    },
+    "ligue_1": {
+        "fp": "https://footballpredictions.com/ligue-1-predictions/",
+        "forebet": "https://www.forebet.com/en/football-predictions/france/ligue-1",
+    },
+    "ucl": {
+        "fp": "https://footballpredictions.com/champions-league-predictions/",
+        "forebet": "https://www.forebet.com/en/football-predictions/champions-league",
+    },
+    "uel": {
+        "fp": "https://footballpredictions.com/europa-league-predictions/",
+        "forebet": "https://www.forebet.com/en/football-predictions/europa-league",
+    },
+}
 
 _sports_headers = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
@@ -2672,17 +2706,28 @@ _sports_headers = {
     "Referer": "https://www.google.com/",
 }
 
+# Cache Polymarket soccer tag_id so we don't refetch every scan
+_sports_poly_soccer_tag_id = None
+
 
 def _sports_scrape_footballpredictions_com():
-    """Scrape footballpredictions.com for correct score + over/under + BTTS tips."""
+    """Scrape footballpredictions.com — both tip pages AND league-specific pages."""
     predictions = []
-    pages = [
+
+    # Tip pages (broad coverage — friendlies, playoffs, etc.)
+    tip_pages = [
         ("correct-score", "https://footballpredictions.com/betting-tips/correct-score/"),
         ("over-2-5", "https://footballpredictions.com/betting-tips/over-2-5-goals/"),
         ("btts", "https://footballpredictions.com/betting-tips/btts/"),
         ("predictions", "https://footballpredictions.com/footballpredictions/"),
     ]
-    for tip_type, url in pages:
+    # League pages (targeted — same leagues as Forebet for overlap)
+    for league_key, urls in _SPORTS_LEAGUES.items():
+        fp_url = urls.get("fp")
+        if fp_url:
+            tip_pages.append((league_key, fp_url))
+
+    for tip_type, url in tip_pages:
         try:
             r = _sports_req.get(url, headers=_sports_headers, timeout=15)
             if r.status_code != 200:
@@ -2690,63 +2735,78 @@ def _sports_scrape_footballpredictions_com():
                 continue
             soup = BeautifulSoup(r.text, "html.parser")
 
-            # Method 1: Find links with "vs" in href or text
+            # Find links with "-vs-" in href
             links = soup.find_all("a", href=True)
             for link in links:
                 href = link.get("href", "")
                 text = link.get_text(" ", strip=True)
-                # Look for match links: team-a-vs-team-b
-                if "-vs-" in href.lower() or " vs " in text.lower() or " v " in text.lower():
-                    # Extract from href
+                if "-vs-" in href.lower():
                     for part in href.split("/"):
                         if "-vs-" in part.lower():
-                            teams = _sports_re.sub(r'-prediction.*|-tips.*|-betting.*', '', part)
+                            teams = _sports_re.sub(r'-prediction.*|-tips.*|-betting.*|-odds.*|-preview.*', '', part)
                             team_parts = teams.split("-vs-")
                             if len(team_parts) == 2:
                                 home = team_parts[0].replace("-", " ").strip().title()
                                 away = team_parts[1].replace("-", " ").strip().title()
                                 if len(home) > 2 and len(away) > 2:
+                                    # Get parent context for score extraction
                                     parent = link.parent
-                                    parent_text = parent.get_text(" ", strip=True) if parent else text
-                                    # Look for score in format like "2-1" or "Prediction: 2-1"
-                                    # Avoid matching odds like "9/4" or "11/2"
+                                    if parent:
+                                        grandparent = parent.parent
+                                    else:
+                                        grandparent = None
+                                    # Search in widening context
+                                    contexts = [text]
+                                    if parent:
+                                        contexts.append(parent.get_text(" ", strip=True))
+                                    if grandparent:
+                                        contexts.append(grandparent.get_text(" ", strip=True))
+
                                     score = None
-                                    score_match = _sports_re.search(r'(?:score|prediction|tip)[:\s]*(\d)\s*[-–:]\s*(\d)', parent_text.lower())
-                                    if score_match:
-                                        h_goals = int(score_match.group(1))
-                                        a_goals = int(score_match.group(2))
-                                        if h_goals <= 6 and a_goals <= 6:  # Sanity check
-                                            score = "{}-{}".format(h_goals, a_goals)
-                                    # Fallback: look for low-digit score patterns
-                                    if not score:
-                                        score_matches = _sports_re.findall(r'(?<!\d)([0-5])\s*[-]\s*([0-5])(?!\d)', parent_text)
-                                        for sm in score_matches:
-                                            s = "{}-{}".format(sm[0], sm[1])
-                                            if s not in ("0-0",):  # Skip 0-0 as it's often a default
-                                                score = s
+                                    for ctx in contexts:
+                                        # Pattern 1: "Prediction: 2-1" or "Score: 1-0"
+                                        sm = _sports_re.search(
+                                            r'(?:score|prediction|tip|result)[:\s]*(\d)\s*[-–:]\s*(\d)',
+                                            ctx.lower())
+                                        if sm:
+                                            h, a = int(sm.group(1)), int(sm.group(2))
+                                            if h <= 6 and a <= 6:
+                                                score = "{}-{}".format(h, a)
                                                 break
+                                        # Pattern 2: standalone low-digit score NOT inside large numbers
+                                        sms = _sports_re.findall(
+                                            r'(?<![0-9/])([0-5])\s*[-]\s*([0-5])(?![0-9/])', ctx)
+                                        for sm2 in sms:
+                                            candidate = "{}-{}".format(sm2[0], sm2[1])
+                                            # Reject common false positives
+                                            if candidate not in ("0-0",) and candidate not in ctx[:3]:
+                                                score = candidate
+                                                break
+                                        if score:
+                                            break
+
                                     predictions.append({
                                         "source": "footballpredictions.com",
                                         "type": tip_type,
                                         "home": home, "away": away,
                                         "score": score,
-                                        "text": parent_text[:200],
+                                        "text": (contexts[1] if len(contexts) > 1 else text)[:200],
                                     })
                             break
-                    # Extract from text if no href match
-                    if " vs " in text or " v " in text:
-                        vs_match = _sports_re.search(r'(.+?)\s+(?:vs?\.?)\s+(.+?)$', text)
-                        if vs_match:
-                            home = vs_match.group(1).strip()[:40]
-                            away = vs_match.group(2).strip()[:40]
-                            if len(home) > 2 and len(away) > 2:
-                                predictions.append({
-                                    "source": "footballpredictions.com",
-                                    "type": tip_type,
-                                    "home": home, "away": away,
-                                    "score": None,
-                                    "text": text[:200],
-                                })
+                # Also try text-based matching for links without -vs- in href
+                elif " vs " in text.lower() or " v " in text.lower():
+                    vs_match = _sports_re.search(r'(.+?)\s+(?:vs?\.?)\s+(.+?)$', text)
+                    if vs_match:
+                        home = vs_match.group(1).strip()[:40]
+                        away = vs_match.group(2).strip()[:40]
+                        if len(home) > 2 and len(away) > 2:
+                            predictions.append({
+                                "source": "footballpredictions.com",
+                                "type": tip_type,
+                                "home": home, "away": away,
+                                "score": None,
+                                "text": text[:200],
+                            })
 
             count = len([p for p in predictions if p["type"] == tip_type])
             print("[SPORTS] FP.com {}: {} predictions".format(tip_type, count))
@@ -2831,89 +2891,191 @@ def _sports_scrape_footballpredictions_net():
 
 
 def _sports_scrape_forebet():
-    """Scrape Forebet for mathematical predictions — 1X2, over/under, BTTS, correct score."""
+    """Scrape Forebet for mathematical predictions — 1X2, over/under, BTTS, correct score.
+    Scrapes both the main today page AND league-specific pages for overlap with FP.com."""
     predictions = []
-    url = "https://www.forebet.com/en/football-tips-and-predictions-for-today"
-    try:
-        r = _sports_req.get(url, headers=_sports_headers, timeout=15)
-        if r.status_code != 200:
-            print("[SPORTS] Forebet — HTTP {}".format(r.status_code))
-            return predictions
-        soup = BeautifulSoup(r.text, "html.parser")
-        # Forebet uses div.rcnt for each match row
-        rows = soup.find_all("div", class_="rcnt") or soup.find_all("tr", class_=_sports_re.compile(r"tr_"))
-        for row in rows:
-            text = row.get_text(" ", strip=True)
-            # Extract teams
-            home_el = row.find("span", class_="homeTeam") or row.find("span", class_="tnms")
-            away_el = row.find("span", class_="awayTeam")
-            if home_el and away_el:
-                home = home_el.get_text(strip=True)[:40]
-                away = away_el.get_text(strip=True)[:40]
-            else:
-                vs_match = _sports_re.search(r'(.+?)\s+(?:vs?\.?|[-–])\s+(.+?)(?:\s+\d|$)', text)
-                if vs_match:
-                    home = vs_match.group(1).strip()[:40]
-                    away = vs_match.group(2).strip()[:40]
-                else:
+
+    # Main today page + all league-specific pages
+    urls_to_scrape = [
+        ("today", "https://www.forebet.com/en/football-tips-and-predictions-for-today"),
+    ]
+    for league_key, league_urls in _SPORTS_LEAGUES.items():
+        forebet_url = league_urls.get("forebet")
+        if forebet_url:
+            urls_to_scrape.append((league_key, forebet_url))
+
+    for page_name, url in urls_to_scrape:
+        try:
+            r = _sports_req.get(url, headers=_sports_headers, timeout=15)
+            if r.status_code != 200:
+                print("[SPORTS] Forebet {} — HTTP {}".format(page_name, r.status_code))
+                continue
+            soup = BeautifulSoup(r.text, "html.parser")
+
+            # Forebet match rows: div.rcnt or tr with class starting with "tr_"
+            rows = soup.find_all("div", class_="rcnt")
+            if not rows:
+                rows = soup.find_all("tr", class_=_sports_re.compile(r"tr_|pred"))
+            # Fallback: look inside contentmiddle container
+            if not rows:
+                container = soup.find("div", id="contentmiddle") or soup.find("section", class_="schema")
+                if container:
+                    rows = container.find_all("div", class_=_sports_re.compile(r"rcnt|predictionRow"))
+
+            for row in rows:
+                text = row.get_text(" ", strip=True)
+                if len(text) < 10:
                     continue
 
-            # Extract probabilities (1X2)
-            probs = row.find_all("span", class_=_sports_re.compile(r"fpr|fprc"))
-            prob_1 = prob_x = prob_2 = None
-            if len(probs) >= 3:
-                try:
-                    prob_1 = int(probs[0].get_text(strip=True).replace("%", ""))
-                    prob_x = int(probs[1].get_text(strip=True).replace("%", ""))
-                    prob_2 = int(probs[2].get_text(strip=True).replace("%", ""))
-                except:
-                    pass
+                # Extract teams — multiple selector strategies
+                home = away = None
 
-            # Extract correct score prediction
-            score_el = row.find("span", class_=_sports_re.compile(r"ex_sc|foremark"))
-            score = score_el.get_text(strip=True) if score_el else None
-            if score and not _sports_re.match(r'\d+-\d+', score):
+                # Strategy 1: homeTeam/awayTeam spans
+                home_el = row.find("span", class_=_sports_re.compile(r"homeTeam|home_team"))
+                away_el = row.find("span", class_=_sports_re.compile(r"awayTeam|away_team"))
+                if home_el and away_el:
+                    home = home_el.get_text(strip=True)[:40]
+                    away = away_el.get_text(strip=True)[:40]
+
+                # Strategy 2: tnms container with two spans/anchors
+                if not home or not away:
+                    tnms = row.find("span", class_="tnms") or row.find("div", class_="tnms")
+                    if tnms:
+                        team_els = tnms.find_all("a") or tnms.find_all("span")
+                        if len(team_els) >= 2:
+                            home = team_els[0].get_text(strip=True)[:40]
+                            away = team_els[1].get_text(strip=True)[:40]
+                        else:
+                            # Single element with "vs" or "-" separator
+                            tnms_text = tnms.get_text(" ", strip=True)
+                            vs_m = _sports_re.search(r'(.+?)\s+(?:vs?\.?|[-–])\s+(.+)', tnms_text)
+                            if vs_m:
+                                home = vs_m.group(1).strip()[:40]
+                                away = vs_m.group(2).strip()[:40]
+
+                # Strategy 3: href-based extraction
+                if not home or not away:
+                    match_link = row.find("a", href=_sports_re.compile(r"-vs-|-against-"))
+                    if match_link:
+                        href = match_link.get("href", "")
+                        for part in href.split("/"):
+                            if "-vs-" in part:
+                                team_parts = part.split("-vs-")
+                                if len(team_parts) == 2:
+                                    home = team_parts[0].replace("-", " ").strip().title()[:40]
+                                    away = team_parts[1].replace("-", " ").strip().title()[:40]
+                                break
+
+                # Strategy 4: regex on row text
+                if not home or not away:
+                    vs_match = _sports_re.search(r'(.{3,30}?)\s+(?:vs?\.?|[-–])\s+(.{3,30}?)(?:\s+\d|$)', text)
+                    if vs_match:
+                        home = vs_match.group(1).strip()[:40]
+                        away = vs_match.group(2).strip()[:40]
+
+                if not home or not away or len(home) < 3 or len(away) < 3:
+                    continue
+
+                # Extract 1X2 probabilities — try multiple CSS class patterns
+                prob_1 = prob_x = prob_2 = None
+                for prob_class in [r"fpr\b", r"fprc\b", r"predict", r"prob"]:
+                    probs = row.find_all("span", class_=_sports_re.compile(prob_class))
+                    if len(probs) >= 3:
+                        try:
+                            prob_1 = int(probs[0].get_text(strip=True).replace("%", ""))
+                            prob_x = int(probs[1].get_text(strip=True).replace("%", ""))
+                            prob_2 = int(probs[2].get_text(strip=True).replace("%", ""))
+                            if prob_1 + prob_x + prob_2 > 50:  # Sanity: should sum near 100
+                                break
+                            else:
+                                prob_1 = prob_x = prob_2 = None
+                        except (ValueError, IndexError):
+                            prob_1 = prob_x = prob_2 = None
+
+                # Fallback: look for percentage values in text
+                if not prob_1:
+                    pct_matches = _sports_re.findall(r'(\d{1,2})%', text)
+                    if len(pct_matches) >= 3:
+                        try:
+                            vals = [int(x) for x in pct_matches[:3]]
+                            if 80 < sum(vals) < 120:
+                                prob_1, prob_x, prob_2 = vals
+                        except:
+                            pass
+
+                # Extract correct score prediction
                 score = None
+                for sc_class in [r"ex_sc", r"foremark", r"scorePred", r"correct.?score"]:
+                    score_el = row.find("span", class_=_sports_re.compile(sc_class))
+                    if score_el:
+                        sc_text = score_el.get_text(strip=True)
+                        if _sports_re.match(r'\d+-\d+$', sc_text):
+                            score = sc_text
+                            break
 
-            # Extract over/under
-            ou_el = row.find("span", class_=_sports_re.compile(r"ou_"))
-            avg_goals = None
-            if ou_el:
-                try:
-                    avg_goals = float(ou_el.get_text(strip=True))
-                except:
-                    pass
+                # Fallback: look for score pattern in specific containers
+                if not score:
+                    for tag in row.find_all(["span", "td", "div"]):
+                        t = tag.get_text(strip=True)
+                        if _sports_re.match(r'^[0-5]-[0-5]$', t):
+                            score = t
+                            break
 
-            predictions.append({
-                "source": "forebet.com",
-                "type": "full",
-                "home": home, "away": away,
-                "score": score,
-                "prob_home": prob_1, "prob_draw": prob_x, "prob_away": prob_2,
-                "avg_goals": avg_goals,
-                "text": text[:200],
-            })
-        print("[SPORTS] Forebet: {} predictions".format(len(predictions)))
-        for p in predictions[:3]:
-            print("[SPORTS] Forebet sample: {} vs {} → {} ({}% / {}% / {}%)".format(
-                p["home"], p["away"], p.get("score", "?"),
-                p.get("prob_home", "?"), p.get("prob_draw", "?"), p.get("prob_away", "?")))
-    except Exception as e:
-        print("[SPORTS] Forebet error: {}".format(e))
-    return predictions
+                # Extract over/under average goals
+                avg_goals = None
+                for ou_class in [r"ou_", r"avg_goals", r"total"]:
+                    ou_el = row.find("span", class_=_sports_re.compile(ou_class))
+                    if ou_el:
+                        try:
+                            avg_goals = float(ou_el.get_text(strip=True))
+                            break
+                        except:
+                            pass
+
+                predictions.append({
+                    "source": "forebet.com",
+                    "type": "full",
+                    "league": page_name,
+                    "home": home, "away": away,
+                    "score": score,
+                    "prob_home": prob_1, "prob_draw": prob_x, "prob_away": prob_2,
+                    "avg_goals": avg_goals,
+                    "text": text[:200],
+                })
+
+            page_count = len([p for p in predictions if p.get("league") == page_name])
+            print("[SPORTS] Forebet {}: {} predictions".format(page_name, page_count))
+        except Exception as e:
+            print("[SPORTS] Forebet {} error: {}".format(page_name, e))
+
+    # Deduplicate across all pages
+    seen = set()
+    unique = []
+    for p in predictions:
+        key = (_sports_normalize_team(p["home"]), _sports_normalize_team(p["away"]))
+        if key not in seen:
+            seen.add(key)
+            unique.append(p)
+
+    print("[SPORTS] Forebet total: {} unique predictions".format(len(unique)))
+    for p in unique[:3]:
+        print("[SPORTS] Forebet sample: {} vs {} → {} ({}% / {}% / {}%)".format(
+            p["home"], p["away"], p.get("score", "?"),
+            p.get("prob_home", "?"), p.get("prob_draw", "?"), p.get("prob_away", "?")))
+    return unique
 
 
 def _sports_scrape_predictz():
-    """Scrape PredictZ for correct score predictions and stats."""
+    """Scrape PredictZ — often blocked (403). Gracefully skip if so."""
     predictions = []
     url = "https://www.predictz.com/predictions/today/"
     try:
-        r = _sports_req.get(url, headers=_sports_headers, timeout=15)
+        r = _sports_req.get(url, headers=_sports_headers, timeout=10)
         if r.status_code != 200:
-            print("[SPORTS] PredictZ — HTTP {}".format(r.status_code))
+            print("[SPORTS] PredictZ — HTTP {} (blocked, skipping)".format(r.status_code))
             return predictions
         soup = BeautifulSoup(r.text, "html.parser")
-        rows = soup.find_all("tr", class_=_sports_re.compile(r"pmark|pointed"))
+        rows = soup.find_all("tr", class_=_sports_re.compile(r"pointed|pttr"))
         if not rows:
             rows = soup.find_all("div", class_=_sports_re.compile(r"match|fixture"))
         for row in rows:
@@ -3000,125 +3162,197 @@ def _sports_match_teams(pred_home, pred_away, market_text):
 
 
 def _sports_fetch_polymarket_sports(match_pairs=None):
-    """Fetch soccer/football markets from Polymarket.
-    Two approaches:
-    1. If match_pairs provided: search for each specific match
-    2. Always: fetch general soccer futures/props markets
-    
-    The search endpoint (GET /search?query=X) finds match-level markets
-    that the /markets endpoint doesn't return."""
+    """Fetch soccer/football markets from Polymarket using correct API endpoints.
+
+    Strategy:
+    1. GET /sports → get soccer tag_id and series info
+    2. GET /markets?tag_id=X&closed=false → all active soccer markets
+    3. GET /public-search?q=<team names> → match-specific markets
+    4. GET /markets?sports_market_types=moneyline,total → match-day markets
+
+    The /search endpoint doesn't exist — use /public-search (documented)."""
+    global _sports_poly_soccer_tag_id
     markets = []
     seen_ids = set()
 
-    # Approach 1: Search for specific matches from predictions
-    if match_pairs:
-        for home, away in match_pairs:
-            # Search with both team names
-            query = "{} {}".format(home, away)
-            try:
-                r = _sports_req.get("{}/search".format(POLY_GAMMA_API),
-                                   params={"query": query, "limit": 10},
-                                   timeout=10)
-                if r.status_code == 200:
-                    results = r.json() if isinstance(r.json(), list) else []
-                    # Results may be a list of events/markets
-                    for item in results:
-                        # Could be an event with nested markets
-                        item_markets = item.get("markets", [])
-                        if item_markets:
-                            for m in item_markets:
-                                mid = m.get("id", "")
-                                if mid in seen_ids:
-                                    continue
-                                seen_ids.add(mid)
-                                q = m.get("question", "") or ""
-                                slug = m.get("slug", "") or item.get("slug", "")
-                                op = m.get("outcomePrices", "")
-                                if isinstance(op, str):
-                                    try: op = json.loads(op)
-                                    except: op = []
-                                outcomes = m.get("outcomes", "")
-                                if isinstance(outcomes, str):
-                                    try: outcomes = json.loads(outcomes)
-                                    except: outcomes = []
-                                markets.append({
-                                    "platform": "polymarket",
-                                    "title": item.get("title", q),
-                                    "question": q,
-                                    "slug": slug,
-                                    "market_id": mid,
-                                    "condition_id": m.get("conditionId", ""),
-                                    "outcome_prices": op,
-                                    "outcomes": outcomes,
-                                    "volume": float(m.get("volume", 0) or 0),
-                                    "url": "https://polymarket.com/event/{}".format(slug) if slug else "",
-                                    "best_ask": float(m.get("bestAsk", 0) or 0),
-                                    "last_price": float(m.get("lastTradePrice", 0) or 0),
-                                })
-                        else:
-                            # Direct market result
-                            mid = item.get("id", "")
-                            if mid and mid not in seen_ids:
-                                seen_ids.add(mid)
-                                q = item.get("question", "") or item.get("title", "")
-                                slug = item.get("slug", "")
-                                op = item.get("outcomePrices", "")
-                                if isinstance(op, str):
-                                    try: op = json.loads(op)
-                                    except: op = []
-                                outcomes = item.get("outcomes", "")
-                                if isinstance(outcomes, str):
-                                    try: outcomes = json.loads(outcomes)
-                                    except: outcomes = []
-                                markets.append({
-                                    "platform": "polymarket",
-                                    "title": q, "question": q, "slug": slug,
-                                    "market_id": mid,
-                                    "condition_id": item.get("conditionId", ""),
-                                    "outcome_prices": op,
-                                    "outcomes": outcomes,
-                                    "volume": float(item.get("volume", 0) or 0),
-                                    "url": "https://polymarket.com/event/{}".format(slug) if slug else "",
-                                    "best_ask": float(item.get("bestAsk", 0) or 0),
-                                    "last_price": float(item.get("lastTradePrice", 0) or 0),
-                                })
-                time.sleep(0.3)  # Rate limit
-            except Exception as e:
-                print("[SPORTS] Poly search '{}' error: {}".format(query[:30], e))
-
-    # Approach 2: Also search for broad soccer terms to catch futures
-    for broad_query in ["world cup winner", "champions league winner",
-                        "premier league champion", "ballon d'or",
-                        "golden boot", "manager sacked", "transfer"]:
+    # Step 1: Get soccer tag_id from /sports metadata (cached)
+    if not _sports_poly_soccer_tag_id:
         try:
-            r = _sports_req.get("{}/search".format(POLY_GAMMA_API),
-                               params={"query": broad_query, "limit": 10},
+            r = _sports_req.get("{}/sports".format(POLY_GAMMA_API), timeout=10)
+            if r.status_code == 200:
+                sports_list = r.json() if isinstance(r.json(), list) else []
+                for sport in sports_list:
+                    sport_name = (sport.get("sport", "") or "").lower()
+                    if sport_name in ("soccer", "football", "ucl", "epl"):
+                        tags_str = sport.get("tags", "")
+                        if tags_str:
+                            # tags is comma-separated tag IDs
+                            tag_ids = [t.strip() for t in str(tags_str).split(",") if t.strip()]
+                            if tag_ids:
+                                _sports_poly_soccer_tag_id = tag_ids[0]
+                                print("[SPORTS] Poly soccer tag_id: {}".format(_sports_poly_soccer_tag_id))
+                                break
+        except Exception as e:
+            print("[SPORTS] Poly /sports error: {}".format(e))
+
+    def _parse_market(m, event_title=""):
+        """Parse a market object into our standard format."""
+        mid = str(m.get("id", "") or m.get("conditionId", ""))
+        if not mid or mid in seen_ids:
+            return None
+        seen_ids.add(mid)
+        q = m.get("question", "") or ""
+        slug = m.get("slug", "") or ""
+        op = m.get("outcomePrices", "")
+        if isinstance(op, str):
+            try:
+                op = json.loads(op)
+            except:
+                op = []
+        outcomes = m.get("outcomes", "")
+        if isinstance(outcomes, str):
+            try:
+                outcomes = json.loads(outcomes)
+            except:
+                outcomes = []
+        return {
+            "platform": "polymarket",
+            "title": event_title or q,
+            "question": q,
+            "slug": slug,
+            "market_id": mid,
+            "condition_id": m.get("conditionId", ""),
+            "outcome_prices": op,
+            "outcomes": outcomes,
+            "volume": float(m.get("volume", 0) or 0),
+            "url": "https://polymarket.com/event/{}".format(slug) if slug else "",
+            "best_ask": float(m.get("bestAsk", 0) or 0),
+            "last_price": float(m.get("lastTradePrice", 0) or 0),
+            "game_id": m.get("gameId", "") or "",
+            "sports_market_type": m.get("sportsMarketType", "") or "",
+        }
+
+    # Step 2: Fetch active soccer markets by tag_id
+    if _sports_poly_soccer_tag_id:
+        try:
+            r = _sports_req.get("{}/markets".format(POLY_GAMMA_API),
+                               params={"tag_id": _sports_poly_soccer_tag_id,
+                                       "closed": False, "limit": 100,
+                                       "order": "volume", "ascending": False},
+                               timeout=15)
+            if r.status_code == 200:
+                data = r.json() if isinstance(r.json(), list) else []
+                for m in data:
+                    parsed = _parse_market(m)
+                    if parsed:
+                        markets.append(parsed)
+                print("[SPORTS] Poly tag_id markets: {}".format(len(markets)))
+        except Exception as e:
+            print("[SPORTS] Poly tag_id fetch error: {}".format(e))
+
+    # Step 3: Fetch match-day sports markets by type (moneyline, total, btts)
+    for smt in ["moneyline", "total", "btts", "spread"]:
+        try:
+            r = _sports_req.get("{}/markets".format(POLY_GAMMA_API),
+                               params={"sports_market_types": smt,
+                                       "closed": False, "limit": 50},
                                timeout=10)
             if r.status_code == 200:
-                results = r.json() if isinstance(r.json(), list) else []
-                for item in results:
-                    item_markets = item.get("markets", [])
-                    for m in (item_markets or [item]):
-                        mid = m.get("id", "")
-                        if mid and mid not in seen_ids:
-                            seen_ids.add(mid)
-                            q = m.get("question", "") or m.get("title", "")
-                            slug = m.get("slug", "") or item.get("slug", "")
-                            markets.append({
-                                "platform": "polymarket",
-                                "title": item.get("title", q), "question": q,
-                                "slug": slug, "market_id": mid,
-                                "condition_id": m.get("conditionId", ""),
-                                "outcome_prices": "", "outcomes": "",
-                                "volume": float(m.get("volume", 0) or 0),
-                                "url": "https://polymarket.com/event/{}".format(slug) if slug else "",
-                            })
+                data = r.json() if isinstance(r.json(), list) else []
+                count = 0
+                for m in data:
+                    q = (m.get("question", "") or "").lower()
+                    # Filter for soccer only (not NBA, NFL, etc.)
+                    if any(kw in q for kw in ["goal", "soccer", "fc", "united",
+                                               "arsenal", "chelsea", "liverpool",
+                                               "barcelona", "real madrid", "bayern",
+                                               "psg", "juventus", "dortmund", "inter",
+                                               "milan", "atletico", "napoli",
+                                               "premier league", "la liga", "serie a",
+                                               "bundesliga", "ligue 1", "champions league",
+                                               "ucl", "europa", "mls"]):
+                        parsed = _parse_market(m)
+                        if parsed:
+                            markets.append(parsed)
+                            count += 1
+                if count:
+                    print("[SPORTS] Poly smt={}: {} soccer markets".format(smt, count))
+        except Exception as e:
+            print("[SPORTS] Poly smt={} error: {}".format(smt, e))
+        time.sleep(0.3)
+
+    # Step 4: Search for specific matches using /public-search
+    if match_pairs:
+        searched = 0
+        for home, away in match_pairs[:15]:  # Limit API calls
+            # Use shortened team names for better search results
+            home_short = home.split()[-1] if home else ""  # Last word (e.g. "United")
+            away_short = away.split()[-1] if away else ""
+            query = "{} {}".format(home_short, away_short)
+            if len(query.strip()) < 5:
+                query = "{} {}".format(home, away)
+            try:
+                r = _sports_req.get("{}/public-search".format(POLY_GAMMA_API),
+                                   params={"q": query, "limit_per_type": 5},
+                                   timeout=10)
+                if r.status_code == 200:
+                    data = r.json()
+                    # /public-search returns {events: [...], tags: [...], profiles: [...]}
+                    events = []
+                    if isinstance(data, dict):
+                        events = data.get("events", []) or []
+                    elif isinstance(data, list):
+                        events = data  # Fallback if format differs
+
+                    for event in events:
+                        event_title = event.get("title", "")
+                        event_markets = event.get("markets", []) or []
+                        if event_markets:
+                            for m in event_markets:
+                                parsed = _parse_market(m, event_title=event_title)
+                                if parsed:
+                                    markets.append(parsed)
+                        else:
+                            # Event itself might be a market
+                            parsed = _parse_market(event)
+                            if parsed:
+                                markets.append(parsed)
+                searched += 1
+                time.sleep(0.3)
+            except Exception as e:
+                print("[SPORTS] Poly search '{}' error: {}".format(query[:30], e))
+                searched += 1
+
+    # Step 5: Also broad soccer searches for futures/props
+    for broad_q in ["world cup", "champions league", "premier league",
+                    "ballon d'or", "golden boot"]:
+        try:
+            r = _sports_req.get("{}/public-search".format(POLY_GAMMA_API),
+                               params={"q": broad_q, "limit_per_type": 5},
+                               timeout=10)
+            if r.status_code == 200:
+                data = r.json()
+                events = data.get("events", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
+                for event in (events or []):
+                    event_title = event.get("title", "")
+                    for m in (event.get("markets", []) or [event]):
+                        parsed = _parse_market(m, event_title=event_title)
+                        if parsed:
+                            markets.append(parsed)
             time.sleep(0.3)
         except:
             pass
 
-    print("[SPORTS] Polymarket: {} soccer/football markets ({} from match search, {} from broad)".format(
-        len(markets), len([m for m in markets if m.get("best_ask")]), len(markets)))
+    print("[SPORTS] Polymarket total: {} soccer/football markets".format(len(markets)))
+    # Show breakdown
+    match_markets = [m for m in markets if m.get("game_id") or m.get("sports_market_type")]
+    futures = [m for m in markets if not m.get("game_id") and not m.get("sports_market_type")]
+    print("[SPORTS] Poly breakdown: {} match-level, {} futures/other".format(
+        len(match_markets), len(futures)))
+    for m in markets[:3]:
+        print("[SPORTS] Poly sample: '{}' | smt={} | ask={}".format(
+            m.get("question", "")[:60], m.get("sports_market_type", "?"),
+            m.get("best_ask", "?")))
     return markets
 
 
@@ -3333,20 +3567,27 @@ def _sports_scan_and_alert():
         return
 
     # 2. Group predictions by match (normalize team names)
+    # Also handle home/away swaps between prediction sites
     matches = {}
     for p in all_predictions:
         key = (_sports_normalize_team(p["home"]), _sports_normalize_team(p["away"]))
+        rev_key = (key[1], key[0])
         if key[0] and key[1]:
-            if key not in matches:
+            if key in matches:
+                matches[key]["predictions"].append(p)
+            elif rev_key in matches:
+                matches[rev_key]["predictions"].append(p)
+            else:
                 matches[key] = {"home": p["home"], "away": p["away"], "predictions": []}
-            matches[key]["predictions"].append(p)
+                matches[key]["predictions"].append(p)
 
     print("[SPORTS] Unique matches found: {}".format(len(matches)))
 
-    # Debug: show first 3 matches and their normalized names
-    for i, (key, md) in enumerate(list(matches.items())[:3]):
-        print("[SPORTS] Sample match {}: '{}' vs '{}' ({} sources)".format(
-            i+1, key[0], key[1], len(md["predictions"])))
+    # Debug: show first 3 matches and their sources
+    for i, (key, md) in enumerate(list(matches.items())[:5]):
+        sources = set(p["source"] for p in md["predictions"])
+        print("[SPORTS] Match {}: '{}' vs '{}' — {} sources: {}".format(
+            i+1, key[0], key[1], len(sources), ", ".join(sources)))
 
     # 3. Fetch markets — search for matches with predictions
     # Count unique SITES per match (not prediction count)
@@ -3460,18 +3701,37 @@ def sports_dashboard():
     body { font-family: 'DM Sans', sans-serif; background: #f0faf0; padding: 20px; }
     h1 { color: #2d6a4f; }
     .info { background: white; border-radius: 12px; padding: 20px; margin: 10px 0; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }
+    .sources { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 10px; }
+    .src { background: #e8f5e9; padding: 10px; border-radius: 8px; font-size: 14px; }
+    .src b { color: #2d6a4f; }
+    code { background: #f5f5f5; padding: 2px 6px; border-radius: 4px; font-size: 13px; }
     </style></head><body>
-    <h1>⚽ Sports Prediction Scanner</h1>
+    <h1>⚽ Sports Prediction Scanner v2</h1>
     <div class="info">
-        <p><strong>Status:</strong> Running</p>
-        <p><strong>Sources:</strong> footballpredictions.com, footballpredictions.net, forebet.com, predictz.com</p>
-        <p><strong>Markets:</strong> Polymarket + Limitless (soccer/football)</p>
-        <p><strong>Scan interval:</strong> Every 6 hours</p>
-        <p><strong>Minimum score:</strong> 70/100</p>
-        <p>Alerts are sent to Telegram when strong consensus picks are found.</p>
+        <p><strong>Status:</strong> Running (scans every 6 hours)</p>
+        <p><strong>Minimum score:</strong> {{ min_score }}/100</p>
+        <p><strong>Strategy:</strong> Scrape same leagues from multiple sites → find consensus → match to Polymarket markets → alert on Telegram</p>
+    </div>
+    <div class="info">
+        <h3>Prediction Sources</h3>
+        <div class="sources">
+            <div class="src"><b>footballpredictions.com</b><br>Tips + league pages (EPL, La Liga, UCL, etc.)</div>
+            <div class="src"><b>forebet.com</b><br>Mathematical predictions + league pages (same leagues)</div>
+            <div class="src"><b>footballpredictions.net</b><br>Correct scores (backup)</div>
+            <div class="src"><b>predictz.com</b><br>Scores (often blocked, graceful skip)</div>
+        </div>
+    </div>
+    <div class="info">
+        <h3>Market Sources</h3>
+        <p><b>Polymarket</b> — <code>/public-search</code> + <code>/sports</code> metadata + <code>/markets?tag_id</code> + <code>sports_market_types</code></p>
+        <p><b>Limitless</b> — Active slug scan (usually no individual match markets)</p>
+    </div>
+    <div class="info">
+        <h3>Leagues Targeted (for cross-site overlap)</h3>
+        <p>EPL, La Liga, Serie A, Bundesliga, Ligue 1, Champions League, Europa League</p>
     </div>
     </body></html>
-    """)
+    """, min_score=SPORTS_MIN_SCORE)
 
 
 # ═══════════════════════════════════════════════════════════
