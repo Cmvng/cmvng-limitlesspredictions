@@ -4971,7 +4971,7 @@ _SB_HEADERS = {
 
 
 _SB_DIAG_COUNT = [0]
-_SB_DIAG_MAX = 10
+_SB_DIAG_MAX = 14
 
 
 def _sb_get(url, timeout=12, diag=False):
@@ -5011,20 +5011,21 @@ def _sb_post(url, payload, timeout=15):
 # STEP 1: Find SportyBet event for a fixture
 # ═══════════════════════════════════════════════════════════════════
 
+_SB_MARKET_CACHE = {}  # eventId -> markets (captured from search results)
+
+
 def sb_search_event(home_team, away_team):
     """
     Search SportyBet for a match by team name. Returns eventId or None.
-    Tries several realistic SportyBet frontend endpoints and logs the raw
-    responses (capped) so the correct one can be confirmed from Railway logs.
+    Uses the confirmed football.com/SportyBet shared backend path
+    'factsCenter/event/firstSearch'. Captures inline markets when present.
     """
     import urllib.parse as _up
     ts = int(time.time() * 1000)
     kwq = _up.quote(home_team.strip())
     candidates = [
-        "{}/factsCenter/liveOrPrematchSearch?words={}&sportId=sr:sport:1&_t={}".format(SB_BASE, kwq, ts),
-        "{}/factsCenter/liveOrPrematchSearch?keyword={}&_t={}".format(SB_BASE, kwq, ts),
-        "{}/factsCenter/search?words={}&_t={}".format(SB_BASE, kwq, ts),
-        "{}/factsCenter/wapPrematchSearch?words={}&_t={}".format(SB_BASE, kwq, ts),
+        "{}/factsCenter/event/firstSearch?keyword={}&offset=0&pageSize=20&_t={}".format(SB_BASE, kwq, ts),
+        "{}/factsCenter/query/frontend/search/event/page/v2?keyword={}&sportId=sr:sport:1&_t={}".format(SB_BASE, kwq, ts),
     ]
     for url in candidates:
         data = _sb_get(url, diag=True)
@@ -5039,34 +5040,40 @@ def sb_search_event(home_team, away_team):
                            or ev.get("awayTeam") or "").lower()
                 if _team_match(home_team, ev_home) and _team_match(away_team, ev_away):
                     eid = ev.get("eventId") or ev.get("id")
-                    print("[SB] matched {} vs {} -> eventId {}".format(home_team, away_team, eid))
+                    # Capture inline markets so we don't need a second call
+                    mkts = ev.get("markets") or ev.get("marketList") or []
+                    if mkts:
+                        _SB_MARKET_CACHE[eid] = mkts
+                    print("[SB] matched {} vs {} -> {} ({} inline markets)".format(
+                        home_team, away_team, eid, len(mkts)))
                     return eid
             if events:
-                # Got a parseable response but no match — this endpoint works,
-                # the team just isn't listed. No point trying other endpoints.
-                break
+                break  # endpoint works, team just not listed
         except Exception as e:
             print("[SB] search parse error: {}".format(e))
     return None
 
 
 def _extract_events_from_search(data):
-    """Pull event list from various possible SportyBet response shapes."""
-    events = []
-    d = data.get("data", data)
-    if isinstance(d, dict):
-        for key in ("events", "tournaments", "results", "list"):
-            val = d.get(key)
-            if isinstance(val, list):
-                for item in val:
-                    if isinstance(item, dict):
-                        if "events" in item and isinstance(item["events"], list):
-                            events.extend(item["events"])
-                        else:
-                            events.append(item)
-    elif isinstance(d, list):
-        events = d
-    return events
+    """Recursively pull event dicts (with eventId + team names) from any shape."""
+    found = []
+
+    def walk(obj, depth=0):
+        if depth > 6:
+            return
+        if isinstance(obj, dict):
+            # An event-like dict has an id and team names
+            if (obj.get("eventId") or obj.get("id")) and \
+               (obj.get("homeTeamName") or obj.get("home") or obj.get("homeTeam")):
+                found.append(obj)
+            for v in obj.values():
+                walk(v, depth + 1)
+        elif isinstance(obj, list):
+            for it in obj:
+                walk(it, depth + 1)
+
+    walk(data.get("data", data))
+    return found
 
 
 def _team_match(name, candidate):
@@ -5087,14 +5094,17 @@ def _team_match(name, candidate):
 # ═══════════════════════════════════════════════════════════════════
 
 def sb_get_event_markets(event_id):
-    """Fetch all markets for a SportyBet event. Returns list of market dicts."""
+    """Return markets for a SportyBet event — inline-cached first, else fetch."""
     if not event_id:
         return []
+    # Markets captured inline during search?
+    if event_id in _SB_MARKET_CACHE:
+        return _SB_MARKET_CACHE[event_id]
     ts = int(time.time() * 1000)
     candidates = [
         "{}/factsCenter/event?eventId={}&productId=3&_t={}".format(SB_BASE, event_id, ts),
-        "{}/factsCenter/wapQueryEvent?eventId={}&productId=3&_t={}".format(SB_BASE, event_id, ts),
-        "{}/factsCenter/event?eventId={}&_t={}".format(SB_BASE, event_id, ts),
+        "{}/factsCenter/query/frontend/match/detail?eventId={}&_t={}".format(SB_BASE, event_id, ts),
+        "{}/factsCenter/wapEvent?eventId={}&_t={}".format(SB_BASE, event_id, ts),
     ]
     for url in candidates:
         data = _sb_get(url, diag=True)
@@ -5102,7 +5112,12 @@ def sb_get_event_markets(event_id):
             continue
         try:
             d = data.get("data", data)
-            markets = d.get("markets", []) if isinstance(d, dict) else []
+            markets = []
+            if isinstance(d, dict):
+                markets = d.get("markets") or d.get("marketList") or []
+                # Sometimes nested under event
+                if not markets and isinstance(d.get("event"), dict):
+                    markets = d["event"].get("markets", [])
             if markets:
                 return markets
         except Exception:
@@ -6140,6 +6155,7 @@ def run_football_engine(get_db, tg_token, tg_chat, send_telegram,
         if generate_codes:
             try:
                 _SB_DIAG_COUNT[0] = 0  # fresh diagnostics each run
+                _SB_MARKET_CACHE.clear()
             except Exception:
                 pass
             event_cache = {}
