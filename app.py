@@ -846,9 +846,17 @@ def _v2_analyze_structure(candles):
     max_candle_range = max(candle_ranges) if candle_ranges else 0
     concentration = (max_candle_range / total_range) if total_range > 0 else 0
 
-    if concentration > 0.50:
+    # With fewer candles, each naturally contributes a higher %.
+    # 2 candles: even split = 50% each, so spike threshold should be higher
+    # 3 candles: even split = 33% each
+    # 5+ candles: even split = 20% each
+    n = len(candles)
+    even_share = 1.0 / n if n > 0 else 0.5
+    spike_threshold = even_share + 0.25  # Must be 25% above even share to be a spike
+
+    if concentration > spike_threshold:
         grind_type = "spike"
-    elif concentration < 0.35:
+    elif concentration < even_share + 0.10:
         grind_type = "steady"
     else:
         grind_type = "normal"
@@ -1860,22 +1868,38 @@ def _v2_scan_timeframe(timeframe):
                     current_range = max(c["h"] for c in period_candles) - min(c["l"] for c in period_candles)
                     vol_label, vol_safe = _v2_volatility_check(prev_candles[:-1], current_range)
 
-                    # Get current price and PTB
-                    price = _get_binance_price(asset)
-                    # Also try Chainlink RTDS price (more accurate for resolution)
-                    chainlink_price = _rtds_current_price(asset)
-                    if chainlink_price and chainlink_price > 0:
-                        price = chainlink_price
+                    # Get current price — prefer Chainlink RTDS (what markets resolve against)
+                    price = _rtds_current_price(asset)
+                    if not price or price <= 0:
+                        price = _get_binance_price(asset)
 
+                    # Get PTB — this is the opening price of the period
+                    # Priority: (1) market title baseline, (2) Chainlink boundary capture,
+                    # (3) period's first candle open — NOT current price
                     ptb = None
-                    if market_data and market_data.get("baseline"):
+                    # From market data (parsed from title/description)
+                    if market_data and market_data.get("baseline") and market_data["baseline"] > 0:
                         ptb = market_data["baseline"]
-                    elif market_data and platform == "polymarket":
-                        ptb = _poly_get_baseline(market_data, price)
-                    elif platform == "limitless" and market_data:
-                        ptb = market_data.get("baseline")
+                    # From Chainlink boundary capture at period start
+                    if not ptb:
+                        key = "{}_{}".format(asset, tf_label)
+                        entry = _chainlink_ptb.get(key)
+                        if entry:
+                            ptb = entry[1]
+                    # From the opening price of the first intra-period candle
                     if not ptb and period_candles:
                         ptb = period_candles[0]["o"]
+                    # Last resort: from the full candle data open
+                    if not ptb and intra_candles:
+                        # Find the candle at boundary start
+                        for c in intra_candles:
+                            if c["t"] >= boundary_ts * 1000:
+                                ptb = c["o"]
+                                break
+
+                    if not ptb or ptb <= 0:
+                        print("[V2] SKIP {} {} {} — no PTB found".format(tf_label, asset, platform[:4]))
+                        continue
 
                     # Calculate time remaining
                     secs_remaining = boundary_secs - secs_into_period
