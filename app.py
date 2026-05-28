@@ -4243,8 +4243,9 @@ def analyze_fixture(fx):
             "confidence": round(confidence, 1),
             "odds": prob_to_odds(confidence),
             "reasoning": reasoning,
-            # SportyBet IDs filled in later by the mapper
-            "sb_event_id": "",
+            "kickoff_ts": fx.get("kickoff_ts", 0),
+            # SportyBet IDs (event id pre-resolved during enrichment)
+            "sb_event_id": fx.get("sb_event_id", ""),
             "sb_market_id": "",
             "sb_specifier": None,
             "sb_outcome_id": "",
@@ -4995,15 +4996,20 @@ def _sb_get(url, timeout=12, diag=False):
     return None
 
 
-def _sb_post(url, payload, timeout=15):
+def _sb_post(url, payload, timeout=15, diag=False):
     if _req is None:
         return None
     try:
         r = _req.post(url, headers=_SB_HEADERS, json=payload, timeout=timeout)
+        if diag:
+            body = (r.text or "")[:300].replace("\n", " ").replace("\r", "")
+            print("[SB-DIAG] POST {} -> HTTP {} | payload={} | resp={}".format(
+                url[:60], r.status_code, json.dumps(payload)[:200], body))
         if r.status_code == 200:
             return r.json()
-    except Exception:
-        pass
+    except Exception as e:
+        if diag:
+            print("[SB-DIAG] POST {} -> EXCEPTION {}".format(url[:60], e))
     return None
 
 
@@ -5012,6 +5018,8 @@ def _sb_post(url, payload, timeout=15):
 # ═══════════════════════════════════════════════════════════════════
 
 _SB_MARKET_CACHE = {}  # eventId -> markets (captured from search results)
+_SB_STRUCT_LOGGED = [False]
+_SB_EVENT_INFO = {}     # eventId -> {kickoff_ts, match_status, scores, teams}
 
 
 def sb_search_event(home_team, away_team):
@@ -5040,10 +5048,33 @@ def sb_search_event(home_team, away_team):
                            or ev.get("awayTeam") or "").lower()
                 if _team_match(home_team, ev_home) and _team_match(away_team, ev_away):
                     eid = ev.get("eventId") or ev.get("id")
+                    # Capture kickoff time + status for display and settlement
+                    try:
+                        _SB_EVENT_INFO[eid] = {
+                            "kickoff_ts": ev.get("estimateStartTime") or ev.get("startTime") or 0,
+                            "match_status": ev.get("matchStatus") or "",
+                            "status": ev.get("status"),
+                            "home_score": ev.get("homeScore") or ev.get("setScore"),
+                            "away_score": ev.get("awayScore"),
+                            "home": ev.get("homeTeamName"), "away": ev.get("awayTeamName"),
+                        }
+                    except Exception:
+                        pass
                     # Capture inline markets so we don't need a second call
                     mkts = ev.get("markets") or ev.get("marketList") or []
                     if mkts:
                         _SB_MARKET_CACHE[eid] = mkts
+                        # One-time dump of real market structure (to confirm field names)
+                        if not _SB_STRUCT_LOGGED[0]:
+                            _SB_STRUCT_LOGGED[0] = True
+                            for mk in mkts[:8]:
+                                ocs = mk.get("outcomes") or mk.get("outcome") or []
+                                oc_str = " ; ".join("{}={}".format(
+                                    o.get("id"), (o.get("desc") or o.get("name") or "")) for o in ocs[:4])
+                                print("[SB-STRUCT] id={} desc='{}' spec='{}' | {}".format(
+                                    mk.get("id"),
+                                    mk.get("desc") or mk.get("name") or mk.get("marketName"),
+                                    mk.get("specifier", ""), oc_str))
                     print("[SB] matched {} vs {} -> {} ({} inline markets)".format(
                         home_team, away_team, eid, len(mkts)))
                     return eid
@@ -5164,7 +5195,8 @@ def sb_map_pick_to_selection(pick, markets):
     """
     Given an engine pick and the event's markets, find the matching
     SportyBet marketId + specifier + outcomeId.
-    Returns a selection dict or None if no match.
+    Handles SportyBet's standard outcome labels (Home/Draw/Away, 1/X/2,
+    Over/Under, Yes/No) as well as full team names.
     """
     mt = pick["market_type"]
     home = pick["home"]
@@ -5175,44 +5207,54 @@ def sb_map_pick_to_selection(pick, markets):
         return None
     name_keywords, want_specifier, outcome_kind = mapping
 
+    def is_home(d):
+        d = d.strip().lower()
+        return _team_match(home, d) or d in ("home", "1", "{} (home)".format(home.lower()))
+    def is_away(d):
+        d = d.strip().lower()
+        return _team_match(away, d) or d in ("away", "2", "{} (away)".format(away.lower()))
+    def is_draw(d):
+        d = d.strip().lower()
+        return d in ("draw", "x", "tie") or "draw" in d
+
     for market in markets:
-        m_name = (market.get("name") or market.get("desc") or "").lower()
+        m_name = (market.get("desc") or market.get("name")
+                  or market.get("marketName") or "").lower()
         m_specifier = market.get("specifier") or ""
 
-        # Match market by name keyword
         if not any(kw in m_name for kw in name_keywords):
             continue
+        if want_specifier and want_specifier not in str(m_specifier) \
+           and want_specifier not in m_name:
+            continue
 
-        # Match specifier (for over/under, corners, cards)
-        if want_specifier:
-            if want_specifier not in str(m_specifier):
-                continue
-
-        # Find the right outcome
-        outcomes = market.get("outcomes", []) or market.get("outcome", [])
+        outcomes = market.get("outcomes") or market.get("outcome") or []
         for oc in outcomes:
-            oc_desc = (oc.get("desc") or oc.get("name") or "").lower()
+            oc_desc = (oc.get("desc") or oc.get("name") or "").strip()
+            od = oc_desc.lower()
             matched = False
-            if outcome_kind == "home" and _team_match(home, oc_desc):
-                matched = True
-            elif outcome_kind == "away" and _team_match(away, oc_desc):
-                matched = True
-            elif outcome_kind == "draw" and ("draw" in oc_desc or oc_desc == "x"):
-                matched = True
-            elif outcome_kind == "1X" and ("1x" in oc_desc.replace(" ", "") or
-                                            (_team_match(home, oc_desc) and "draw" in oc_desc)):
-                matched = True
-            elif outcome_kind == "X2" and ("x2" in oc_desc.replace(" ", "") or
-                                            (_team_match(away, oc_desc) and "draw" in oc_desc)):
-                matched = True
-            elif outcome_kind == "over" and "over" in oc_desc:
-                matched = True
-            elif outcome_kind == "under" and "under" in oc_desc:
-                matched = True
-            elif outcome_kind == "yes" and ("yes" in oc_desc or oc_desc == "gg"):
-                matched = True
-            elif outcome_kind == "no" and ("no" in oc_desc or oc_desc == "ng"):
-                matched = True
+            if outcome_kind == "home":
+                matched = is_home(od)
+            elif outcome_kind == "away":
+                matched = is_away(od)
+            elif outcome_kind == "draw":
+                matched = is_draw(od)
+            elif outcome_kind == "1X":
+                nd = od.replace(" ", "").replace("/", "")
+                matched = nd in ("1x", "1ordraw", "homeordraw") or \
+                          (is_home(od) and "draw" in od) or "home/draw" in od
+            elif outcome_kind == "X2":
+                nd = od.replace(" ", "").replace("/", "")
+                matched = nd in ("x2", "2ordraw", "awayordraw") or \
+                          (is_away(od) and "draw" in od) or "draw/away" in od
+            elif outcome_kind == "over":
+                matched = "over" in od or od.startswith("o ") or od == "o"
+            elif outcome_kind == "under":
+                matched = "under" in od or od.startswith("u ") or od == "u"
+            elif outcome_kind == "yes":
+                matched = od in ("yes", "gg") or "yes" in od
+            elif outcome_kind == "no":
+                matched = od in ("no", "ng") or od == "no"
 
             if matched:
                 return {
@@ -5236,7 +5278,7 @@ def sb_create_code(selections):
     if not selections:
         return None
     url = "{}/orders/share".format(SB_BASE)
-    resp = _sb_post(url, {"selections": selections})
+    resp = _sb_post(url, {"selections": selections}, diag=True)
     if not resp:
         return None
     if str(resp.get("message", "")).lower() == "success":
@@ -5300,6 +5342,10 @@ def generate_code_for_accumulator(accumulator, event_id_cache=None):
             continue
 
         pick["sb_event_id"] = event_id
+        # Attach kickoff time from the SportyBet event info we captured
+        info = _SB_EVENT_INFO.get(event_id, {})
+        if info.get("kickoff_ts"):
+            pick["kickoff_ts"] = info["kickoff_ts"]
 
         # Get markets and map the pick
         markets = sb_get_event_markets(event_id)
@@ -5478,20 +5524,34 @@ def _nav(active):
             '<div class="tabs">{}</div></div>').format(items)
 
 
+def _fb_fmt_kickoff(ts):
+    """Epoch-ms -> 'Sat 15:00' (UTC+1 Lagos), or '' if unknown."""
+    if not ts:
+        return ""
+    try:
+        dt = _dt.datetime.utcfromtimestamp(int(ts) / 1000) + _dt.timedelta(hours=1)
+        return dt.strftime("%a %H:%M")
+    except Exception:
+        return ""
+
+
 def render_codes_page(accumulators, date_str):
     """Render the SportyBet codes page. accumulators = list of dicts with code info."""
     blocks = []
     for acca in accumulators:
         if not acca:
             continue
-        sels = "".join(
-            '<div class="sel"><div class="ico">{}</div>'
-            '<div class="body"><div class="match">{}</div>'
-            '<div class="pick">{}</div></div>'
-            '<div><div class="odds">{}</div><div class="conf">{:.0f}%</div></div></div>'.format(
-                "⚽", s["match"], s["pick"], s["odds"], s["confidence"])
-            for s in acca["selections"]
-        )
+        rows = []
+        for s in acca["selections"]:
+            ko = _fb_fmt_kickoff(s.get("kickoff_ts"))
+            ko_html = '<div class="reason">🕐 {}</div>'.format(ko) if ko else ""
+            rows.append(
+                '<div class="sel"><div class="ico">⚽</div>'
+                '<div class="body"><div class="match">{}</div>'
+                '<div class="pick">{}</div>{}</div>'
+                '<div><div class="odds">{}</div><div class="conf">{:.0f}%</div></div></div>'.format(
+                    s["match"], s["pick"], ko_html, s["odds"], s["confidence"]))
+        sels = "".join(rows)
         if acca.get("code"):
             code_box = (
                 '<div class="code-box"><div><div class="label">SportyBet Code</div>'
@@ -5500,7 +5560,7 @@ def render_codes_page(accumulators, date_str):
             ).format(acca["code"], acca["code"])
         else:
             code_box = ('<div class="code-box pending"><div><div class="label">SportyBet Code</div>'
-                        '<div class="code">generating…</div></div></div>')
+                        '<div class="code">build manually below</div></div></div>')
 
         dot_color = {"🟢": "#15803d", "🟡": "#ca8a04", "🟠": "#ea580c", "🔴": "#dc2626"}.get(acca["emoji"], "#15803d")
         blocks.append(
@@ -5892,7 +5952,9 @@ def fmt_codes(accumulators, date_str):
             acca["total_odds"], acca.get("num_selections", len(acca["selections"]))))
         lines.append("")
         for s in acca["selections"]:
-            lines.append("  ⚽ {}".format(_short(s["match"])))
+            ko = _fb_fmt_kickoff(s.get("kickoff_ts")) if "_fb_fmt_kickoff" in globals() else ""
+            ko_str = "  🕐 {}".format(ko) if ko else ""
+            lines.append("  ⚽ {}{}".format(_short(s["match"]), ko_str))
             lines.append("     → <b>{}</b>  @ {:.2f}".format(s["pick"], s["odds"]))
         lines.append("")
         if acca.get("code"):
@@ -6081,12 +6143,278 @@ def fb_save_run(get_db, date_str, all_picks, accumulators):
                 tg=acca["target_odds"], to=acca["total_odds"],
                 ns=acca["num_selections"],
                 sj=json.dumps([{"match": s["match"], "pick": s["pick"],
-                                "odds": s["odds"], "confidence": s["confidence"]}
+                                "odds": s["odds"], "confidence": s["confidence"],
+                                "market_type": s.get("market_type", ""),
+                                "home": s.get("home", ""), "away": s.get("away", ""),
+                                "sb_event_id": s.get("sb_event_id", ""),
+                                "kickoff_ts": s.get("kickoff_ts", 0),
+                                "result": s.get("result", "pending")}
                                for s in acca["selections"]]),
                 cd=acca.get("code"))
         conn.close()
     except Exception as e:
         print("[FB] save error: {}".format(e))
+
+
+# ═══════════════════════════════════════════════════════════════════
+# SETTLEMENT — mark accumulators won/lost from final scores
+# ═══════════════════════════════════════════════════════════════════
+
+def _fb_settle_pick(market_type, pick_text, hs, aw):
+    """Evaluate a pick against a final score. Returns True/False/None (unknown)."""
+    total = hs + aw
+    mt = market_type
+    if mt == "home_win":            return hs > aw
+    if mt == "away_win":            return aw > hs
+    if mt == "draw":                return hs == aw
+    if mt == "double_chance_1X":    return hs >= aw
+    if mt == "double_chance_X2":    return aw >= hs
+    if mt == "over_0.5":            return total > 0.5
+    if mt == "over_1.5":            return total > 1.5
+    if mt == "over_2.5":            return total > 2.5
+    if mt == "over_3.5":            return total > 3.5
+    if mt == "under_2.5":           return total < 2.5
+    if mt == "under_3.5":           return total < 3.5
+    if mt == "btts_yes":            return hs > 0 and aw > 0
+    if mt == "btts_no":             return not (hs > 0 and aw > 0)
+    if mt == "home_win_btts":       return hs > aw and hs > 0 and aw > 0
+    if mt == "home_win_over_2.5":   return hs > aw and total > 2.5
+    if mt == "dc_over_1.5":         return hs >= aw and total > 1.5
+    if mt == "handicap_home_-1.5":  return (hs - aw) > 1.5
+    if mt == "handicap_away_-1.5":  return (aw - hs) > 1.5
+    if mt == "correct_score":
+        m = _sports_re.search(r'(\d+)-(\d+)', pick_text or "")
+        if m:
+            return hs == int(m.group(1)) and aw == int(m.group(2))
+        return None
+    # corners_* / cards_* can't be settled from the goal score alone
+    return None
+
+
+def sb_get_event_result(event_id, home, away):
+    """
+    Fallback: fetch score for a SportyBet event that's still listed (live or
+    just-finished). SportyBet drops games soon after they end, so this only
+    catches in-play/just-ended games — ESPN is the primary settlement source.
+    """
+    try:
+        sb_search_event(home, away)
+    except Exception:
+        pass
+    info = _SB_EVENT_INFO.get(event_id, {})
+    hs, aw = info.get("home_score"), info.get("away_score")
+    status = str(info.get("match_status") or "").lower()
+    st = info.get("status")
+    finished = ("end" in status or "ft" in status or "finish" in status
+                or st in (3, 4, 100))
+    if hs is not None and aw is not None:
+        try:
+            return int(hs), int(aw), finished
+        except (ValueError, TypeError):
+            return None
+    return None
+
+
+# ── ESPN scoreboard: the settlement score feed (free, no key, keeps finished
+#    games — unlike SportyBet which drops them, and livescore.com whose own API
+#    is body-encrypted). One scoreboard call per league per date. ─────────────
+ESPN_SOCCER_LEAGUES = [
+    "eng.1", "eng.2", "esp.1", "esp.2", "ita.1", "ger.1", "fra.1",
+    "ned.1", "por.1", "sco.1", "tur.1", "bel.1",
+    "uefa.champions", "uefa.europa", "uefa.europa_conf",
+    "fifa.friendly", "fifa.friendly.w",
+    "fifa.worldq.uefa", "fifa.worldq.conmebol", "fifa.worldq.concacaf",
+    "fifa.worldq.afc", "fifa.worldq.caf",
+    "conmebol.libertadores", "conmebol.sudamericana",
+]
+
+
+def _espn_scoreboard(slug, yyyymmdd):
+    """Fetch one ESPN league+date scoreboard. Returns finished/in-play games."""
+    if _req is None:
+        return []
+    url = ("https://site.api.espn.com/apis/site/v2/sports/soccer/{}"
+           "/scoreboard?dates={}".format(slug, yyyymmdd))
+    out = []
+    try:
+        r = _req.get(url, timeout=12, headers={"User-Agent": "Mozilla/5.0"})
+        if r.status_code != 200:
+            return []
+        data = r.json()
+        for ev in data.get("events", []):
+            comp = (ev.get("competitions") or [{}])[0]
+            stype = ((ev.get("status") or {}).get("type")) or {}
+            completed = bool(stype.get("completed"))
+            home = away = None
+            hs = aw = None
+            for c in comp.get("competitors", []):
+                team = c.get("team") or {}
+                nm = team.get("displayName") or team.get("name") or team.get("shortDisplayName") or ""
+                sc = c.get("score")
+                if c.get("homeAway") == "home":
+                    home, hs = nm, sc
+                else:
+                    away, aw = nm, sc
+            if home and away and hs is not None and aw is not None:
+                try:
+                    out.append({"home": home, "away": away,
+                                "hs": int(hs), "aw": int(aw), "completed": completed})
+                except (ValueError, TypeError):
+                    pass
+    except Exception:
+        return []
+    return out
+
+
+def _fb_build_score_index(dates):
+    """Build a list of finished-game results across all leagues for given dates."""
+    index = []
+    for d in dates:
+        for slug in ESPN_SOCCER_LEAGUES:
+            rows = _espn_scoreboard(slug, d)
+            if rows:
+                index.extend(rows)
+            time.sleep(0.08)
+    fin = sum(1 for r in index if r["completed"])
+    print("[FB] ESPN score index: {} games found ({} finished) across {} dates".format(
+        len(index), fin, len(dates)))
+    return index
+
+
+def _fb_lookup_score(index, home, away):
+    """Find a finished game in the ESPN index matching these teams. -> (hs,aw) or None."""
+    def norm(s):
+        s = (s or "").lower()
+        for junk in (" fc", " cf", " sc", " ac", " afc", " cd", " ud", " club",
+                     "real ", "deportivo ", " calcio", " 1929", " 1913", "."):
+            s = s.replace(junk, " ")
+        return " ".join(s.split())
+
+    def teams_match(a, b):
+        a, b = norm(a), norm(b)
+        if not a or not b:
+            return False
+        if a == b or a in b or b in a:
+            return True
+        wa, wb = set(a.split()), set(b.split())
+        # share a distinctive (>=4 char) token
+        return any(len(w) >= 4 and w in wb for w in wa)
+
+    for g in index:
+        if not g["completed"]:
+            continue
+        if teams_match(home, g["home"]) and teams_match(away, g["away"]):
+            return g["hs"], g["aw"]
+        if teams_match(home, g["away"]) and teams_match(away, g["home"]):
+            return g["aw"], g["hs"]
+    return None
+
+
+def _fb_settle_accumulators(get_db):
+    """Settle pending accumulators using ESPN final scores (goal-based legs)."""
+    import time as _t
+    now_ms = int(_t.time() * 1000)
+    try:
+        conn = get_db()
+        rows = conn.run(
+            "SELECT id, selections_json, result FROM sportybet_accumulators "
+            "WHERE result IS NULL OR result = 'pending'")
+        cols_rows = [(r[0], r[1], r[2]) for r in rows]
+        conn.close()
+    except Exception as e:
+        print("[FB] settle query error: {}".format(e))
+        return
+
+    if not cols_rows:
+        return
+
+    # Only bother if at least one pending leg has finished (kickoff + 2.5h passed)
+    needs_scores = False
+    for _id, sj, _r in cols_rows:
+        try:
+            for s in (json.loads(sj) if sj else []):
+                ko = s.get("kickoff_ts") or 0
+                if ko and now_ms > (ko + 2.5 * 3600 * 1000):
+                    needs_scores = True
+                    break
+        except Exception:
+            pass
+        if needs_scores:
+            break
+    if not needs_scores:
+        return
+
+    # Build the ESPN score index for the last few days (covers recent kickoffs)
+    today = _dt.datetime.utcnow()
+    dates = [(today - _dt.timedelta(days=i)).strftime("%Y%m%d") for i in (0, 1, 2)]
+    index = _fb_build_score_index(dates)
+    if not index:
+        print("[FB] settle: no scores available yet")
+        return
+
+    settled_count = 0
+    for acc_id, sj, _res in cols_rows:
+        try:
+            sels = json.loads(sj) if sj else []
+        except Exception:
+            continue
+        if not sels:
+            continue
+
+        any_lost = False
+        all_known = True
+        evaluable = 0
+        for s in sels:
+            ko = s.get("kickoff_ts") or 0
+            if not ko or now_ms < (ko + 2.5 * 3600 * 1000):
+                all_known = False
+                continue
+            score = _fb_lookup_score(index, s.get("home", ""), s.get("away", ""))
+            if score is None:
+                all_known = False
+                continue
+            hs, aw = score
+            outcome = _fb_settle_pick(s.get("market_type", ""), s.get("pick", ""), hs, aw)
+            if outcome is None:
+                continue  # corners/cards — can't grade from score
+            evaluable += 1
+            s["result"] = "won" if outcome else "lost"
+            if not outcome:
+                any_lost = True
+
+        new_result = None
+        if any_lost:
+            new_result = "lost"
+        elif all_known and evaluable > 0:
+            new_result = "won"
+
+        if new_result:
+            try:
+                conn = get_db()
+                conn.run("UPDATE sportybet_accumulators SET result=:r, selections_json=:sj WHERE id=:i",
+                         r=new_result, sj=json.dumps(sels), i=acc_id)
+                conn.close()
+                settled_count += 1
+            except Exception as e:
+                print("[FB] settle update error: {}".format(e))
+
+    if settled_count:
+        print("[FB] Settled {} accumulators (won/lost)".format(settled_count))
+
+
+def fb_settle_thread(get_db):
+    """Background thread: settle finished accumulators hourly."""
+    def loop():
+        _t = __import__("time")
+        _t.sleep(180)
+        while True:
+            try:
+                _fb_settle_accumulators(get_db)
+            except Exception as e:
+                print("[FB] settle thread error: {}".format(e))
+            _t.sleep(3600)
+    threading.Thread(target=loop, daemon=True).start()
+    print("[FB] settle thread started (hourly)")
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -6096,6 +6424,49 @@ def fb_save_run(get_db, date_str, all_picks, accumulators):
 #   top_picks_per_match, generate_code_for_accumulator,
 #   tg_send (+ token/chat), fmt_codes, fmt_picks
 # ═══════════════════════════════════════════════════════════════════
+
+def _fb_enrich_and_filter_upcoming(fixtures, max_lookup=60):
+    """
+    Look each fixture up on SportyBet and keep ONLY upcoming, not-started
+    games that still have markets. SportyBet removes a game the moment it
+    kicks off, so 'present on SportyBet with markets' == 'bettable'.
+
+    Attaches sb_event_id + kickoff_ts to each surviving fixture.
+    Returns (upcoming_fixtures, match->event_id cache for code-gen reuse).
+    """
+    import time as _t
+    now_ms = int(_t.time() * 1000)
+    upcoming = []
+    cache = {}
+    looked = 0
+    for fx in fixtures:
+        if looked >= max_lookup:
+            break
+        looked += 1
+        try:
+            eid = sb_search_event(fx["home_team"], fx["away_team"])
+            _t.sleep(0.35)
+        except Exception:
+            eid = None
+        if not eid:
+            continue
+        info = _SB_EVENT_INFO.get(eid, {})
+        ko = info.get("kickoff_ts") or 0
+        status = str(info.get("match_status") or "").lower()
+        has_markets = bool(_SB_MARKET_CACHE.get(eid))
+        # Keep only games that haven't started and still have markets
+        not_started = ("not start" in status) or (status == "" and (not ko or now_ms < ko))
+        future_ok = (not ko) or (now_ms < ko)
+        if not has_markets or not not_started or not future_ok:
+            continue
+        fx["sb_event_id"] = eid
+        fx["kickoff_ts"] = ko
+        cache["{} vs {}".format(fx["home_team"], fx["away_team"])] = eid
+        upcoming.append(fx)
+    print("[FB] {} upcoming bettable fixtures (looked up {} on SportyBet)".format(
+        len(upcoming), looked))
+    return upcoming, cache
+
 
 def run_football_engine(get_db, tg_token, tg_chat, send_telegram,
                         generate_codes=True, announce=True):
@@ -6127,6 +6498,29 @@ def run_football_engine(get_db, tg_token, tg_chat, send_telegram,
             _FB_CACHE["running"] = False
             return
 
+        # 1b. Reset SportyBet caches, then enrich + filter to UPCOMING bettable
+        #     games only. SportyBet drops games once they start, so this both
+        #     gets kickoff times AND guarantees codes can map (markets exist).
+        try:
+            _SB_DIAG_COUNT[0] = 0
+            _SB_MARKET_CACHE.clear()
+            _SB_STRUCT_LOGGED[0] = False
+            _SB_EVENT_INFO.clear()
+        except Exception:
+            pass
+
+        event_cache = {}
+        if generate_codes:
+            try:
+                fixtures, event_cache = _fb_enrich_and_filter_upcoming(fixtures)
+            except Exception as e:
+                print("[FB] enrich/filter error: {}".format(e))
+
+        if not fixtures:
+            print("[FB] No upcoming bettable fixtures right now — nothing to post")
+            _FB_CACHE["running"] = False
+            return
+
         # 2. Analyze
         all_picks = []
         for fx in fixtures:
@@ -6151,14 +6545,8 @@ def run_football_engine(get_db, tg_token, tg_chat, send_telegram,
                         ["2_odds", "3_odds", "5_odds", "10_odds", "1000_odds"]
                         if acca_dict.get(k)]
 
-        # 4. Generate SportyBet codes
+        # 4. Generate SportyBet codes (reusing the event cache from enrichment)
         if generate_codes:
-            try:
-                _SB_DIAG_COUNT[0] = 0  # fresh diagnostics each run
-                _SB_MARKET_CACHE.clear()
-            except Exception:
-                pass
-            event_cache = {}
             for acca in accumulators:
                 try:
                     result = generate_code_for_accumulator(acca, event_cache)
@@ -6810,6 +7198,12 @@ try:
     fb_scanner_thread(get_db, TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, send_telegram, interval_hours=6)
 except Exception as e:
     print("[FB] scanner thread error: {}".format(e))
+
+# Football settlement thread (marks accumulators won/lost from final scores, hourly)
+try:
+    fb_settle_thread(get_db)
+except Exception as e:
+    print("[FB] settle thread error: {}".format(e))
 
 print("[V2] All threads launched — engine running")
 print("=" * 60)
