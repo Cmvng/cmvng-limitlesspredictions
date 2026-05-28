@@ -3175,42 +3175,65 @@ def _sports_fetch_polymarket_sports(match_pairs=None):
     markets = []
     seen_ids = set()
 
-    # Step 1: Get soccer tag_id from /sports metadata (cached)
+    # Step 1: Get soccer-specific tag_ids from /sports metadata (cached)
+    # tag_id=1 is shared across ALL sports — useless for filtering.
+    # We need sport-specific tags like EPL=82, UCL=306, etc.
     if not _sports_poly_soccer_tag_id:
         try:
             r = _sports_req.get("{}/sports".format(POLY_GAMMA_API), timeout=10)
             if r.status_code == 200:
                 sports_list = r.json() if isinstance(r.json(), list) else []
-                print("[SPORTS] Poly /sports returned {} sports: {}".format(
-                    len(sports_list),
-                    ", ".join("{}=tags:{}".format(
-                        s.get("sport", "?"), s.get("tags", "?"))
-                        for s in sports_list[:8])))
+                print("[SPORTS] Poly /sports returned {} sports".format(len(sports_list)))
+                soccer_tag_ids = set()
+                soccer_sport_codes = ["epl", "ucl", "uel", "ser", "bun", "lig",  # leagues
+                                       "mls", "lcu", "acn", "fif", "es2", "cdr",
+                                       "ucf", "soc", "football"]
                 for sport in sports_list:
-                    sport_name = (sport.get("sport", "") or "").lower()
-                    if sport_name in ("soccer", "football", "epl", "ucl", "mls"):
-                        tags_str = sport.get("tags", "")
-                        if tags_str:
-                            tag_ids = [t.strip() for t in str(tags_str).split(",") if t.strip()]
-                            if tag_ids:
-                                _sports_poly_soccer_tag_id = tag_ids[0]
-                                print("[SPORTS] Poly soccer tag_id: {} (from sport='{}')".format(
-                                    _sports_poly_soccer_tag_id, sport_name))
-                                break
-                # If no explicit soccer sport found, skip tag_id approach
-                if not _sports_poly_soccer_tag_id:
-                    print("[SPORTS] No soccer sport found in /sports metadata — skipping tag_id step")
+                    sport_code = (sport.get("sport", "") or "").lower()
+                    if any(sc in sport_code for sc in soccer_sport_codes):
+                        tags_str = str(sport.get("tags", ""))
+                        for t in tags_str.split(","):
+                            t = t.strip()
+                            if t and t != "1":  # Skip tag_id=1 (shared by all)
+                                soccer_tag_ids.add(t)
+                if soccer_tag_ids:
+                    _sports_poly_soccer_tag_id = ",".join(list(soccer_tag_ids)[:5])
+                    print("[SPORTS] Poly soccer tag_ids: {} (from {} soccer sports)".format(
+                        _sports_poly_soccer_tag_id,
+                        sum(1 for s in sports_list
+                            if any(sc in (s.get("sport","") or "").lower() for sc in soccer_sport_codes))))
+                else:
+                    _sports_poly_soccer_tag_id = "NONE"
+                    print("[SPORTS] No soccer-specific tags found, will rely on search + smt only")
         except Exception as e:
             print("[SPORTS] Poly /sports error: {}".format(e))
 
     def _parse_market(m, event_title=""):
-        """Parse a market object into our standard format."""
+        """Parse a market object into our standard format.
+        Rejects stale markets (dates more than 3 days from today)."""
         mid = str(m.get("id", "") or m.get("conditionId", ""))
         if not mid or mid in seen_ids:
             return None
         seen_ids.add(mid)
         q = m.get("question", "") or ""
         slug = m.get("slug", "") or ""
+
+        # Date freshness check — reject markets with dates > 3 days from today
+        # Slugs often contain dates like "2026-05-30" or "2026-05-28"
+        import datetime as _dt
+        today = _dt.date.today()
+        date_match = _sports_re.search(r'(\d{4})-(\d{2})-(\d{2})', slug)
+        if date_match:
+            try:
+                market_date = _dt.date(int(date_match.group(1)),
+                                        int(date_match.group(2)),
+                                        int(date_match.group(3)))
+                days_diff = abs((market_date - today).days)
+                if days_diff > 3:
+                    return None  # Stale or too far future
+            except:
+                pass
+
         op = m.get("outcomePrices", "")
         if isinstance(op, str):
             try:
@@ -3223,8 +3246,7 @@ def _sports_fetch_polymarket_sports(match_pairs=None):
                 outcomes = json.loads(outcomes)
             except:
                 outcomes = []
-        # Build URL — sports match markets use /event/{slug}
-        # The slug IS the market identifier on Polymarket
+        # Build URL — use /event/{slug} for individual market pages
         market_url = ""
         if slug:
             market_url = "https://polymarket.com/event/{}".format(slug)
@@ -3245,36 +3267,28 @@ def _sports_fetch_polymarket_sports(match_pairs=None):
             "sports_market_type": m.get("sportsMarketType", "") or "",
         }
 
-    # Step 2: Fetch active soccer markets by tag_id
-    # NOTE: tag_id=1 returns ALL sports, so we filter for soccer keywords
-    if _sports_poly_soccer_tag_id:
-        try:
-            r = _sports_req.get("{}/markets".format(POLY_GAMMA_API),
-                               params={"tag_id": _sports_poly_soccer_tag_id,
-                                       "closed": False, "limit": 100,
-                                       "order": "volume", "ascending": False},
-                               timeout=15)
-            if r.status_code == 200:
-                data = r.json() if isinstance(r.json(), list) else []
-                for m in data:
-                    smt_val = (m.get("sportsMarketType", "") or "").lower()
-                    q = (m.get("question", "") or "").lower()
-                    # Exclude non-soccer
-                    if any(x in smt_val for x in ["tennis", "map_handicap", "esport",
-                                                    "round_handicap", "nba", "nfl",
-                                                    "nhl", "mlb", "mma", "ufc",
-                                                    "set_totals", "game_handicap"]):
-                        continue
-                    if any(x in q for x in ["tennis", "map handicap", "esport",
-                                             "sets o/u", "total sets",
-                                             "round handicap", "nba", "nfl"]):
-                        continue
-                    parsed = _parse_market(m)
-                    if parsed:
-                        markets.append(parsed)
-                print("[SPORTS] Poly tag_id markets: {} (after soccer filter)".format(len(markets)))
-        except Exception as e:
-            print("[SPORTS] Poly tag_id fetch error: {}".format(e))
+    # Step 2: Fetch active soccer markets by soccer-specific tag_ids
+    if _sports_poly_soccer_tag_id and _sports_poly_soccer_tag_id != "NONE":
+        for tag_id in _sports_poly_soccer_tag_id.split(",")[:3]:  # Query top 3 tags
+            try:
+                r = _sports_req.get("{}/markets".format(POLY_GAMMA_API),
+                                   params={"tag_id": tag_id,
+                                           "closed": False, "limit": 50,
+                                           "order": "volume", "ascending": False},
+                                   timeout=15)
+                if r.status_code == 200:
+                    data = r.json() if isinstance(r.json(), list) else []
+                    tag_count = 0
+                    for m in data:
+                        parsed = _parse_market(m)
+                        if parsed:
+                            markets.append(parsed)
+                            tag_count += 1
+                    if tag_count:
+                        print("[SPORTS] Poly tag={}: {} markets".format(tag_id, tag_count))
+                time.sleep(0.2)
+            except Exception as e:
+                print("[SPORTS] Poly tag={} error: {}".format(tag_id, e))
 
     # Step 3: Fetch match-day sports markets by type (moneyline, total, btts)
     for smt in ["moneyline", "total", "btts", "spread"]:
@@ -3534,22 +3548,20 @@ def _sports_score_pick(insights, market):
     """Score a potential pick from 0-100."""
     score = 0
     reasons = []
-    n_sources = len(insights["sources"])
-
-    if n_sources < 2:
-        return 0, []
-
-    # Consensus strength (max 30)
+    n_preds = len(insights["sources"])  # Total prediction count (may include duplicates)
     unique_sources = len(set(insights["sources"]))
+
+    # Consensus strength — multi-source (max 30)
     if unique_sources >= 4:
         score += 30
-        reasons.append("4/4 sites agree")
+        reasons.append("4+ sites agree")
     elif unique_sources >= 3:
         score += 20
         reasons.append("3+ sites agree")
     elif unique_sources >= 2:
         score += 10
         reasons.append("2 sites agree")
+    # Single source gets base points from score predictions below
 
     # Score predictions support the pick (max 15)
     if insights["scores"]:
@@ -3682,6 +3694,7 @@ def _sports_scan_and_alert():
         preds = match_data["predictions"]
         sources = set(p["source"] for p in preds)
         match_alerts = 0  # Track alerts for this match
+        seen_alert_keys = set()  # Deduplicate same market appearing twice
 
         # Extract insights
         insights = _sports_extract_insights(preds, home, away)
@@ -3692,6 +3705,16 @@ def _sports_scan_and_alert():
             mq = (market.get("question", "") + " " + market.get("title", "")).lower()
             if _sports_match_teams(home, away, mq):
                 matched_count += 1
+
+                # Deduplicate — same game slug with same market type shouldn't alert twice
+                mslug = market.get("slug", "")
+                smt = market.get("sports_market_type", "") or "general"
+                # Normalize slug for dedup: sort team codes so home/away swap doesn't matter
+                slug_parts = mslug.replace("-", " ").split()
+                alert_key = (tuple(sorted(slug_parts)), smt)
+                if alert_key in seen_alert_keys:
+                    continue
+                seen_alert_keys.add(alert_key)
 
                 # Single source without a score prediction is too weak — skip
                 if len(sources) == 1:
