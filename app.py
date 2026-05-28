@@ -208,6 +208,23 @@ def init_db():
     print("[V2] Database initialized")
 
 
+def reset_db():
+    """Reset all paper trades and balances for a fresh start."""
+    try:
+        conn = get_db()
+        # Delete all existing trades
+        conn.run("DELETE FROM v2_paper_trades")
+        # Reset balances to $50 each
+        conn.run("UPDATE v2_balances SET balance = 50.0, peak_balance = 50.0, wins = 0, losses = 0, updated_at = NOW()")
+        conn.close()
+        # Reset in-memory balances
+        _v2_balances["polymarket"] = {"balance": 50.0, "peak_balance": 50.0, "wins": 0, "losses": 0}
+        _v2_balances["limitless"] = {"balance": 50.0, "peak_balance": 50.0, "wins": 0, "losses": 0}
+        print("[V2] *** DATABASE RESET — all trades cleared, balances reset to $50 ***")
+    except Exception as e:
+        print("[V2] Reset error: {}".format(e))
+
+
 # ═══════════════════════════════════════════════════════════
 # TELEGRAM
 # ═══════════════════════════════════════════════════════════
@@ -768,14 +785,14 @@ def _poly_get_baseline(parsed, price=None):
     return price
 
 
+
 # ═══════════════════════════════════════════════════════════
 # V2 CONFIRMATION ENGINE — CORE ANALYSIS
 # ═══════════════════════════════════════════════════════════
 
 def _v2_session_filter(utc_hour):
-    """Return session label and whether it's safe to trade.
-    Per spec: AVOID London/US crossover, Peak US, Peak Asia.
-    PREFER: Late US/early Asian, Early morning."""
+    """AVOID London/US cross + Peak US + Peak Asia.
+    PREFER: Late US/early Asian + Early morning."""
     if 4 <= utc_hour <= 11:
         return "EARLY_MORNING", True
     elif 17 <= utc_hour <= 22:
@@ -783,96 +800,67 @@ def _v2_session_filter(utc_hour):
     elif 11 <= utc_hour < 12:
         return "PRE_LONDON", True
     elif 12 <= utc_hour <= 17:
-        return "US_SESSION", False  # London/US cross + Peak US — SKIP
+        return "US_SESSION", False
     elif 23 <= utc_hour or utc_hour < 4:
-        return "PEAK_ASIA", False  # Peak Asia — SKIP
+        return "PEAK_ASIA", False
     else:
         return "TRANSITION", True
 
 
 def _v2_analyze_structure(candles):
-    """Analyze HH/HL structure from intra-period candles (1m or 5m).
-    Returns dict with hh_count, hl_count, lh_count, ll_count,
-    grind_type ('steady'|'spike'|'choppy'), direction ('UP'|'DOWN'|'FLAT')."""
+    """Analyze HH/HL structure from intra-period candles.
+    Candle intervals per timeframe (set by caller):
+    - Hourly watcher: 15M candles (3 completed at T+45)
+    - 15M watcher: 5M candles (2 completed at T+10)
+    - Daily watcher: 4H candles (4-5 by quiet hours)
 
-    if not candles or len(candles) < 3:
+    With 2-5 candles, compare each consecutively for HH/HL/LH/LL.
+    Spike = one candle did >50% of the total range."""
+
+    if not candles or len(candles) < 2:
         return None
 
-    # Find swing points using 3-bar pivots
-    swing_highs = []
-    swing_lows = []
-    for i in range(1, len(candles) - 1):
-        if candles[i]["h"] > candles[i-1]["h"] and candles[i]["h"] > candles[i+1]["h"]:
-            swing_highs.append((i, candles[i]["h"]))
-        if candles[i]["l"] < candles[i-1]["l"] and candles[i]["l"] < candles[i+1]["l"]:
-            swing_lows.append((i, candles[i]["l"]))
-
-    # If not enough swings, use raw highs/lows in chunks
-    if len(swing_highs) < 2 or len(swing_lows) < 2:
-        chunk_size = max(1, len(candles) // 5)
-        swing_highs = []
-        swing_lows = []
-        for i in range(0, len(candles), chunk_size):
-            chunk = candles[i:i+chunk_size]
-            if chunk:
-                max_h = max(c["h"] for c in chunk)
-                min_l = min(c["l"] for c in chunk)
-                swing_highs.append((i, max_h))
-                swing_lows.append((i, min_l))
-
-    # Count HH, HL, LH, LL
+    # Count HH, HL, LH, LL by comparing consecutive candle highs and lows
     hh_count = 0
     lh_count = 0
-    for i in range(1, len(swing_highs)):
-        if swing_highs[i][1] > swing_highs[i-1][1]:
+    for i in range(1, len(candles)):
+        if candles[i]["h"] > candles[i-1]["h"]:
             hh_count += 1
-        elif swing_highs[i][1] < swing_highs[i-1][1]:
+        elif candles[i]["h"] < candles[i-1]["h"]:
             lh_count += 1
 
     hl_count = 0
     ll_count = 0
-    for i in range(1, len(swing_lows)):
-        if swing_lows[i][1] > swing_lows[i-1][1]:
+    for i in range(1, len(candles)):
+        if candles[i]["l"] > candles[i-1]["l"]:
             hl_count += 1
-        elif swing_lows[i][1] < swing_lows[i-1][1]:
+        elif candles[i]["l"] < candles[i-1]["l"]:
             ll_count += 1
 
-    # Grind analysis — steady vs spike
-    # Calculate per-candle moves
-    moves = []
-    for i in range(1, len(candles)):
-        move = abs(candles[i]["c"] - candles[i-1]["c"])
-        moves.append(move)
+    # Spike detection — concentration of move
+    # What % of the total period range came from the single largest candle?
+    total_high = max(c["h"] for c in candles)
+    total_low = min(c["l"] for c in candles)
+    total_range = total_high - total_low
+    candle_ranges = [c["h"] - c["l"] for c in candles]
+    max_candle_range = max(candle_ranges) if candle_ranges else 0
+    concentration = (max_candle_range / total_range) if total_range > 0 else 0
 
-    avg_move = sum(moves) / len(moves) if moves else 0
-    max_move = max(moves) if moves else 0
-
-    if avg_move > 0 and len(moves) >= 3:
-        # Spec: "if any 5-min move > 2x average move → spike"
-        # For 1M candles: single 1M candle being 2x avg is normal noise
-        # Spike = one move drove MOST of the total distance (aggressive pump)
-        total_distance = abs(candles[-1]["c"] - candles[0]["o"])
-        if total_distance > 0 and max_move > total_distance * 0.5:
-            # One single candle moved more than half the total distance = pump
-            grind_type = "spike"
-        elif max_move < avg_move * 1.5:
-            grind_type = "steady"
-        else:
-            grind_type = "choppy"
-    elif avg_move > 0:
-        grind_type = "choppy"
-    else:
+    if concentration > 0.50:
+        grind_type = "spike"
+    elif concentration < 0.35:
         grind_type = "steady"
+    else:
+        grind_type = "normal"
 
-    # Direction determination — per spec: HH>=2 AND HL>=2 = clean trend
-    # No weak fallbacks — if structure isn't clean, it's FLAT (skip)
-    if hh_count >= 2 and hl_count >= 2 and lh_count == 0 and ll_count == 0:
-        direction = "UP"
-    elif ll_count >= 2 and lh_count >= 2 and hh_count == 0 and hl_count == 0:
-        direction = "DOWN"
-    elif hh_count >= 2 and hl_count >= 2 and hh_count > lh_count:
+    # Direction — HH>=2 AND HL>=2 = clean trend, else FLAT
+    if hh_count >= 2 and hl_count >= 2 and hh_count > lh_count:
         direction = "UP"
     elif ll_count >= 2 and lh_count >= 2 and ll_count > hh_count:
+        direction = "DOWN"
+    elif hh_count >= 2 and hl_count >= 2 and lh_count == 0:
+        direction = "UP"
+    elif ll_count >= 2 and lh_count >= 2 and hh_count == 0:
         direction = "DOWN"
     else:
         direction = "FLAT"
@@ -881,25 +869,23 @@ def _v2_analyze_structure(candles):
         "hh_count": hh_count, "hl_count": hl_count,
         "lh_count": lh_count, "ll_count": ll_count,
         "grind_type": grind_type, "direction": direction,
-        "swing_highs": swing_highs, "swing_lows": swing_lows,
+        "concentration": round(concentration, 3),
     }
 
 
 def _v2_analyze_prev_candle(candle):
-    """Analyze previous period's candle for strength/direction.
-    Returns dict with color, body_pct, close_position, wick_ratios."""
+    """Analyze previous period's candle for strength/direction."""
     if not candle:
         return None
     o, h, l, c = candle["o"], candle["h"], candle["l"], candle["c"]
     rng = max(h - l, 0.0001)
     body = abs(c - o)
     body_pct = body / rng
-    close_pos = (c - l) / rng  # 0 = closed at low, 1 = closed at high
+    close_pos = (c - l) / rng
     green = c > o
     upper_wick = (h - max(o, c)) / rng
     lower_wick = (min(o, c) - l) / rng
 
-    # Strength assessment
     if body_pct > 0.6 and close_pos > 0.7 and green:
         strength = "STRONG_BULL"
     elif body_pct > 0.6 and close_pos < 0.3 and not green:
@@ -920,76 +906,47 @@ def _v2_analyze_prev_candle(candle):
 
 
 def _v2_volatility_check(candles, current_range=None):
-    """Check if current volatility is normal or excessive.
-    Returns (label, is_safe) — 'normal'|'high'|'extreme'."""
-    if not candles or len(candles) < 5:
+    """ATR-based volatility check."""
+    if not candles or len(candles) < 3:
         return "unknown", True
-
-    # ATR of recent candles
     ranges = [c["h"] - c["l"] for c in candles[-10:]]
     atr = sum(ranges) / len(ranges) if ranges else 0
-
     if current_range is None:
         current_range = candles[-1]["h"] - candles[-1]["l"]
-
     if atr <= 0:
         return "unknown", True
-
     ratio = current_range / atr
     if ratio > 2.5:
         return "extreme", False
     elif ratio > 1.8:
         return "high", False
-    elif ratio > 1.3:
-        return "elevated", True
     else:
         return "normal", True
 
 
-def _v2_ptb_distance(price, ptb, asset):
-    """Calculate distance from PTB as percentage.
-    Returns (pct_distance, direction, is_meaningful)."""
-    if not price or not ptb or ptb <= 0:
-        return 0, "NONE", False
+def _v2_should_enter(price, ptb, asset, structure, prev_candle,
+                     vol_safe, session_safe, timeframe, secs_remaining):
+    """Master entry decision — CONFIRMATION, not prediction.
 
-    pct = ((price - ptb) / ptb) * 100
-    direction = "ABOVE" if pct > 0 else "BELOW" if pct < 0 else "AT"
+    The question: "Will this close above/below the PTB?"
 
-    # Minimum meaningful distance varies by asset
-    min_dist = {
-        "BTC": 0.05, "ETH": 0.08, "SOL": 0.10,
-        "XRP": 0.15, "DOGE": 0.20, "BNB": 0.10,
-    }.get(asset, 0.10)
+    1. Where is price relative to PTB? (must be meaningfully on one side)
+    2. How did it get there? (steady grind = safe, spike = dangerous)
+    3. Previous candle supports the bias?
+    4. Structure confirms the path? (no reversal signs)
+    5. Session quiet? Volatility normal?
+    6. Given the distance and time left, is it unlikely to reverse back?
+    """
 
-    is_meaningful = abs(pct) > min_dist
-    return round(pct, 4), direction, is_meaningful
-
-
-def _v2_should_enter(structure, prev_candle, volatility_label, vol_safe,
-                     session_safe, ptb_meaningful, ptb_direction, grind_type,
-                     timeframe="1H"):
-    """Master entry decision — follows spec EXACTLY.
-    
-    Per spec, a SAFE entry requires ALL of:
-    1. Previous candle was GREEN/strong (for UP) or RED/strong (for DOWN)
-    2. Current candle making HH>=2 and HL>=2 (clean trend)
-    3. No aggressive pump spikes (these reverse)
-    4. Price meaningfully above PTB (for UP) or below (for DOWN)
-    5. Quiet market conditions (not volatile session)
-    
-    If ANY reversal sign → SKIP."""
-
-    # Hard filter: session
+    # Hard filters
     if not session_safe and timeframe != "DAILY":
         return False, None, 0, "Volatile session — skip"
 
-    # Hard filter: volatility
     if not vol_safe:
         return False, None, 0, "Volatility too high — skip"
 
-    # Hard filter: spike = SKIP (spec says aggressive pump = DANGEROUS)
-    if grind_type == "spike":
-        return False, None, 0, "Spike detected — dangerous, skip"
+    if not price or not ptb or ptb <= 0:
+        return False, None, 0, "No price or PTB data"
 
     if not structure:
         return False, None, 0, "No structure data"
@@ -997,120 +954,108 @@ def _v2_should_enter(structure, prev_candle, volatility_label, vol_safe,
     if not prev_candle:
         return False, None, 0, "No previous candle data"
 
-    struct_dir = structure["direction"]
-    if struct_dir == "FLAT":
-        return False, None, 0, "No clean trend — choppy around PTB"
+    # 1. Distance from PTB
+    distance_pct = ((price - ptb) / ptb) * 100
+    abs_dist = abs(distance_pct)
 
-    hh = structure["hh_count"]
-    hl = structure["hl_count"]
-    lh = structure["lh_count"]
-    ll = structure["ll_count"]
+    min_dist = {
+        "BTC": 0.05, "ETH": 0.08, "SOL": 0.10,
+        "XRP": 0.15, "DOGE": 0.20, "BNB": 0.10,
+    }.get(asset, 0.10)
 
-    if struct_dir == "UP":
-        # Spec: previous candle must be GREEN
-        if prev_candle["strength"] in ("STRONG_BEAR", "MILD_BEAR"):
-            return False, None, 0, "Prev candle RED — no bullish bias, skip"
+    if abs_dist < min_dist:
+        return False, None, 0, "Too close to PTB ({:+.3f}%) — coin flip".format(distance_pct)
 
-        # Spec: HH>=2 AND HL>=2 = clean trend
-        if hh < 2 or hl < 2:
-            return False, None, 0, "Structure not clean (HH={} HL={}) — need 2+2".format(hh, hl)
+    direction = "UP" if distance_pct > 0 else "DOWN"
 
-        # Spec: any reversal signs = skip
-        if lh >= 1:
-            return False, None, 0, "Lower high forming (LH={}) — momentum fading, skip".format(lh)
+    # 2. How did price get here?
+    grind = structure.get("grind_type", "normal")
+    if grind == "spike":
+        return False, None, 0, "Spike — one candle did the move, reversal risk"
 
-        # Spec: price must be meaningfully above PTB
-        if ptb_meaningful and ptb_direction == "BELOW":
-            return False, None, 0, "Price below PTB — chopping, skip"
+    # 3. Previous candle must align with direction
+    if direction == "UP" and prev_candle["strength"] in ("STRONG_BEAR", "MILD_BEAR"):
+        return False, None, 0, "Prev candle RED — no bullish momentum behind this"
 
-        # All checks passed — calculate confidence
-        if prev_candle["strength"] == "STRONG_BULL" and grind_type == "steady":
-            confidence = 95
-            reason = "Strong green prev + clean HH/HL + steady grind"
-        elif prev_candle["strength"] == "STRONG_BULL":
-            confidence = 90
-            reason = "Strong green prev + clean HH/HL structure"
-        elif prev_candle["strength"] == "MILD_BULL" and grind_type == "steady":
-            confidence = 85
-            reason = "Mild green prev + clean HH/HL + steady grind"
+    if direction == "DOWN" and prev_candle["strength"] in ("STRONG_BULL", "MILD_BULL"):
+        return False, None, 0, "Prev candle GREEN — no bearish momentum behind this"
+
+    # 4. Structure must not contradict
+    struct_dir = structure.get("direction", "FLAT")
+    hh = structure.get("hh_count", 0)
+    hl = structure.get("hl_count", 0)
+    lh = structure.get("lh_count", 0)
+    ll = structure.get("ll_count", 0)
+
+    # If structure shows clear opposite direction, skip
+    if direction == "UP" and struct_dir == "DOWN":
+        return False, None, 0, "Price above PTB but structure DOWN — conflicting"
+
+    if direction == "DOWN" and struct_dir == "UP":
+        return False, None, 0, "Price below PTB but structure UP — conflicting"
+
+    # Any reversal signs = skip
+    if direction == "UP" and lh >= 1:
+        return False, None, 0, "LH={} — momentum fading, may drop back to PTB".format(lh)
+
+    if direction == "DOWN" and hl >= 1:
+        return False, None, 0, "HL={} — momentum fading, may rise back to PTB".format(hl)
+
+    # 5. Build confidence
+    confidence = 60
+
+    # Distance bonus — further from PTB = safer
+    if abs_dist > 0.30:
+        confidence += 15
+    elif abs_dist > 0.15:
+        confidence += 10
+    elif abs_dist > min_dist:
+        confidence += 5
+
+    # Previous candle strength
+    if direction == "UP":
+        if prev_candle["strength"] == "STRONG_BULL":
+            confidence += 15
         elif prev_candle["strength"] == "MILD_BULL":
-            confidence = 80
-            reason = "Mild green prev + clean HH/HL structure"
-        elif prev_candle["strength"] == "DOJI":
-            # Doji = indecision — only enter if structure is very strong
-            if hh >= 3 and hl >= 3 and grind_type == "steady":
-                confidence = 70
-                reason = "Prev doji BUT very strong structure (HH={} HL={}) + steady".format(hh, hl)
-            else:
-                return False, None, 0, "Prev doji + not enough structure to override"
-        else:
-            confidence = 80
-            reason = "Green prev + clean structure"
-
-        # PTB above = extra confidence
-        if ptb_meaningful and ptb_direction == "ABOVE":
-            confidence += 5
-            reason += " | Well above PTB"
-
-        # Extra HH/HL = bonus
-        if hh >= 3 and hl >= 3:
-            confidence += 5
-            reason += " | Strong HH={} HL={}".format(hh, hl)
-
-        return True, "UP", min(confidence, 99), reason
-
-    elif struct_dir == "DOWN":
-        # Spec: previous candle must be RED for DOWN
-        if prev_candle["strength"] in ("STRONG_BULL", "MILD_BULL"):
-            return False, None, 0, "Prev candle GREEN — no bearish bias, skip"
-
-        if ll < 2 or lh < 2:
-            return False, None, 0, "Structure not clean (LL={} LH={}) — need 2+2".format(ll, lh)
-
-        if hl >= 1:
-            return False, None, 0, "Higher low forming (HL={}) — momentum fading, skip".format(hl)
-
-        if ptb_meaningful and ptb_direction == "ABOVE":
-            return False, None, 0, "Price above PTB — chopping, skip"
-
-        if prev_candle["strength"] == "STRONG_BEAR" and grind_type == "steady":
-            confidence = 95
-            reason = "Strong red prev + clean LL/LH + steady grind"
-        elif prev_candle["strength"] == "STRONG_BEAR":
-            confidence = 90
-            reason = "Strong red prev + clean LL/LH structure"
-        elif prev_candle["strength"] == "MILD_BEAR" and grind_type == "steady":
-            confidence = 85
-            reason = "Mild red prev + clean LL/LH + steady grind"
+            confidence += 10
+    else:
+        if prev_candle["strength"] == "STRONG_BEAR":
+            confidence += 15
         elif prev_candle["strength"] == "MILD_BEAR":
-            confidence = 80
-            reason = "Mild red prev + clean LL/LH structure"
-        elif prev_candle["strength"] == "DOJI":
-            if ll >= 3 and lh >= 3 and grind_type == "steady":
-                confidence = 70
-                reason = "Prev doji BUT very strong structure (LL={} LH={}) + steady".format(ll, lh)
-            else:
-                return False, None, 0, "Prev doji + not enough structure to override"
-        else:
-            confidence = 80
-            reason = "Red prev + clean structure"
+            confidence += 10
 
-        if ptb_meaningful and ptb_direction == "BELOW":
-            confidence += 5
-            reason += " | Well below PTB"
+    # Doji prev = no bonus but not a skip (distance and structure carry it)
+    # Structure HH/HL bonus
+    if direction == "UP":
+        confidence += min(hh * 3, 10)
+        confidence += min(hl * 3, 10)
+    else:
+        confidence += min(ll * 3, 10)
+        confidence += min(lh * 3, 10)
 
-        if ll >= 3 and lh >= 3:
-            confidence += 5
-            reason += " | Strong LL={} LH={}".format(ll, lh)
+    # Steady grind bonus
+    if grind == "steady":
+        confidence += 5
 
-        return True, "DOWN", min(confidence, 99), reason
+    confidence = min(confidence, 99)
 
-    return False, None, 0, "No clear signal"
+    # Build reason
+    reason = "{} {:+.3f}% from PTB | {} | HH={} HL={} LH={} LL={} | {} | {}min left".format(
+        direction, distance_pct, prev_candle["strength"],
+        hh, hl, lh, ll, grind, int(secs_remaining / 60))
+
+    # Minimum confidence per timeframe
+    min_conf = {"1H": 70, "15M": 70, "DAILY": 75}.get(timeframe, 70)
+    if confidence < min_conf:
+        return False, None, confidence, "Conf {} < {} — {}".format(confidence, min_conf, reason)
+
+    return True, direction, confidence, reason
 
 
 def _v2_build_entry_note(asset, timeframe, direction, prev_candle, structure,
-                         ptb, price, session_label, volatility_label, confidence):
-    """Build human-readable entry note for paper trade record."""
+                         ptb, price, session_label, vol_label, confidence,
+                         secs_remaining=0):
+    """Build human-readable entry note."""
     prev_str = ""
     if prev_candle:
         color = "green" if prev_candle["green"] else "red"
@@ -1130,11 +1075,11 @@ def _v2_build_entry_note(asset, timeframe, direction, prev_candle, structure,
         dist = ((price - ptb) / ptb) * 100
         ptb_str = "PTB dist: {:+.3f}%".format(dist)
 
-    now_utc = datetime.now(timezone.utc)
-    return "{} {} {} | {} | {} | {} | Session: {} ({}h UTC) | Vol: {} | Conf: {}".format(
+    return "{} {} {} | {} | {} | {} | Session: {} | Vol: {} | Conf: {} | {}min left".format(
         timeframe, asset, direction,
         prev_str, struct_str, ptb_str,
-        session_label, now_utc.hour, volatility_label, confidence)
+        session_label, vol_label, confidence,
+        int(secs_remaining / 60) if secs_remaining else "?")
 
 
 def _v2_market_url(platform, market_data=None, asset=None, timeframe=None):
@@ -1148,15 +1093,12 @@ def _v2_market_url(platform, market_data=None, asset=None, timeframe=None):
             return "https://polymarket.com/market/{}".format(condition_id)
         return "https://polymarket.com"
     elif platform == "limitless":
-        # Limitless uses market slugs like /markets/{slug}
         slug = market_data.get("slug", "") if market_data else ""
         if slug:
             return "https://limitless.exchange/markets/{}".format(slug)
         return "https://limitless.exchange"
     return ""
 
-
-# ═══════════════════════════════════════════════════════════
 # V2 HEDGE LOGIC
 # ═══════════════════════════════════════════════════════════
 
@@ -1788,38 +1730,33 @@ def _v2_scan_timeframe(timeframe):
     MAX_ENTRIES_PER_SCAN = 2  # Only the best 2 trades per cycle
     tf_label = timeframe
 
-    # Timeframe-specific config — per spec timing
+    # Timeframe-specific config — correct candle intervals
     if tf_label == "1H":
-        intra_interval = "5m"
-        prev_interval = "1h"
-        min_intra_candles = 6       # Need 6+ 5M candles (30+ min of data)
-        min_confidence = 70         # Spec: 70c+ average entry = 70+ confidence
+        intra_interval = "15m"      # 15M candles for hourly structure
+        prev_interval = "1h"        # Previous 1H candle
+        min_intra_candles = 2       # Need 2+ completed 15M candles (at T+45 we have 3)
         boundary_secs = 3600
         poly_tf_filter = "1H"
         scan_sleep = 120
-        # Spec: check at T+45min (wait for candle to form)
-        entry_window_start = 2700   # T+45min = 2700 seconds into the hour
-        entry_window_end = 3540     # T+59min = stop 60s before close
+        entry_window_start = 2700   # T+45min
+        entry_window_end = 3540     # T+59min
     elif tf_label == "15M":
-        intra_interval = "1m"
-        prev_interval = "15m"
-        min_intra_candles = 5       # Need 5+ 1M candles
-        min_confidence = 70         # Spec: only obvious setups
+        intra_interval = "5m"       # 5M candles for 15M structure
+        prev_interval = "15m"       # Previous 15M candle
+        min_intra_candles = 1       # Need 1+ completed 5M candle (at T+5 we have 1, at T+10 we have 2)
         boundary_secs = 900
         poly_tf_filter = "15M"
         scan_sleep = 60
-        # Spec: check at T+5 to T+10
         entry_window_start = 300    # T+5min
-        entry_window_end = 840      # T+14min (stop 60s before close)
+        entry_window_end = 840      # T+14min
     else:  # DAILY
-        intra_interval = "1h"
-        prev_interval = "1d"
-        min_intra_candles = 6       # Need 6+ hours of data
-        min_confidence = 80         # Spec: 85c+ average entry = 80+ confidence
+        intra_interval = "4h"       # 4H candles for daily structure
+        prev_interval = "1d"        # Previous daily candle
+        min_intra_candles = 3       # Need 3+ completed 4H candles
         boundary_secs = 86400
         poly_tf_filter = "DAILY"
-        scan_sleep = 1800           # Check every 30 min per spec
-        entry_window_start = 0      # Handled by quiet hours check below
+        scan_sleep = 1800
+        entry_window_start = 0      # Handled by quiet hours
         entry_window_end = 86400
 
     while True:
@@ -1923,8 +1860,13 @@ def _v2_scan_timeframe(timeframe):
                     current_range = max(c["h"] for c in period_candles) - min(c["l"] for c in period_candles)
                     vol_label, vol_safe = _v2_volatility_check(prev_candles[:-1], current_range)
 
-                    # PTB distance
+                    # Get current price and PTB
                     price = _get_binance_price(asset)
+                    # Also try Chainlink RTDS price (more accurate for resolution)
+                    chainlink_price = _rtds_current_price(asset)
+                    if chainlink_price and chainlink_price > 0:
+                        price = chainlink_price
+
                     ptb = None
                     if market_data and market_data.get("baseline"):
                         ptb = market_data["baseline"]
@@ -1932,22 +1874,21 @@ def _v2_scan_timeframe(timeframe):
                         ptb = _poly_get_baseline(market_data, price)
                     elif platform == "limitless" and market_data:
                         ptb = market_data.get("baseline")
-                    # Fallback: use period open price
                     if not ptb and period_candles:
                         ptb = period_candles[0]["o"]
 
-                    ptb_pct, ptb_dir, ptb_meaningful = _v2_ptb_distance(price, ptb, asset) if ptb else (0, "NONE", False)
+                    # Calculate time remaining
+                    secs_remaining = boundary_secs - secs_into_period
 
-                    # Entry decision
+                    # Entry decision — new signature
                     should, direction, confidence, reason = _v2_should_enter(
-                        structure, prev_candle, vol_label, vol_safe,
-                        session_safe if tf_label != "DAILY" else True,  # Daily ignores session
-                        ptb_meaningful, ptb_dir,
-                        structure["grind_type"] if structure else "unknown",
-                        timeframe=tf_label
+                        price, ptb, asset, structure, prev_candle,
+                        vol_safe,
+                        session_safe if tf_label != "DAILY" else True,
+                        tf_label, secs_remaining
                     )
 
-                    if not should or not confidence or confidence < min_confidence:
+                    if not should:
                         print("[V2] REJECT {} {} {} — conf={} reason={}".format(
                             tf_label, asset, platform[:4], confidence, reason[:80] if reason else "none"))
                         continue
@@ -1961,6 +1902,7 @@ def _v2_scan_timeframe(timeframe):
                             prev_candle["strength"], prev_candle["body_pct"] * 100) if prev_candle else "",
                         "ptb": ptb, "price": price, "session_label": session_label,
                         "vol_label": vol_label, "boundary_key": boundary_key,
+                        "secs_remaining": secs_remaining,
                     })
 
             # === SELECTIVITY: Rank candidates by confidence, enter only the best ===
@@ -2009,9 +1951,11 @@ def _v2_scan_timeframe(timeframe):
                     entry_odds = limit_price
 
                     # Build entry note
+                    secs_rem = cand.get("secs_remaining", 0)
                     note = _v2_build_entry_note(
                         asset, tf_label, direction, prev_candle, structure,
-                        ptb, price, session_label, vol_label, confidence)
+                        ptb, price, session_label, vol_label, confidence,
+                        secs_remaining=secs_rem)
                     if book_ask:
                         note += " | Book: {:.0f}c → Limit: {:.0f}c".format(book_ask, limit_price)
 
@@ -2682,6 +2626,7 @@ print("=" * 60)
 
 try:
     init_db()
+    reset_db()  # Fresh start — clear all old trades, reset balances to $50
     _v2_load_balances()
     print("[V2] Balances: {}".format(
         ", ".join("{}=${:.2f}".format(k, v["balance"]) for k, v in _v2_balances.items())))
@@ -2696,7 +2641,8 @@ print("[V2] RTDS thread launched")
 threading.Thread(target=_v2_hourly_watcher, daemon=True, name="v2-hourly").start()
 threading.Thread(target=_v2_fifteen_min_watcher, daemon=True, name="v2-15m").start()
 threading.Thread(target=_v2_daily_watcher, daemon=True, name="v2-daily").start()
-threading.Thread(target=_v2_monitor_thread, daemon=True, name="v2-monitor").start()
+# Hedge monitor DISABLED — if entries are correct, hedging is unnecessary
+# threading.Thread(target=_v2_monitor_thread, daemon=True, name="v2-monitor").start()
 threading.Thread(target=_v2_resolve_loop, daemon=True, name="v2-resolve").start()
 threading.Thread(target=_v2_fill_checker, daemon=True, name="v2-fills").start()
 threading.Thread(target=_v2_cleanup_loop, daemon=True, name="v2-cleanup").start()
