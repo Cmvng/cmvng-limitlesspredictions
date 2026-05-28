@@ -2386,6 +2386,9 @@ def _v2_dashboard_html(platform, trades, bal):
     h += '<div class="nav">'
     h += '<a href="/app/paper-poly" class="{}">Polymarket</a>'.format("active" if platform == "polymarket" else "")
     h += '<a href="/app/paper-limitless" class="{}">Limitless</a>'.format("active" if platform == "limitless" else "")
+    h += '<a href="/app/picks">⚽ Picks</a>'
+    h += '<a href="/app/codes">🎫 Codes</a>'
+    h += '<a href="/app/results">📈 Results</a>'
     h += '<a href="/v2/status">Engine Status</a>'
     h += '</div>'
 
@@ -4198,17 +4201,36 @@ def analyze_fixture(fx):
         })
 
     # ── MATCH RESULT ──
-    home_win_conf = home_win_raw * 100 * 0.85  # temper raw probability
-    away_win_conf = away_win_raw * 100 * 0.80
-    draw_conf = (1 - abs(home_win_raw - away_win_raw)) * 35  # draws ~25-32% typically
+    # If we have prediction-site probabilities (Forebet etc.), use them directly —
+    # they're a stronger signal than our form heuristic. Recompute raw shares too,
+    # so double-chance and combos downstream stay consistent.
+    pred_ph = fx.get("pred_prob_home")
+    pred_pd = fx.get("pred_prob_draw")
+    pred_pa = fx.get("pred_prob_away")
+    if pred_ph is not None:
+        ph = max(1.0, float(pred_ph))
+        pd = max(1.0, float(pred_pd)) if pred_pd is not None else 26.0
+        pa = max(1.0, float(pred_pa)) if pred_pa is not None else max(1.0, 100 - ph - pd)
+        tot_p = ph + pd + pa
+        home_win_raw = ph / tot_p
+        away_win_raw = pa / tot_p
+        home_win_conf = ph
+        away_win_conf = pa
+        draw_conf = pd
+        _win_reason = "prediction sites: {:.0f}% / {:.0f}% / {:.0f}%".format(ph, pd, pa)
+    else:
+        home_win_conf = home_win_raw * 100 * 0.85  # temper raw probability
+        away_win_conf = away_win_raw * 100 * 0.80
+        draw_conf = (1 - abs(home_win_raw - away_win_raw)) * 35  # draws ~25-32% typically
+        _win_reason = "form {:.1f} vs {:.1f}, table {} vs {}".format(
+            home_form_pts, away_form_pts, home_pos, away_pos)
 
     add("home_win", "{} to Win".format(home), home_win_conf,
-        "{} form {:.1f}pts vs {} {:.1f}pts, home advantage, table {} vs {}".format(
-            home, home_form_pts, away, away_form_pts, home_pos, away_pos))
+        "{}: {}".format(home, _win_reason))
     add("away_win", "{} to Win".format(away), away_win_conf,
-        "{} away form {:.1f}pts, table position {}".format(away, away_form_pts, away_pos))
+        "{}: {}".format(away, _win_reason))
     add("draw", "Draw", draw_conf,
-        "Evenly matched: {:.0f}% vs {:.0f}% strength".format(home_win_raw*100, away_win_raw*100))
+        "Draw probability: {:.0f}%".format(draw_conf))
 
     # ── DOUBLE CHANCE (much safer than straight win) ──
     dc_1x = (home_win_raw + (draw_conf/100)) * 100 * 0.92
@@ -5780,9 +5802,13 @@ def run_football_engine(get_db, tg_token, tg_chat, send_telegram,
         date_human = _dt.date.today().strftime("%A, %B %d, %Y")
         print("[FB] ═══ Engine run starting ({}) ═══".format(date_human))
 
-        # 1. Scrape
+        # 1. Scrape — PRIMARY: prediction scrapers (proven working on Railway).
+        #    Sofascore is Cloudflare-blocked from datacenter IPs, so it's only a fallback.
         try:
-            fixtures = build_fixture_dataset()
+            fixtures = _fb_fixtures_from_predictions()
+            if not fixtures:
+                print("[FB] prediction scrapers empty — trying Sofascore fallback")
+                fixtures = build_fixture_dataset()
         except Exception as e:
             print("[FB] scrape failed: {}".format(e))
             fixtures = []
@@ -6023,6 +6049,179 @@ def _send_results(tg_token, chat_id, getter):
 # ═══════════════════════════════════════════════════════════════════
 # FOOTBALL v3 — BRIDGE: data getters for Telegram + Flask routes
 # ═══════════════════════════════════════════════════════════════════
+
+def _fb_parse_score(score_str):
+    """Parse a predicted score like '2-1' or '2:1' -> (2, 1), else None."""
+    try:
+        m = _sports_re.search(r'(\d+)\s*[-:]\s*(\d+)', str(score_str))
+        if m:
+            return int(m.group(1)), int(m.group(2))
+    except Exception:
+        pass
+    return None
+
+
+_FB_LEAGUE_NAMES = {
+    "epl": "EPL", "la_liga": "La Liga", "serie_a": "Serie A",
+    "bundesliga": "Bundesliga", "ligue_1": "Ligue 1",
+    "ucl": "Champions League", "uel": "Europa League",
+}
+
+
+def _fb_fixtures_from_predictions(max_fixtures=40):
+    """
+    Build engine fixtures from the prediction scrapers that are PROVEN to
+    work on Railway (footballpredictions.com + forebet + fp.net).
+
+    Each prediction carries a predicted score (e.g. "2-1"). We derive the
+    engine's goal/xG inputs and a form bias from that score, then optionally
+    overlay real Understat xG when available. Markets with no real data
+    (corners/cards) fall back to league averages inside the engine.
+    """
+    all_predictions = []
+    for scraper, name in [
+        (_sports_scrape_footballpredictions_com, "fp.com"),
+        (_sports_scrape_forebet, "forebet"),
+        (_sports_scrape_footballpredictions_net, "fp.net"),
+    ]:
+        try:
+            all_predictions.extend(scraper() or [])
+        except Exception as e:
+            print("[FB] {} scrape error: {}".format(name, e))
+
+    if not all_predictions:
+        print("[FB] No predictions from any scraper")
+        return []
+
+    # Group predictions by match (handle home/away swaps)
+    matches = {}
+    for p in all_predictions:
+        h = _sports_normalize_team(p.get("home", ""))
+        a = _sports_normalize_team(p.get("away", ""))
+        if not h or not a:
+            continue
+        key, rev = (h, a), (a, h)
+        if key in matches:
+            matches[key]["preds"].append(p)
+        elif rev in matches:
+            matches[rev]["preds"].append(p)
+        else:
+            matches[key] = {"home": p.get("home"), "away": p.get("away"), "preds": [p]}
+
+    # Merge fuzzy-duplicate matches (e.g. "Ireland" vs "Republic of Ireland").
+    # Substring-only match — strict enough not to merge "Man Utd" with "Man City".
+    def _same_team(n1, n2):
+        a1 = (n1 or "").lower().replace(" fc", "").replace("afc ", "").strip()
+        b1 = (n2 or "").lower().replace(" fc", "").replace("afc ", "").strip()
+        if not a1 or not b1:
+            return False
+        if a1 == b1:
+            return True
+        short, lng = (a1, b1) if len(a1) <= len(b1) else (b1, a1)
+        if len(short) >= 4 and short in lng:
+            return True
+        # Initials match: "psg" == initials of "paris saint germain"
+        short_ns = short.replace(" ", "").replace(".", "")
+        initials = "".join(w[0] for w in lng.split() if w)
+        if len(short_ns) >= 3 and short_ns == initials:
+            return True
+        return False
+
+    merged = []
+    for md in matches.values():
+        placed = False
+        for m in merged:
+            same = ((_same_team(md["home"], m["home"]) and _same_team(md["away"], m["away"])) or
+                    (_same_team(md["home"], m["away"]) and _same_team(md["away"], m["home"])))
+            if same:
+                m["preds"].extend(md["preds"])
+                # Keep the longer (more complete) team names
+                if len(md["home"]) > len(m["home"]):
+                    m["home"] = md["home"]
+                if len(md["away"]) > len(m["away"]):
+                    m["away"] = md["away"]
+                placed = True
+                break
+        if not placed:
+            merged.append(md)
+
+    # Optional: real xG overlay from Understat (best-effort, never fatal)
+    xg_cache = {}
+
+    fixtures = []
+    for md in merged:
+        scores = [s for s in (_fb_parse_score(p.get("score")) for p in md["preds"]) if s]
+        if not scores:
+            continue  # need at least one score prediction to analyze
+        avg_h = sum(s[0] for s in scores) / len(scores)
+        avg_a = sum(s[1] for s in scores) / len(scores)
+
+        # League from prediction type tags
+        league = ""
+        for p in md["preds"]:
+            t = (p.get("type") or "").lower()
+            if t in _FB_LEAGUE_NAMES:
+                league = _FB_LEAGUE_NAMES[t]
+                break
+
+        # Derive a form bias from the predicted margin
+        margin = avg_h - avg_a
+        if margin >= 1.5:
+            hf, af = "WWWWW", "LLLDL"
+        elif margin >= 0.6:
+            hf, af = "WWWDW", "LDLLL"
+        elif margin <= -1.5:
+            hf, af = "LLLDL", "WWWWW"
+        elif margin <= -0.6:
+            hf, af = "LDLLL", "WWWDW"
+        else:
+            hf, af = "WDWDW", "DWDWD"
+
+        both_score = avg_h >= 0.5 and avg_a >= 0.5
+        btts_pct = 65 if both_score else 35
+
+        fx = {
+            "home_team": md["home"], "away_team": md["away"], "league": league,
+            "kickoff_time": "",
+            "home_form": hf, "away_form": af,
+            "home_xg_for": round(avg_h, 2), "home_xg_against": round(avg_a, 2),
+            "away_xg_for": round(avg_a, 2), "away_xg_against": round(avg_h, 2),
+            "home_goals_scored_avg": round(avg_h, 2), "home_goals_conceded_avg": round(avg_a, 2),
+            "away_goals_scored_avg": round(avg_a, 2), "away_goals_conceded_avg": round(avg_h, 2),
+            "home_btts_pct": btts_pct, "away_btts_pct": btts_pct,
+            "home_clean_sheet_pct": 35 if not both_score else 22,
+            "away_clean_sheet_pct": 35 if not both_score else 22,
+            "home_position": 8, "away_position": 8,
+            "home_key_injuries": 0, "away_key_injuries": 0,
+            "_pred_score": "{:.0f}-{:.0f}".format(round(avg_h), round(avg_a)),
+            "_n_sources": len(set(p.get("source") for p in md["preds"])),
+        }
+
+        # Overlay real xG from Understat where the league is supported
+        try:
+            if league in UNDERSTAT_LEAGUES:
+                if league not in xg_cache:
+                    xg_cache[league] = understat_team_xg(league)
+                lg = xg_cache[league]
+                hx = _match_team_xg(lg, md["home"])
+                ax = _match_team_xg(lg, md["away"])
+                if hx:
+                    fx["home_xg_for"] = hx["xg_for"]
+                    fx["home_xg_against"] = hx["xg_against"]
+                if ax:
+                    fx["away_xg_for"] = ax["xg_for"]
+                    fx["away_xg_against"] = ax["xg_against"]
+        except Exception:
+            pass
+
+        fixtures.append(fx)
+
+    # Prefer matches confirmed by more sources
+    fixtures.sort(key=lambda f: f.get("_n_sources", 0), reverse=True)
+    print("[FB] Built {} fixtures from predictions ({} with multi-source)".format(
+        len(fixtures), sum(1 for f in fixtures if f.get("_n_sources", 0) >= 2)))
+    return fixtures[:max_fixtures]
+
 
 def _fb_today_human():
     return _dt.date.today().strftime("%A, %B %d, %Y")
