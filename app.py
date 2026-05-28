@@ -2668,31 +2668,31 @@ SPORTS_SOURCES = [
 # League pages that BOTH FP.com and Forebet cover — ensures overlap
 _SPORTS_LEAGUES = {
     "epl": {
-        "fp": "https://footballpredictions.com/premier-league-predictions/",
+        "fp": "https://footballpredictions.com/footballpredictions/premierleaguepredictions/",
         "forebet": "https://www.forebet.com/en/football-predictions/england/premier-league",
     },
     "la_liga": {
-        "fp": "https://footballpredictions.com/la-liga-predictions/",
+        "fp": "https://footballpredictions.com/footballpredictions/primeradivisionpredictions/",
         "forebet": "https://www.forebet.com/en/football-predictions/spain/la-liga",
     },
     "serie_a": {
-        "fp": "https://footballpredictions.com/serie-a-predictions/",
+        "fp": "https://footballpredictions.com/footballpredictions/serieapredictions/",
         "forebet": "https://www.forebet.com/en/football-predictions/italy/serie-a",
     },
     "bundesliga": {
-        "fp": "https://footballpredictions.com/bundesliga-predictions/",
+        "fp": "https://footballpredictions.com/footballpredictions/bundesligapredictions/",
         "forebet": "https://www.forebet.com/en/football-predictions/germany/bundesliga",
     },
     "ligue_1": {
-        "fp": "https://footballpredictions.com/ligue-1-predictions/",
+        "fp": "https://footballpredictions.com/footballpredictions/ligue1predictions/",
         "forebet": "https://www.forebet.com/en/football-predictions/france/ligue-1",
     },
     "ucl": {
-        "fp": "https://footballpredictions.com/champions-league-predictions/",
+        "fp": "https://footballpredictions.com/footballpredictions/championsleaguepredictions/",
         "forebet": "https://www.forebet.com/en/football-predictions/champions-league",
     },
     "uel": {
-        "fp": "https://footballpredictions.com/europa-league-predictions/",
+        "fp": "https://footballpredictions.com/footballpredictions/europaleaguepredictions/",
         "forebet": "https://www.forebet.com/en/football-predictions/europa-league",
     },
 }
@@ -3262,15 +3262,30 @@ def _sports_fetch_polymarket_sports(match_pairs=None):
                 count = 0
                 for m in data:
                     q = (m.get("question", "") or "").lower()
-                    # Filter for soccer only (not NBA, NFL, etc.)
-                    if any(kw in q for kw in ["goal", "soccer", "fc", "united",
-                                               "arsenal", "chelsea", "liverpool",
-                                               "barcelona", "real madrid", "bayern",
-                                               "psg", "juventus", "dortmund", "inter",
-                                               "milan", "atletico", "napoli",
-                                               "premier league", "la liga", "serie a",
-                                               "bundesliga", "ligue 1", "champions league",
-                                               "ucl", "europa", "mls"]):
+                    smt_val = (m.get("sportsMarketType", "") or "").lower()
+                    # EXCLUDE non-soccer sports market types
+                    if any(x in smt_val for x in ["tennis", "map_handicap", "esport",
+                                                    "round_handicap", "nba", "nfl",
+                                                    "nhl", "mlb", "mma", "ufc"]):
+                        continue
+                    # Filter for soccer — team names, league names, or soccer-specific market types
+                    soccer_market_types = ["moneyline", "total", "btts", "spread",
+                                           "total_corners", "both_teams_to_score",
+                                           "correct_score", "first_goal", "anytime_goal"]
+                    is_soccer_smt = any(x in smt_val for x in soccer_market_types)
+                    is_soccer_q = any(kw in q for kw in [
+                        "goal", "soccer", " fc", "united",
+                        "arsenal", "chelsea", "liverpool",
+                        "barcelona", "real madrid", "bayern",
+                        "psg", "juventus", "dortmund", "inter",
+                        "milan", "atletico", "napoli", "benfica",
+                        "porto", "ajax", "celtic", "rangers",
+                        "premier league", "la liga", "serie a",
+                        "bundesliga", "ligue 1", "champions league",
+                        "ucl", "europa", "mls", "corner",
+                        "both teams to score", "clean sheet",
+                    ])
+                    if is_soccer_smt or is_soccer_q:
                         parsed = _parse_market(m)
                         if parsed:
                             markets.append(parsed)
