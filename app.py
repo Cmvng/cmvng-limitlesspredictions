@@ -2643,6 +2643,645 @@ def v2_prices():
 
 
 # ═══════════════════════════════════════════════════════════
+# SPORTS PREDICTION MODULE — Football Consensus Scanner
+# ═══════════════════════════════════════════════════════════
+# Scrapes prediction sites, finds consensus, matches against
+# Polymarket/Limitless markets, scores picks, sends Telegram alerts.
+# No Claude — purely mechanical scoring.
+# ═══════════════════════════════════════════════════════════
+
+import requests as _sports_req
+from bs4 import BeautifulSoup
+import re as _sports_re
+
+SPORTS_SCAN_INTERVAL = 21600  # 6 hours between full scans
+SPORTS_MIN_SCORE = 70         # Minimum score to alert
+SPORTS_SOURCES = [
+    "footballpredictions.com",
+    "footballpredictions.net",
+    "forebet.com",
+    "predictz.com",
+]
+
+_sports_headers = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate",
+    "Connection": "keep-alive",
+    "Referer": "https://www.google.com/",
+}
+
+
+def _sports_scrape_footballpredictions_com():
+    """Scrape footballpredictions.com for correct score + over/under + BTTS tips."""
+    predictions = []
+    pages = [
+        ("correct-score", "https://footballpredictions.com/betting-tips/correct-score/"),
+        ("over-2-5", "https://footballpredictions.com/betting-tips/over-2-5-goals/"),
+        ("btts", "https://footballpredictions.com/betting-tips/btts/"),
+    ]
+    for tip_type, url in pages:
+        try:
+            r = _sports_req.get(url, headers=_sports_headers, timeout=15)
+            if r.status_code != 200:
+                print("[SPORTS] FP.com {} — HTTP {}".format(tip_type, r.status_code))
+                continue
+            soup = BeautifulSoup(r.text, "html.parser")
+            # Find match rows — look for common patterns
+            rows = soup.find_all("tr") or soup.find_all("div", class_=_sports_re.compile(r"match|prediction|tip|game"))
+            for row in rows:
+                cells = row.find_all("td") or row.find_all("span")
+                text = row.get_text(" ", strip=True)
+                if not text or len(text) < 10:
+                    continue
+                # Try to extract team names and prediction
+                # Common patterns: "Team A vs Team B" or "Team A - Team B"
+                vs_match = _sports_re.search(r'(.+?)\s+(?:vs?\.?|[-–])\s+(.+?)(?:\s+\d|$)', text)
+                if vs_match:
+                    home = vs_match.group(1).strip()[:40]
+                    away = vs_match.group(2).strip()[:40]
+                    # Look for score prediction (e.g. "2-1", "3-0")
+                    score_match = _sports_re.search(r'(\d)\s*[-–:]\s*(\d)', text)
+                    score = "{}-{}".format(score_match.group(1), score_match.group(2)) if score_match else None
+                    predictions.append({
+                        "source": "footballpredictions.com",
+                        "type": tip_type,
+                        "home": home, "away": away,
+                        "score": score,
+                        "text": text[:200],
+                    })
+            print("[SPORTS] FP.com {}: {} predictions".format(tip_type, len([p for p in predictions if p["type"] == tip_type])))
+        except Exception as e:
+            print("[SPORTS] FP.com {} error: {}".format(tip_type, e))
+    return predictions
+
+
+def _sports_scrape_footballpredictions_net():
+    """Scrape footballpredictions.net for correct score predictions."""
+    predictions = []
+    url = "https://footballpredictions.net/correct-score-predictions-betting-tips"
+    try:
+        r = _sports_req.get(url, headers=_sports_headers, timeout=15)
+        if r.status_code != 200:
+            print("[SPORTS] FP.net — HTTP {}".format(r.status_code))
+            return predictions
+        soup = BeautifulSoup(r.text, "html.parser")
+        rows = soup.find_all("tr") or soup.find_all("div", class_=_sports_re.compile(r"match|prediction|fixture"))
+        for row in rows:
+            text = row.get_text(" ", strip=True)
+            if not text or len(text) < 10:
+                continue
+            vs_match = _sports_re.search(r'(.+?)\s+(?:vs?\.?|[-–])\s+(.+?)(?:\s+\d|$)', text)
+            if vs_match:
+                home = vs_match.group(1).strip()[:40]
+                away = vs_match.group(2).strip()[:40]
+                score_match = _sports_re.search(r'(\d)\s*[-–:]\s*(\d)', text)
+                score = "{}-{}".format(score_match.group(1), score_match.group(2)) if score_match else None
+                predictions.append({
+                    "source": "footballpredictions.net",
+                    "type": "correct-score",
+                    "home": home, "away": away,
+                    "score": score,
+                    "text": text[:200],
+                })
+        print("[SPORTS] FP.net: {} predictions".format(len(predictions)))
+    except Exception as e:
+        print("[SPORTS] FP.net error: {}".format(e))
+    return predictions
+
+
+def _sports_scrape_forebet():
+    """Scrape Forebet for mathematical predictions — 1X2, over/under, BTTS, correct score."""
+    predictions = []
+    url = "https://www.forebet.com/en/football-tips-and-predictions-for-today"
+    try:
+        r = _sports_req.get(url, headers=_sports_headers, timeout=15)
+        if r.status_code != 200:
+            print("[SPORTS] Forebet — HTTP {}".format(r.status_code))
+            return predictions
+        soup = BeautifulSoup(r.text, "html.parser")
+        # Forebet uses div.rcnt for each match row
+        rows = soup.find_all("div", class_="rcnt") or soup.find_all("tr", class_=_sports_re.compile(r"tr_"))
+        for row in rows:
+            text = row.get_text(" ", strip=True)
+            # Extract teams
+            home_el = row.find("span", class_="homeTeam") or row.find("span", class_="tnms")
+            away_el = row.find("span", class_="awayTeam")
+            if home_el and away_el:
+                home = home_el.get_text(strip=True)[:40]
+                away = away_el.get_text(strip=True)[:40]
+            else:
+                vs_match = _sports_re.search(r'(.+?)\s+(?:vs?\.?|[-–])\s+(.+?)(?:\s+\d|$)', text)
+                if vs_match:
+                    home = vs_match.group(1).strip()[:40]
+                    away = vs_match.group(2).strip()[:40]
+                else:
+                    continue
+
+            # Extract probabilities (1X2)
+            probs = row.find_all("span", class_=_sports_re.compile(r"fpr|fprc"))
+            prob_1 = prob_x = prob_2 = None
+            if len(probs) >= 3:
+                try:
+                    prob_1 = int(probs[0].get_text(strip=True).replace("%", ""))
+                    prob_x = int(probs[1].get_text(strip=True).replace("%", ""))
+                    prob_2 = int(probs[2].get_text(strip=True).replace("%", ""))
+                except:
+                    pass
+
+            # Extract correct score prediction
+            score_el = row.find("span", class_=_sports_re.compile(r"ex_sc|foremark"))
+            score = score_el.get_text(strip=True) if score_el else None
+            if score and not _sports_re.match(r'\d+-\d+', score):
+                score = None
+
+            # Extract over/under
+            ou_el = row.find("span", class_=_sports_re.compile(r"ou_"))
+            avg_goals = None
+            if ou_el:
+                try:
+                    avg_goals = float(ou_el.get_text(strip=True))
+                except:
+                    pass
+
+            predictions.append({
+                "source": "forebet.com",
+                "type": "full",
+                "home": home, "away": away,
+                "score": score,
+                "prob_home": prob_1, "prob_draw": prob_x, "prob_away": prob_2,
+                "avg_goals": avg_goals,
+                "text": text[:200],
+            })
+        print("[SPORTS] Forebet: {} predictions".format(len(predictions)))
+    except Exception as e:
+        print("[SPORTS] Forebet error: {}".format(e))
+    return predictions
+
+
+def _sports_scrape_predictz():
+    """Scrape PredictZ for correct score predictions and stats."""
+    predictions = []
+    url = "https://www.predictz.com/predictions/today/"
+    try:
+        r = _sports_req.get(url, headers=_sports_headers, timeout=15)
+        if r.status_code != 200:
+            print("[SPORTS] PredictZ — HTTP {}".format(r.status_code))
+            return predictions
+        soup = BeautifulSoup(r.text, "html.parser")
+        rows = soup.find_all("tr", class_=_sports_re.compile(r"pmark|pointed"))
+        if not rows:
+            rows = soup.find_all("div", class_=_sports_re.compile(r"match|fixture"))
+        for row in rows:
+            text = row.get_text(" ", strip=True)
+            if not text or len(text) < 10:
+                continue
+            vs_match = _sports_re.search(r'(.+?)\s+(?:vs?\.?|[-–])\s+(.+?)(?:\s+\d|$)', text)
+            if vs_match:
+                home = vs_match.group(1).strip()[:40]
+                away = vs_match.group(2).strip()[:40]
+                score_match = _sports_re.search(r'(\d)\s*[-–:]\s*(\d)', text)
+                score = "{}-{}".format(score_match.group(1), score_match.group(2)) if score_match else None
+                predictions.append({
+                    "source": "predictz.com",
+                    "type": "correct-score",
+                    "home": home, "away": away,
+                    "score": score,
+                    "text": text[:200],
+                })
+        print("[SPORTS] PredictZ: {} predictions".format(len(predictions)))
+    except Exception as e:
+        print("[SPORTS] PredictZ error: {}".format(e))
+    return predictions
+
+
+def _sports_normalize_team(name):
+    """Normalize team names for matching across sources."""
+    if not name:
+        return ""
+    n = name.lower().strip()
+    # Remove common suffixes
+    for suffix in [" fc", " cf", " sc", " ac", " afc", " united", " city"]:
+        if n.endswith(suffix):
+            n = n[:-len(suffix)].strip()
+    # Remove special chars
+    n = _sports_re.sub(r'[^a-z0-9 ]', '', n)
+    n = _sports_re.sub(r'\s+', ' ', n).strip()
+    return n
+
+
+def _sports_match_teams(pred_home, pred_away, market_text):
+    """Check if a prediction's teams match a market title."""
+    mt = market_text.lower()
+    ph = _sports_normalize_team(pred_home)
+    pa = _sports_normalize_team(pred_away)
+    # Both teams must appear in the market text
+    ph_words = ph.split()
+    pa_words = pa.split()
+    # Check if key words from both teams are in market text
+    home_match = any(w in mt for w in ph_words if len(w) > 3)
+    away_match = any(w in mt for w in pa_words if len(w) > 3)
+    return home_match and away_match
+
+
+def _sports_fetch_polymarket_sports():
+    """Fetch soccer/football markets from Polymarket Gamma API."""
+    markets = []
+    try:
+        # Use the sports endpoint to get tag IDs, then fetch soccer events
+        r = _sports_req.get("{}/events".format(POLY_GAMMA_API),
+                           params={"tag": "soccer", "active": "true", "closed": "false",
+                                   "limit": 100, "order": "volume24hr", "ascending": "false"},
+                           timeout=15)
+        if r.status_code == 200:
+            events = r.json() if isinstance(r.json(), list) else []
+            for ev in events:
+                title = ev.get("title", "") or ev.get("question", "")
+                slug = ev.get("slug", "")
+                # Get markets within this event
+                ev_markets = ev.get("markets", [])
+                if ev_markets:
+                    for m in ev_markets:
+                        q = m.get("question", "") or m.get("title", "")
+                        markets.append({
+                            "platform": "polymarket",
+                            "title": title,
+                            "question": q,
+                            "slug": slug,
+                            "market_id": m.get("id", ""),
+                            "condition_id": m.get("conditionId", ""),
+                            "outcome_prices": m.get("outcomePrices", ""),
+                            "outcomes": m.get("outcomes", ""),
+                            "volume": m.get("volume", 0),
+                            "url": "https://polymarket.com/event/{}".format(slug) if slug else "",
+                        })
+                else:
+                    markets.append({
+                        "platform": "polymarket",
+                        "title": title,
+                        "question": title,
+                        "slug": slug,
+                        "market_id": ev.get("id", ""),
+                        "condition_id": "",
+                        "outcome_prices": "",
+                        "outcomes": "",
+                        "volume": 0,
+                        "url": "https://polymarket.com/event/{}".format(slug) if slug else "",
+                    })
+        # Also try broader sports search
+        r2 = _sports_req.get("{}/events".format(POLY_GAMMA_API),
+                            params={"tag": "sports", "active": "true", "closed": "false",
+                                    "limit": 100, "order": "volume24hr", "ascending": "false"},
+                            timeout=15)
+        if r2.status_code == 200:
+            events2 = r2.json() if isinstance(r2.json(), list) else []
+            existing_slugs = {m["slug"] for m in markets}
+            for ev in events2:
+                slug = ev.get("slug", "")
+                if slug in existing_slugs:
+                    continue
+                title = ev.get("title", "") or ev.get("question", "")
+                # Filter for football/soccer related
+                tl = title.lower()
+                if any(kw in tl for kw in ["soccer", "football", "fc", "united", "cup", "league",
+                                            "premier", "champions", "world cup", "fifa", "uefa",
+                                            "la liga", "bundesliga", "serie a", "ligue"]):
+                    ev_markets = ev.get("markets", [])
+                    for m in (ev_markets or [ev]):
+                        q = m.get("question", "") or m.get("title", title)
+                        markets.append({
+                            "platform": "polymarket",
+                            "title": title, "question": q, "slug": slug,
+                            "market_id": m.get("id", ""), "condition_id": m.get("conditionId", ""),
+                            "outcome_prices": m.get("outcomePrices", ""),
+                            "outcomes": m.get("outcomes", ""),
+                            "volume": m.get("volume", 0),
+                            "url": "https://polymarket.com/event/{}".format(slug) if slug else "",
+                        })
+        print("[SPORTS] Polymarket: {} soccer/football markets".format(len(markets)))
+    except Exception as e:
+        print("[SPORTS] Polymarket fetch error: {}".format(e))
+    return markets
+
+
+def _sports_fetch_limitless_sports():
+    """Fetch sports markets from Limitless."""
+    markets = []
+    try:
+        r = _sports_req.get("{}/markets/active/slugs".format(LIMITLESS_API), timeout=10)
+        if r.status_code == 200:
+            slugs = r.json() if isinstance(r.json(), list) else []
+            for slug in slugs:
+                sl = str(slug).lower()
+                # Filter for football/soccer related slugs
+                if any(kw in sl for kw in ["soccer", "football", "fc-", "united", "cup",
+                                            "league", "premier", "champions", "world-cup",
+                                            "fifa", "uefa", "win", "goal", "score",
+                                            "arsenal", "chelsea", "liverpool", "man-",
+                                            "barcelona", "real-madrid", "bayern", "psg"]):
+                    try:
+                        mr = _sports_req.get("{}/markets/{}".format(LIMITLESS_API, slug), timeout=8)
+                        if mr.status_code == 200:
+                            mdata = mr.json()
+                            markets.append({
+                                "platform": "limitless",
+                                "title": mdata.get("title", "") or mdata.get("question", slug),
+                                "question": mdata.get("question", "") or mdata.get("title", slug),
+                                "slug": slug,
+                                "market_id": slug,
+                                "url": "https://limitless.exchange/markets/{}".format(slug),
+                            })
+                        time.sleep(0.35)  # Rate limit
+                    except:
+                        pass
+        print("[SPORTS] Limitless: {} sports markets".format(len(markets)))
+    except Exception as e:
+        print("[SPORTS] Limitless fetch error: {}".format(e))
+    return markets
+
+
+def _sports_extract_insights(predictions, home, away):
+    """From all predictions for a match, extract actionable insights."""
+    insights = {
+        "match": "{} vs {}".format(home, away),
+        "sources": [],
+        "scores": [],
+        "home_wins": 0, "draws": 0, "away_wins": 0,
+        "total_goals_predicted": [],
+        "over_25": 0, "under_25": 0,
+        "btts_yes": 0, "btts_no": 0,
+        "consensus_winner": None,
+        "consensus_goals": None,
+        "consensus_btts": None,
+    }
+
+    for p in predictions:
+        insights["sources"].append(p["source"])
+        score = p.get("score")
+        if score and _sports_re.match(r'\d+-\d+', score):
+            insights["scores"].append({"source": p["source"], "score": score})
+            parts = score.split("-")
+            try:
+                h_goals = int(parts[0])
+                a_goals = int(parts[1])
+                total = h_goals + a_goals
+                insights["total_goals_predicted"].append(total)
+                if h_goals > a_goals:
+                    insights["home_wins"] += 1
+                elif a_goals > h_goals:
+                    insights["away_wins"] += 1
+                else:
+                    insights["draws"] += 1
+                if total > 2.5:
+                    insights["over_25"] += 1
+                else:
+                    insights["under_25"] += 1
+                if h_goals > 0 and a_goals > 0:
+                    insights["btts_yes"] += 1
+                else:
+                    insights["btts_no"] += 1
+            except:
+                pass
+
+        # Check tip type
+        if p.get("type") == "over-2-5":
+            insights["over_25"] += 1
+        elif p.get("type") == "btts":
+            insights["btts_yes"] += 1
+
+        # Forebet probabilities
+        if p.get("prob_home") and p.get("prob_away"):
+            if p["prob_home"] > p["prob_away"] and p["prob_home"] > (p.get("prob_draw") or 0):
+                insights["home_wins"] += 1
+            elif p["prob_away"] > p["prob_home"]:
+                insights["away_wins"] += 1
+            else:
+                insights["draws"] += 1
+
+    n = len(insights["sources"])
+    if n > 0:
+        if insights["home_wins"] > n / 2:
+            insights["consensus_winner"] = home
+        elif insights["away_wins"] > n / 2:
+            insights["consensus_winner"] = away
+
+        if insights["over_25"] > n / 2:
+            insights["consensus_goals"] = "OVER"
+        elif insights["under_25"] > n / 2:
+            insights["consensus_goals"] = "UNDER"
+
+        if insights["btts_yes"] > n / 2:
+            insights["consensus_btts"] = "YES"
+        elif insights["btts_no"] > n / 2:
+            insights["consensus_btts"] = "NO"
+
+    return insights
+
+
+def _sports_score_pick(insights, market):
+    """Score a potential pick from 0-100."""
+    score = 0
+    reasons = []
+    n_sources = len(insights["sources"])
+
+    if n_sources < 2:
+        return 0, []
+
+    # Consensus strength (max 30)
+    unique_sources = len(set(insights["sources"]))
+    if unique_sources >= 4:
+        score += 30
+        reasons.append("4/4 sites agree")
+    elif unique_sources >= 3:
+        score += 20
+        reasons.append("3+ sites agree")
+    elif unique_sources >= 2:
+        score += 10
+        reasons.append("2 sites agree")
+
+    # Score predictions support the pick (max 15)
+    if insights["scores"]:
+        score += min(len(insights["scores"]) * 5, 15)
+        reasons.append("{} score predictions".format(len(insights["scores"])))
+
+    # Goals data supports (max 15)
+    if insights["total_goals_predicted"]:
+        avg = sum(insights["total_goals_predicted"]) / len(insights["total_goals_predicted"])
+        if avg > 2.5 and "over" in market.get("question", "").lower():
+            score += 15
+            reasons.append("Avg predicted goals: {:.1f}".format(avg))
+        elif avg < 2.5 and "under" in market.get("question", "").lower():
+            score += 15
+            reasons.append("Avg predicted goals: {:.1f}".format(avg))
+        elif avg > 2.0:
+            score += 8
+            reasons.append("Goals avg {:.1f}".format(avg))
+
+    # Winner consensus matches market (max 15)
+    mq = market.get("question", "").lower()
+    if insights["consensus_winner"]:
+        winner_norm = _sports_normalize_team(insights["consensus_winner"])
+        if any(w in mq for w in winner_norm.split() if len(w) > 3):
+            score += 15
+            reasons.append("{} consensus winner".format(insights["consensus_winner"]))
+
+    # BTTS consensus (max 10)
+    if insights["consensus_btts"] == "YES" and "both" in mq and "score" in mq:
+        score += 10
+        reasons.append("BTTS YES consensus")
+
+    # Forebet probability (max 15)
+    for p in [pred for pred in insights.get("_raw_preds", []) if pred.get("prob_home")]:
+        max_prob = max(p.get("prob_home", 0) or 0, p.get("prob_away", 0) or 0)
+        if max_prob > 70:
+            score += 15
+            reasons.append("Forebet {}% confidence".format(max_prob))
+            break
+        elif max_prob > 55:
+            score += 8
+            reasons.append("Forebet {}%".format(max_prob))
+            break
+
+    return score, reasons
+
+
+def _sports_scan_and_alert():
+    """Main sports scanning function. Scrapes all sites, finds consensus, matches markets, sends alerts."""
+    print("[SPORTS] Starting scan...")
+
+    # 1. Scrape all prediction sites
+    all_predictions = []
+    all_predictions.extend(_sports_scrape_footballpredictions_com())
+    all_predictions.extend(_sports_scrape_footballpredictions_net())
+    all_predictions.extend(_sports_scrape_forebet())
+    all_predictions.extend(_sports_scrape_predictz())
+    print("[SPORTS] Total predictions scraped: {}".format(len(all_predictions)))
+
+    if not all_predictions:
+        print("[SPORTS] No predictions found — skipping")
+        return
+
+    # 2. Group predictions by match (normalize team names)
+    matches = {}
+    for p in all_predictions:
+        key = (_sports_normalize_team(p["home"]), _sports_normalize_team(p["away"]))
+        if key[0] and key[1]:
+            if key not in matches:
+                matches[key] = {"home": p["home"], "away": p["away"], "predictions": []}
+            matches[key]["predictions"].append(p)
+
+    # Also try reversed order (away vs home)
+    print("[SPORTS] Unique matches found: {}".format(len(matches)))
+
+    # 3. Fetch markets from both platforms
+    poly_markets = _sports_fetch_polymarket_sports()
+    lmts_markets = _sports_fetch_limitless_sports()
+    all_markets = poly_markets + lmts_markets
+    print("[SPORTS] Total sports markets: {} (Poly: {}, Limitless: {})".format(
+        len(all_markets), len(poly_markets), len(lmts_markets)))
+
+    if not all_markets:
+        print("[SPORTS] No sports markets found — skipping")
+        return
+
+    # 4. Match predictions to markets and score
+    alerts_sent = 0
+    for key, match_data in matches.items():
+        home = match_data["home"]
+        away = match_data["away"]
+        preds = match_data["predictions"]
+
+        # Only process matches with 2+ sources
+        sources = set(p["source"] for p in preds)
+        if len(sources) < 2:
+            continue
+
+        # Extract insights
+        insights = _sports_extract_insights(preds, home, away)
+        insights["_raw_preds"] = preds
+
+        # Find matching markets
+        for market in all_markets:
+            mq = (market.get("question", "") + " " + market.get("title", "")).lower()
+            if _sports_match_teams(home, away, mq):
+                # Score this pick
+                pick_score, reasons = _sports_score_pick(insights, market)
+
+                if pick_score >= SPORTS_MIN_SCORE:
+                    # Build alert message
+                    scores_str = ", ".join("{}: {}".format(s["source"].split(".")[0], s["score"])
+                                          for s in insights["scores"][:4])
+                    consensus_str = []
+                    if insights["consensus_winner"]:
+                        consensus_str.append("Winner: {}".format(insights["consensus_winner"]))
+                    if insights["consensus_goals"]:
+                        consensus_str.append("Goals: {} 2.5".format(insights["consensus_goals"]))
+                    if insights["consensus_btts"]:
+                        consensus_str.append("BTTS: {}".format(insights["consensus_btts"]))
+
+                    msg = (
+                        "⚽ <b>SPORTS PICK</b>\n"
+                        "🏟 {} vs {}\n"
+                        "📊 <b>{}</b>\n"
+                        "🔗 {}\n\n"
+                        "📈 Consensus ({} sites):\n{}\n\n"
+                        "🎯 Scores: {}\n"
+                        "💡 {}\n"
+                        "⭐ Score: {}/100"
+                    ).format(
+                        home, away,
+                        market.get("question", market.get("title", "")),
+                        market.get("url", ""),
+                        len(sources), "\n".join(consensus_str) if consensus_str else "Mixed",
+                        scores_str or "N/A",
+                        " | ".join(reasons[:4]),
+                        pick_score,
+                    )
+                    send_telegram(msg)
+                    alerts_sent += 1
+                    print("[SPORTS] ALERT: {} vs {} — score {}/100 on {}".format(
+                        home, away, pick_score, market.get("platform", "?")))
+
+    print("[SPORTS] Scan complete — {} alerts sent".format(alerts_sent))
+
+
+def _sports_scanner_thread():
+    """Background thread that runs sports scanning periodically."""
+    print("[SPORTS] Scanner thread started")
+    while True:
+        try:
+            _sports_scan_and_alert()
+        except Exception as e:
+            print("[SPORTS] Scanner error: {}".format(e))
+            import traceback; traceback.print_exc()
+        time.sleep(SPORTS_SCAN_INTERVAL)
+
+
+# Sports dashboard page
+@app.route("/app/sports")
+def sports_dashboard():
+    return render_template_string("""
+    <html><head><title>Sports Predictions</title>
+    <style>
+    body { font-family: 'DM Sans', sans-serif; background: #f0faf0; padding: 20px; }
+    h1 { color: #2d6a4f; }
+    .info { background: white; border-radius: 12px; padding: 20px; margin: 10px 0; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }
+    </style></head><body>
+    <h1>⚽ Sports Prediction Scanner</h1>
+    <div class="info">
+        <p><strong>Status:</strong> Running</p>
+        <p><strong>Sources:</strong> footballpredictions.com, footballpredictions.net, forebet.com, predictz.com</p>
+        <p><strong>Markets:</strong> Polymarket + Limitless (soccer/football)</p>
+        <p><strong>Scan interval:</strong> Every 6 hours</p>
+        <p><strong>Minimum score:</strong> 70/100</p>
+        <p>Alerts are sent to Telegram when strong consensus picks are found.</p>
+    </div>
+    </body></html>
+    """)
+
+
+# ═══════════════════════════════════════════════════════════
 # STARTUP
 # ═══════════════════════════════════════════════════════════
 
@@ -2672,6 +3311,10 @@ threading.Thread(target=_v2_daily_watcher, daemon=True, name="v2-daily").start()
 threading.Thread(target=_v2_resolve_loop, daemon=True, name="v2-resolve").start()
 threading.Thread(target=_v2_fill_checker, daemon=True, name="v2-fills").start()
 threading.Thread(target=_v2_cleanup_loop, daemon=True, name="v2-cleanup").start()
+
+# Sports prediction scanner
+threading.Thread(target=_sports_scanner_thread, daemon=True, name="sports-scanner").start()
+print("[SPORTS] Scanner thread launched")
 
 print("[V2] All threads launched — engine running")
 print("=" * 60)
