@@ -3181,17 +3181,25 @@ def _sports_fetch_polymarket_sports(match_pairs=None):
             r = _sports_req.get("{}/sports".format(POLY_GAMMA_API), timeout=10)
             if r.status_code == 200:
                 sports_list = r.json() if isinstance(r.json(), list) else []
+                print("[SPORTS] Poly /sports returned {} sports: {}".format(
+                    len(sports_list),
+                    ", ".join("{}=tags:{}".format(
+                        s.get("sport", "?"), s.get("tags", "?"))
+                        for s in sports_list[:8])))
                 for sport in sports_list:
                     sport_name = (sport.get("sport", "") or "").lower()
-                    if sport_name in ("soccer", "football", "ucl", "epl"):
+                    if sport_name in ("soccer", "football", "epl", "ucl", "mls"):
                         tags_str = sport.get("tags", "")
                         if tags_str:
-                            # tags is comma-separated tag IDs
                             tag_ids = [t.strip() for t in str(tags_str).split(",") if t.strip()]
                             if tag_ids:
                                 _sports_poly_soccer_tag_id = tag_ids[0]
-                                print("[SPORTS] Poly soccer tag_id: {}".format(_sports_poly_soccer_tag_id))
+                                print("[SPORTS] Poly soccer tag_id: {} (from sport='{}')".format(
+                                    _sports_poly_soccer_tag_id, sport_name))
                                 break
+                # If no explicit soccer sport found, skip tag_id approach
+                if not _sports_poly_soccer_tag_id:
+                    print("[SPORTS] No soccer sport found in /sports metadata — skipping tag_id step")
         except Exception as e:
             print("[SPORTS] Poly /sports error: {}".format(e))
 
@@ -3215,6 +3223,11 @@ def _sports_fetch_polymarket_sports(match_pairs=None):
                 outcomes = json.loads(outcomes)
             except:
                 outcomes = []
+        # Build URL — sports match markets use /event/{slug}
+        # The slug IS the market identifier on Polymarket
+        market_url = ""
+        if slug:
+            market_url = "https://polymarket.com/event/{}".format(slug)
         return {
             "platform": "polymarket",
             "title": event_title or q,
@@ -3225,7 +3238,7 @@ def _sports_fetch_polymarket_sports(match_pairs=None):
             "outcome_prices": op,
             "outcomes": outcomes,
             "volume": float(m.get("volume", 0) or 0),
-            "url": "https://polymarket.com/event/{}".format(slug) if slug else "",
+            "url": market_url,
             "best_ask": float(m.get("bestAsk", 0) or 0),
             "last_price": float(m.get("lastTradePrice", 0) or 0),
             "game_id": m.get("gameId", "") or "",
@@ -3377,10 +3390,16 @@ def _sports_fetch_polymarket_sports(match_pairs=None):
     futures = [m for m in markets if not m.get("game_id") and not m.get("sports_market_type")]
     print("[SPORTS] Poly breakdown: {} match-level, {} futures/other".format(
         len(match_markets), len(futures)))
-    for m in markets[:3]:
-        print("[SPORTS] Poly sample: '{}' | smt={} | ask={}".format(
-            m.get("question", "")[:60], m.get("sports_market_type", "?"),
-            m.get("best_ask", "?")))
+    # Show soccer-relevant samples (skip generic ones)
+    shown = 0
+    for m in markets:
+        q = (m.get("question", "") or "").lower()
+        if shown < 3 and any(kw in q for kw in ["vs", "goal", "corner", "win",
+                                                   "fc", "united", "arsenal"]):
+            print("[SPORTS] Poly sample: '{}' | smt={} | ask={}".format(
+                m.get("question", "")[:60], m.get("sports_market_type", "?"),
+                m.get("best_ask", "?")))
+            shown += 1
     return markets
 
 
@@ -3652,13 +3671,17 @@ def _sports_scan_and_alert():
         return
 
     # 4. Match predictions to markets and score
+    print("[SPORTS] Starting prediction↔market matching: {} matches × {} markets...".format(
+        len(matches), len(all_markets)))
     alerts_sent = 0
     matched_count = 0
+    MAX_ALERTS_PER_MATCH = 5  # Cap alerts per match to avoid Telegram spam
     for key, match_data in matches.items():
         home = match_data["home"]
         away = match_data["away"]
         preds = match_data["predictions"]
         sources = set(p["source"] for p in preds)
+        match_alerts = 0  # Track alerts for this match
 
         # Extract insights
         insights = _sports_extract_insights(preds, home, away)
@@ -3693,40 +3716,81 @@ def _sports_scan_and_alert():
                         home, away, market.get("question", "")[:50],
                         pick_score, ", ".join(reasons[:3])))
 
-                if pick_score >= SPORTS_MIN_SCORE:
-                    # Build alert message
+                if pick_score >= SPORTS_MIN_SCORE and match_alerts < MAX_ALERTS_PER_MATCH:
+                    # Build market type label
+                    smt = market.get("sports_market_type", "")
+                    smt_labels = {
+                        "moneyline": "🏆 Match Winner",
+                        "total": "⚽ Over/Under Goals",
+                        "totals": "⚽ Over/Under Goals",
+                        "btts": "🎯 Both Teams To Score",
+                        "both_teams_to_score": "🎯 Both Teams To Score",
+                        "spread": "📊 Handicap/Spread",
+                        "total_corners": "🔲 Total Corners",
+                        "correct_score": "🎯 Correct Score",
+                        "first_goal": "1️⃣ First Goal Scorer",
+                        "anytime_goal": "⚽ Anytime Goal Scorer",
+                    }
+                    market_label = smt_labels.get(smt, "📊 {}".format(smt.replace("_", " ").title() if smt else "Market"))
+                    mq = market.get("question", "") or market.get("title", "")
+
+                    # Build odds string from outcome prices
+                    odds_str = ""
+                    op = market.get("outcome_prices", [])
+                    oc = market.get("outcomes", [])
+                    if op and oc and len(op) == len(oc):
+                        odds_parts = []
+                        for i, (outcome, price) in enumerate(zip(oc, op)):
+                            try:
+                                pct = float(price) * 100
+                                odds_parts.append("{}: {:.0f}%".format(outcome, pct))
+                            except:
+                                pass
+                        if odds_parts:
+                            odds_str = " | ".join(odds_parts)
+
+                    # Build prediction context
                     scores_str = ", ".join("{}: {}".format(s["source"].split(".")[0], s["score"])
-                                          for s in insights["scores"][:4])
-                    consensus_str = []
+                                          for s in insights["scores"][:3])
+                    consensus_parts = []
                     if insights["consensus_winner"]:
-                        consensus_str.append("Winner: {}".format(insights["consensus_winner"]))
+                        consensus_parts.append("Winner: {}".format(insights["consensus_winner"]))
                     if insights["consensus_goals"]:
-                        consensus_str.append("Goals: {} 2.5".format(insights["consensus_goals"]))
+                        consensus_parts.append("Goals: {} 2.5".format(insights["consensus_goals"]))
                     if insights["consensus_btts"]:
-                        consensus_str.append("BTTS: {}".format(insights["consensus_btts"]))
+                        consensus_parts.append("BTTS: {}".format(insights["consensus_btts"]))
 
                     msg = (
                         "⚽ <b>SPORTS PICK</b>\n"
-                        "🏟 {} vs {}\n"
-                        "📊 <b>{}</b>\n"
-                        "🔗 {}\n\n"
-                        "📈 Consensus ({} sites):\n{}\n\n"
-                        "🎯 Scores: {}\n"
-                        "💡 {}\n"
-                        "⭐ Score: {}/100"
+                        "🏟 <b>{home} vs {away}</b>\n\n"
+                        "{market_label}\n"
+                        "📊 <b>{question}</b>\n"
+                        "{odds_line}"
+                        "🔗 {url}\n\n"
+                        "📈 Prediction ({n_sites} site{s}):\n"
+                        "{consensus}\n"
+                        "{scores_line}"
+                        "💡 {reasons}\n"
+                        "⭐ Confidence: {score}/100"
                     ).format(
-                        home, away,
-                        market.get("question", market.get("title", "")),
-                        market.get("url", ""),
-                        len(sources), "\n".join(consensus_str) if consensus_str else "Mixed",
-                        scores_str or "N/A",
-                        " | ".join(reasons[:4]),
-                        pick_score,
+                        home=home, away=away,
+                        market_label=market_label,
+                        question=mq,
+                        odds_line="💰 Odds: {}\n".format(odds_str) if odds_str else "",
+                        url=market.get("url", ""),
+                        n_sites=len(sources),
+                        s="" if len(sources) == 1 else "s",
+                        consensus=" | ".join(consensus_parts) if consensus_parts else "N/A",
+                        scores_line="🎯 Score predictions: {}\n".format(scores_str) if scores_str else "",
+                        reasons=" | ".join(reasons[:4]),
+                        score=pick_score,
                     )
                     send_telegram(msg)
                     alerts_sent += 1
-                    print("[SPORTS] ALERT: {} vs {} — score {}/100 on {}".format(
-                        home, away, pick_score, market.get("platform", "?")))
+                    match_alerts += 1
+                    print("[SPORTS] ALERT: {} vs {} — {} — score {}/100 | {}".format(
+                        home, away, smt or "general", pick_score,
+                        market.get("url", "")[:50]))
 
     print("[SPORTS] Scan complete — {} predictions matched to markets, {} alerts sent".format(
         matched_count, alerts_sent))
