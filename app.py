@@ -2861,10 +2861,33 @@ def _sports_normalize_team(name):
     if not name:
         return ""
     n = name.lower().strip()
-    # Remove common suffixes
-    for suffix in [" fc", " cf", " sc", " ac", " afc", " united", " city"]:
-        if n.endswith(suffix):
-            n = n[:-len(suffix)].strip()
+    # Remove common suffixes/prefixes
+    for suffix in [" fc", " cf", " sc", " ac", " afc", " united", " city",
+                   " town", " rovers", " wanderers", " athletic", " sporting",
+                   " de ", " del "]:
+        n = n.replace(suffix, " ")
+    # Common abbreviations
+    abbrevs = {
+        "psg": "paris saint germain",
+        "man utd": "manchester united", "man united": "manchester united",
+        "man city": "manchester city",
+        "spurs": "tottenham", "tottenham hotspur": "tottenham",
+        "wolves": "wolverhampton",
+        "newcastle utd": "newcastle",
+        "west ham utd": "west ham",
+        "real madrid": "real madrid", "r madrid": "real madrid",
+        "atletico madrid": "atletico",
+        "atletico": "atletico",
+        "inter milan": "inter", "internazionale": "inter",
+        "ac milan": "milan",
+        "bayern munich": "bayern", "bayern munchen": "bayern",
+        "borussia dortmund": "dortmund", "bvb": "dortmund",
+        "rb leipzig": "leipzig",
+        "st etienne": "saint etienne",
+    }
+    for abbr, full in abbrevs.items():
+        if abbr in n:
+            n = n.replace(abbr, full)
     # Remove special chars
     n = _sports_re.sub(r'[^a-z0-9 ]', '', n)
     n = _sports_re.sub(r'\s+', ' ', n).strip()
@@ -2872,16 +2895,24 @@ def _sports_normalize_team(name):
 
 
 def _sports_match_teams(pred_home, pred_away, market_text):
-    """Check if a prediction's teams match a market title."""
-    mt = market_text.lower()
+    """Check if a prediction's teams match a market title.
+    Uses fuzzy matching — any significant word from BOTH teams must appear."""
+    mt = _sports_normalize_team(market_text)
+
     ph = _sports_normalize_team(pred_home)
     pa = _sports_normalize_team(pred_away)
-    # Both teams must appear in the market text
-    ph_words = ph.split()
-    pa_words = pa.split()
-    # Check if key words from both teams are in market text
-    home_match = any(w in mt for w in ph_words if len(w) > 3)
-    away_match = any(w in mt for w in pa_words if len(w) > 3)
+
+    # Get significant words (>2 chars) from each team
+    ph_words = [w for w in ph.split() if len(w) > 2]
+    pa_words = [w for w in pa.split() if len(w) > 2]
+
+    if not ph_words or not pa_words:
+        return False
+
+    # At least one significant word from each team must be in the market text
+    home_match = any(w in mt for w in ph_words)
+    away_match = any(w in mt for w in pa_words)
+
     return home_match and away_match
 
 
@@ -2889,76 +2920,56 @@ def _sports_fetch_polymarket_sports():
     """Fetch soccer/football markets from Polymarket Gamma API."""
     markets = []
     try:
-        # Use the sports endpoint to get tag IDs, then fetch soccer events
-        r = _sports_req.get("{}/events".format(POLY_GAMMA_API),
-                           params={"tag": "soccer", "active": "true", "closed": "false",
-                                   "limit": 100, "order": "volume24hr", "ascending": "false"},
-                           timeout=15)
-        if r.status_code == 200:
-            events = r.json() if isinstance(r.json(), list) else []
-            for ev in events:
-                title = ev.get("title", "") or ev.get("question", "")
-                slug = ev.get("slug", "")
-                # Get markets within this event
-                ev_markets = ev.get("markets", [])
-                if ev_markets:
-                    for m in ev_markets:
-                        q = m.get("question", "") or m.get("title", "")
-                        markets.append({
-                            "platform": "polymarket",
-                            "title": title,
-                            "question": q,
-                            "slug": slug,
-                            "market_id": m.get("id", ""),
-                            "condition_id": m.get("conditionId", ""),
-                            "outcome_prices": m.get("outcomePrices", ""),
-                            "outcomes": m.get("outcomes", ""),
-                            "volume": m.get("volume", 0),
-                            "url": "https://polymarket.com/event/{}".format(slug) if slug else "",
-                        })
-                else:
-                    markets.append({
-                        "platform": "polymarket",
-                        "title": title,
-                        "question": title,
-                        "slug": slug,
-                        "market_id": ev.get("id", ""),
-                        "condition_id": "",
-                        "outcome_prices": "",
-                        "outcomes": "",
-                        "volume": 0,
-                        "url": "https://polymarket.com/event/{}".format(slug) if slug else "",
-                    })
-        # Also try broader sports search
-        r2 = _sports_req.get("{}/events".format(POLY_GAMMA_API),
-                            params={"tag": "sports", "active": "true", "closed": "false",
-                                    "limit": 100, "order": "volume24hr", "ascending": "false"},
-                            timeout=15)
-        if r2.status_code == 200:
-            events2 = r2.json() if isinstance(r2.json(), list) else []
-            existing_slugs = {m["slug"] for m in markets}
-            for ev in events2:
-                slug = ev.get("slug", "")
-                if slug in existing_slugs:
+        # Use tag_slug parameter for soccer markets
+        for tag_slug in ["soccer", "football", "ucl", "epl", "world-cup",
+                         "champions-league", "la-liga", "bundesliga", "serie-a",
+                         "ligue-1", "mls", "copa-libertadores"]:
+            try:
+                r = _sports_req.get("{}/events".format(POLY_GAMMA_API),
+                                   params={"tag_slug": tag_slug, "active": "true",
+                                           "closed": "false", "limit": 50,
+                                           "order": "volume24hr", "ascending": "false"},
+                                   timeout=15)
+                if r.status_code != 200:
                     continue
-                title = ev.get("title", "") or ev.get("question", "")
-                # Filter for football/soccer related
-                tl = title.lower()
-                if any(kw in tl for kw in ["soccer", "football", "fc", "united", "cup", "league",
-                                            "premier", "champions", "world cup", "fifa", "uefa",
-                                            "la liga", "bundesliga", "serie a", "ligue"]):
+                events = r.json() if isinstance(r.json(), list) else []
+                existing_ids = {m["market_id"] for m in markets}
+                for ev in events:
+                    title = ev.get("title", "") or ev.get("question", "")
+                    slug = ev.get("slug", "")
                     ev_markets = ev.get("markets", [])
-                    for m in (ev_markets or [ev]):
+                    for m in (ev_markets or [{"question": title, "id": ev.get("id", ""),
+                                              "conditionId": "", "outcomePrices": "",
+                                              "outcomes": "", "volume": 0}]):
+                        mid = m.get("id", "")
+                        if mid in existing_ids:
+                            continue
+                        existing_ids.add(mid)
                         q = m.get("question", "") or m.get("title", title)
+                        # Parse outcome prices
+                        op = m.get("outcomePrices", "")
+                        if isinstance(op, str):
+                            try: op = json.loads(op)
+                            except: op = []
+                        outcomes = m.get("outcomes", "")
+                        if isinstance(outcomes, str):
+                            try: outcomes = json.loads(outcomes)
+                            except: outcomes = []
+
                         markets.append({
                             "platform": "polymarket",
                             "title": title, "question": q, "slug": slug,
-                            "market_id": m.get("id", ""), "condition_id": m.get("conditionId", ""),
-                            "outcome_prices": m.get("outcomePrices", ""),
-                            "outcomes": m.get("outcomes", ""),
-                            "volume": m.get("volume", 0),
+                            "market_id": mid,
+                            "condition_id": m.get("conditionId", ""),
+                            "outcome_prices": op,
+                            "outcomes": outcomes,
+                            "volume": float(m.get("volume", 0) or 0),
                             "url": "https://polymarket.com/event/{}".format(slug) if slug else "",
                         })
+            except Exception as e:
+                print("[SPORTS] Poly tag {} error: {}".format(tag_slug, e))
+                continue
+
         print("[SPORTS] Polymarket: {} soccer/football markets".format(len(markets)))
     except Exception as e:
         print("[SPORTS] Polymarket fetch error: {}".format(e))
@@ -2972,30 +2983,43 @@ def _sports_fetch_limitless_sports():
         r = _sports_req.get("{}/markets/active/slugs".format(LIMITLESS_API), timeout=10)
         if r.status_code == 200:
             slugs = r.json() if isinstance(r.json(), list) else []
-            for slug in slugs:
-                sl = str(slug).lower()
-                # Filter for football/soccer related slugs
-                if any(kw in sl for kw in ["soccer", "football", "fc-", "united", "cup",
-                                            "league", "premier", "champions", "world-cup",
-                                            "fifa", "uefa", "win", "goal", "score",
-                                            "arsenal", "chelsea", "liverpool", "man-",
-                                            "barcelona", "real-madrid", "bayern", "psg"]):
-                    try:
-                        mr = _sports_req.get("{}/markets/{}".format(LIMITLESS_API, slug), timeout=8)
-                        if mr.status_code == 200:
-                            mdata = mr.json()
+            # Filter out crypto slugs (they contain "up-or-down")
+            sports_slugs = [s for s in slugs if "up-or-down" not in str(s).lower()
+                           and "above" not in str(s).lower()]
+            # Check each non-crypto slug for sports content
+            checked = 0
+            for slug in sports_slugs:
+                if checked >= 50:  # Limit API calls
+                    break
+                try:
+                    mr = _sports_req.get("{}/markets/{}".format(LIMITLESS_API, slug), timeout=8)
+                    if mr.status_code == 200:
+                        mdata = mr.json()
+                        title = (mdata.get("title", "") or mdata.get("question", "") or str(slug)).lower()
+                        # Check for any sports/football keywords
+                        if any(kw in title for kw in [
+                            "win", "goal", "score", "match", "game", "cup", "league",
+                            "champion", "final", "premier", "world cup", "fifa", "uefa",
+                            "soccer", "football", "fc", "united", "arsenal", "chelsea",
+                            "liverpool", "barcelona", "real madrid", "bayern", "psg",
+                            "juventus", "inter", "milan", "dortmund", "manager", "sack",
+                            "transfer", "sign", "ballon", "golden boot", "relegat",
+                            "promot", "trophy", "medal", "coach", "player",
+                        ]):
                             markets.append({
                                 "platform": "limitless",
-                                "title": mdata.get("title", "") or mdata.get("question", slug),
-                                "question": mdata.get("question", "") or mdata.get("title", slug),
-                                "slug": slug,
-                                "market_id": slug,
+                                "title": mdata.get("title", "") or str(slug),
+                                "question": mdata.get("question", "") or mdata.get("title", str(slug)),
+                                "slug": str(slug),
+                                "market_id": str(slug),
                                 "url": "https://limitless.exchange/markets/{}".format(slug),
                             })
-                        time.sleep(0.35)  # Rate limit
-                    except:
-                        pass
-        print("[SPORTS] Limitless: {} sports markets".format(len(markets)))
+                    checked += 1
+                    time.sleep(0.35)
+                except:
+                    checked += 1
+                    pass
+        print("[SPORTS] Limitless: {} sports markets (checked {} slugs)".format(len(markets), checked))
     except Exception as e:
         print("[SPORTS] Limitless fetch error: {}".format(e))
     return markets
@@ -3171,8 +3195,12 @@ def _sports_scan_and_alert():
                 matches[key] = {"home": p["home"], "away": p["away"], "predictions": []}
             matches[key]["predictions"].append(p)
 
-    # Also try reversed order (away vs home)
     print("[SPORTS] Unique matches found: {}".format(len(matches)))
+
+    # Debug: show first 3 matches and their normalized names
+    for i, (key, md) in enumerate(list(matches.items())[:3]):
+        print("[SPORTS] Sample match {}: '{}' vs '{}' ({} sources)".format(
+            i+1, key[0], key[1], len(md["predictions"])))
 
     # 3. Fetch markets from both platforms
     poly_markets = _sports_fetch_polymarket_sports()
@@ -3180,6 +3208,11 @@ def _sports_scan_and_alert():
     all_markets = poly_markets + lmts_markets
     print("[SPORTS] Total sports markets: {} (Poly: {}, Limitless: {})".format(
         len(all_markets), len(poly_markets), len(lmts_markets)))
+
+    # Debug: show first 3 markets
+    for i, m in enumerate(all_markets[:3]):
+        print("[SPORTS] Sample market {}: '{}' | '{}'".format(
+            i+1, m.get("title", "")[:50], m.get("question", "")[:50]))
 
     if not all_markets:
         print("[SPORTS] No sports markets found — skipping")
