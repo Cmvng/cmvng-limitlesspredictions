@@ -3487,69 +3487,72 @@ def _sports_fetch_limitless_sports(match_pairs=None):
             "sports_market_type": "",
         }
 
-    # Step 1: Fetch all sports markets directly via automationType filter
-    try:
-        for page in range(1, 4):  # Up to 3 pages
-            r = _sports_req.get("{}/markets/active".format(LIMITLESS_API),
-                               params={"automationType": "sports", "page": page, "limit": 50},
-                               timeout=15)
-            if r.status_code == 200:
-                data = r.json()
-                items = data.get("data", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
-                for m in items:
-                    title_lower = (m.get("title", "") or "").lower()
-                    # Filter for soccer/football keywords
-                    if any(kw in title_lower for kw in [
-                        "goal", "soccer", "football", " fc", "united",
-                        "arsenal", "chelsea", "liverpool", "barcelona",
-                        "real madrid", "bayern", "psg", "juventus",
-                        "premier league", "la liga", "serie a",
-                        "bundesliga", "champions league", "ucl",
-                        "europa", "mls", "cup", "corner", "btts",
-                        "both teams", "clean sheet", " vs ", " v ",
-                    ]):
-                        parsed = _parse_limitless(m)
-                        if parsed:
-                            markets.append(parsed)
-                if len(items) < 50:
-                    break  # No more pages
-            else:
-                print("[SPORTS] Limitless /markets/active?automationType=sports — HTTP {}".format(r.status_code))
-                break
-            time.sleep(0.3)
-    except Exception as e:
-        print("[SPORTS] Limitless sports browse error: {}".format(e))
-
-    print("[SPORTS] Limitless automationType=sports: {} soccer markets".format(len(markets)))
-
-    # Step 2: Also try browsing without automationType filter for manual sports markets
+    # Step 1: Try automationType=sports (may 400 if Limitless doesn't support it yet)
     try:
         r = _sports_req.get("{}/markets/active".format(LIMITLESS_API),
-                           params={"page": 1, "limit": 100, "sortBy": "newest"},
+                           params={"automationType": "sports", "page": 1, "limit": 50},
                            timeout=15)
         if r.status_code == 200:
             data = r.json()
             items = data.get("data", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
-            manual_count = 0
             for m in items:
                 title_lower = (m.get("title", "") or "").lower()
-                tags = [str(t).lower() for t in (m.get("tags", []) or [])]
-                cats = [str(c).lower() for c in (m.get("categories", []) or [])]
-                is_sports = "sports" in " ".join(tags + cats) or any(
-                    kw in title_lower for kw in [
-                        "goal", " fc ", "vs.", "corner", "btts",
-                        "premier league", "champions league",
-                        "world cup", "fifa", "uefa",
-                    ])
-                if is_sports:
+                if any(kw in title_lower for kw in [
+                    "goal", "soccer", "football", " fc", "united",
+                    "arsenal", "chelsea", "liverpool", "barcelona",
+                    "real madrid", "bayern", "psg", "juventus",
+                    "premier league", "la liga", "serie a",
+                    "bundesliga", "champions league", "ucl",
+                    "europa", "mls", "cup", "corner", "btts",
+                    "both teams", "clean sheet", " vs ", " v ",
+                ]):
                     parsed = _parse_limitless(m)
                     if parsed:
                         markets.append(parsed)
-                        manual_count += 1
-            if manual_count:
-                print("[SPORTS] Limitless manual browse: {} additional sports markets".format(manual_count))
+            if items:
+                print("[SPORTS] Limitless automationType=sports: {} soccer markets".format(len(markets)))
+        else:
+            print("[SPORTS] Limitless automationType=sports — HTTP {} (trying alternatives)".format(r.status_code))
     except Exception as e:
-        print("[SPORTS] Limitless browse error: {}".format(e))
+        print("[SPORTS] Limitless sports browse error: {}".format(e))
+
+    # Step 2: Discover categories first, then browse sports category if it exists
+    try:
+        r = _sports_req.get("{}/markets/categories/count".format(LIMITLESS_API), timeout=10)
+        if r.status_code == 200:
+            cat_data = r.json()
+            cat_counts = cat_data.get("category", {}) if isinstance(cat_data, dict) else {}
+            print("[SPORTS] Limitless categories: {}".format(
+                ", ".join("{}={}".format(k, v) for k, v in list(cat_counts.items())[:8])))
+            # Try each category to find sports-related ones
+            for cat_id, count in cat_counts.items():
+                if int(count) > 0:
+                    try:
+                        cr = _sports_req.get("{}/markets/active/{}".format(LIMITLESS_API, cat_id),
+                                           params={"page": 1, "limit": 20}, timeout=10)
+                        if cr.status_code == 200:
+                            cdata = cr.json()
+                            citems = cdata.get("data", []) if isinstance(cdata, dict) else []
+                            for m in citems[:3]:  # Sample first 3
+                                title = (m.get("title", "") or "").lower()
+                                tags = " ".join(str(t).lower() for t in (m.get("tags", []) or []))
+                                cats = " ".join(str(c).lower() for c in (m.get("categories", []) or []))
+                                if any(kw in (title + tags + cats) for kw in [
+                                    "soccer", "football", "goal", " fc ", "match",
+                                    "premier", "champions", "world cup", "btts", " vs "
+                                ]):
+                                    # This category has sports — fetch all
+                                    print("[SPORTS] Limitless cat={} has sports markets, fetching...".format(cat_id))
+                                    for fm in citems:
+                                        parsed = _parse_limitless(fm)
+                                        if parsed:
+                                            markets.append(parsed)
+                                    break
+                        time.sleep(0.2)
+                    except:
+                        pass
+    except Exception as e:
+        print("[SPORTS] Limitless categories error: {}".format(e))
 
     # Step 3: Semantic search for specific matches
     if match_pairs:
@@ -3645,6 +3648,8 @@ def _sports_extract_insights(predictions, home, away):
             insights["consensus_winner"] = home
         elif insights["away_wins"] > n / 2:
             insights["consensus_winner"] = away
+        elif insights["draws"] > n / 2:
+            insights["consensus_winner"] = "DRAW"
 
         if insights["over_25"] > n / 2:
             insights["consensus_goals"] = "OVER"
@@ -3698,12 +3703,22 @@ def _sports_score_pick(insights, market):
         elif avg <= 2.5 and "under" in mq:
             score += 15
             reasons.append("Goals avg {:.1f} (under)".format(avg))
-        elif avg > 2.0:
+        elif avg >= 2.0:
             score += 8
             reasons.append("Goals avg {:.1f}".format(avg))
 
-    # 4. Winner consensus matches market (max 15)
-    if insights["consensus_winner"]:
+    # 4. Winner/draw consensus matches market (max 15)
+    if insights["consensus_winner"] == "DRAW":
+        if "draw" in mq or "end in a draw" in mq:
+            score += 15
+            reasons.append("DRAW consensus")
+        # Also boost BTTS if draw predicted with goals
+        if insights["total_goals_predicted"]:
+            avg_g = sum(insights["total_goals_predicted"]) / len(insights["total_goals_predicted"])
+            if avg_g >= 2 and ("both" in mq and "score" in mq):
+                score += 10
+                reasons.append("Draw {:.0f}-{:.0f} → BTTS likely".format(avg_g/2, avg_g/2))
+    elif insights["consensus_winner"]:
         winner_norm = _sports_normalize_team(insights["consensus_winner"])
         winner_words = [w for w in winner_norm.split() if len(w) > 3]
         if any(w in mq for w in winner_words):
