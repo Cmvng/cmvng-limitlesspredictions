@@ -837,26 +837,27 @@ def _v2_analyze_structure(candles):
         elif candles[i]["l"] < candles[i-1]["l"]:
             ll_count += 1
 
-    # Spike detection — concentration of move
-    # What % of the total period range came from the single largest candle?
-    total_high = max(c["h"] for c in candles)
-    total_low = min(c["l"] for c in candles)
-    total_range = total_high - total_low
-    candle_ranges = [c["h"] - c["l"] for c in candles]
-    max_candle_range = max(candle_ranges) if candle_ranges else 0
-    concentration = (max_candle_range / total_range) if total_range > 0 else 0
+    # Spike detection — did one candle do all the work?
+    # Measure by BODY MOVE (close - open), not range (high - low)
+    # In a steady grind, each candle contributes similar body moves
+    # In a spike, one candle has a huge body while others are small/flat
+    body_moves = [abs(c["c"] - c["o"]) for c in candles]
+    total_body = sum(body_moves)
+    max_body = max(body_moves) if body_moves else 0
 
-    # With fewer candles, each naturally contributes a higher %.
-    # 2 candles: even split = 50% each, so spike threshold should be higher
-    # 3 candles: even split = 33% each
-    # 5+ candles: even split = 20% each
-    n = len(candles)
-    even_share = 1.0 / n if n > 0 else 0.5
-    spike_threshold = even_share + 0.25  # Must be 25% above even share to be a spike
+    if total_body > 0:
+        body_concentration = max_body / total_body
+    else:
+        body_concentration = 0
 
-    if concentration > spike_threshold:
+    # Also check: did the total period move happen gradually?
+    total_range = max(c["h"] for c in candles) - min(c["l"] for c in candles)
+
+    # Spike = one candle's body is more than 70% of the total body movement
+    # This means one candle did most of the work
+    if body_concentration > 0.70:
         grind_type = "spike"
-    elif concentration < even_share + 0.10:
+    elif body_concentration < 0.45:
         grind_type = "steady"
     else:
         grind_type = "normal"
@@ -877,7 +878,7 @@ def _v2_analyze_structure(candles):
         "hh_count": hh_count, "hl_count": hl_count,
         "lh_count": lh_count, "ll_count": ll_count,
         "grind_type": grind_type, "direction": direction,
-        "concentration": round(concentration, 3),
+        "concentration": round(body_concentration, 3),
     }
 
 
@@ -979,7 +980,8 @@ def _v2_should_enter(price, ptb, asset, structure, prev_candle,
     # 2. How did price get here?
     grind = structure.get("grind_type", "normal")
     if grind == "spike":
-        return False, None, 0, "Spike — one candle did the move, reversal risk"
+        return False, None, 0, "Spike — one candle did {:.0f}% of the body move".format(
+            structure.get("concentration", 0) * 100)
 
     # 3. Previous candle must align with direction
     if direction == "UP" and prev_candle["strength"] in ("STRONG_BEAR", "MILD_BEAR"):
@@ -2650,7 +2652,7 @@ print("=" * 60)
 
 try:
     init_db()
-    reset_db()  # Fresh start — clear all old trades, reset balances to $50
+    # reset_db()  # Uncomment to reset — already ran once on first deploy
     _v2_load_balances()
     print("[V2] Balances: {}".format(
         ", ".join("{}=${:.2f}".format(k, v["balance"]) for k, v in _v2_balances.items())))
