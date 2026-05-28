@@ -2520,6 +2520,7 @@ body { font-family:'DM Sans',sans-serif; background:#0a0f0d; color:#e8ede9; min-
 <div class="card"><h3>📅 Daily</h3><p>Hourly candles for intra-day structure. Both platforms. Session-safe. Scans every 10 minutes.</p></div>
 </div>
 <div class="cta"><a href="/app/paper-poly">View Dashboard →</a></div>
+<div class="cta" style="padding-top:0"><a href="/app/picks" style="background:transparent;border:1px solid #1a2e1f;color:#4ade80;margin:0 4px">⚽ Football Picks</a><a href="/app/codes" style="background:transparent;border:1px solid #1a2e1f;color:#4ade80;margin:0 4px">🎫 SportyBet Codes</a></div>
 </body></html>"""
 
 
@@ -3748,6 +3749,10 @@ def _sports_score_pick(insights, market):
     return score, reasons
 
 
+# Football v3: cache of recent sports alerts per platform (for /sports menu)
+_sports_market_cache = {"polymarket": [], "limitless": []}
+
+
 def _sports_scan_and_alert():
     """Main sports scanning function. Scrapes all sites, finds consensus, matches markets, sends alerts."""
     print("[SPORTS] Starting scan...")
@@ -3969,6 +3974,14 @@ def _sports_scan_and_alert():
                         score=pick_score,
                     )
                     send_telegram(msg)
+                    try:
+                        _u = market.get('url', '')
+                        _plat = 'limitless' if 'limitless' in _u else 'polymarket'
+                        _sports_market_cache.setdefault(_plat, [])
+                        _sports_market_cache[_plat].insert(0, '{} vs {} — {} ({}/100)'.format(home, away, (mq or '')[:40], pick_score))
+                        _sports_market_cache[_plat] = _sports_market_cache[_plat][:25]
+                    except Exception:
+                        pass
                     alerts_sent += 1
                     match_alerts += 1
                     print("[SPORTS] ALERT: {} vs {} — {} — score {}/100 | {}".format(
@@ -4033,6 +4046,2113 @@ def sports_dashboard():
     """, min_score=SPORTS_MIN_SCORE)
 
 
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CMVNG BOT v3 — FOOTBALL ENGINE (auto-assembled from modules)
+# ═══════════════════════════════════════════════════════════════════════════
+"""
+═══════════════════════════════════════════════════════════════════
+CMVNG BOT v3 — FOOTBALL ANALYSIS ENGINE
+═══════════════════════════════════════════════════════════════════
+Pure-logic core: scoring + accumulator building.
+No network calls here — fully testable in isolation.
+
+Flow:
+  1. analyze_fixture(data) -> scores every market type for one match
+  2. build_accumulator(picks, tier) -> packs best picks into an odds tier
+═══════════════════════════════════════════════════════════════════
+"""
+
+import math
+
+
+# ═══════════════════════════════════════════════════════════════════
+# ODDS ESTIMATION
+# Convert a win probability into fair decimal odds, then shade it to
+# look like a real bookmaker price (bookmakers add ~5-8% margin).
+# ═══════════════════════════════════════════════════════════════════
+
+def prob_to_odds(prob_pct, margin=0.06):
+    """Convert probability % to realistic decimal odds with bookmaker margin."""
+    p = max(0.01, min(0.99, prob_pct / 100.0))
+    fair = 1.0 / p
+    # Bookmaker shortens odds (adds margin) -> divide by (1+margin)
+    shaded = fair / (1.0 + margin)
+    return round(max(1.01, shaded), 2)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# MARKET SCORING
+# Each function returns a confidence percentage (0-100) for one market,
+# using the 6 criteria the user specified.
+# ═══════════════════════════════════════════════════════════════════
+
+def _form_points(form_str):
+    """Convert form string 'WWDLW' to avg points per game (0-3)."""
+    if not form_str:
+        return 1.5
+    pts = {"W": 3, "D": 1, "L": 0}
+    vals = [pts.get(c.upper(), 1) for c in form_str if c.upper() in pts]
+    return sum(vals) / len(vals) if vals else 1.5
+
+
+def _safe(d, key, default=0.0):
+    """Safely pull a numeric value from a dict."""
+    v = d.get(key, default)
+    try:
+        return float(v) if v is not None else default
+    except (ValueError, TypeError):
+        return default
+
+
+def analyze_fixture(fx):
+    """
+    Score every market type for a single fixture.
+    `fx` is a dict with all scraped data (form, xg, stats, h2h, injuries).
+    Returns a list of scored picks (each a dict).
+
+    All fields are optional — missing data degrades the relevant market's
+    confidence rather than crashing.
+    """
+    home = fx.get("home_team", "Home")
+    away = fx.get("away_team", "Away")
+    league = fx.get("league", "")
+    kickoff = fx.get("kickoff_time", "")
+    match_label = "{} vs {}".format(home, away)
+
+    # ── Pull the inputs (all safe) ──
+    home_form_pts = _form_points(fx.get("home_form", ""))
+    away_form_pts = _form_points(fx.get("away_form", ""))
+    home_xg_for = _safe(fx, "home_xg_for", 1.3)
+    home_xg_against = _safe(fx, "home_xg_against", 1.3)
+    away_xg_for = _safe(fx, "away_xg_for", 1.3)
+    away_xg_against = _safe(fx, "away_xg_against", 1.3)
+    home_gf = _safe(fx, "home_goals_scored_avg", home_xg_for)
+    home_ga = _safe(fx, "home_goals_conceded_avg", home_xg_against)
+    away_gf = _safe(fx, "away_goals_scored_avg", away_xg_for)
+    away_ga = _safe(fx, "away_goals_conceded_avg", away_xg_against)
+    home_corners_for = _safe(fx, "home_corners_for_avg", 5.0)
+    home_corners_against = _safe(fx, "home_corners_against_avg", 5.0)
+    away_corners_for = _safe(fx, "away_corners_for_avg", 5.0)
+    away_corners_against = _safe(fx, "away_corners_against_avg", 5.0)
+    home_cards = _safe(fx, "home_cards_avg", 2.0)
+    away_cards = _safe(fx, "away_cards_avg", 2.0)
+    home_btts = _safe(fx, "home_btts_pct", 50.0)
+    away_btts = _safe(fx, "away_btts_pct", 50.0)
+    home_cs = _safe(fx, "home_clean_sheet_pct", 30.0)
+    away_cs = _safe(fx, "away_clean_sheet_pct", 30.0)
+    home_pos = int(_safe(fx, "home_position", 10))
+    away_pos = int(_safe(fx, "away_position", 10))
+
+    # Injuries: count of key players out (passed as int)
+    home_inj = int(_safe(fx, "home_key_injuries", 0))
+    away_inj = int(_safe(fx, "away_key_injuries", 0))
+
+    # ── CRITERION 1+2: Relative strength (form + home advantage + table) ──
+    HOME_ADV = 0.35  # home advantage boost in "strength points"
+    home_strength = home_form_pts + HOME_ADV
+    away_strength = away_form_pts
+
+    # Table context adjustment: higher team (lower position number) gets boost
+    pos_gap = away_pos - home_pos  # positive = home ranked higher
+    home_strength += pos_gap * 0.05
+    away_strength -= pos_gap * 0.05
+
+    # Injury penalty
+    home_strength -= home_inj * 0.20
+    away_strength -= away_inj * 0.20
+
+    total_strength = home_strength + away_strength
+    if total_strength <= 0:
+        total_strength = 1.0
+    home_win_raw = home_strength / total_strength
+    away_win_raw = away_strength / total_strength
+
+    # ── Expected goals for THIS match (blend attack vs defense) ──
+    exp_home_goals = (home_gf + away_ga) / 2.0
+    exp_away_goals = (away_gf + home_ga) / 2.0
+    exp_total_goals = exp_home_goals + exp_away_goals
+
+    picks = []
+
+    def add(market_type, pick_label, confidence, reasoning):
+        confidence = max(1.0, min(99.0, confidence))
+        picks.append({
+            "match": match_label,
+            "home": home,
+            "away": away,
+            "league": league,
+            "kickoff": kickoff,
+            "market_type": market_type,
+            "pick": pick_label,
+            "confidence": round(confidence, 1),
+            "odds": prob_to_odds(confidence),
+            "reasoning": reasoning,
+            # SportyBet IDs filled in later by the mapper
+            "sb_event_id": "",
+            "sb_market_id": "",
+            "sb_specifier": None,
+            "sb_outcome_id": "",
+            "result": "pending",
+        })
+
+    # ── MATCH RESULT ──
+    home_win_conf = home_win_raw * 100 * 0.85  # temper raw probability
+    away_win_conf = away_win_raw * 100 * 0.80
+    draw_conf = (1 - abs(home_win_raw - away_win_raw)) * 35  # draws ~25-32% typically
+
+    add("home_win", "{} to Win".format(home), home_win_conf,
+        "{} form {:.1f}pts vs {} {:.1f}pts, home advantage, table {} vs {}".format(
+            home, home_form_pts, away, away_form_pts, home_pos, away_pos))
+    add("away_win", "{} to Win".format(away), away_win_conf,
+        "{} away form {:.1f}pts, table position {}".format(away, away_form_pts, away_pos))
+    add("draw", "Draw", draw_conf,
+        "Evenly matched: {:.0f}% vs {:.0f}% strength".format(home_win_raw*100, away_win_raw*100))
+
+    # ── DOUBLE CHANCE (much safer than straight win) ──
+    dc_1x = (home_win_raw + (draw_conf/100)) * 100 * 0.92
+    dc_x2 = (away_win_raw + (draw_conf/100)) * 100 * 0.92
+    add("double_chance_1X", "{} or Draw".format(home), dc_1x,
+        "{} home + draw cover, form {:.1f}pts".format(home, home_form_pts))
+    add("double_chance_X2", "{} or Draw".format(away), dc_x2,
+        "{} + draw cover".format(away))
+
+    # ── OVER/UNDER GOALS ──
+    # Poisson-ish heuristic from expected total goals
+    over_05 = min(98, 70 + exp_total_goals * 10)
+    over_15 = min(96, 45 + exp_total_goals * 13)
+    over_25 = min(90, 20 + exp_total_goals * 16)
+    over_35 = min(80, exp_total_goals * 15)
+    under_25 = 100 - over_25
+    under_35 = 100 - over_35
+
+    add("over_0.5", "Over 0.5 Goals", over_05,
+        "Expected {:.1f} total goals".format(exp_total_goals))
+    add("over_1.5", "Over 1.5 Goals", over_15,
+        "Expected {:.1f} goals ({} {:.1f}xG, {} {:.1f}xG)".format(
+            exp_total_goals, home, home_xg_for, away, away_xg_for))
+    add("over_2.5", "Over 2.5 Goals", over_25,
+        "Expected {:.1f} goals, both attacks active".format(exp_total_goals))
+    add("over_3.5", "Over 3.5 Goals", over_35,
+        "High-scoring projection {:.1f}".format(exp_total_goals))
+    add("under_2.5", "Under 2.5 Goals", under_25,
+        "Lower-scoring projection {:.1f}".format(exp_total_goals))
+    add("under_3.5", "Under 3.5 Goals", under_35,
+        "Defensive projection {:.1f}".format(exp_total_goals))
+
+    # ── BTTS ──
+    btts_yes = (home_btts + away_btts) / 2.0
+    # Adjust by clean sheet tendency
+    btts_yes -= (home_cs + away_cs) / 4.0
+    btts_yes = max(15, min(88, btts_yes + (exp_total_goals - 2.5) * 8))
+    btts_no = 100 - btts_yes
+    add("btts_yes", "Both Teams to Score - Yes", btts_yes,
+        "{} BTTS {:.0f}%, {} BTTS {:.0f}%, exp {:.1f} goals".format(
+            home, home_btts, away, away_btts, exp_total_goals))
+    add("btts_no", "Both Teams to Score - No", btts_no,
+        "Clean sheet tendency: {} {:.0f}%, {} {:.0f}%".format(home, home_cs, away, away_cs))
+
+    # ── CORNERS ──
+    exp_corners = (home_corners_for + away_corners_against) / 2.0 + \
+                  (away_corners_for + home_corners_against) / 2.0
+    over_75c = min(92, exp_corners * 8)
+    over_85c = min(85, exp_corners * 7)
+    over_95c = min(75, exp_corners * 6)
+    add("corners_over_7.5", "Over 7.5 Corners", over_75c,
+        "Expected {:.1f} corners ({} {:.1f}, {} {:.1f})".format(
+            exp_corners, home, home_corners_for, away, away_corners_for))
+    add("corners_over_8.5", "Over 8.5 Corners", over_85c,
+        "Expected {:.1f} corners".format(exp_corners))
+    add("corners_over_9.5", "Over 9.5 Corners", over_95c,
+        "Expected {:.1f} corners, both teams attack wide".format(exp_corners))
+
+    # ── CARDS ──
+    exp_cards = home_cards + away_cards
+    over_25cards = min(88, exp_cards * 22)
+    over_35cards = min(75, exp_cards * 17)
+    add("cards_over_2.5", "Over 2.5 Cards", over_25cards,
+        "Expected {:.1f} cards combined".format(exp_cards))
+    add("cards_over_3.5", "Over 3.5 Cards", over_35cards,
+        "Expected {:.1f} cards, physical matchup".format(exp_cards))
+
+    # ── COMBOS ──
+    home_win_btts = (home_win_conf/100) * (btts_yes/100) * 100 * 1.05
+    add("home_win_btts", "{} Win & BTTS".format(home), home_win_btts,
+        "{} favored + both score".format(home))
+    home_win_over25 = (home_win_conf/100) * (over_25/100) * 100 * 1.05
+    add("home_win_over_2.5", "{} Win & Over 2.5".format(home), home_win_over25,
+        "{} win in high-scoring game".format(home))
+    wd_over15 = (dc_1x/100) * (over_15/100) * 100
+    add("dc_over_1.5", "{} or Draw & Over 1.5".format(home), wd_over15,
+        "Safe double chance + goals")
+
+    # ── HANDICAP ──
+    if home_win_raw > 0.55:
+        hcp = home_win_conf * 0.65
+        add("handicap_home_-1.5", "{} -1.5".format(home), hcp,
+            "{} strongly favored to win by 2+".format(home))
+    if away_win_raw > 0.55:
+        hcp = away_win_conf * 0.65
+        add("handicap_away_-1.5", "{} -1.5".format(away), hcp,
+            "{} strongly favored to win by 2+".format(away))
+
+    # ── CORRECT SCORE (top likely scorelines) ──
+    h = max(0, round(exp_home_goals))
+    a = max(0, round(exp_away_goals))
+    cs_conf = 12 + (10 if home_win_raw > 0.5 else 5)  # correct scores are low prob
+    add("correct_score", "{} {}-{} {}".format(home, h, a, away), cs_conf,
+        "Most likely scoreline from xG ({:.1f}-{:.1f})".format(exp_home_goals, exp_away_goals))
+
+    return picks
+
+
+# ═══════════════════════════════════════════════════════════════════
+# ACCUMULATOR BUILDER
+# Pack the best picks into each odds tier.
+# ═══════════════════════════════════════════════════════════════════
+
+# Tier configuration: per-selection odds band + packing rules
+TIER_CONFIG = {
+    "2_odds": {
+        "target": 2.0, "min_conf": 80, "min_sel": 3, "max_sel": 8,
+        "odds_lo": 1.05, "odds_hi": 1.30,
+        "prefer": ["over_0.5", "over_1.5", "double_chance_1X", "double_chance_X2", "btts_yes"],
+        "label": "2 ODDS — BANKER", "emoji": "🟢",
+    },
+    "3_odds": {
+        "target": 3.0, "min_conf": 72, "min_sel": 3, "max_sel": 7,
+        "odds_lo": 1.12, "odds_hi": 1.45,
+        "prefer": ["over_1.5", "double_chance_1X", "btts_yes", "home_win", "over_2.5"],
+        "label": "3 ODDS — SAFE", "emoji": "🟢",
+    },
+    "5_odds": {
+        "target": 5.0, "min_conf": 60, "min_sel": 3, "max_sel": 6,
+        "odds_lo": 1.25, "odds_hi": 1.75,
+        "prefer": ["over_2.5", "home_win", "btts_yes", "corners_over_8.5", "dc_over_1.5"],
+        "label": "5 ODDS — VALUE", "emoji": "🟡",
+    },
+    "10_odds": {
+        "target": 10.0, "min_conf": 50, "min_sel": 4, "max_sel": 6,
+        "odds_lo": 1.40, "odds_hi": 2.30,
+        "prefer": ["home_win", "away_win", "home_win_btts", "corners_over_9.5",
+                   "handicap_home_-1.5", "cards_over_3.5", "over_2.5"],
+        "label": "10 ODDS — RISK", "emoji": "🟠",
+    },
+    "1000_odds": {
+        "target": 1000.0, "min_conf": 15, "min_sel": 8, "max_sel": 16,
+        "odds_lo": 1.45, "odds_hi": 15.0,
+        "prefer": ["correct_score", "home_win_btts", "home_win_over_2.5",
+                   "handicap_home_-1.5", "handicap_away_-1.5", "over_3.5",
+                   "cards_over_3.5", "away_win"],
+        "label": "1000+ ODDS — MOONSHOT", "emoji": "🔴",
+    },
+}
+
+
+def build_accumulator(all_picks, tier_key):
+    """
+    Build one accumulator tier.
+    Strategy:
+      1. Filter picks to this tier's confidence floor + odds band
+      2. Prefer this tier's market types (sort them first)
+      3. Greedily pack (max 1 per match) until total odds hits target
+    Returns dict {selections, total_odds, ...} or None if not buildable.
+    """
+    cfg = TIER_CONFIG[tier_key]
+
+    # Filter: confidence floor + odds band
+    eligible = [
+        p for p in all_picks
+        if p["confidence"] >= cfg["min_conf"]
+        and cfg["odds_lo"] <= p["odds"] <= cfg["odds_hi"]
+    ]
+
+    if not eligible:
+        return None
+
+    # Sort: preferred market types first, then by confidence descending
+    prefer_set = cfg["prefer"]
+
+    def sort_key(p):
+        is_preferred = 0 if p["market_type"] in prefer_set else 1
+        return (is_preferred, -p["confidence"])
+
+    eligible.sort(key=sort_key)
+
+    # Greedy packing
+    slip = []
+    used_matches = set()
+    running = 1.0
+    target = cfg["target"]
+
+    for pick in eligible:
+        if pick["match"] in used_matches:
+            continue
+        if len(slip) >= cfg["max_sel"]:
+            break
+        new_running = running * pick["odds"]
+        # Don't overshoot beyond 18% over target
+        if new_running > target * 1.18 and len(slip) >= cfg["min_sel"]:
+            continue
+        slip.append(pick)
+        used_matches.add(pick["match"])
+        running = new_running
+        # Stop once we're in the acceptable band (>= 92% of target)
+        if running >= target * 0.92 and len(slip) >= cfg["min_sel"]:
+            break
+
+    if len(slip) < cfg["min_sel"]:
+        return None
+
+    return {
+        "tier": tier_key,
+        "label": cfg["label"],
+        "emoji": cfg["emoji"],
+        "target_odds": target,
+        "total_odds": round(running, 2),
+        "num_selections": len(slip),
+        "selections": slip,
+    }
+
+
+def build_all_accumulators(all_picks):
+    """Build all 5 tiers. Returns dict of {tier_key: accumulator or None}."""
+    result = {}
+    for tier_key in ["2_odds", "3_odds", "5_odds", "10_odds", "1000_odds"]:
+        result[tier_key] = build_accumulator(all_picks, tier_key)
+    return result
+
+
+def top_picks_per_match(all_picks, n=3):
+    """Group picks by match, return top N per match by confidence."""
+    by_match = {}
+    for p in all_picks:
+        by_match.setdefault(p["match"], []).append(p)
+    out = {}
+    for match, picks in by_match.items():
+        picks.sort(key=lambda x: x["confidence"], reverse=True)
+        out[match] = picks[:n]
+    return out
+
+
+"""
+═══════════════════════════════════════════════════════════════════
+CMVNG BOT v3 — FOOTBALL DATA SCRAPERS
+═══════════════════════════════════════════════════════════════════
+Scrapes Sofascore (fixtures/form/h2h/injuries/standings),
+Understat (xG), and FootyStats (corners/cards/btts).
+
+EVERY function is wrapped so a failure returns safe defaults instead
+of crashing. The engine fills gaps with league-average assumptions.
+
+NOTE: These endpoints cannot be tested from the build sandbox
+(network restricted). They are written from documented API shapes
+and need one round of Railway validation. Failures degrade gracefully.
+═══════════════════════════════════════════════════════════════════
+"""
+
+import time
+import json
+import datetime as _dt
+
+try:
+    import requests as _req
+except ImportError:
+    _req = None
+
+try:
+    from bs4 import BeautifulSoup as _BS
+except ImportError:
+    _BS = None
+
+# Browser-like headers to avoid trivial blocks
+_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
+SOFA = "https://api.sofascore.com/api/v1"
+
+
+def _get_json(url, timeout=12, retries=2):
+    """GET a URL and parse JSON. Returns None on any failure."""
+    if _req is None:
+        return None
+    for attempt in range(retries):
+        try:
+            r = _req.get(url, headers=_HEADERS, timeout=timeout)
+            if r.status_code == 200:
+                return r.json()
+            if r.status_code == 429:
+                time.sleep(3)  # rate limited, back off
+        except Exception:
+            pass
+        time.sleep(1)
+    return None
+
+
+def _get_html(url, timeout=12):
+    """GET a URL and return text. Returns None on any failure."""
+    if _req is None:
+        return None
+    try:
+        r = _req.get(url, headers=_HEADERS, timeout=timeout)
+        if r.status_code == 200:
+            return r.text
+    except Exception:
+        pass
+    return None
+
+
+# ═══════════════════════════════════════════════════════════════════
+# SOFASCORE — fixtures, form, H2H, injuries, standings
+# ═══════════════════════════════════════════════════════════════════
+
+# Soccer leagues we care about (Sofascore uniqueTournament IDs)
+# These are stable IDs from Sofascore.
+SOFA_LEAGUES = {
+    "EPL": 17, "La Liga": 8, "Bundesliga": 35, "Serie A": 23,
+    "Ligue 1": 34, "Eredivisie": 37, "Primeira Liga": 238,
+    "Champions League": 7, "Europa League": 679, "Championship": 18,
+}
+
+
+def sofa_todays_fixtures(date_str=None, max_leagues=None):
+    """
+    Get today's football fixtures from Sofascore.
+    Returns list of fixture dicts with event_id, teams, league, kickoff.
+    """
+    if date_str is None:
+        date_str = _dt.date.today().isoformat()
+
+    fixtures = []
+    data = _get_json("{}/sport/football/scheduled-events/{}".format(SOFA, date_str))
+    if not data or "events" not in data:
+        return fixtures
+
+    wanted_league_ids = set(SOFA_LEAGUES.values())
+    for ev in data.get("events", []):
+        try:
+            tournament = ev.get("tournament", {})
+            unique_t = tournament.get("uniqueTournament", {}) or {}
+            league_id = unique_t.get("id")
+            league_name = unique_t.get("name", tournament.get("name", ""))
+
+            # Only keep leagues we track (or all if not restricting)
+            if wanted_league_ids and league_id not in wanted_league_ids:
+                continue
+
+            status = ev.get("status", {}).get("type", "")
+            if status not in ("notstarted", "inprogress"):
+                continue  # skip finished games
+
+            home = ev.get("homeTeam", {})
+            away = ev.get("awayTeam", {})
+            start_ts = ev.get("startTimestamp", 0)
+
+            fixtures.append({
+                "event_id": str(ev.get("id", "")),
+                "home_team": home.get("name", ""),
+                "away_team": away.get("name", ""),
+                "home_id": home.get("id"),
+                "away_id": away.get("id"),
+                "league": league_name,
+                "league_id": league_id,
+                "season_id": unique_t.get("id"),  # resolved later
+                "kickoff_time": _dt.datetime.fromtimestamp(start_ts).isoformat() if start_ts else "",
+                "kickoff_ts": start_ts,
+            })
+        except Exception:
+            continue
+
+    return fixtures
+
+
+def sofa_team_form(team_id, limit=5):
+    """Get last N results for a team as a form string like 'WWDLW'."""
+    if not team_id:
+        return ""
+    data = _get_json("{}/team/{}/events/last/0".format(SOFA, team_id))
+    if not data or "events" not in data:
+        return ""
+    events = data.get("events", [])[-limit:]
+    form = []
+    for ev in reversed(events):  # most recent first
+        try:
+            home_id = ev.get("homeTeam", {}).get("id")
+            hs = ev.get("homeScore", {}).get("current")
+            as_ = ev.get("awayScore", {}).get("current")
+            if hs is None or as_ is None:
+                continue
+            is_home = (home_id == team_id)
+            my_score = hs if is_home else as_
+            opp_score = as_ if is_home else hs
+            if my_score > opp_score:
+                form.append("W")
+            elif my_score < opp_score:
+                form.append("L")
+            else:
+                form.append("D")
+        except Exception:
+            continue
+    return "".join(form)
+
+
+def sofa_h2h(event_id):
+    """Get head-to-head summary for a match. Returns dict with last meetings."""
+    if not event_id:
+        return {}
+    data = _get_json("{}/event/{}/h2h".format(SOFA, event_id))
+    if not data:
+        return {}
+    return data.get("teamDuel", {}) or {}
+
+
+def sofa_injuries(team_id):
+    """Get count of injured/suspended players for a team."""
+    if not team_id:
+        return 0
+    data = _get_json("{}/team/{}/player/injuries".format(SOFA, team_id))
+    if not data:
+        return 0
+    injuries = data.get("playerInjuries", data.get("injuries", []))
+    if isinstance(injuries, list):
+        return len(injuries)
+    return 0
+
+
+def sofa_match_stats_summary(event_id):
+    """Get corners/cards from a finished match (for averages). Used in aggregation."""
+    if not event_id:
+        return {}
+    data = _get_json("{}/event/{}/statistics".format(SOFA, event_id))
+    if not data:
+        return {}
+    out = {}
+    try:
+        for period in data.get("statistics", []):
+            if period.get("period") != "ALL":
+                continue
+            for group in period.get("groups", []):
+                for item in group.get("statisticsItems", []):
+                    name = item.get("name", "").lower()
+                    if "corner" in name:
+                        out["home_corners"] = _to_num(item.get("home"))
+                        out["away_corners"] = _to_num(item.get("away"))
+                    if "yellow" in name:
+                        out["home_cards"] = _to_num(item.get("home"))
+                        out["away_cards"] = _to_num(item.get("away"))
+    except Exception:
+        pass
+    return out
+
+
+def _to_num(v):
+    try:
+        return float(str(v).split()[0])
+    except (ValueError, TypeError, IndexError, AttributeError):
+        return 0.0
+
+
+# ═══════════════════════════════════════════════════════════════════
+# UNDERSTAT — xG data (JSON embedded in <script> tags)
+# ═══════════════════════════════════════════════════════════════════
+
+UNDERSTAT_LEAGUES = {
+    "EPL": "EPL", "La Liga": "La_liga", "Bundesliga": "Bundesliga",
+    "Serie A": "Serie_A", "Ligue 1": "Ligue_1",
+}
+
+
+def understat_team_xg(league_name, season="2025"):
+    """
+    Scrape Understat for team xG data.
+    Returns dict: {team_name: {xg_for, xg_against, played}}
+    Understat embeds data as JSON.parse('...') inside <script> tags.
+    """
+    out = {}
+    us_league = UNDERSTAT_LEAGUES.get(league_name)
+    if not us_league:
+        return out
+
+    html = _get_html("https://understat.com/league/{}/{}".format(us_league, season))
+    if not html:
+        return out
+
+    try:
+        # Find the teamsData script — format: var teamsData = JSON.parse('...')
+        import re
+        m = re.search(r"teamsData\s*=\s*JSON\.parse\('([^']+)'\)", html)
+        if not m:
+            return out
+        # Decode the hex-escaped JSON
+        raw = m.group(1).encode().decode("unicode_escape")
+        teams_data = json.loads(raw)
+
+        for team_id, tdata in teams_data.items():
+            name = tdata.get("title", "")
+            history = tdata.get("history", [])
+            if not history:
+                continue
+            xg_for = sum(_to_num(h.get("xG")) for h in history)
+            xg_against = sum(_to_num(h.get("xGA")) for h in history)
+            played = len(history)
+            if played > 0:
+                out[name] = {
+                    "xg_for": round(xg_for / played, 2),
+                    "xg_against": round(xg_against / played, 2),
+                    "played": played,
+                }
+    except Exception:
+        pass
+
+    return out
+
+
+# ═══════════════════════════════════════════════════════════════════
+# FOOTYSTATS — corners, cards, BTTS (HTML tables)
+# ═══════════════════════════════════════════════════════════════════
+
+def footystats_team(team_slug):
+    """
+    Scrape FootyStats team page for corners/cards/btts stats.
+    Returns dict of stats or empty dict on failure.
+    NOTE: FootyStats slugs are unpredictable; this is best-effort.
+    """
+    out = {}
+    if _BS is None:
+        return out
+    html = _get_html("https://footystats.org/clubs/{}".format(team_slug))
+    if not html:
+        return out
+    try:
+        soup = _BS(html, "html.parser")
+        text = soup.get_text().lower()
+        # Best-effort extraction — FootyStats layout varies
+        # This is a placeholder structure; refined after Railway inspection
+        import re
+        btts_m = re.search(r"btts[^\d]*(\d+)%", text)
+        if btts_m:
+            out["btts_pct"] = float(btts_m.group(1))
+    except Exception:
+        pass
+    return out
+
+
+# ═══════════════════════════════════════════════════════════════════
+# AGGREGATOR — combine all sources into one fixture record
+# ═══════════════════════════════════════════════════════════════════
+
+def build_fixture_dataset(date_str=None, rate_limit=1.5, max_fixtures=30):
+    """
+    Master function: scrape everything and return enriched fixture dicts
+    ready for the analysis engine.
+
+    Rate-limited to be respectful to Sofascore (Cloudflare).
+    """
+    fixtures = sofa_todays_fixtures(date_str)
+    if not fixtures:
+        print("[FB] No fixtures found for {}".format(date_str or "today"))
+        return []
+
+    fixtures = fixtures[:max_fixtures]
+    print("[FB] Found {} fixtures, enriching...".format(len(fixtures)))
+
+    # Pre-fetch Understat xG per league (one call per league)
+    xg_cache = {}
+    leagues_present = set(f["league"] for f in fixtures)
+    for lg in leagues_present:
+        if lg in UNDERSTAT_LEAGUES:
+            xg_cache[lg] = understat_team_xg(lg)
+            time.sleep(rate_limit)
+
+    enriched = []
+    for fx in fixtures:
+        try:
+            # Form (2 calls)
+            fx["home_form"] = sofa_team_form(fx.get("home_id"))
+            time.sleep(rate_limit)
+            fx["away_form"] = sofa_team_form(fx.get("away_id"))
+            time.sleep(rate_limit)
+
+            # Injuries (2 calls)
+            fx["home_key_injuries"] = sofa_injuries(fx.get("home_id"))
+            fx["away_key_injuries"] = sofa_injuries(fx.get("away_id"))
+            time.sleep(rate_limit)
+
+            # xG from Understat cache (name matching)
+            lg_xg = xg_cache.get(fx["league"], {})
+            home_xg = _match_team_xg(lg_xg, fx["home_team"])
+            away_xg = _match_team_xg(lg_xg, fx["away_team"])
+            if home_xg:
+                fx["home_xg_for"] = home_xg["xg_for"]
+                fx["home_xg_against"] = home_xg["xg_against"]
+            if away_xg:
+                fx["away_xg_for"] = away_xg["xg_for"]
+                fx["away_xg_against"] = away_xg["xg_against"]
+
+            enriched.append(fx)
+        except Exception as e:
+            print("[FB] enrich error for {}: {}".format(fx.get("home_team"), e))
+            enriched.append(fx)  # keep it with whatever data we have
+
+    print("[FB] Enriched {} fixtures".format(len(enriched)))
+    return enriched
+
+
+def _match_team_xg(xg_dict, team_name):
+    """Fuzzy-match a team name to Understat data (names differ slightly)."""
+    if not xg_dict or not team_name:
+        return None
+    # Exact
+    if team_name in xg_dict:
+        return xg_dict[team_name]
+    # Partial — match on last word or substring
+    tn_lower = team_name.lower()
+    for name, data in xg_dict.items():
+        nl = name.lower()
+        if nl in tn_lower or tn_lower in nl:
+            return data
+        # Match on significant word overlap
+        tn_words = set(tn_lower.replace("fc", "").replace("afc", "").split())
+        n_words = set(nl.replace("fc", "").replace("afc", "").split())
+        if tn_words & n_words:
+            return data
+    return None
+
+
+"""
+═══════════════════════════════════════════════════════════════════
+CMVNG BOT v3 — SPORTYBET BOOKING CODE GENERATOR
+═══════════════════════════════════════════════════════════════════
+Confirmed endpoints (from sacsbrainz/betconverter source):
+
+  READ a code:
+    GET https://www.sportybet.com/api/ng/orders/share/{CODE}
+    -> {message:"success", data:{outcomes:[{eventId, markets:[{id, specifier, outcomes:[{id}]}]}]}}
+
+  CREATE a code:
+    POST https://www.sportybet.com/api/ng/orders/share
+    body: {"selections":[{eventId, marketId, specifier, outcomeId}, ...]}
+    -> {message:"success", data:{code:"A7K2M9"}}
+
+To map analysis picks -> SportyBet IDs, we:
+  1. Search SportyBet fixtures for the match (by team name)
+  2. Pull that event's markets
+  3. Match our pick to the right market+outcome by description
+  4. Build selections and POST
+
+NOTE: cannot be tested from build sandbox (network restricted).
+Written from confirmed endpoint shapes. Needs Railway validation.
+Every step degrades gracefully — an unmappable pick is skipped, not fatal.
+═══════════════════════════════════════════════════════════════════
+"""
+
+import time
+import json
+
+try:
+    import requests as _req
+except ImportError:
+    _req = None
+
+SB_BASE = "https://www.sportybet.com/api/ng"
+
+_SB_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Content-Type": "application/json",
+    "Accept": "application/json",
+    "Referer": "https://www.sportybet.com/ng/sport/football",
+}
+
+
+def _sb_get(url, timeout=12):
+    if _req is None:
+        return None
+    try:
+        r = _req.get(url, headers=_SB_HEADERS, timeout=timeout)
+        if r.status_code == 200:
+            return r.json()
+    except Exception:
+        pass
+    return None
+
+
+def _sb_post(url, payload, timeout=15):
+    if _req is None:
+        return None
+    try:
+        r = _req.post(url, headers=_SB_HEADERS, json=payload, timeout=timeout)
+        if r.status_code == 200:
+            return r.json()
+    except Exception:
+        pass
+    return None
+
+
+# ═══════════════════════════════════════════════════════════════════
+# STEP 1: Find SportyBet event for a fixture
+# ═══════════════════════════════════════════════════════════════════
+
+def sb_search_event(home_team, away_team):
+    """
+    Search SportyBet for a match by team name.
+    Returns eventId or None.
+    Tries the factsCenter search endpoint (same family as football.com).
+    """
+    ts = int(time.time() * 1000)
+    # Search by home team name
+    keyword = home_team.replace(" ", "%20")
+    url = "{}/factsCenter/liveOrPrematchSearch?keyword={}&_t={}".format(SB_BASE, keyword, ts)
+    data = _sb_get(url)
+
+    if not data or data.get("bizCode") not in (10000, None):
+        # Try alternate search endpoint
+        url2 = "{}/factsCenter/search?query={}&_t={}".format(SB_BASE, keyword, ts)
+        data = _sb_get(url2)
+
+    if not data:
+        return None
+
+    # Navigate the response to find a matching event
+    try:
+        events = _extract_events_from_search(data)
+        for ev in events:
+            ev_home = (ev.get("homeTeamName") or ev.get("home") or "").lower()
+            ev_away = (ev.get("awayTeamName") or ev.get("away") or "").lower()
+            if _team_match(home_team, ev_home) and _team_match(away_team, ev_away):
+                return ev.get("eventId") or ev.get("id")
+    except Exception:
+        pass
+    return None
+
+
+def _extract_events_from_search(data):
+    """Pull event list from various possible SportyBet response shapes."""
+    events = []
+    d = data.get("data", data)
+    if isinstance(d, dict):
+        for key in ("events", "tournaments", "results", "list"):
+            val = d.get(key)
+            if isinstance(val, list):
+                for item in val:
+                    if isinstance(item, dict):
+                        if "events" in item and isinstance(item["events"], list):
+                            events.extend(item["events"])
+                        else:
+                            events.append(item)
+    elif isinstance(d, list):
+        events = d
+    return events
+
+
+def _team_match(name, candidate):
+    """Fuzzy team name match."""
+    if not name or not candidate:
+        return False
+    n = name.lower().replace("fc", "").replace("afc", "").strip()
+    c = candidate.lower().replace("fc", "").replace("afc", "").strip()
+    if n in c or c in n:
+        return True
+    n_words = set(n.split())
+    c_words = set(c.split())
+    return bool(n_words & c_words)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# STEP 2: Get markets for an event, match our pick
+# ═══════════════════════════════════════════════════════════════════
+
+def sb_get_event_markets(event_id):
+    """Fetch all markets for a SportyBet event. Returns list of market dicts."""
+    if not event_id:
+        return []
+    ts = int(time.time() * 1000)
+    url = "{}/factsCenter/event?eventId={}&_t={}".format(SB_BASE, event_id, ts)
+    data = _sb_get(url)
+    if not data:
+        return []
+    try:
+        d = data.get("data", data)
+        return d.get("markets", []) or []
+    except Exception:
+        return []
+
+
+# Map engine market_type -> matching logic against SportyBet market descriptions
+# Each entry: (market_name_keywords, outcome_matcher_function)
+def _outcome_matches_home(desc, home, away):
+    return _team_match(home, desc) or desc.strip() in ("1", "home")
+
+def _outcome_matches_away(desc, home, away):
+    return _team_match(away, desc) or desc.strip() in ("2", "away")
+
+def _outcome_matches_draw(desc, home, away):
+    return "draw" in desc.lower() or desc.strip().upper() == "X"
+
+
+# Mapping: engine market_type -> (sb_market_name_keywords, specifier_value, outcome_desc_matcher)
+SB_MARKET_MAP = {
+    "home_win":            (["1x2", "match result", "3way", "1 x 2"], None, "home"),
+    "away_win":            (["1x2", "match result", "3way", "1 x 2"], None, "away"),
+    "draw":                (["1x2", "match result", "3way", "1 x 2"], None, "draw"),
+    "double_chance_1X":    (["double chance"], None, "1X"),
+    "double_chance_X2":    (["double chance"], None, "X2"),
+    "over_0.5":            (["total", "over/under", "goals over/under"], "0.5", "over"),
+    "over_1.5":            (["total", "over/under", "goals over/under"], "1.5", "over"),
+    "over_2.5":            (["total", "over/under", "goals over/under"], "2.5", "over"),
+    "over_3.5":            (["total", "over/under", "goals over/under"], "3.5", "over"),
+    "under_2.5":           (["total", "over/under", "goals over/under"], "2.5", "under"),
+    "under_3.5":           (["total", "over/under", "goals over/under"], "3.5", "under"),
+    "btts_yes":            (["both teams to score", "gg/ng", "both teams"], None, "yes"),
+    "btts_no":             (["both teams to score", "gg/ng", "both teams"], None, "no"),
+    "corners_over_7.5":    (["corner"], "7.5", "over"),
+    "corners_over_8.5":    (["corner"], "8.5", "over"),
+    "corners_over_9.5":    (["corner"], "9.5", "over"),
+    "cards_over_2.5":      (["card", "booking"], "2.5", "over"),
+    "cards_over_3.5":      (["card", "booking"], "3.5", "over"),
+}
+
+
+def sb_map_pick_to_selection(pick, markets):
+    """
+    Given an engine pick and the event's markets, find the matching
+    SportyBet marketId + specifier + outcomeId.
+    Returns a selection dict or None if no match.
+    """
+    mt = pick["market_type"]
+    home = pick["home"]
+    away = pick["away"]
+
+    mapping = SB_MARKET_MAP.get(mt)
+    if not mapping:
+        return None
+    name_keywords, want_specifier, outcome_kind = mapping
+
+    for market in markets:
+        m_name = (market.get("name") or market.get("desc") or "").lower()
+        m_specifier = market.get("specifier") or ""
+
+        # Match market by name keyword
+        if not any(kw in m_name for kw in name_keywords):
+            continue
+
+        # Match specifier (for over/under, corners, cards)
+        if want_specifier:
+            if want_specifier not in str(m_specifier):
+                continue
+
+        # Find the right outcome
+        outcomes = market.get("outcomes", []) or market.get("outcome", [])
+        for oc in outcomes:
+            oc_desc = (oc.get("desc") or oc.get("name") or "").lower()
+            matched = False
+            if outcome_kind == "home" and _team_match(home, oc_desc):
+                matched = True
+            elif outcome_kind == "away" and _team_match(away, oc_desc):
+                matched = True
+            elif outcome_kind == "draw" and ("draw" in oc_desc or oc_desc == "x"):
+                matched = True
+            elif outcome_kind == "1X" and ("1x" in oc_desc.replace(" ", "") or
+                                            (_team_match(home, oc_desc) and "draw" in oc_desc)):
+                matched = True
+            elif outcome_kind == "X2" and ("x2" in oc_desc.replace(" ", "") or
+                                            (_team_match(away, oc_desc) and "draw" in oc_desc)):
+                matched = True
+            elif outcome_kind == "over" and "over" in oc_desc:
+                matched = True
+            elif outcome_kind == "under" and "under" in oc_desc:
+                matched = True
+            elif outcome_kind == "yes" and ("yes" in oc_desc or oc_desc == "gg"):
+                matched = True
+            elif outcome_kind == "no" and ("no" in oc_desc or oc_desc == "ng"):
+                matched = True
+
+            if matched:
+                return {
+                    "eventId": pick.get("sb_event_id", ""),
+                    "marketId": str(market.get("id", "")),
+                    "specifier": m_specifier if m_specifier else None,
+                    "outcomeId": str(oc.get("id", "")),
+                }
+    return None
+
+
+# ═══════════════════════════════════════════════════════════════════
+# STEP 3: Create a booking code from selections
+# ═══════════════════════════════════════════════════════════════════
+
+def sb_create_code(selections):
+    """
+    POST selections to SportyBet, return booking code or None.
+    selections = [{eventId, marketId, specifier, outcomeId}, ...]
+    """
+    if not selections:
+        return None
+    url = "{}/orders/share".format(SB_BASE)
+    resp = _sb_post(url, {"selections": selections})
+    if not resp:
+        return None
+    if str(resp.get("message", "")).lower() == "success":
+        return resp.get("data", {}).get("code")
+    # Some deployments use bizCode
+    if resp.get("bizCode") == 10000:
+        return resp.get("data", {}).get("shareCode") or resp.get("data", {}).get("code")
+    return None
+
+
+def sb_decode_code(code):
+    """
+    Decode an existing SportyBet code (for testing / validation).
+    Returns the selections list or None.
+    """
+    if not code:
+        return None
+    url = "{}/orders/share/{}".format(SB_BASE, code)
+    resp = _sb_get(url)
+    if not resp:
+        return None
+    if str(resp.get("message", "")).lower() == "success":
+        return resp.get("data", {}).get("outcomes", [])
+    return None
+
+
+# ═══════════════════════════════════════════════════════════════════
+# ORCHESTRATOR: accumulator -> SportyBet code
+# ═══════════════════════════════════════════════════════════════════
+
+def generate_code_for_accumulator(accumulator, event_id_cache=None):
+    """
+    Take an accumulator (from football_engine.build_accumulator) and
+    generate a SportyBet booking code.
+
+    Returns dict: {code, mapped, total, missing} where:
+      code   = the booking code (or None)
+      mapped = number of picks successfully mapped
+      total  = total picks in the accumulator
+      missing = list of picks that couldn't be mapped
+    """
+    if event_id_cache is None:
+        event_id_cache = {}
+
+    selections = []
+    missing = []
+
+    for pick in accumulator["selections"]:
+        match_key = pick["match"]
+
+        # Resolve event ID (cached per match)
+        if match_key in event_id_cache:
+            event_id = event_id_cache[match_key]
+        else:
+            event_id = sb_search_event(pick["home"], pick["away"])
+            event_id_cache[match_key] = event_id
+            time.sleep(0.4)
+
+        if not event_id:
+            missing.append("{} ({})".format(pick["match"], pick["pick"]))
+            continue
+
+        pick["sb_event_id"] = event_id
+
+        # Get markets and map the pick
+        markets = sb_get_event_markets(event_id)
+        time.sleep(0.3)
+        selection = sb_map_pick_to_selection(pick, markets)
+
+        if selection and selection.get("outcomeId"):
+            selections.append(selection)
+        else:
+            missing.append("{} ({})".format(pick["match"], pick["pick"]))
+
+    code = sb_create_code(selections) if selections else None
+
+    return {
+        "code": code,
+        "mapped": len(selections),
+        "total": len(accumulator["selections"]),
+        "missing": missing,
+        "selections": selections,
+    }
+
+
+"""
+CMVNG BOT v3 — DASHBOARD TEMPLATES
+Glassmorphism, light-green theme, DM Sans + JetBrains Mono.
+Matches the arcaprotocol aesthetic (frosted cards, bold display type).
+"""
+
+# Shared CSS for all v3 football pages
+FB_CSS = """
+@import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;700;900&family=JetBrains+Mono:wght@400;500;700&display=swap');
+* { margin:0; padding:0; box-sizing:border-box; }
+body {
+  font-family:'DM Sans',sans-serif;
+  background:
+    radial-gradient(1200px 600px at 10% -10%, rgba(74,222,128,0.12), transparent 60%),
+    radial-gradient(1000px 500px at 90% 0%, rgba(34,197,94,0.10), transparent 55%),
+    linear-gradient(160deg, #eafaf0 0%, #dff5e8 35%, #d2f0de 100%);
+  color:#0f2417; min-height:100vh; padding-bottom:60px;
+}
+.nav {
+  position:sticky; top:0; z-index:50;
+  display:flex; align-items:center; justify-content:space-between;
+  padding:16px 22px;
+  background:rgba(255,255,255,0.55);
+  backdrop-filter:blur(18px); -webkit-backdrop-filter:blur(18px);
+  border-bottom:1px solid rgba(74,222,128,0.25);
+}
+.nav .logo { font-weight:900; font-size:1.15rem; color:#15803d; letter-spacing:-0.5px; }
+.nav .logo span { color:#0f2417; }
+.nav .tabs { display:flex; gap:6px; flex-wrap:wrap; }
+.nav .tabs a {
+  font-size:0.8rem; font-weight:700; text-decoration:none; color:#356148;
+  padding:8px 14px; border-radius:999px; transition:all .15s;
+}
+.nav .tabs a:hover { background:rgba(74,222,128,0.18); }
+.nav .tabs a.active { background:#15803d; color:#fff; }
+.wrap { max-width:980px; margin:0 auto; padding:28px 18px 0; }
+.page-head { margin:18px 4px 22px; }
+.page-head h1 { font-size:2.1rem; font-weight:900; letter-spacing:-1px; color:#0f2417; }
+.page-head .sub { color:#42795a; font-size:0.95rem; margin-top:4px; font-weight:500; }
+.page-head .date { font-family:'JetBrains Mono',monospace; font-size:0.8rem; color:#5b8a6e; margin-top:6px; }
+
+/* Glass card */
+.glass {
+  background:rgba(255,255,255,0.62);
+  backdrop-filter:blur(20px); -webkit-backdrop-filter:blur(20px);
+  border:1px solid rgba(255,255,255,0.8);
+  border-radius:22px;
+  box-shadow:0 8px 32px rgba(21,128,61,0.10), inset 0 1px 0 rgba(255,255,255,0.6);
+  padding:22px; margin-bottom:18px;
+}
+
+/* Accumulator tier card */
+.tier { position:relative; overflow:hidden; }
+.tier-head { display:flex; align-items:center; justify-content:space-between; margin-bottom:16px; }
+.tier-title { display:flex; align-items:center; gap:10px; }
+.tier-title .dot { width:12px; height:12px; border-radius:50%; }
+.tier-title h2 { font-size:1.15rem; font-weight:900; letter-spacing:-0.3px; }
+.tier-odds {
+  font-family:'JetBrains Mono',monospace; font-weight:700; font-size:1.4rem;
+  color:#15803d;
+}
+.tier-odds .lbl { font-size:0.65rem; color:#5b8a6e; display:block; text-align:right; font-weight:500; letter-spacing:1px; }
+.sel { display:flex; align-items:flex-start; gap:12px; padding:11px 0; border-top:1px solid rgba(21,128,61,0.10); }
+.sel:first-of-type { border-top:none; }
+.sel .ico { font-size:1.1rem; margin-top:1px; }
+.sel .body { flex:1; min-width:0; }
+.sel .match { font-weight:700; font-size:0.88rem; color:#0f2417; }
+.sel .pick { font-size:0.82rem; color:#2f6347; margin-top:1px; }
+.sel .reason { font-size:0.72rem; color:#6b9580; margin-top:3px; font-style:italic; }
+.sel .odds { font-family:'JetBrains Mono',monospace; font-weight:700; font-size:0.95rem; color:#15803d; white-space:nowrap; }
+.sel .conf { font-family:'JetBrains Mono',monospace; font-size:0.68rem; color:#5b8a6e; text-align:right; }
+.code-box {
+  margin-top:16px; padding:14px 16px; border-radius:14px;
+  background:linear-gradient(135deg, rgba(74,222,128,0.20), rgba(34,197,94,0.12));
+  border:1px dashed rgba(21,128,61,0.4);
+  display:flex; align-items:center; justify-content:space-between; gap:10px;
+}
+.code-box .label { font-size:0.68rem; color:#42795a; font-weight:700; text-transform:uppercase; letter-spacing:1px; }
+.code-box .code { font-family:'JetBrains Mono',monospace; font-weight:700; font-size:1.35rem; color:#15803d; letter-spacing:2px; }
+.code-box a { font-size:0.75rem; font-weight:700; color:#fff; background:#15803d; padding:8px 14px; border-radius:999px; text-decoration:none; white-space:nowrap; }
+.code-box.pending { background:rgba(120,120,120,0.08); border-color:rgba(120,120,120,0.3); }
+.code-box.pending .code { color:#888; font-size:0.9rem; }
+
+/* Match pick card */
+.match-card .mhead { display:flex; align-items:center; justify-content:space-between; margin-bottom:6px; }
+.match-card .teams { font-weight:900; font-size:1.05rem; color:#0f2417; letter-spacing:-0.3px; }
+.match-card .league { font-size:0.68rem; color:#5b8a6e; font-weight:700; text-transform:uppercase; letter-spacing:1px; background:rgba(74,222,128,0.15); padding:3px 10px; border-radius:999px; }
+.match-card .meta { font-family:'JetBrains Mono',monospace; font-size:0.72rem; color:#5b8a6e; margin-bottom:12px; }
+.match-card .meta .inj { color:#c2410c; }
+.pickrow { display:flex; align-items:center; gap:10px; padding:9px 0; border-top:1px solid rgba(21,128,61,0.08); }
+.pickrow:first-of-type { border-top:none; }
+.pickrow .rank { width:22px; height:22px; border-radius:50%; background:#15803d; color:#fff; font-size:0.7rem; font-weight:700; display:flex; align-items:center; justify-content:center; }
+.pickrow .ptext { flex:1; font-weight:600; font-size:0.85rem; color:#1a3d2a; }
+.pickrow .pct { font-family:'JetBrains Mono',monospace; font-weight:700; font-size:0.95rem; }
+.bar { height:5px; background:rgba(21,128,61,0.12); border-radius:999px; margin-top:5px; overflow:hidden; }
+.bar > div { height:100%; background:linear-gradient(90deg,#4ade80,#15803d); border-radius:999px; }
+.empty { text-align:center; padding:50px 20px; color:#5b8a6e; }
+.empty .big { font-size:2.2rem; margin-bottom:10px; }
+.disclaimer { text-align:center; font-size:0.72rem; color:#6b9580; margin:24px 18px; line-height:1.5; }
+@media (max-width:600px){
+  .page-head h1 { font-size:1.7rem; }
+  .nav .logo { font-size:1rem; }
+  .nav .tabs a { padding:7px 10px; font-size:0.72rem; }
+  .tier-odds { font-size:1.2rem; }
+}
+"""
+
+
+def _nav(active):
+    tabs = [
+        ("picks", "/app/picks", "⚽ Picks"),
+        ("codes", "/app/codes", "🎫 Codes"),
+        ("crypto", "/app/paper-poly", "💰 Crypto"),
+        ("sports", "/app/sports", "📊 Markets"),
+        ("results", "/app/results", "📈 Results"),
+    ]
+    items = "".join(
+        '<a href="{}" class="{}">{}</a>'.format(url, "active" if key == active else "", label)
+        for key, url, label in tabs
+    )
+    return ('<div class="nav"><div class="logo">CMVNG<span>BOT</span></div>'
+            '<div class="tabs">{}</div></div>').format(items)
+
+
+def render_codes_page(accumulators, date_str):
+    """Render the SportyBet codes page. accumulators = list of dicts with code info."""
+    blocks = []
+    for acca in accumulators:
+        if not acca:
+            continue
+        sels = "".join(
+            '<div class="sel"><div class="ico">{}</div>'
+            '<div class="body"><div class="match">{}</div>'
+            '<div class="pick">{}</div></div>'
+            '<div><div class="odds">{}</div><div class="conf">{:.0f}%</div></div></div>'.format(
+                "⚽", s["match"], s["pick"], s["odds"], s["confidence"])
+            for s in acca["selections"]
+        )
+        if acca.get("code"):
+            code_box = (
+                '<div class="code-box"><div><div class="label">SportyBet Code</div>'
+                '<div class="code">{}</div></div>'
+                '<a href="https://www.sportybet.com/ng/sport/football?shareCode={}" target="_blank">Open →</a></div>'
+            ).format(acca["code"], acca["code"])
+        else:
+            code_box = ('<div class="code-box pending"><div><div class="label">SportyBet Code</div>'
+                        '<div class="code">generating…</div></div></div>')
+
+        dot_color = {"🟢": "#15803d", "🟡": "#ca8a04", "🟠": "#ea580c", "🔴": "#dc2626"}.get(acca["emoji"], "#15803d")
+        blocks.append(
+            '<div class="glass tier"><div class="tier-head"><div class="tier-title">'
+            '<div class="dot" style="background:{}"></div><h2>{}</h2></div>'
+            '<div class="tier-odds">{:.2f}<span class="lbl">TOTAL ODDS</span></div></div>'
+            '{}{}</div>'.format(dot_color, acca["label"], acca["total_odds"], sels, code_box)
+        )
+
+    if not blocks:
+        body = ('<div class="glass empty"><div class="big">🎫</div>'
+                '<div>No codes generated yet. The engine runs every few hours — '
+                'check back after the next scan.</div></div>')
+    else:
+        body = "".join(blocks)
+
+    return """<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SportyBet Codes — Cmvng Bot</title><style>{css}</style></head><body>
+{nav}
+<div class="wrap">
+<div class="page-head"><h1>Today's Codes</h1>
+<div class="sub">Accumulator booking codes for SportyBet</div>
+<div class="date">{date}</div></div>
+{body}
+<div class="disclaimer">Codes are auto-generated from data analysis. Odds may shift before kickoff.
+Always review selections in your SportyBet app before staking. No bet is guaranteed.</div>
+</div></body></html>""".format(css=FB_CSS, nav=_nav("codes"), date=date_str, body=body)
+
+
+def render_picks_page(match_picks, date_str):
+    """Render the analyzed picks page. match_picks = dict {match: [top picks]}."""
+    blocks = []
+    for match, picks in match_picks.items():
+        if not picks:
+            continue
+        first = picks[0]
+        meta_bits = []
+        if first.get("home_form_disp"):
+            meta_bits.append("Form: {} {} | {} {}".format(
+                first["home"], first.get("home_form_disp", "?"),
+                first["away"], first.get("away_form_disp", "?")))
+        meta = " · ".join(meta_bits) if meta_bits else first.get("reasoning", "")
+
+        rows = "".join(
+            '<div class="pickrow"><div class="rank">{}</div>'
+            '<div class="ptext">{}<div class="bar"><div style="width:{:.0f}%"></div></div></div>'
+            '<div class="pct" style="color:{}">{:.0f}%</div></div>'.format(
+                i, p["pick"], p["confidence"],
+                "#15803d" if p["confidence"] >= 70 else ("#ca8a04" if p["confidence"] >= 55 else "#ea580c"),
+                p["confidence"])
+            for i, p in enumerate(picks, 1)
+        )
+        league = first.get("league", "")
+        blocks.append(
+            '<div class="glass match-card"><div class="mhead">'
+            '<div class="teams">{}</div><div class="league">{}</div></div>'
+            '<div class="meta">{}</div>{}</div>'.format(match, league, meta, rows)
+        )
+
+    if not blocks:
+        body = ('<div class="glass empty"><div class="big">⚽</div>'
+                '<div>No picks analyzed yet. The engine runs every few hours.</div></div>')
+    else:
+        body = "".join(blocks)
+
+    return """<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Football Picks — Cmvng Bot</title><style>{css}</style></head><body>
+{nav}
+<div class="wrap">
+<div class="page-head"><h1>Football Picks</h1>
+<div class="sub">Top 3 highest-probability picks per match</div>
+<div class="date">{date}</div></div>
+{body}
+<div class="disclaimer">Picks generated from form, xG, head-to-head, injuries and team stats.
+Percentages are model estimates, not guarantees.</div>
+</div></body></html>""".format(css=FB_CSS, nav=_nav("picks"), date=date_str, body=body)
+
+
+def render_results_page(stats, date_str):
+    """Render results/win-rate page. stats = list of {tier, won, total, ...}."""
+    blocks = []
+    for st in stats:
+        wr = (st["wins"] / st["settled"] * 100) if st.get("settled") else 0
+        blocks.append(
+            '<div class="glass"><div class="tier-head">'
+            '<div class="tier-title"><h2>{}</h2></div>'
+            '<div class="tier-odds">{:.0f}%<span class="lbl">WIN RATE</span></div></div>'
+            '<div class="meta" style="font-family:JetBrains Mono,monospace;color:#5b8a6e;font-size:0.8rem">'
+            '{} won / {} settled · {} pending</div></div>'.format(
+                st["tier_label"], wr, st["wins"], st["settled"], st.get("pending", 0))
+        )
+    if not blocks:
+        body = ('<div class="glass empty"><div class="big">📈</div>'
+                '<div>No settled results yet. Win rates appear after matches finish.</div></div>')
+    else:
+        body = "".join(blocks)
+
+    return """<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Results — Cmvng Bot</title><style>{css}</style></head><body>
+{nav}
+<div class="wrap">
+<div class="page-head"><h1>Results</h1>
+<div class="sub">Win-rate tracking per accumulator tier</div>
+<div class="date">{date}</div></div>
+{body}
+</div></body></html>""".format(css=FB_CSS, nav=_nav("results"), date=date_str, body=body)
+
+
+"""
+═══════════════════════════════════════════════════════════════════
+CMVNG BOT v3 — TELEGRAM COMMAND SYSTEM
+═══════════════════════════════════════════════════════════════════
+Menu structure exactly as specified:
+
+  /sports  -> [Polymarket Sports] [Limitless Sports] [Football Picks]
+  /crypto  -> [Polymarket Crypto] [Limitless Crypto]
+  /picks   -> today's football picks
+  /codes   -> SportyBet booking codes (5 tiers)
+  /live    -> all unresolved bets across platforms
+  /results -> win rates per tier
+
+Anyone can use / commands to browse. New picks/signals auto-send.
+
+This module builds the message text + inline keyboards. The actual
+send/answer happens via the Telegram Bot API. Wired in app.py.
+═══════════════════════════════════════════════════════════════════
+"""
+
+import json
+
+try:
+    import requests as _req
+except ImportError:
+    _req = None
+
+
+# ═══════════════════════════════════════════════════════════════════
+# LOW-LEVEL TELEGRAM API
+# ═══════════════════════════════════════════════════════════════════
+
+def tg_send(token, chat_id, text, keyboard=None, parse_mode="HTML"):
+    """Send a message, optionally with an inline keyboard."""
+    if _req is None or not token or not chat_id:
+        return None
+    payload = {"chat_id": chat_id, "text": text, "parse_mode": parse_mode,
+               "disable_web_page_preview": True}
+    if keyboard:
+        payload["reply_markup"] = json.dumps({"inline_keyboard": keyboard})
+    try:
+        r = _req.post("https://api.telegram.org/bot{}/sendMessage".format(token),
+                      json=payload, timeout=10)
+        return r.json()
+    except Exception as e:
+        print("[TG] send error: {}".format(e))
+        return None
+
+
+def tg_answer_callback(token, callback_id, text=""):
+    """Acknowledge a button tap so Telegram stops the loading spinner."""
+    if _req is None or not token:
+        return
+    try:
+        _req.post("https://api.telegram.org/bot{}/answerCallbackQuery".format(token),
+                  json={"callback_query_id": callback_id, "text": text}, timeout=8)
+    except Exception:
+        pass
+
+
+def tg_set_webhook(token, url):
+    """Register the webhook URL with Telegram."""
+    if _req is None or not token:
+        return None
+    try:
+        r = _req.post("https://api.telegram.org/bot{}/setWebhook".format(token),
+                      json={"url": url, "allowed_updates": ["message", "callback_query"]},
+                      timeout=10)
+        return r.json()
+    except Exception as e:
+        print("[TG] setWebhook error: {}".format(e))
+        return None
+
+
+def tg_set_commands(token):
+    """Register the slash-command menu shown in the Telegram UI."""
+    if _req is None or not token:
+        return
+    commands = [
+        {"command": "picks", "description": "Today's football picks"},
+        {"command": "codes", "description": "SportyBet booking codes"},
+        {"command": "sports", "description": "Sports markets menu"},
+        {"command": "crypto", "description": "Crypto signals menu"},
+        {"command": "live", "description": "Unresolved bets (all platforms)"},
+        {"command": "results", "description": "Win rates per tier"},
+    ]
+    try:
+        _req.post("https://api.telegram.org/bot{}/setMyCommands".format(token),
+                  json={"commands": commands}, timeout=8)
+    except Exception:
+        pass
+
+
+# ═══════════════════════════════════════════════════════════════════
+# MENU KEYBOARDS
+# ═══════════════════════════════════════════════════════════════════
+
+def kb_sports_menu():
+    return [
+        [{"text": "📊 Polymarket Sports", "callback_data": "sports_poly"}],
+        [{"text": "📊 Limitless Sports", "callback_data": "sports_limitless"}],
+        [{"text": "⚽ Football Picks", "callback_data": "show_picks"}],
+        [{"text": "🎫 SportyBet Codes", "callback_data": "show_codes"}],
+    ]
+
+
+def kb_crypto_menu():
+    return [
+        [{"text": "💰 Polymarket Crypto", "callback_data": "crypto_poly"}],
+        [{"text": "💰 Limitless Crypto", "callback_data": "crypto_limitless"}],
+    ]
+
+
+def kb_main_menu():
+    return [
+        [{"text": "⚽ Football Picks", "callback_data": "show_picks"},
+         {"text": "🎫 Codes", "callback_data": "show_codes"}],
+        [{"text": "📊 Sports Markets", "callback_data": "menu_sports"},
+         {"text": "💰 Crypto", "callback_data": "menu_crypto"}],
+        [{"text": "📈 Results", "callback_data": "show_results"},
+         {"text": "🔴 Live Bets", "callback_data": "show_live"}],
+    ]
+
+
+# ═══════════════════════════════════════════════════════════════════
+# MESSAGE FORMATTERS
+# ═══════════════════════════════════════════════════════════════════
+
+def fmt_welcome():
+    return (
+        "🤖 <b>CMVNG BOT</b>\n\n"
+        "Your automated football + crypto prediction engine.\n\n"
+        "<b>Commands:</b>\n"
+        "/picks — today's football picks\n"
+        "/codes — SportyBet booking codes\n"
+        "/sports — sports markets menu\n"
+        "/crypto — crypto signals menu\n"
+        "/live — unresolved bets\n"
+        "/results — win rates\n\n"
+        "Pick a section below 👇"
+    )
+
+
+def fmt_codes(accumulators, date_str):
+    """Format the SportyBet codes message for all tiers."""
+    if not accumulators:
+        return "🎫 <b>No codes generated yet.</b>\nThe engine runs every few hours — check back soon."
+
+    lines = ["🎫 <b>TODAY'S CODES</b> — {}".format(date_str), ""]
+    for acca in accumulators:
+        if not acca:
+            continue
+        lines.append("{} <b>{}</b>  ·  <code>{:.2f}</code>".format(
+            acca["emoji"], acca["label"], acca["total_odds"]))
+        for s in acca["selections"]:
+            lines.append("• {} — {} @ {:.2f}".format(
+                _short(s["match"]), s["pick"], s["odds"]))
+        if acca.get("code"):
+            lines.append("🎫 <b>Code:</b> <code>{}</code>".format(acca["code"]))
+            lines.append("🔗 sportybet.com/ng → load <code>{}</code>".format(acca["code"]))
+        else:
+            lines.append("🎫 <i>code generating…</i>")
+        lines.append("")
+    return "\n".join(lines)
+
+
+def fmt_picks(match_picks, date_str, limit=12):
+    """Format the football picks message."""
+    if not match_picks:
+        return "⚽ <b>No picks analyzed yet.</b>\nThe engine runs every few hours."
+
+    lines = ["⚽ <b>FOOTBALL PICKS</b> — {}".format(date_str), ""]
+    count = 0
+    for match, picks in match_picks.items():
+        if not picks or count >= limit:
+            continue
+        count += 1
+        lines.append("🏟 <b>{}</b>".format(match))
+        for i, p in enumerate(picks, 1):
+            lines.append("  {}. {} — <b>{:.0f}%</b>".format(i, p["pick"], p["confidence"]))
+        lines.append("")
+    return "\n".join(lines)
+
+
+def fmt_results(stats, date_str):
+    if not stats:
+        return "📈 <b>No settled results yet.</b>\nWin rates appear after matches finish."
+    lines = ["📈 <b>RESULTS</b> — {}".format(date_str), ""]
+    for st in stats:
+        wr = (st["wins"] / st["settled"] * 100) if st.get("settled") else 0
+        lines.append("{}\n  {} won / {} settled ({:.0f}%) · {} pending".format(
+            st["tier_label"], st["wins"], st["settled"], wr, st.get("pending", 0)))
+    return "\n".join(lines)
+
+
+def _short(match, n=34):
+    return match if len(match) <= n else match[:n-1] + "…"
+
+
+"""
+═══════════════════════════════════════════════════════════════════
+CMVNG BOT v3 — FOOTBALL INTEGRATION GLUE
+═══════════════════════════════════════════════════════════════════
+This is the code that gets inlined into app.py. It assumes all the
+engine/scraper/sportybet/web/telegram functions are in the same
+namespace (they're concatenated above it in the final app.py).
+
+Provides:
+  - DB tables (football_picks, sportybet_accumulators, pick_results)
+  - run_football_engine()  -> the daily scrape→analyze→build→codes→save→telegram
+  - in-memory cache so /picks /codes serve instantly
+  - background thread (every 6h)
+  - Flask routes  /app/picks /app/codes /app/results
+  - Telegram webhook  /api/telegram-webhook  + command router
+═══════════════════════════════════════════════════════════════════
+"""
+
+
+import os
+import json
+import time
+import threading
+import datetime as _dt
+
+
+# ═══════════════════════════════════════════════════════════════════
+# IN-MEMORY CACHE — latest engine output (so commands respond instantly)
+# ═══════════════════════════════════════════════════════════════════
+
+_FB_CACHE = {
+    "date": "",
+    "match_picks": {},      # {match: [top picks]}
+    "accumulators": [],     # [acca dict with code]
+    "last_run": None,
+    "running": False,
+}
+
+
+# ═══════════════════════════════════════════════════════════════════
+# DB SETUP
+# ═══════════════════════════════════════════════════════════════════
+
+def fb_init_db(get_db):
+    """Create football tables. Safe to call repeatedly."""
+    try:
+        conn = get_db()
+        conn.run("""
+            CREATE TABLE IF NOT EXISTS football_picks (
+                id SERIAL PRIMARY KEY,
+                match_date DATE,
+                home TEXT, away TEXT, league TEXT,
+                market_type TEXT, pick TEXT,
+                confidence REAL, odds REAL,
+                reasoning TEXT,
+                result TEXT DEFAULT 'pending',
+                created_at TIMESTAMPTZ DEFAULT NOW()
+            )
+        """)
+        conn.run("""
+            CREATE TABLE IF NOT EXISTS sportybet_accumulators (
+                id SERIAL PRIMARY KEY,
+                match_date DATE,
+                tier TEXT, label TEXT,
+                target_odds REAL, total_odds REAL,
+                num_selections INT,
+                selections_json TEXT,
+                sportybet_code TEXT,
+                status TEXT DEFAULT 'pending',
+                result TEXT,
+                created_at TIMESTAMPTZ DEFAULT NOW()
+            )
+        """)
+        conn.run("""
+            CREATE TABLE IF NOT EXISTS pick_results (
+                id SERIAL PRIMARY KEY,
+                match_date DATE,
+                tier TEXT, total_picks INT, hits INT,
+                won BOOLEAN, total_odds REAL,
+                created_at TIMESTAMPTZ DEFAULT NOW()
+            )
+        """)
+        conn.close()
+        print("[FB] DB tables ready")
+    except Exception as e:
+        print("[FB] DB init error: {}".format(e))
+
+
+def fb_save_run(get_db, date_str, all_picks, accumulators):
+    """Persist the day's picks and accumulators."""
+    try:
+        conn = get_db()
+        today = _dt.date.today()
+        # Save top picks (limit to keep DB lean)
+        for p in all_picks[:200]:
+            conn.run("""INSERT INTO football_picks
+                (match_date, home, away, league, market_type, pick, confidence, odds, reasoning)
+                VALUES (:d,:h,:a,:l,:mt,:pk,:cf,:od,:rs)""",
+                d=today, h=p["home"], a=p["away"], l=p["league"],
+                mt=p["market_type"], pk=p["pick"], cf=p["confidence"],
+                od=p["odds"], rs=p["reasoning"])
+        # Save accumulators
+        for acca in accumulators:
+            if not acca:
+                continue
+            conn.run("""INSERT INTO sportybet_accumulators
+                (match_date, tier, label, target_odds, total_odds, num_selections,
+                 selections_json, sportybet_code)
+                VALUES (:d,:t,:lb,:tg,:to,:ns,:sj,:cd)""",
+                d=today, t=acca["tier"], lb=acca["label"],
+                tg=acca["target_odds"], to=acca["total_odds"],
+                ns=acca["num_selections"],
+                sj=json.dumps([{"match": s["match"], "pick": s["pick"],
+                                "odds": s["odds"], "confidence": s["confidence"]}
+                               for s in acca["selections"]]),
+                cd=acca.get("code"))
+        conn.close()
+    except Exception as e:
+        print("[FB] save error: {}".format(e))
+
+
+# ═══════════════════════════════════════════════════════════════════
+# MAIN ORCHESTRATION
+# Assumes these are in namespace (inlined above in app.py):
+#   build_fixture_dataset, analyze_fixture, build_all_accumulators,
+#   top_picks_per_match, generate_code_for_accumulator,
+#   tg_send (+ token/chat), fmt_codes, fmt_picks
+# ═══════════════════════════════════════════════════════════════════
+
+def run_football_engine(get_db, tg_token, tg_chat, send_telegram,
+                        generate_codes=True, announce=True):
+    """
+    The full daily pipeline. Designed to never crash — every stage is
+    wrapped, and a failure in one stage doesn't kill the others.
+    """
+    if _FB_CACHE["running"]:
+        print("[FB] engine already running, skip")
+        return
+    _FB_CACHE["running"] = True
+    try:
+        date_human = _dt.date.today().strftime("%A, %B %d, %Y")
+        print("[FB] ═══ Engine run starting ({}) ═══".format(date_human))
+
+        # 1. Scrape
+        try:
+            fixtures = build_fixture_dataset()
+        except Exception as e:
+            print("[FB] scrape failed: {}".format(e))
+            fixtures = []
+
+        if not fixtures:
+            print("[FB] No fixtures — engine run aborted")
+            _FB_CACHE["running"] = False
+            return
+
+        # 2. Analyze
+        all_picks = []
+        for fx in fixtures:
+            try:
+                all_picks.extend(analyze_fixture(fx))
+            except Exception as e:
+                print("[FB] analyze error for {}: {}".format(fx.get("home_team"), e))
+        print("[FB] Scored {} picks across {} fixtures".format(len(all_picks), len(fixtures)))
+
+        if not all_picks:
+            _FB_CACHE["running"] = False
+            return
+
+        # 3. Build accumulators
+        try:
+            acca_dict = build_all_accumulators(all_picks)
+        except Exception as e:
+            print("[FB] accumulator build error: {}".format(e))
+            acca_dict = {}
+
+        accumulators = [acca_dict[k] for k in
+                        ["2_odds", "3_odds", "5_odds", "10_odds", "1000_odds"]
+                        if acca_dict.get(k)]
+
+        # 4. Generate SportyBet codes
+        if generate_codes:
+            event_cache = {}
+            for acca in accumulators:
+                try:
+                    result = generate_code_for_accumulator(acca, event_cache)
+                    acca["code"] = result.get("code")
+                    acca["code_mapped"] = result.get("mapped", 0)
+                    acca["code_total"] = result.get("total", 0)
+                    if result.get("code"):
+                        print("[FB] {} code: {} ({}/{} mapped)".format(
+                            acca["tier"], result["code"], result["mapped"], result["total"]))
+                    else:
+                        print("[FB] {} code FAILED ({}/{} mapped, missing: {})".format(
+                            acca["tier"], result.get("mapped", 0), result.get("total", 0),
+                            result.get("missing", [])[:3]))
+                except Exception as e:
+                    print("[FB] code gen error for {}: {}".format(acca["tier"], e))
+                    acca["code"] = None
+
+        # 5. Cache + persist
+        match_picks = top_picks_per_match(all_picks, 3)
+        _FB_CACHE["date"] = date_human
+        _FB_CACHE["match_picks"] = match_picks
+        _FB_CACHE["accumulators"] = accumulators
+        _FB_CACHE["last_run"] = _dt.datetime.now()
+
+        try:
+            fb_save_run(get_db, date_human, all_picks, accumulators)
+        except Exception as e:
+            print("[FB] persist error: {}".format(e))
+
+        # 6. Telegram announce
+        if announce:
+            try:
+                msg = fmt_codes(accumulators, date_human)
+                send_telegram(msg)
+            except Exception as e:
+                print("[FB] announce error: {}".format(e))
+
+        print("[FB] ═══ Engine run complete ═══")
+    finally:
+        _FB_CACHE["running"] = False
+
+
+def fb_scanner_thread(get_db, tg_token, tg_chat, send_telegram, interval_hours=6):
+    """Background thread: run the engine on a schedule."""
+    def loop():
+        time.sleep(30)  # let app boot first
+        # Initial run
+        try:
+            run_football_engine(get_db, tg_token, tg_chat, send_telegram)
+        except Exception as e:
+            print("[FB] initial run error: {}".format(e))
+        # Periodic
+        while True:
+            time.sleep(interval_hours * 3600)
+            try:
+                run_football_engine(get_db, tg_token, tg_chat, send_telegram)
+            except Exception as e:
+                print("[FB] scheduled run error: {}".format(e))
+    threading.Thread(target=loop, daemon=True).start()
+    print("[FB] scanner thread started (every {}h)".format(interval_hours))
+
+
+# ═══════════════════════════════════════════════════════════════════
+# TELEGRAM WEBHOOK HANDLER
+# Assumes in namespace: tg_send, tg_answer_callback, kb_*, fmt_*
+# Plus crypto/sports market accessors from existing app.py
+# ═══════════════════════════════════════════════════════════════════
+
+def fb_handle_telegram_update(update, tg_token,
+                              get_crypto_signals=None, get_sports_markets=None,
+                              get_live_bets=None, get_results=None):
+    """
+    Process one Telegram update (message or callback).
+    Returns nothing — sends replies directly.
+    """
+    try:
+        # ── Slash commands ──
+        if "message" in update:
+            msg = update["message"]
+            chat_id = msg["chat"]["id"]
+            text = (msg.get("text") or "").strip().lower()
+
+            if text in ("/start", "/menu", "/help"):
+                tg_send(tg_token, chat_id, fmt_welcome(), kb_main_menu())
+            elif text.startswith("/picks"):
+                tg_send(tg_token, chat_id,
+                        fmt_picks(_FB_CACHE["match_picks"], _FB_CACHE["date"] or "today"))
+            elif text.startswith("/codes"):
+                tg_send(tg_token, chat_id,
+                        fmt_codes(_FB_CACHE["accumulators"], _FB_CACHE["date"] or "today"))
+            elif text.startswith("/sports"):
+                tg_send(tg_token, chat_id, "📊 <b>Sports Markets</b>\nChoose a source:", kb_sports_menu())
+            elif text.startswith("/crypto"):
+                tg_send(tg_token, chat_id, "💰 <b>Crypto Signals</b>\nChoose a source:", kb_crypto_menu())
+            elif text.startswith("/live"):
+                _send_live(tg_token, chat_id, get_live_bets)
+            elif text.startswith("/results"):
+                _send_results(tg_token, chat_id, get_results)
+            return
+
+        # ── Button taps ──
+        if "callback_query" in update:
+            cq = update["callback_query"]
+            chat_id = cq["message"]["chat"]["id"]
+            data = cq.get("data", "")
+            tg_answer_callback(tg_token, cq["id"])
+
+            if data == "show_picks":
+                tg_send(tg_token, chat_id,
+                        fmt_picks(_FB_CACHE["match_picks"], _FB_CACHE["date"] or "today"))
+            elif data == "show_codes":
+                tg_send(tg_token, chat_id,
+                        fmt_codes(_FB_CACHE["accumulators"], _FB_CACHE["date"] or "today"))
+            elif data == "menu_sports":
+                tg_send(tg_token, chat_id, "📊 <b>Sports Markets</b>\nChoose a source:", kb_sports_menu())
+            elif data == "menu_crypto":
+                tg_send(tg_token, chat_id, "💰 <b>Crypto Signals</b>\nChoose a source:", kb_crypto_menu())
+            elif data == "show_results":
+                _send_results(tg_token, chat_id, get_results)
+            elif data == "show_live":
+                _send_live(tg_token, chat_id, get_live_bets)
+            elif data in ("crypto_poly", "crypto_limitless"):
+                platform = "polymarket" if data == "crypto_poly" else "limitless"
+                _send_crypto(tg_token, chat_id, platform, get_crypto_signals)
+            elif data in ("sports_poly", "sports_limitless"):
+                platform = "polymarket" if data == "sports_poly" else "limitless"
+                _send_sports(tg_token, chat_id, platform, get_sports_markets)
+            return
+    except Exception as e:
+        print("[TG] handler error: {}".format(e))
+
+
+def _send_crypto(tg_token, chat_id, platform, getter):
+    if getter is None:
+        tg_send(tg_token, chat_id, "💰 Crypto signals not available right now.")
+        return
+    try:
+        signals = getter(platform)
+        if not signals:
+            tg_send(tg_token, chat_id,
+                    "💰 <b>{} Crypto</b>\nNo open signals right now.".format(platform.title()))
+            return
+        lines = ["💰 <b>{} Crypto Signals</b>".format(platform.title()), ""]
+        for s in signals[:15]:
+            lines.append("• {}".format(s))
+        tg_send(tg_token, chat_id, "\n".join(lines))
+    except Exception as e:
+        tg_send(tg_token, chat_id, "💰 Error loading crypto signals.")
+        print("[TG] crypto error: {}".format(e))
+
+
+def _send_sports(tg_token, chat_id, platform, getter):
+    if getter is None:
+        tg_send(tg_token, chat_id, "📊 Sports markets not available right now.")
+        return
+    try:
+        markets = getter(platform)
+        if not markets:
+            tg_send(tg_token, chat_id,
+                    "📊 <b>{} Sports</b>\nNo sports markets right now.".format(platform.title()))
+            return
+        lines = ["📊 <b>{} Sports Markets</b>".format(platform.title()), ""]
+        for m in markets[:15]:
+            lines.append("• {}".format(m))
+        tg_send(tg_token, chat_id, "\n".join(lines))
+    except Exception as e:
+        tg_send(tg_token, chat_id, "📊 Error loading sports markets.")
+        print("[TG] sports error: {}".format(e))
+
+
+def _send_live(tg_token, chat_id, getter):
+    if getter is None:
+        tg_send(tg_token, chat_id, "🔴 Live bets not available right now.")
+        return
+    try:
+        bets = getter()
+        if not bets:
+            tg_send(tg_token, chat_id, "🔴 <b>Live Bets</b>\nNo unresolved bets right now.")
+            return
+        lines = ["🔴 <b>Unresolved Bets</b>", ""]
+        for b in bets[:25]:
+            lines.append("• {}".format(b))
+        tg_send(tg_token, chat_id, "\n".join(lines))
+    except Exception as e:
+        tg_send(tg_token, chat_id, "🔴 Error loading live bets.")
+        print("[TG] live error: {}".format(e))
+
+
+def _send_results(tg_token, chat_id, getter):
+    if getter is None:
+        tg_send(tg_token, chat_id, fmt_results([], _FB_CACHE["date"] or "today"))
+        return
+    try:
+        stats = getter()
+        tg_send(tg_token, chat_id, fmt_results(stats, _FB_CACHE["date"] or "today"))
+    except Exception as e:
+        tg_send(tg_token, chat_id, "📈 Error loading results.")
+        print("[TG] results error: {}".format(e))
+
+
+
+# ═══════════════════════════════════════════════════════════════════
+# FOOTBALL v3 — BRIDGE: data getters for Telegram + Flask routes
+# ═══════════════════════════════════════════════════════════════════
+
+def _fb_today_human():
+    return _dt.date.today().strftime("%A, %B %d, %Y")
+
+
+def _fb_get_crypto_signals(platform):
+    """Open crypto signals for a platform (from v2_paper_trades)."""
+    out = []
+    try:
+        conn = get_db()
+        rows = conn.run(
+            "SELECT asset, direction, timeframe, entry_odds, confidence "
+            "FROM v2_paper_trades WHERE platform=:p AND status='OPEN' "
+            "ORDER BY id DESC LIMIT 20", p=platform)
+        conn.close()
+        for r in rows:
+            asset, direction, tf, odds, conf = r
+            odds_disp = ""
+            if odds:
+                cents = odds * 100 if odds <= 1 else odds
+                odds_disp = " @ {:.0f}c".format(cents)
+            conf_disp = " ({})".format(conf) if conf else ""
+            out.append("{} {} · {}{}{}".format(asset, direction, tf, odds_disp, conf_disp))
+    except Exception as e:
+        print("[FB] crypto getter error: {}".format(e))
+    return out
+
+
+def _fb_get_sports_markets(platform):
+    """Recent sports market alerts for a platform (from in-memory cache)."""
+    try:
+        return list(_sports_market_cache.get(platform, []))
+    except Exception:
+        return []
+
+
+def _fb_get_live_bets():
+    """All unresolved bets across platforms (crypto open + football codes)."""
+    out = []
+    try:
+        conn = get_db()
+        rows = conn.run(
+            "SELECT platform, asset, direction, timeframe FROM v2_paper_trades "
+            "WHERE status='OPEN' ORDER BY id DESC LIMIT 30")
+        conn.close()
+        for r in rows:
+            out.append("{} · {} {} {}".format(r[0], r[1], r[2], r[3]))
+    except Exception as e:
+        print("[FB] live getter error: {}".format(e))
+    for acca in _FB_CACHE.get("accumulators", []):
+        if acca.get("code"):
+            out.append("{} {} — code {} @ {:.2f}".format(
+                acca.get("emoji", "⚽"), acca["label"], acca["code"], acca["total_odds"]))
+    return out
+
+
+def _fb_get_results():
+    """Win-rate stats per accumulator tier."""
+    tiers = [("2_odds", "🟢 2 ODDS — BANKER"), ("3_odds", "🟢 3 ODDS — SAFE"),
+             ("5_odds", "🟡 5 ODDS — VALUE"), ("10_odds", "🟠 10 ODDS — RISK"),
+             ("1000_odds", "🔴 1000+ ODDS — MOONSHOT")]
+    stats = []
+    agg = {}
+    try:
+        conn = get_db()
+        rows = conn.run("SELECT tier, result FROM sportybet_accumulators")
+        conn.close()
+        for r in rows:
+            tier, result = r[0], r[1]
+            a = agg.setdefault(tier, {"wins": 0, "settled": 0, "pending": 0})
+            if result == "won":
+                a["wins"] += 1; a["settled"] += 1
+            elif result == "lost":
+                a["settled"] += 1
+            else:
+                a["pending"] += 1
+    except Exception as e:
+        print("[FB] results getter error: {}".format(e))
+    for tier, label in tiers:
+        a = agg.get(tier, {"wins": 0, "settled": 0, "pending": 0})
+        stats.append({"tier_label": label, "wins": a["wins"],
+                      "settled": a["settled"], "pending": a["pending"]})
+    return stats
+
+
+# ── Flask routes ──
+
+@app.route("/app/picks")
+def fb_picks_page():
+    return render_picks_page(_FB_CACHE.get("match_picks", {}),
+                             _FB_CACHE.get("date") or _fb_today_human())
+
+
+@app.route("/app/codes")
+def fb_codes_page():
+    return render_codes_page(_FB_CACHE.get("accumulators", []),
+                             _FB_CACHE.get("date") or _fb_today_human())
+
+
+@app.route("/app/results")
+def fb_results_page():
+    return render_results_page(_fb_get_results(),
+                               _FB_CACHE.get("date") or _fb_today_human())
+
+
+@app.route("/api/telegram-webhook", methods=["POST"])
+def telegram_webhook():
+    try:
+        update = request.get_json(force=True, silent=True) or {}
+        fb_handle_telegram_update(
+            update, TELEGRAM_TOKEN,
+            get_crypto_signals=_fb_get_crypto_signals,
+            get_sports_markets=_fb_get_sports_markets,
+            get_live_bets=_fb_get_live_bets,
+            get_results=_fb_get_results)
+    except Exception as e:
+        print("[TG] webhook error: {}".format(e))
+    return jsonify({"ok": True})
+
+
+@app.route("/app/run-football")
+def fb_manual_run():
+    """Manual trigger to run the football engine now (for testing)."""
+    threading.Thread(
+        target=run_football_engine,
+        args=(get_db, TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, send_telegram),
+        daemon=True).start()
+    return jsonify({"ok": True, "msg": "Football engine started — check logs and /app/codes in a minute"})
+
+
 # ═══════════════════════════════════════════════════════════
 # STARTUP
 # ═══════════════════════════════════════════════════════════
@@ -4068,10 +6188,41 @@ threading.Thread(target=_v2_cleanup_loop, daemon=True, name="v2-cleanup").start(
 threading.Thread(target=_sports_scanner_thread, daemon=True, name="sports-scanner").start()
 print("[SPORTS] Scanner thread launched")
 
+# ── Football v3 engine ──
+try:
+    fb_init_db(get_db)
+except Exception as e:
+    print("[FB] DB init error: {}".format(e))
+
+# Telegram commands + webhook
+try:
+    tg_set_commands(TELEGRAM_TOKEN)
+    _webhook_base = os.environ.get("WEBHOOK_BASE_URL") or os.environ.get("RAILWAY_PUBLIC_DOMAIN", "")
+    if _webhook_base:
+        if not _webhook_base.startswith("http"):
+            _webhook_base = "https://" + _webhook_base
+        _wh = tg_set_webhook(TELEGRAM_TOKEN, _webhook_base.rstrip("/") + "/api/telegram-webhook")
+        print("[TG] Webhook set to {}/api/telegram-webhook -> {}".format(_webhook_base.rstrip("/"), _wh))
+    else:
+        print("[TG] No WEBHOOK_BASE_URL / RAILWAY_PUBLIC_DOMAIN set — set one so /commands work")
+except Exception as e:
+    print("[TG] Webhook setup error: {}".format(e))
+
+# Football scanner thread (scrape -> analyze -> build -> codes -> telegram, every 6h)
+try:
+    fb_scanner_thread(get_db, TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, send_telegram, interval_hours=6)
+except Exception as e:
+    print("[FB] scanner thread error: {}".format(e))
+
 print("[V2] All threads launched — engine running")
 print("=" * 60)
 
-send_telegram("🚀 <b>CMVNG BOT v2 STARTED</b>\nConfirmation Trading Engine\nMode: PAPER | $50/platform | $3/trade\nWatchers: 1H + 15M + DAILY\nPlatforms: Polymarket + Limitless")
+send_telegram("🚀 <b>CMVNG BOT v3 STARTED</b>\n\n"
+              "💰 <b>Crypto:</b> Polymarket + Limitless (1H/15M/Daily)\n"
+              "⚽ <b>Football:</b> analysis engine + SportyBet codes\n"
+              "📊 <b>Sports markets:</b> live scanner\n\n"
+              "Commands: /picks /codes /sports /crypto /live /results\n"
+              "Tap /start for the menu.")
 
 
 if __name__ == "__main__":
