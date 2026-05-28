@@ -2310,45 +2310,64 @@ def _v2_cleanup_loop():
 
 DASHBOARD_CSS = """
 <style>
-@import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;700&family=JetBrains+Mono:wght@400;500&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;700;900&family=JetBrains+Mono:wght@400;500;700&display=swap');
 * { margin: 0; padding: 0; box-sizing: border-box; }
-body { font-family: 'DM Sans', sans-serif; background: #0a0f0d; color: #e8ede9; min-height: 100vh; }
-.container { max-width: 1200px; margin: 0 auto; padding: 20px; }
-.header { display: flex; justify-content: space-between; align-items: center; padding: 20px 0; border-bottom: 1px solid #1a2e1f; margin-bottom: 24px; }
-.header h1 { font-size: 1.5rem; color: #4ade80; font-weight: 700; }
-.header .subtitle { font-size: 0.85rem; color: #6b8f74; }
-.nav { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 24px; }
-.nav a { color: #4ade80; text-decoration: none; font-size: 0.85rem; padding: 6px 14px; border: 1px solid #1a2e1f; border-radius: 6px; transition: all 0.2s; }
-.nav a:hover, .nav a.active { background: #1a2e1f; border-color: #4ade80; }
-.stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; margin-bottom: 24px; }
-.stat-card { background: #111a14; border: 1px solid #1a2e1f; border-radius: 10px; padding: 16px; }
-.stat-card .label { font-size: 0.75rem; color: #6b8f74; text-transform: uppercase; letter-spacing: 0.5px; }
-.stat-card .value { font-size: 1.5rem; font-weight: 700; font-family: 'JetBrains Mono', monospace; margin-top: 4px; }
-.stat-card .value.green { color: #4ade80; }
-.stat-card .value.red { color: #f87171; }
-.stat-card .value.blue { color: #60a5fa; }
+body {
+  font-family: 'DM Sans', sans-serif; color: #0f2417; min-height: 100vh;
+  background:
+    radial-gradient(1200px 600px at 10% -10%, rgba(74,222,128,0.12), transparent 60%),
+    radial-gradient(1000px 500px at 90% 0%, rgba(34,197,94,0.10), transparent 55%),
+    linear-gradient(160deg, #eafaf0 0%, #dff5e8 35%, #d2f0de 100%);
+}
+.container { max-width: 1100px; margin: 0 auto; padding: 22px 18px 60px; }
+.header { display: flex; justify-content: space-between; align-items: center; padding: 10px 0 18px; margin-bottom: 18px; }
+.header h1 { font-size: 1.6rem; color: #15803d; font-weight: 900; letter-spacing: -0.5px; }
+.header .subtitle { font-size: 0.85rem; color: #42795a; font-weight: 500; }
+.nav { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 22px; }
+.nav a { color: #356148; text-decoration: none; font-size: 0.8rem; font-weight: 700; padding: 8px 14px; border-radius: 999px; transition: all 0.15s; }
+.nav a:hover { background: rgba(74,222,128,0.18); }
+.nav a.active { background: #15803d; color: #fff; }
+.stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin-bottom: 22px; }
+.stat-card {
+  background: rgba(255,255,255,0.62); backdrop-filter: blur(20px); -webkit-backdrop-filter: blur(20px);
+  border: 1px solid rgba(255,255,255,0.8); border-radius: 18px; padding: 16px;
+  box-shadow: 0 8px 32px rgba(21,128,61,0.08), inset 0 1px 0 rgba(255,255,255,0.6);
+}
+.stat-card .label { font-size: 0.7rem; color: #5b8a6e; text-transform: uppercase; letter-spacing: 0.5px; font-weight: 700; }
+.stat-card .value { font-size: 1.5rem; font-weight: 700; font-family: 'JetBrains Mono', monospace; margin-top: 4px; color:#0f2417; }
+.stat-card .value.green { color: #15803d; }
+.stat-card .value.red { color: #dc2626; }
+.stat-card .value.blue { color: #0ea5e9; }
+.table-wrap { background: rgba(255,255,255,0.62); backdrop-filter: blur(20px); -webkit-backdrop-filter: blur(20px); border: 1px solid rgba(255,255,255,0.8); border-radius: 18px; padding: 8px; overflow-x: auto; box-shadow: 0 8px 32px rgba(21,128,61,0.08); }
 table { width: 100%; border-collapse: collapse; font-size: 0.82rem; }
-thead th { background: #111a14; color: #6b8f74; text-transform: uppercase; font-size: 0.7rem; letter-spacing: 0.5px; padding: 10px 8px; text-align: left; border-bottom: 1px solid #1a2e1f; position: sticky; top: 0; }
-tbody td { padding: 10px 8px; border-bottom: 1px solid #0f1a12; font-family: 'JetBrains Mono', monospace; font-size: 0.78rem; }
-tbody tr:hover { background: #111a14; }
-.up { color: #4ade80; }
-.down { color: #f87171; }
-.win { color: #4ade80; font-weight: 700; }
-.loss { color: #f87171; font-weight: 700; }
-.pend { color: #fbbf24; }
-.hedge-badge { background: #1e3a5f; color: #60a5fa; padding: 2px 6px; border-radius: 4px; font-size: 0.7rem; }
-.conf-high { color: #4ade80; }
-.conf-med { color: #fbbf24; }
-.conf-low { color: #f87171; }
-.note-cell { max-width: 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: pointer; color: #6b8f74; font-size: 0.72rem; }
-.note-cell:hover { white-space: normal; color: #e8ede9; }
-.filter-bar { display: flex; gap: 8px; margin-bottom: 16px; }
-.filter-btn { background: #111a14; border: 1px solid #1a2e1f; color: #6b8f74; padding: 6px 12px; border-radius: 6px; cursor: pointer; font-size: 0.8rem; }
-.filter-btn.active { background: #1a2e1f; color: #4ade80; border-color: #4ade80; }
+thead th { color: #5b8a6e; text-transform: uppercase; font-size: 0.66rem; letter-spacing: 0.5px; padding: 10px 8px; text-align: left; border-bottom: 1px solid rgba(21,128,61,0.15); }
+tbody td { padding: 10px 8px; border-bottom: 1px solid rgba(21,128,61,0.08); font-family: 'JetBrains Mono', monospace; font-size: 0.76rem; color:#1a3d2a; }
+tbody tr:hover { background: rgba(74,222,128,0.10); }
+.up { color: #15803d; }
+.down { color: #dc2626; }
+.win { color: #15803d; font-weight: 700; }
+.loss { color: #dc2626; font-weight: 700; }
+.pend { color: #ca8a04; }
+.hedge-badge { background: rgba(14,165,233,0.15); color: #0ea5e9; padding: 2px 6px; border-radius: 6px; font-size: 0.7rem; }
+.conf-high { color: #15803d; }
+.conf-med { color: #ca8a04; }
+.conf-low { color: #dc2626; }
+.note-cell { max-width: 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: pointer; color: #6b9580; font-size: 0.72rem; }
+.note-cell:hover { white-space: normal; color: #0f2417; }
+.filter-bar { display: flex; gap: 8px; margin-bottom: 16px; flex-wrap: wrap; }
+.filter-btn { background: rgba(255,255,255,0.5); border: 1px solid rgba(21,128,61,0.2); color: #42795a; padding: 7px 14px; border-radius: 999px; cursor: pointer; font-size: 0.8rem; font-weight: 600; }
+.filter-btn.active { background: #15803d; color: #fff; border-color: #15803d; }
 .rtds-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
-.rtds-dot.on { background: #4ade80; box-shadow: 0 0 6px #4ade80; }
-.rtds-dot.off { background: #f87171; }
-.empty { text-align: center; padding: 40px; color: #6b8f74; }
+.rtds-dot.on { background: #15803d; box-shadow: 0 0 6px #15803d; }
+.rtds-dot.off { background: #dc2626; }
+.empty { text-align: center; padding: 40px; color: #5b8a6e; }
+@media (max-width:600px){
+  .header h1 { font-size: 1.25rem; }
+  .nav { gap: 4px; overflow-x: auto; flex-wrap: nowrap; }
+  .nav a { padding: 7px 11px; font-size: 0.72rem; white-space: nowrap; }
+  .stats-grid { grid-template-columns: repeat(2, 1fr); }
+  .container { padding: 18px 12px 50px; }
+}
 </style>
 """
 
@@ -2405,7 +2424,7 @@ def _v2_dashboard_html(platform, trades, bal):
     h += '</div>'
 
     # Trade table
-    h += '<table><thead><tr>'
+    h += '<div class="table-wrap"><table><thead><tr>'
     h += '<th>#</th><th>Time</th><th>TF</th><th>Asset</th><th>Dir</th>'
     h += '<th>Limit</th><th>Ask</th><th>Fill</th><th>Conf</th><th>PTB</th><th>Result</th>'
     h += '<th>P&L</th><th>Bal</th><th>Hedge</th><th>Market</th><th>Note</th>'
@@ -2476,7 +2495,7 @@ def _v2_dashboard_html(platform, trades, bal):
             h += '<td class="note-cell" title="{}">{}</td>'.format(note, note[:60])
             h += '</tr>'
 
-    h += '</tbody></table></div></body></html>'
+    h += '</tbody></table></div></div></body></html>'
     return h
 
 
@@ -3980,9 +3999,26 @@ def _sports_scan_and_alert():
                     try:
                         _u = market.get('url', '')
                         _plat = 'limitless' if 'limitless' in _u else 'polymarket'
+                        _winner = insights.get('consensus_winner') or ''
+                        _pick_txt = market_label
                         _sports_market_cache.setdefault(_plat, [])
-                        _sports_market_cache[_plat].insert(0, '{} vs {} — {} ({}/100)'.format(home, away, (mq or '')[:40], pick_score))
-                        _sports_market_cache[_plat] = _sports_market_cache[_plat][:25]
+                        _sports_market_cache[_plat].insert(0, {
+                            'home': home, 'away': away,
+                            'winner': _winner,
+                            'market': _pick_txt,
+                            'question': (mq or '')[:90],
+                            'url': _u,
+                            'score': pick_score,
+                            'odds': odds_str,
+                        })
+                        # Dedup by match, keep newest 30
+                        _seen = set(); _clean = []
+                        for _it in _sports_market_cache[_plat]:
+                            _k = (_it.get('home'), _it.get('away'), _it.get('market'))
+                            if _k in _seen:
+                                continue
+                            _seen.add(_k); _clean.append(_it)
+                        _sports_market_cache[_plat] = _clean[:30]
                     except Exception:
                         pass
                     alerts_sent += 1
@@ -4010,43 +4046,58 @@ def _sports_scanner_thread():
 # Sports dashboard page
 @app.route("/app/sports")
 def sports_dashboard():
-    return render_template_string("""
-    <html><head><title>Sports Predictions</title>
-    <style>
-    body { font-family: 'DM Sans', sans-serif; background: #f0faf0; padding: 20px; }
-    h1 { color: #2d6a4f; }
-    .info { background: white; border-radius: 12px; padding: 20px; margin: 10px 0; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }
-    .sources { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 10px; }
-    .src { background: #e8f5e9; padding: 10px; border-radius: 8px; font-size: 14px; }
-    .src b { color: #2d6a4f; }
-    code { background: #f5f5f5; padding: 2px 6px; border-radius: 4px; font-size: 13px; }
-    </style></head><body>
-    <h1>⚽ Sports Prediction Scanner v2</h1>
-    <div class="info">
-        <p><strong>Status:</strong> Running (scans every 6 hours)</p>
-        <p><strong>Minimum score:</strong> {{ min_score }}/100</p>
-        <p><strong>Strategy:</strong> Scrape same leagues from multiple sites → find consensus → match to Polymarket markets → alert on Telegram</p>
-    </div>
-    <div class="info">
-        <h3>Prediction Sources</h3>
-        <div class="sources">
-            <div class="src"><b>footballpredictions.com</b><br>Tips + league pages (EPL, La Liga, UCL, etc.)</div>
-            <div class="src"><b>forebet.com</b><br>Mathematical predictions + league pages (same leagues)</div>
-            <div class="src"><b>footballpredictions.net</b><br>Correct scores (backup)</div>
-            <div class="src"><b>predictz.com</b><br>Scores (often blocked, graceful skip)</div>
-        </div>
-    </div>
-    <div class="info">
-        <h3>Market Sources</h3>
-        <p><b>Polymarket</b> — <code>/public-search</code> + <code>/sports</code> metadata + <code>/markets?tag_id</code> + <code>sports_market_types</code></p>
-        <p><b>Limitless</b> — Active slug scan (usually no individual match markets)</p>
-    </div>
-    <div class="info">
-        <h3>Leagues Targeted (for cross-site overlap)</h3>
-        <p>EPL, La Liga, Serie A, Bundesliga, Ligue 1, Champions League, Europa League</p>
-    </div>
-    </body></html>
-    """, min_score=SPORTS_MIN_SCORE)
+    def _cards(platform):
+        items = []
+        try:
+            items = list(_sports_market_cache.get(platform, []))
+        except Exception:
+            items = []
+        if not items:
+            return ('<div class="glass empty"><div class="big">📊</div>'
+                    '<div>No {} picks cached yet. The scanner runs every few hours.</div></div>'.format(
+                        platform.title()))
+        blocks = []
+        for m in items[:20]:
+            if not isinstance(m, dict):
+                continue
+            winner = m.get("winner", "")
+            winner_line = ""
+            if winner and winner.upper() != "DRAW":
+                winner_line = '<div class="pick">🏆 Pick: <b>{}</b></div>'.format(winner)
+            elif winner:
+                winner_line = '<div class="pick">🏆 Pick: <b>Draw</b></div>'
+            market = (m.get("market", "") or "").replace("🏆 ", "").replace("⚽ ", "")
+            url = m.get("url", "")
+            link = ('<a href="{}" target="_blank">Place bet →</a>'.format(url)) if url else ""
+            blocks.append(
+                '<div class="glass match-card"><div class="mhead">'
+                '<div class="teams">{} vs {}</div>'
+                '<div class="league">{}/100</div></div>'
+                '{}'
+                '<div class="meta">📍 {}</div>'
+                '<div class="code-box" style="margin-top:10px">'
+                '<div><div class="label">{}</div></div>{}</div></div>'.format(
+                    m.get("home", ""), m.get("away", ""), m.get("score", ""),
+                    winner_line, market or "Market", platform.title(), link))
+        return "".join(blocks)
+
+    poly_cards = _cards("polymarket")
+    lmts_cards = _cards("limitless")
+
+    html = """<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sports Markets — Cmvng Bot</title><style>{css}</style></head><body>
+{nav}<div class="wrap">
+<div class="page-head"><h1>Sports Markets</h1>
+<div class="sub">Live picks matched to Polymarket & Limitless</div></div>
+<h2 style="font-size:1rem;font-weight:900;color:#15803d;margin:6px 4px 12px">📊 Polymarket</h2>
+{poly}
+<h2 style="font-size:1rem;font-weight:900;color:#15803d;margin:22px 4px 12px">📊 Limitless</h2>
+{lmts}
+<div class="disclaimer">Picks are cross-validated across prediction sites then matched to live
+prediction-market questions. Tap "Place bet" to open the market.</div>
+</div></body></html>""".format(css=FB_CSS, nav=_nav("sports"), poly=poly_cards, lmts=lmts_cards)
+    return html
 
 
 
@@ -4337,28 +4388,32 @@ def analyze_fixture(fx):
 # Tier configuration: per-selection odds band + packing rules
 TIER_CONFIG = {
     "2_odds": {
-        "target": 2.0, "min_conf": 80, "min_sel": 3, "max_sel": 8,
-        "odds_lo": 1.05, "odds_hi": 1.30,
-        "prefer": ["over_0.5", "over_1.5", "double_chance_1X", "double_chance_X2", "btts_yes"],
+        "target": 2.0, "min_conf": 78, "min_sel": 4, "max_sel": 8,
+        "odds_lo": 1.04, "odds_hi": 1.32,
+        "prefer": ["over_1.5", "double_chance_1X", "double_chance_X2", "btts_yes",
+                   "over_0.5", "under_3.5", "btts_no"],
         "label": "2 ODDS — BANKER", "emoji": "🟢",
     },
     "3_odds": {
-        "target": 3.0, "min_conf": 72, "min_sel": 3, "max_sel": 7,
-        "odds_lo": 1.12, "odds_hi": 1.45,
-        "prefer": ["over_1.5", "double_chance_1X", "btts_yes", "home_win", "over_2.5"],
+        "target": 3.0, "min_conf": 70, "min_sel": 4, "max_sel": 7,
+        "odds_lo": 1.12, "odds_hi": 1.48,
+        "prefer": ["double_chance_1X", "over_1.5", "home_win", "btts_yes",
+                   "over_2.5", "double_chance_X2", "corners_over_7.5", "under_2.5"],
         "label": "3 ODDS — SAFE", "emoji": "🟢",
     },
     "5_odds": {
-        "target": 5.0, "min_conf": 60, "min_sel": 3, "max_sel": 6,
-        "odds_lo": 1.25, "odds_hi": 1.75,
-        "prefer": ["over_2.5", "home_win", "btts_yes", "corners_over_8.5", "dc_over_1.5"],
+        "target": 5.0, "min_conf": 58, "min_sel": 3, "max_sel": 6,
+        "odds_lo": 1.22, "odds_hi": 1.80,
+        "prefer": ["home_win", "over_2.5", "btts_yes", "corners_over_8.5",
+                   "dc_over_1.5", "cards_over_2.5", "away_win", "home_win_btts"],
         "label": "5 ODDS — VALUE", "emoji": "🟡",
     },
     "10_odds": {
-        "target": 10.0, "min_conf": 50, "min_sel": 4, "max_sel": 6,
-        "odds_lo": 1.40, "odds_hi": 2.30,
+        "target": 10.0, "min_conf": 48, "min_sel": 4, "max_sel": 6,
+        "odds_lo": 1.38, "odds_hi": 2.40,
         "prefer": ["home_win", "away_win", "home_win_btts", "corners_over_9.5",
-                   "handicap_home_-1.5", "cards_over_3.5", "over_2.5"],
+                   "handicap_home_-1.5", "cards_over_3.5", "over_2.5",
+                   "home_win_over_2.5", "over_3.5"],
         "label": "10 ODDS — RISK", "emoji": "🟠",
     },
     "1000_odds": {
@@ -4366,7 +4421,7 @@ TIER_CONFIG = {
         "odds_lo": 1.45, "odds_hi": 15.0,
         "prefer": ["correct_score", "home_win_btts", "home_win_over_2.5",
                    "handicap_home_-1.5", "handicap_away_-1.5", "over_3.5",
-                   "cards_over_3.5", "away_win"],
+                   "cards_over_3.5", "away_win", "corners_over_9.5"],
         "label": "1000+ ODDS — MOONSHOT", "emoji": "🔴",
     },
 }
@@ -4374,55 +4429,78 @@ TIER_CONFIG = {
 
 def build_accumulator(all_picks, tier_key):
     """
-    Build one accumulator tier.
+    Build one accumulator tier with a DIVERSE mix of market types.
     Strategy:
       1. Filter picks to this tier's confidence floor + odds band
-      2. Prefer this tier's market types (sort them first)
-      3. Greedily pack (max 1 per match) until total odds hits target
+      2. Greedily pack (max 1 per match) but cap how many of each market
+         type can appear, so a slip is a genuine mix (not all "win or draw"
+         or all "over 8.5 corners")
+      3. Stop when total odds reaches the tier target
     Returns dict {selections, total_odds, ...} or None if not buildable.
     """
     cfg = TIER_CONFIG[tier_key]
+    target = cfg["target"]
+    prefer_set = set(cfg["prefer"])
 
-    # Filter: confidence floor + odds band
     eligible = [
         p for p in all_picks
         if p["confidence"] >= cfg["min_conf"]
         and cfg["odds_lo"] <= p["odds"] <= cfg["odds_hi"]
     ]
-
     if not eligible:
         return None
 
-    # Sort: preferred market types first, then by confidence descending
-    prefer_set = cfg["prefer"]
+    # How many distinct market types are available? Use it to set a diversity cap.
+    distinct_types = len(set(p["market_type"] for p in eligible))
+    # Allow at most ~ceil(max_sel / distinct_types)+1 of any one type, min 1.
+    import math as _m
+    max_per_type = max(1, _m.ceil(cfg["max_sel"] / max(1, distinct_types)) + 1)
+    if distinct_types >= cfg["max_sel"]:
+        max_per_type = 1  # plenty of variety -> force every leg a different type
 
-    def sort_key(p):
-        is_preferred = 0 if p["market_type"] in prefer_set else 1
-        return (is_preferred, -p["confidence"])
+    def base_rank(p):
+        # Preferred types first, then by confidence
+        return (0 if p["market_type"] in prefer_set else 1, -p["confidence"])
 
-    eligible.sort(key=sort_key)
+    remaining = sorted(eligible, key=base_rank)
 
-    # Greedy packing
     slip = []
     used_matches = set()
+    type_count = {}
     running = 1.0
-    target = cfg["target"]
 
-    for pick in eligible:
-        if pick["match"] in used_matches:
-            continue
-        if len(slip) >= cfg["max_sel"]:
-            break
-        new_running = running * pick["odds"]
-        # Don't overshoot beyond 18% over target
-        if new_running > target * 1.18 and len(slip) >= cfg["min_sel"]:
-            continue
-        slip.append(pick)
-        used_matches.add(pick["match"])
-        running = new_running
-        # Stop once we're in the acceptable band (>= 92% of target)
-        if running >= target * 0.92 and len(slip) >= cfg["min_sel"]:
-            break
+    def try_pack(per_type_cap):
+        nonlocal running
+        # Greedy with diversity: each step, pick the highest-ranked candidate
+        # whose market type is still under the cap and that doesn't overshoot.
+        progressed = True
+        while progressed and len(slip) < cfg["max_sel"]:
+            progressed = False
+            for p in remaining:
+                if p in slip or p["match"] in used_matches:
+                    continue
+                if type_count.get(p["market_type"], 0) >= per_type_cap:
+                    continue
+                new_running = running * p["odds"]
+                if new_running > target * 1.18 and len(slip) >= cfg["min_sel"]:
+                    continue
+                slip.append(p)
+                used_matches.add(p["match"])
+                type_count[p["market_type"]] = type_count.get(p["market_type"], 0) + 1
+                running = new_running
+                progressed = True
+                if running >= target * 0.92 and len(slip) >= cfg["min_sel"]:
+                    return True
+                break  # restart scan from the top for best-ranked next pick
+        return running >= target * 0.92 and len(slip) >= cfg["min_sel"]
+
+    # First pass: strict diversity cap
+    done = try_pack(max_per_type)
+    # If we couldn't reach the target band, relax the cap and keep packing
+    if not done and len(slip) < cfg["min_sel"]:
+        try_pack(max_per_type + 2)
+    if not done and len(slip) < cfg["min_sel"]:
+        try_pack(cfg["max_sel"])  # last resort: allow repeats to hit min legs
 
     if len(slip) < cfg["min_sel"]:
         return None
@@ -4892,15 +4970,28 @@ _SB_HEADERS = {
 }
 
 
-def _sb_get(url, timeout=12):
+_SB_DIAG_COUNT = [0]
+_SB_DIAG_MAX = 10
+
+
+def _sb_get(url, timeout=12, diag=False):
     if _req is None:
         return None
     try:
         r = _req.get(url, headers=_SB_HEADERS, timeout=timeout)
+        if diag and _SB_DIAG_COUNT[0] < _SB_DIAG_MAX:
+            _SB_DIAG_COUNT[0] += 1
+            body = (r.text or "")[:280].replace("\n", " ").replace("\r", "")
+            print("[SB-DIAG] GET {} -> HTTP {} | {}".format(url[:95], r.status_code, body))
         if r.status_code == 200:
-            return r.json()
-    except Exception:
-        pass
+            try:
+                return r.json()
+            except Exception:
+                return None
+    except Exception as e:
+        if diag and _SB_DIAG_COUNT[0] < _SB_DIAG_MAX:
+            _SB_DIAG_COUNT[0] += 1
+            print("[SB-DIAG] GET {} -> EXCEPTION {}".format(url[:95], e))
     return None
 
 
@@ -4922,34 +5013,40 @@ def _sb_post(url, payload, timeout=15):
 
 def sb_search_event(home_team, away_team):
     """
-    Search SportyBet for a match by team name.
-    Returns eventId or None.
-    Tries the factsCenter search endpoint (same family as football.com).
+    Search SportyBet for a match by team name. Returns eventId or None.
+    Tries several realistic SportyBet frontend endpoints and logs the raw
+    responses (capped) so the correct one can be confirmed from Railway logs.
     """
+    import urllib.parse as _up
     ts = int(time.time() * 1000)
-    # Search by home team name
-    keyword = home_team.replace(" ", "%20")
-    url = "{}/factsCenter/liveOrPrematchSearch?keyword={}&_t={}".format(SB_BASE, keyword, ts)
-    data = _sb_get(url)
-
-    if not data or data.get("bizCode") not in (10000, None):
-        # Try alternate search endpoint
-        url2 = "{}/factsCenter/search?query={}&_t={}".format(SB_BASE, keyword, ts)
-        data = _sb_get(url2)
-
-    if not data:
-        return None
-
-    # Navigate the response to find a matching event
-    try:
-        events = _extract_events_from_search(data)
-        for ev in events:
-            ev_home = (ev.get("homeTeamName") or ev.get("home") or "").lower()
-            ev_away = (ev.get("awayTeamName") or ev.get("away") or "").lower()
-            if _team_match(home_team, ev_home) and _team_match(away_team, ev_away):
-                return ev.get("eventId") or ev.get("id")
-    except Exception:
-        pass
+    kwq = _up.quote(home_team.strip())
+    candidates = [
+        "{}/factsCenter/liveOrPrematchSearch?words={}&sportId=sr:sport:1&_t={}".format(SB_BASE, kwq, ts),
+        "{}/factsCenter/liveOrPrematchSearch?keyword={}&_t={}".format(SB_BASE, kwq, ts),
+        "{}/factsCenter/search?words={}&_t={}".format(SB_BASE, kwq, ts),
+        "{}/factsCenter/wapPrematchSearch?words={}&_t={}".format(SB_BASE, kwq, ts),
+    ]
+    for url in candidates:
+        data = _sb_get(url, diag=True)
+        if not data:
+            continue
+        try:
+            events = _extract_events_from_search(data)
+            for ev in events:
+                ev_home = (ev.get("homeTeamName") or ev.get("home")
+                           or ev.get("homeTeam") or "").lower()
+                ev_away = (ev.get("awayTeamName") or ev.get("away")
+                           or ev.get("awayTeam") or "").lower()
+                if _team_match(home_team, ev_home) and _team_match(away_team, ev_away):
+                    eid = ev.get("eventId") or ev.get("id")
+                    print("[SB] matched {} vs {} -> eventId {}".format(home_team, away_team, eid))
+                    return eid
+            if events:
+                # Got a parseable response but no match — this endpoint works,
+                # the team just isn't listed. No point trying other endpoints.
+                break
+        except Exception as e:
+            print("[SB] search parse error: {}".format(e))
     return None
 
 
@@ -4994,15 +5091,23 @@ def sb_get_event_markets(event_id):
     if not event_id:
         return []
     ts = int(time.time() * 1000)
-    url = "{}/factsCenter/event?eventId={}&_t={}".format(SB_BASE, event_id, ts)
-    data = _sb_get(url)
-    if not data:
-        return []
-    try:
-        d = data.get("data", data)
-        return d.get("markets", []) or []
-    except Exception:
-        return []
+    candidates = [
+        "{}/factsCenter/event?eventId={}&productId=3&_t={}".format(SB_BASE, event_id, ts),
+        "{}/factsCenter/wapQueryEvent?eventId={}&productId=3&_t={}".format(SB_BASE, event_id, ts),
+        "{}/factsCenter/event?eventId={}&_t={}".format(SB_BASE, event_id, ts),
+    ]
+    for url in candidates:
+        data = _sb_get(url, diag=True)
+        if not data:
+            continue
+        try:
+            d = data.get("data", data)
+            markets = d.get("markets", []) if isinstance(d, dict) else []
+            if markets:
+                return markets
+        except Exception:
+            pass
+    return []
 
 
 # Map engine market_type -> matching logic against SportyBet market descriptions
@@ -5301,11 +5406,43 @@ body {
 .empty { text-align:center; padding:50px 20px; color:#5b8a6e; }
 .empty .big { font-size:2.2rem; margin-bottom:10px; }
 .disclaimer { text-align:center; font-size:0.72rem; color:#6b9580; margin:24px 18px; line-height:1.5; }
+
+/* Calendar */
+.cal-head { display:flex; align-items:center; justify-content:space-between; margin-bottom:14px; }
+.cal-head h2 { font-size:1.2rem; font-weight:900; color:#0f2417; }
+.cal-nav a { text-decoration:none; color:#15803d; font-weight:700; font-size:1.3rem; padding:4px 12px; border-radius:10px; background:rgba(74,222,128,0.15); }
+.cal-grid { display:grid; grid-template-columns:repeat(7,1fr); gap:6px; }
+.cal-dow { text-align:center; font-size:0.65rem; font-weight:700; color:#5b8a6e; text-transform:uppercase; letter-spacing:0.5px; padding:4px 0; }
+.cal-cell { aspect-ratio:1; border-radius:12px; background:rgba(255,255,255,0.4); border:1px solid rgba(255,255,255,0.6); display:flex; flex-direction:column; align-items:center; justify-content:center; text-decoration:none; color:#0f2417; position:relative; transition:transform .12s; }
+.cal-cell.has-data { background:rgba(74,222,128,0.22); border-color:rgba(21,128,61,0.35); font-weight:700; }
+.cal-cell.has-data:active { transform:scale(0.95); }
+.cal-cell.empty-cell { background:transparent; border:none; }
+.cal-cell.today { outline:2px solid #15803d; }
+.cal-cell .dnum { font-size:0.85rem; }
+.cal-cell .dcount { font-size:0.6rem; color:#15803d; font-family:'JetBrains Mono',monospace; margin-top:1px; }
+.cal-cell .ddots { display:flex; gap:2px; margin-top:2px; }
+.cal-cell .ddot { width:5px; height:5px; border-radius:50%; }
+.legend { display:flex; gap:14px; justify-content:center; flex-wrap:wrap; margin-top:14px; font-size:0.72rem; color:#5b8a6e; }
+.legend span { display:flex; align-items:center; gap:5px; }
+.legend i { width:9px; height:9px; border-radius:50%; display:inline-block; }
+.back-link { display:inline-block; margin-bottom:14px; color:#15803d; font-weight:700; text-decoration:none; font-size:0.85rem; }
+.badge { font-size:0.62rem; font-weight:700; padding:2px 8px; border-radius:999px; text-transform:uppercase; letter-spacing:0.5px; }
+.badge.won { background:rgba(21,128,61,0.15); color:#15803d; }
+.badge.lost { background:rgba(220,38,38,0.13); color:#dc2626; }
+.badge.pending { background:rgba(120,120,120,0.12); color:#777; }
+
 @media (max-width:600px){
   .page-head h1 { font-size:1.7rem; }
-  .nav .logo { font-size:1rem; }
-  .nav .tabs a { padding:7px 10px; font-size:0.72rem; }
+  .nav { padding:12px 14px; gap:8px; }
+  .nav .logo { font-size:0.95rem; }
+  .nav .tabs { gap:3px; overflow-x:auto; -webkit-overflow-scrolling:touch; flex-wrap:nowrap; max-width:62vw; }
+  .nav .tabs a { padding:7px 10px; font-size:0.72rem; white-space:nowrap; }
   .tier-odds { font-size:1.2rem; }
+  .wrap { padding:18px 12px 0; }
+  .glass { padding:16px; border-radius:18px; }
+  .sel .match { font-size:0.82rem; }
+  .cal-grid { gap:4px; }
+  .cal-cell .dnum { font-size:0.78rem; }
 }
 """
 
@@ -5430,7 +5567,7 @@ Percentages are model estimates, not guarantees.</div>
 
 
 def render_results_page(stats, date_str):
-    """Render results/win-rate page. stats = list of {tier, won, total, ...}."""
+    """Tier win-rate summary cards (used at top of the calendar page)."""
     blocks = []
     for st in stats:
         wr = (st["wins"] / st["settled"] * 100) if st.get("settled") else 0
@@ -5442,22 +5579,143 @@ def render_results_page(stats, date_str):
             '{} won / {} settled · {} pending</div></div>'.format(
                 st["tier_label"], wr, st["wins"], st["settled"], st.get("pending", 0))
         )
-    if not blocks:
-        body = ('<div class="glass empty"><div class="big">📈</div>'
-                '<div>No settled results yet. Win rates appear after matches finish.</div></div>')
-    else:
-        body = "".join(blocks)
+    body = "".join(blocks) if blocks else (
+        '<div class="glass empty"><div class="big">📈</div>'
+        '<div>No settled results yet. Win rates appear after matches finish.</div></div>')
+    return """<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Results — Cmvng Bot</title><style>{css}</style></head><body>
+{nav}<div class="wrap"><div class="page-head"><h1>Results</h1>
+<div class="sub">Win-rate tracking per accumulator tier</div>
+<div class="date">{date}</div></div>{body}</div></body></html>""".format(
+        css=FB_CSS, nav=_nav("results"), date=date_str, body=body)
+
+
+_MONTHS = ["", "January", "February", "March", "April", "May", "June",
+           "July", "August", "September", "October", "November", "December"]
+
+
+def render_results_calendar(year, month, day_data, tier_stats, today_iso):
+    """
+    Calendar view of results history.
+    day_data = {day_int: {"slips":N, "won":N, "lost":N, "pending":N}}
+    tier_stats = list of tier summary dicts (overall win rates)
+    """
+    import calendar as _cal
+    cal = _cal.Calendar(firstweekday=0)  # Monday first
+    weeks = cal.monthdayscalendar(year, month)
+
+    # Prev / next month links
+    pm, py = (12, year - 1) if month == 1 else (month - 1, year)
+    nm, ny = (1, year + 1) if month == 12 else (month + 1, year)
+
+    dow = "".join('<div class="cal-dow">{}</div>'.format(d)
+                  for d in ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"])
+
+    cells = []
+    for week in weeks:
+        for day in week:
+            if day == 0:
+                cells.append('<div class="cal-cell empty-cell"></div>')
+                continue
+            iso = "{:04d}-{:02d}-{:02d}".format(year, month, day)
+            d = day_data.get(day)
+            classes = "cal-cell"
+            if iso == today_iso:
+                classes += " today"
+            if d and d["slips"] > 0:
+                classes += " has-data"
+                dots = ""
+                if d["won"]:
+                    dots += '<span class="ddot" style="background:#15803d"></span>'
+                if d["lost"]:
+                    dots += '<span class="ddot" style="background:#dc2626"></span>'
+                if d["pending"]:
+                    dots += '<span class="ddot" style="background:#9ca3af"></span>'
+                cells.append(
+                    '<a href="/app/results?date={}" class="{}">'
+                    '<div class="dnum">{}</div>'
+                    '<div class="dcount">{} slip{}</div>'
+                    '<div class="ddots">{}</div></a>'.format(
+                        iso, classes, day, d["slips"], "" if d["slips"] == 1 else "s", dots))
+            else:
+                cells.append('<div class="{}"><div class="dnum">{}</div></div>'.format(classes, day))
+
+    grid = '<div class="cal-grid">{}{}</div>'.format(dow, "".join(cells))
+
+    cal_card = (
+        '<div class="glass"><div class="cal-head">'
+        '<div class="cal-nav"><a href="/app/results?ym={:04d}-{:02d}">‹</a></div>'
+        '<h2>{} {}</h2>'
+        '<div class="cal-nav"><a href="/app/results?ym={:04d}-{:02d}">›</a></div>'
+        '</div>{}'
+        '<div class="legend">'
+        '<span><i style="background:#15803d"></i>Won</span>'
+        '<span><i style="background:#dc2626"></i>Lost</span>'
+        '<span><i style="background:#9ca3af"></i>Pending</span></div></div>'
+    ).format(py, pm, _MONTHS[month], year, ny, nm, grid)
+
+    # Tier summary below
+    summary = []
+    for st in tier_stats:
+        wr = (st["wins"] / st["settled"] * 100) if st.get("settled") else 0
+        summary.append(
+            '<div class="glass" style="padding:14px 18px"><div class="tier-head" style="margin:0">'
+            '<div class="tier-title"><h2 style="font-size:0.95rem">{}</h2></div>'
+            '<div class="tier-odds" style="font-size:1.1rem">{:.0f}%'
+            '<span class="lbl">{} / {}</span></div></div></div>'.format(
+                st["tier_label"], wr, st["wins"], st["settled"]))
+    summary_html = "".join(summary)
 
     return """<!DOCTYPE html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Results — Cmvng Bot</title><style>{css}</style></head><body>
-{nav}
-<div class="wrap">
-<div class="page-head"><h1>Results</h1>
-<div class="sub">Win-rate tracking per accumulator tier</div>
-<div class="date">{date}</div></div>
-{body}
-</div></body></html>""".format(css=FB_CSS, nav=_nav("results"), date=date_str, body=body)
+{nav}<div class="wrap"><div class="page-head"><h1>Results History</h1>
+<div class="sub">Tap any highlighted day to see that day's slips</div></div>
+{cal}{summary}</div></body></html>""".format(
+        css=FB_CSS, nav=_nav("results"), cal=cal_card, summary=summary_html)
+
+
+def render_results_day(date_iso, date_human, accas):
+    """Detail view for one day's accumulators."""
+    blocks = []
+    for a in accas:
+        status = (a.get("result") or "pending").lower()
+        badge = '<span class="badge {}">{}</span>'.format(
+            status, {"won": "WON", "lost": "LOST"}.get(status, "PENDING"))
+        sels = ""
+        try:
+            sel_list = a.get("selections", [])
+            sels = "".join(
+                '<div class="sel"><div class="ico">⚽</div><div class="body">'
+                '<div class="match">{}</div><div class="pick">{}</div></div>'
+                '<div class="odds">{}</div></div>'.format(
+                    s.get("match", ""), s.get("pick", ""), s.get("odds", ""))
+                for s in sel_list)
+        except Exception:
+            pass
+        code = ""
+        if a.get("sportybet_code"):
+            code = ('<div class="code-box"><div><div class="label">SportyBet Code</div>'
+                    '<div class="code">{}</div></div></div>'.format(a["sportybet_code"]))
+        blocks.append(
+            '<div class="glass tier"><div class="tier-head"><div class="tier-title">'
+            '<h2>{}</h2>{}</div><div class="tier-odds">{:.2f}'
+            '<span class="lbl">TOTAL ODDS</span></div></div>{}{}</div>'.format(
+                a.get("label", ""), badge, a.get("total_odds", 0), sels, code))
+
+    body = "".join(blocks) if blocks else (
+        '<div class="glass empty"><div class="big">📅</div>'
+        '<div>No slips were generated on this day.</div></div>')
+
+    return """<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{date} Results — Cmvng Bot</title><style>{css}</style></head><body>
+{nav}<div class="wrap">
+<a href="/app/results" class="back-link">‹ Back to calendar</a>
+<div class="page-head"><h1>{date}</h1><div class="sub">Slips generated this day</div></div>
+{body}</div></body></html>""".format(
+        css=FB_CSS, nav=_nav("results"), date=date_human, body=body)
 
 
 """
@@ -5604,34 +5862,41 @@ def fmt_welcome():
 
 
 def fmt_codes(accumulators, date_str):
-    """Format the SportyBet codes message for all tiers."""
+    """Format the SportyBet codes message for all tiers — clean and scannable."""
     if not accumulators:
-        return "🎫 <b>No codes generated yet.</b>\nThe engine runs every few hours — check back soon."
+        return ("🎫 <b>SPORTYBET CODES</b>\n\nNo codes generated yet. "
+                "The engine runs every few hours — check back soon.")
 
-    lines = ["🎫 <b>TODAY'S CODES</b> — {}".format(date_str), ""]
+    lines = ["🎫 <b>SPORTYBET CODES</b>", "<i>{}</i>".format(date_str), ""]
     for acca in accumulators:
         if not acca:
             continue
-        lines.append("{} <b>{}</b>  ·  <code>{:.2f}</code>".format(
-            acca["emoji"], acca["label"], acca["total_odds"]))
+        lines.append("━━━━━━━━━━━━━━━")
+        lines.append("{} <b>{}</b>".format(acca["emoji"], acca["label"]))
+        lines.append("💰 Total odds: <b>{:.2f}</b>  ·  {} legs".format(
+            acca["total_odds"], acca.get("num_selections", len(acca["selections"]))))
+        lines.append("")
         for s in acca["selections"]:
-            lines.append("• {} — {} @ {:.2f}".format(
-                _short(s["match"]), s["pick"], s["odds"]))
+            lines.append("  ⚽ {}".format(_short(s["match"])))
+            lines.append("     → <b>{}</b>  @ {:.2f}".format(s["pick"], s["odds"]))
+        lines.append("")
         if acca.get("code"):
-            lines.append("🎫 <b>Code:</b> <code>{}</code>".format(acca["code"]))
-            lines.append("🔗 sportybet.com/ng → load <code>{}</code>".format(acca["code"]))
+            lines.append("🎫 Code: <code>{}</code>".format(acca["code"]))
+            lines.append('🔗 <a href="https://www.sportybet.com/ng/sport/football?shareCode={}">Open in SportyBet</a>'.format(acca["code"]))
         else:
-            lines.append("🎫 <i>code generating…</i>")
+            lines.append("🎫 <i>Build manually from the picks above</i>")
         lines.append("")
     return "\n".join(lines)
 
 
 def fmt_picks(match_picks, date_str, limit=12):
-    """Format the football picks message."""
+    """Format the football picks message — top 3 per match, clean layout."""
     if not match_picks:
-        return "⚽ <b>No picks analyzed yet.</b>\nThe engine runs every few hours."
+        return ("⚽ <b>FOOTBALL PICKS</b>\n\nNo picks analyzed yet. "
+                "The engine runs every few hours.")
 
-    lines = ["⚽ <b>FOOTBALL PICKS</b> — {}".format(date_str), ""]
+    lines = ["⚽ <b>FOOTBALL PICKS</b>", "<i>{}</i>".format(date_str),
+             "<i>Top 3 picks per match</i>", ""]
     count = 0
     for match, picks in match_picks.items():
         if not picks or count >= limit:
@@ -5639,19 +5904,23 @@ def fmt_picks(match_picks, date_str, limit=12):
         count += 1
         lines.append("🏟 <b>{}</b>".format(match))
         for i, p in enumerate(picks, 1):
-            lines.append("  {}. {} — <b>{:.0f}%</b>".format(i, p["pick"], p["confidence"]))
+            bar = "🟢" if p["confidence"] >= 70 else ("🟡" if p["confidence"] >= 55 else "🟠")
+            lines.append("  {} {} — <b>{:.0f}%</b>".format(bar, p["pick"], p["confidence"]))
         lines.append("")
+    lines.append("🎫 /codes for ready-made SportyBet slips")
     return "\n".join(lines)
 
 
 def fmt_results(stats, date_str):
     if not stats:
-        return "📈 <b>No settled results yet.</b>\nWin rates appear after matches finish."
-    lines = ["📈 <b>RESULTS</b> — {}".format(date_str), ""]
+        return "📈 <b>RESULTS</b>\n\nNo settled results yet. Win rates appear after matches finish."
+    lines = ["📈 <b>WIN RATES BY TIER</b>", ""]
     for st in stats:
         wr = (st["wins"] / st["settled"] * 100) if st.get("settled") else 0
-        lines.append("{}\n  {} won / {} settled ({:.0f}%) · {} pending".format(
-            st["tier_label"], st["wins"], st["settled"], wr, st.get("pending", 0)))
+        lines.append("{}".format(st["tier_label"]))
+        lines.append("   ✅ {} won / {} settled ({:.0f}%)  ·  ⏳ {} pending".format(
+            st["wins"], st["settled"], wr, st.get("pending", 0)))
+        lines.append("")
     return "\n".join(lines)
 
 
@@ -5741,6 +6010,31 @@ def fb_init_db(get_db):
                 created_at TIMESTAMPTZ DEFAULT NOW()
             )
         """)
+        # Migrations — in case an older football_picks/accumulators table exists
+        # from a previous session with a different schema.
+        _fp_cols = [
+            ("match_date", "DATE"), ("home", "TEXT"), ("away", "TEXT"),
+            ("league", "TEXT"), ("market_type", "TEXT"), ("pick", "TEXT"),
+            ("confidence", "REAL"), ("odds", "REAL"), ("reasoning", "TEXT"),
+            ("result", "TEXT DEFAULT 'pending'"), ("created_at", "TIMESTAMPTZ DEFAULT NOW()"),
+        ]
+        for col, typ in _fp_cols:
+            try:
+                conn.run("ALTER TABLE football_picks ADD COLUMN IF NOT EXISTS {} {}".format(col, typ))
+            except Exception:
+                pass
+        _acc_cols = [
+            ("match_date", "DATE"), ("tier", "TEXT"), ("label", "TEXT"),
+            ("target_odds", "REAL"), ("total_odds", "REAL"), ("num_selections", "INT"),
+            ("selections_json", "TEXT"), ("sportybet_code", "TEXT"),
+            ("status", "TEXT DEFAULT 'pending'"), ("result", "TEXT"),
+            ("created_at", "TIMESTAMPTZ DEFAULT NOW()"),
+        ]
+        for col, typ in _acc_cols:
+            try:
+                conn.run("ALTER TABLE sportybet_accumulators ADD COLUMN IF NOT EXISTS {} {}".format(col, typ))
+            except Exception:
+                pass
         conn.close()
         print("[FB] DB tables ready")
     except Exception as e:
@@ -5844,6 +6138,10 @@ def run_football_engine(get_db, tg_token, tg_chat, send_telegram,
 
         # 4. Generate SportyBet codes
         if generate_codes:
+            try:
+                _SB_DIAG_COUNT[0] = 0  # fresh diagnostics each run
+            except Exception:
+                pass
             event_cache = {}
             for acca in accumulators:
                 try:
@@ -6004,11 +6302,33 @@ def _send_sports(tg_token, chat_id, platform, getter):
         markets = getter(platform)
         if not markets:
             tg_send(tg_token, chat_id,
-                    "📊 <b>{} Sports</b>\nNo sports markets right now.".format(platform.title()))
+                    "📊 <b>{} Sports</b>\n\nNo sports picks cached yet. "
+                    "The scanner runs every few hours — check back soon.".format(platform.title()))
             return
-        lines = ["📊 <b>{} Sports Markets</b>".format(platform.title()), ""]
-        for m in markets[:15]:
-            lines.append("• {}".format(m))
+        lines = ["📊 <b>{} — SPORTS PICKS</b>".format(platform.title()),
+                 "<i>Verified across prediction sites</i>", ""]
+        for m in markets[:12]:
+            if isinstance(m, dict):
+                home = m.get("home", "")
+                away = m.get("away", "")
+                winner = m.get("winner", "")
+                market = m.get("market", "")
+                url = m.get("url", "")
+                score = m.get("score", "")
+                lines.append("⚽ <b>{} vs {}</b>".format(home, away))
+                if winner and winner.upper() != "DRAW":
+                    lines.append("🏆 Pick: <b>{}</b>".format(winner))
+                elif winner:
+                    lines.append("🏆 Pick: <b>Draw</b>")
+                if market:
+                    lines.append("📍 {}".format(market.replace("🏆 ", "").replace("⚽ ", "")))
+                if score:
+                    lines.append("⭐ Confidence: {}/100".format(score))
+                if url:
+                    lines.append('🔗 <a href="{}">Place this bet</a>'.format(url))
+                lines.append("")
+            else:
+                lines.append("• {}".format(m))
         tg_send(tg_token, chat_id, "\n".join(lines))
     except Exception as e:
         tg_send(tg_token, chat_id, "📊 Error loading sports markets.")
@@ -6323,8 +6643,70 @@ def fb_codes_page():
 
 @app.route("/app/results")
 def fb_results_page():
-    return render_results_page(_fb_get_results(),
-                               _FB_CACHE.get("date") or _fb_today_human())
+    date_q = request.args.get("date")
+    ym_q = request.args.get("ym")
+
+    # Day-detail view
+    if date_q:
+        accas = []
+        try:
+            conn = get_db()
+            rows = conn.run(
+                "SELECT label, total_odds, selections_json, sportybet_code, result, tier "
+                "FROM sportybet_accumulators WHERE match_date = :d ORDER BY target_odds ASC",
+                d=date_q)
+            conn.close()
+            order = {"2_odds": 0, "3_odds": 1, "5_odds": 2, "10_odds": 3, "1000_odds": 4}
+            for r in rows:
+                try:
+                    sels = json.loads(r[2]) if r[2] else []
+                except Exception:
+                    sels = []
+                accas.append({"label": r[0], "total_odds": r[1] or 0,
+                              "selections": sels, "sportybet_code": r[3],
+                              "result": r[4], "tier": r[5]})
+            accas.sort(key=lambda a: order.get(a.get("tier"), 9))
+        except Exception as e:
+            print("[FB] day results error: {}".format(e))
+        try:
+            human = _dt.date.fromisoformat(date_q).strftime("%A, %B %d, %Y")
+        except Exception:
+            human = date_q
+        return render_results_day(date_q, human, accas)
+
+    # Calendar view
+    today = _dt.date.today()
+    if ym_q:
+        try:
+            yy, mm = ym_q.split("-")
+            year, month = int(yy), int(mm)
+        except Exception:
+            year, month = today.year, today.month
+    else:
+        year, month = today.year, today.month
+
+    day_data = {}
+    try:
+        conn = get_db()
+        rows = conn.run(
+            "SELECT EXTRACT(DAY FROM match_date)::int, result FROM sportybet_accumulators "
+            "WHERE EXTRACT(YEAR FROM match_date) = :y AND EXTRACT(MONTH FROM match_date) = :m",
+            y=year, m=month)
+        conn.close()
+        for r in rows:
+            day = int(r[0]); result = (r[1] or "pending").lower()
+            d = day_data.setdefault(day, {"slips": 0, "won": 0, "lost": 0, "pending": 0})
+            d["slips"] += 1
+            if result == "won":
+                d["won"] += 1
+            elif result == "lost":
+                d["lost"] += 1
+            else:
+                d["pending"] += 1
+    except Exception as e:
+        print("[FB] calendar query error: {}".format(e))
+
+    return render_results_calendar(year, month, day_data, _fb_get_results(), today.isoformat())
 
 
 @app.route("/api/telegram-webhook", methods=["POST"])
