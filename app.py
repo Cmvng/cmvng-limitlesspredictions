@@ -2708,8 +2708,23 @@ def _sports_scrape_footballpredictions_com():
                                 if len(home) > 2 and len(away) > 2:
                                     parent = link.parent
                                     parent_text = parent.get_text(" ", strip=True) if parent else text
-                                    score_match = _sports_re.search(r'(\d)\s*[-–:]\s*(\d)', parent_text)
-                                    score = "{}-{}".format(score_match.group(1), score_match.group(2)) if score_match else None
+                                    # Look for score in format like "2-1" or "Prediction: 2-1"
+                                    # Avoid matching odds like "9/4" or "11/2"
+                                    score = None
+                                    score_match = _sports_re.search(r'(?:score|prediction|tip)[:\s]*(\d)\s*[-–:]\s*(\d)', parent_text.lower())
+                                    if score_match:
+                                        h_goals = int(score_match.group(1))
+                                        a_goals = int(score_match.group(2))
+                                        if h_goals <= 6 and a_goals <= 6:  # Sanity check
+                                            score = "{}-{}".format(h_goals, a_goals)
+                                    # Fallback: look for low-digit score patterns
+                                    if not score:
+                                        score_matches = _sports_re.findall(r'(?<!\d)([0-5])\s*[-]\s*([0-5])(?!\d)', parent_text)
+                                        for sm in score_matches:
+                                            s = "{}-{}".format(sm[0], sm[1])
+                                            if s not in ("0-0",):  # Skip 0-0 as it's often a default
+                                                score = s
+                                                break
                                     predictions.append({
                                         "source": "footballpredictions.com",
                                         "type": tip_type,
@@ -2984,80 +2999,126 @@ def _sports_match_teams(pred_home, pred_away, market_text):
     return home_match and away_match
 
 
-def _sports_fetch_polymarket_sports():
+def _sports_fetch_polymarket_sports(match_pairs=None):
     """Fetch soccer/football markets from Polymarket.
-    The Gamma API tag filtering is unreliable for sports.
-    Instead: fetch all active markets and filter by soccer keywords in the question text.
-    This is the proven approach used by successful Polymarket bots."""
+    Two approaches:
+    1. If match_pairs provided: search for each specific match
+    2. Always: fetch general soccer futures/props markets
+    
+    The search endpoint (GET /search?query=X) finds match-level markets
+    that the /markets endpoint doesn't return."""
     markets = []
-    soccer_keywords = [
-        "soccer", "premier league", "fifa", "uefa", "champions league",
-        "europa league", "la liga", "bundesliga", "serie a", "ligue 1",
-        "eredivisie", "world cup", "copa", "epl", "mls",
-        # Team names
-        "arsenal", "chelsea", "liverpool", "manchester", "tottenham",
-        "barcelona", "real madrid", "bayern", "dortmund", "psg",
-        "juventus", "inter milan", "ac milan", "napoli", "roma",
-        "atletico", "sevilla", "benfica", "porto",
-        # Match keywords
-        " fc ", " vs ", "match result", "to win",
-        "clean sheet", "both teams to score", "btts",
-        "over 0.5", "over 1.5", "over 2.5", "over 3.5",
-        "under 0.5", "under 1.5", "under 2.5", "under 3.5",
-        "first goal", "penalty", "red card",
-        # Off-pitch
-        "manager sacked", "next manager", "transfer", "ballon d'or",
-        "golden boot", "relegat", "promot",
-    ]
-    try:
-        offset = 0
-        while offset < 500:
-            r = _sports_req.get("{}/markets".format(POLY_GAMMA_API),
-                               params={"active": "true", "closed": "false",
-                                       "limit": 100, "offset": offset},
-                               timeout=20)
-            if r.status_code != 200:
-                break
-            batch = r.json() if isinstance(r.json(), list) else []
-            if not batch:
-                break
-            for m in batch:
-                q = (m.get("question", "") or "").lower()
-                title = (m.get("groupItemTitle", "") or "").lower()
-                desc = (m.get("description", "") or "")[:200].lower()
-                combined = q + " " + title + " " + desc
-                if any(kw in combined for kw in soccer_keywords):
-                    slug = m.get("slug", "")
-                    # Parse outcomes
-                    op = m.get("outcomePrices", "")
-                    if isinstance(op, str):
-                        try: op = json.loads(op)
-                        except: op = []
-                    outcomes = m.get("outcomes", "")
-                    if isinstance(outcomes, str):
-                        try: outcomes = json.loads(outcomes)
-                        except: outcomes = []
-                    markets.append({
-                        "platform": "polymarket",
-                        "title": m.get("groupItemTitle", "") or q,
-                        "question": q,
-                        "slug": slug,
-                        "market_id": m.get("id", ""),
-                        "condition_id": m.get("conditionId", ""),
-                        "outcome_prices": op,
-                        "outcomes": outcomes,
-                        "volume": float(m.get("volume", 0) or 0),
-                        "url": "https://polymarket.com/event/{}".format(slug) if slug else "",
-                        "best_ask": float(m.get("bestAsk", 0) or 0),
-                        "best_bid": float(m.get("bestBid", 0) or 0),
-                        "last_price": float(m.get("lastTradePrice", 0) or 0),
-                    })
-            offset += 100
-            time.sleep(0.5)  # Rate limit
+    seen_ids = set()
 
-        print("[SPORTS] Polymarket: {} soccer/football markets (scanned {} total)".format(len(markets), offset))
-    except Exception as e:
-        print("[SPORTS] Polymarket fetch error: {}".format(e))
+    # Approach 1: Search for specific matches from predictions
+    if match_pairs:
+        for home, away in match_pairs:
+            # Search with both team names
+            query = "{} {}".format(home, away)
+            try:
+                r = _sports_req.get("{}/search".format(POLY_GAMMA_API),
+                                   params={"query": query, "limit": 10},
+                                   timeout=10)
+                if r.status_code == 200:
+                    results = r.json() if isinstance(r.json(), list) else []
+                    # Results may be a list of events/markets
+                    for item in results:
+                        # Could be an event with nested markets
+                        item_markets = item.get("markets", [])
+                        if item_markets:
+                            for m in item_markets:
+                                mid = m.get("id", "")
+                                if mid in seen_ids:
+                                    continue
+                                seen_ids.add(mid)
+                                q = m.get("question", "") or ""
+                                slug = m.get("slug", "") or item.get("slug", "")
+                                op = m.get("outcomePrices", "")
+                                if isinstance(op, str):
+                                    try: op = json.loads(op)
+                                    except: op = []
+                                outcomes = m.get("outcomes", "")
+                                if isinstance(outcomes, str):
+                                    try: outcomes = json.loads(outcomes)
+                                    except: outcomes = []
+                                markets.append({
+                                    "platform": "polymarket",
+                                    "title": item.get("title", q),
+                                    "question": q,
+                                    "slug": slug,
+                                    "market_id": mid,
+                                    "condition_id": m.get("conditionId", ""),
+                                    "outcome_prices": op,
+                                    "outcomes": outcomes,
+                                    "volume": float(m.get("volume", 0) or 0),
+                                    "url": "https://polymarket.com/event/{}".format(slug) if slug else "",
+                                    "best_ask": float(m.get("bestAsk", 0) or 0),
+                                    "last_price": float(m.get("lastTradePrice", 0) or 0),
+                                })
+                        else:
+                            # Direct market result
+                            mid = item.get("id", "")
+                            if mid and mid not in seen_ids:
+                                seen_ids.add(mid)
+                                q = item.get("question", "") or item.get("title", "")
+                                slug = item.get("slug", "")
+                                op = item.get("outcomePrices", "")
+                                if isinstance(op, str):
+                                    try: op = json.loads(op)
+                                    except: op = []
+                                outcomes = item.get("outcomes", "")
+                                if isinstance(outcomes, str):
+                                    try: outcomes = json.loads(outcomes)
+                                    except: outcomes = []
+                                markets.append({
+                                    "platform": "polymarket",
+                                    "title": q, "question": q, "slug": slug,
+                                    "market_id": mid,
+                                    "condition_id": item.get("conditionId", ""),
+                                    "outcome_prices": op,
+                                    "outcomes": outcomes,
+                                    "volume": float(item.get("volume", 0) or 0),
+                                    "url": "https://polymarket.com/event/{}".format(slug) if slug else "",
+                                    "best_ask": float(item.get("bestAsk", 0) or 0),
+                                    "last_price": float(item.get("lastTradePrice", 0) or 0),
+                                })
+                time.sleep(0.3)  # Rate limit
+            except Exception as e:
+                print("[SPORTS] Poly search '{}' error: {}".format(query[:30], e))
+
+    # Approach 2: Also search for broad soccer terms to catch futures
+    for broad_query in ["world cup winner", "champions league winner",
+                        "premier league champion", "ballon d'or",
+                        "golden boot", "manager sacked", "transfer"]:
+        try:
+            r = _sports_req.get("{}/search".format(POLY_GAMMA_API),
+                               params={"query": broad_query, "limit": 10},
+                               timeout=10)
+            if r.status_code == 200:
+                results = r.json() if isinstance(r.json(), list) else []
+                for item in results:
+                    item_markets = item.get("markets", [])
+                    for m in (item_markets or [item]):
+                        mid = m.get("id", "")
+                        if mid and mid not in seen_ids:
+                            seen_ids.add(mid)
+                            q = m.get("question", "") or m.get("title", "")
+                            slug = m.get("slug", "") or item.get("slug", "")
+                            markets.append({
+                                "platform": "polymarket",
+                                "title": item.get("title", q), "question": q,
+                                "slug": slug, "market_id": mid,
+                                "condition_id": m.get("conditionId", ""),
+                                "outcome_prices": "", "outcomes": "",
+                                "volume": float(m.get("volume", 0) or 0),
+                                "url": "https://polymarket.com/event/{}".format(slug) if slug else "",
+                            })
+            time.sleep(0.3)
+        except:
+            pass
+
+    print("[SPORTS] Polymarket: {} soccer/football markets ({} from match search, {} from broad)".format(
+        len(markets), len([m for m in markets if m.get("best_ask")]), len(markets)))
     return markets
 
 
@@ -3287,8 +3348,11 @@ def _sports_scan_and_alert():
         print("[SPORTS] Sample match {}: '{}' vs '{}' ({} sources)".format(
             i+1, key[0], key[1], len(md["predictions"])))
 
-    # 3. Fetch markets from both platforms
-    poly_markets = _sports_fetch_polymarket_sports()
+    # 3. Fetch markets — pass match pairs so Polymarket searches for specific matches
+    match_pairs = [(md["home"], md["away"]) for key, md in matches.items()
+                   if len(set(p["source"] for p in md["predictions"])) >= 2]
+    print("[SPORTS] Searching Polymarket for {} matches with 2+ sources".format(len(match_pairs)))
+    poly_markets = _sports_fetch_polymarket_sports(match_pairs=match_pairs)
     lmts_markets = _sports_fetch_limitless_sports()
     all_markets = poly_markets + lmts_markets
     print("[SPORTS] Total sports markets: {} (Poly: {}, Limitless: {})".format(
