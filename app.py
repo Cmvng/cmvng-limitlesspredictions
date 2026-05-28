@@ -3246,10 +3246,36 @@ def _sports_fetch_polymarket_sports(match_pairs=None):
                 outcomes = json.loads(outcomes)
             except:
                 outcomes = []
-        # Build URL — use /event/{slug} for individual market pages
+        # Build URL — sports match markets use /sports/{sport}/{game_slug}
+        # Non-sports events use /event/{slug}
+        # The game slug is the slug without trailing market type suffix
+        # Sport code is the first segment of the slug (e.g. "ucl", "fif", "epl", "es2")
         market_url = ""
+        game_id_val = m.get("gameId", "") or ""
+        smt_val = m.get("sportsMarketType", "") or ""
         if slug:
-            market_url = "https://polymarket.com/event/{}".format(slug)
+            if game_id_val or smt_val or _sports_re.match(r'^[a-z]{2,5}-[a-z]{2,5}-[a-z]{2,5}-\d{4}', slug):
+                # Sports market — extract sport code and game slug
+                parts = slug.split("-")
+                sport_code = parts[0] if parts else ""
+                # Game slug is the date-based portion: {sport}-{team1}-{team2}-{date}
+                # Strip trailing market type suffixes
+                game_slug = _sports_re.sub(
+                    r'-(moneyline|totals?|btts|spread|both-teams-to-score|'
+                    r'corners?|total-corners|draw|soccer-halftime-result|'
+                    r'will-[a-z-]+win[a-z-]*|o-u-\d+.*|handicap.*)$',
+                    '', slug)
+                # If stripping didn't change it, use slug up to date portion
+                if game_slug == slug:
+                    date_m = _sports_re.search(r'(\d{4}-\d{2}-\d{2})', slug)
+                    if date_m:
+                        end_idx = date_m.end()
+                        game_slug = slug[:end_idx]
+                market_url = "https://polymarket.com/sports/{}/{}".format(
+                    sport_code, game_slug)
+            else:
+                # Non-sports event
+                market_url = "https://polymarket.com/event/{}".format(slug)
         return {
             "platform": "polymarket",
             "title": event_title or q,
@@ -3417,52 +3443,141 @@ def _sports_fetch_polymarket_sports(match_pairs=None):
     return markets
 
 
-def _sports_fetch_limitless_sports():
-    """Fetch sports markets from Limitless."""
+def _sports_fetch_limitless_sports(match_pairs=None):
+    """Fetch sports markets from Limitless using documented API endpoints.
+
+    Strategy (from docs.limitless.exchange):
+    1. GET /markets/active?automationType=sports — returns all sports markets directly
+    2. GET /markets/search?query=<team names> — semantic search for specific matches
+    3. GET /markets/categories/count — discover what categories exist
+    """
     markets = []
+    seen_ids = set()
+
+    def _parse_limitless(m):
+        """Parse a Limitless market object."""
+        mid = str(m.get("id", "") or m.get("address", "") or m.get("slug", ""))
+        if not mid or mid in seen_ids:
+            return None
+        seen_ids.add(mid)
+        title = m.get("title", "") or ""
+        slug = m.get("slug", "") or ""
+        address = m.get("address", "") or ""
+        prices = m.get("prices", [])
+        # Build URL — Limitless uses /markets/{slug} or /markets/{address}
+        market_url = ""
+        if slug:
+            market_url = "https://limitless.exchange/markets/{}".format(slug)
+        elif address:
+            market_url = "https://limitless.exchange/markets/{}".format(address)
+        return {
+            "platform": "limitless",
+            "title": title,
+            "question": title,
+            "slug": slug,
+            "market_id": mid,
+            "condition_id": m.get("conditionId", ""),
+            "outcome_prices": [str(p/100) for p in prices] if prices else [],
+            "outcomes": ["Yes", "No"],
+            "volume": float(m.get("volumeFormatted", 0) or 0),
+            "url": market_url,
+            "best_ask": 0,
+            "last_price": float(prices[0]/100) if prices else 0,
+            "game_id": "",
+            "sports_market_type": "",
+        }
+
+    # Step 1: Fetch all sports markets directly via automationType filter
     try:
-        r = _sports_req.get("{}/markets/active/slugs".format(LIMITLESS_API), timeout=10)
-        if r.status_code == 200:
-            slugs = r.json() if isinstance(r.json(), list) else []
-            # Filter out crypto slugs (they contain "up-or-down")
-            sports_slugs = [s for s in slugs if "up-or-down" not in str(s).lower()
-                           and "above" not in str(s).lower()]
-            # Check each non-crypto slug for sports content
-            checked = 0
-            for slug in sports_slugs:
-                if checked >= 50:  # Limit API calls
-                    break
-                try:
-                    mr = _sports_req.get("{}/markets/{}".format(LIMITLESS_API, slug), timeout=8)
-                    if mr.status_code == 200:
-                        mdata = mr.json()
-                        title = (mdata.get("title", "") or mdata.get("question", "") or str(slug)).lower()
-                        # Check for any sports/football keywords
-                        if any(kw in title for kw in [
-                            "win", "goal", "score", "match", "game", "cup", "league",
-                            "champion", "final", "premier", "world cup", "fifa", "uefa",
-                            "soccer", "football", "fc", "united", "arsenal", "chelsea",
-                            "liverpool", "barcelona", "real madrid", "bayern", "psg",
-                            "juventus", "inter", "milan", "dortmund", "manager", "sack",
-                            "transfer", "sign", "ballon", "golden boot", "relegat",
-                            "promot", "trophy", "medal", "coach", "player",
-                        ]):
-                            markets.append({
-                                "platform": "limitless",
-                                "title": mdata.get("title", "") or str(slug),
-                                "question": mdata.get("question", "") or mdata.get("title", str(slug)),
-                                "slug": str(slug),
-                                "market_id": str(slug),
-                                "url": "https://limitless.exchange/markets/{}".format(slug),
-                            })
-                    checked += 1
-                    time.sleep(0.35)
-                except:
-                    checked += 1
-                    pass
-        print("[SPORTS] Limitless: {} sports markets (checked {} slugs)".format(len(markets), checked))
+        for page in range(1, 4):  # Up to 3 pages
+            r = _sports_req.get("{}/markets/active".format(LIMITLESS_API),
+                               params={"automationType": "sports", "page": page, "limit": 50},
+                               timeout=15)
+            if r.status_code == 200:
+                data = r.json()
+                items = data.get("data", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
+                for m in items:
+                    title_lower = (m.get("title", "") or "").lower()
+                    # Filter for soccer/football keywords
+                    if any(kw in title_lower for kw in [
+                        "goal", "soccer", "football", " fc", "united",
+                        "arsenal", "chelsea", "liverpool", "barcelona",
+                        "real madrid", "bayern", "psg", "juventus",
+                        "premier league", "la liga", "serie a",
+                        "bundesliga", "champions league", "ucl",
+                        "europa", "mls", "cup", "corner", "btts",
+                        "both teams", "clean sheet", " vs ", " v ",
+                    ]):
+                        parsed = _parse_limitless(m)
+                        if parsed:
+                            markets.append(parsed)
+                if len(items) < 50:
+                    break  # No more pages
+            else:
+                print("[SPORTS] Limitless /markets/active?automationType=sports — HTTP {}".format(r.status_code))
+                break
+            time.sleep(0.3)
     except Exception as e:
-        print("[SPORTS] Limitless fetch error: {}".format(e))
+        print("[SPORTS] Limitless sports browse error: {}".format(e))
+
+    print("[SPORTS] Limitless automationType=sports: {} soccer markets".format(len(markets)))
+
+    # Step 2: Also try browsing without automationType filter for manual sports markets
+    try:
+        r = _sports_req.get("{}/markets/active".format(LIMITLESS_API),
+                           params={"page": 1, "limit": 100, "sortBy": "newest"},
+                           timeout=15)
+        if r.status_code == 200:
+            data = r.json()
+            items = data.get("data", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
+            manual_count = 0
+            for m in items:
+                title_lower = (m.get("title", "") or "").lower()
+                tags = [str(t).lower() for t in (m.get("tags", []) or [])]
+                cats = [str(c).lower() for c in (m.get("categories", []) or [])]
+                is_sports = "sports" in " ".join(tags + cats) or any(
+                    kw in title_lower for kw in [
+                        "goal", " fc ", "vs.", "corner", "btts",
+                        "premier league", "champions league",
+                        "world cup", "fifa", "uefa",
+                    ])
+                if is_sports:
+                    parsed = _parse_limitless(m)
+                    if parsed:
+                        markets.append(parsed)
+                        manual_count += 1
+            if manual_count:
+                print("[SPORTS] Limitless manual browse: {} additional sports markets".format(manual_count))
+    except Exception as e:
+        print("[SPORTS] Limitless browse error: {}".format(e))
+
+    # Step 3: Semantic search for specific matches
+    if match_pairs:
+        searched = 0
+        for home, away in match_pairs[:10]:
+            query = "{} {}".format(home.split()[-1] if home else "", away.split()[-1] if away else "").strip()
+            if len(query) < 4:
+                query = "{} {}".format(home, away)
+            try:
+                r = _sports_req.get("{}/markets/search".format(LIMITLESS_API),
+                                   params={"query": query, "limit": 5},
+                                   timeout=10)
+                if r.status_code == 200:
+                    data = r.json()
+                    items = data if isinstance(data, list) else data.get("data", []) if isinstance(data, dict) else []
+                    for m in items:
+                        parsed = _parse_limitless(m)
+                        if parsed:
+                            markets.append(parsed)
+                searched += 1
+                time.sleep(0.3)
+            except:
+                searched += 1
+
+    print("[SPORTS] Limitless total: {} sports markets".format(len(markets)))
+    for m in markets[:3]:
+        print("[SPORTS] Limitless sample: '{}' | {}".format(
+            m.get("title", "")[:60], m.get("url", "")))
     return markets
 
 
@@ -3677,7 +3792,7 @@ def _sports_scan_and_alert():
     single_pairs = [(md["home"], md["away"]) for md in matches.values() if md.get("unique_sites", 0) < 2]
     search_pairs = multi_pairs + single_pairs
     poly_markets = _sports_fetch_polymarket_sports(match_pairs=search_pairs[:30])
-    lmts_markets = _sports_fetch_limitless_sports()
+    lmts_markets = _sports_fetch_limitless_sports(match_pairs=search_pairs[:10])
     all_markets = poly_markets + lmts_markets
     print("[SPORTS] Total sports markets: {} (Poly: {}, Limitless: {})".format(
         len(all_markets), len(poly_markets), len(lmts_markets)))
@@ -3694,6 +3809,16 @@ def _sports_scan_and_alert():
     # 4. Match predictions to markets and score
     print("[SPORTS] Starting prediction↔market matching: {} matches × {} markets...".format(
         len(matches), len(all_markets)))
+
+    # Debug: log details for high-profile matches
+    for key, md in matches.items():
+        if "paris" in key[0] or "arsenal" in key[1] or "psg" in key[0]:
+            preds = md["predictions"]
+            scores = [p.get("score") for p in preds if p.get("score")]
+            types = [p.get("type", "?") for p in preds]
+            print("[SPORTS] DEBUG PSG: {} preds, types={}, scores={}, home='{}' away='{}'".format(
+                len(preds), types, scores, md["home"], md["away"]))
+
     alerts_sent = 0
     matched_count = 0
     MAX_ALERTS_PER_MATCH = 5  # Cap alerts per match to avoid Telegram spam
@@ -3730,22 +3855,28 @@ def _sports_scan_and_alert():
                     continue
                 seen_alert_keys.add(alert_key)
 
-                # Single source without a score prediction is too weak — skip
+                # Single source without any useful signal is too weak — skip
                 if len(sources) == 1:
                     has_score = any(p.get("score") for p in preds)
-                    if not has_score:
+                    has_consensus = insights.get("consensus_winner") is not None
+                    if not has_score and not has_consensus:
                         continue
 
                 # Score this pick
                 pick_score, reasons = _sports_score_pick(insights, market)
 
-                # Multi-source bonus
+                # Source count bonus
                 if len(sources) >= 2:
                     pick_score += 15
                     reasons.append("{} prediction sites".format(len(sources)))
                 elif len(sources) == 1:
-                    pick_score += 5
-                    reasons.append("1 site with score prediction")
+                    has_score = any(p.get("score") for p in preds)
+                    if has_score:
+                        pick_score += 5
+                        reasons.append("1 site with score prediction")
+                    else:
+                        pick_score += 3
+                        reasons.append("1 site prediction")
 
                 # Log first 5 matches for debugging
                 if matched_count <= 5:
