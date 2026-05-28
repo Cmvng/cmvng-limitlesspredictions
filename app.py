@@ -6549,9 +6549,27 @@ def run_football_engine(get_db, tg_token, tg_chat, send_telegram,
             _FB_CACHE["running"] = False
             return
 
-        # 3. Build accumulators
+        # 2b. Keep only picks that map to a real SportyBet market on that event,
+        #     so every accumulator leg produces a valid code (no dead legs from
+        #     corners/cards/combos SportyBet doesn't offer for the game).
+        build_picks = all_picks
+        if generate_codes:
+            mappable = []
+            for p in all_picks:
+                eid = p.get("sb_event_id")
+                if not eid:
+                    continue
+                mkts = _SB_MARKET_CACHE.get(eid, [])
+                if mkts and sb_map_pick_to_selection(p, mkts):
+                    mappable.append(p)
+            print("[FB] {} of {} picks are SportyBet-bettable".format(
+                len(mappable), len(all_picks)))
+            if mappable:
+                build_picks = mappable
+
+        # 3. Build accumulators (from bettable picks)
         try:
-            acca_dict = build_all_accumulators(all_picks)
+            acca_dict = build_all_accumulators(build_picks)
         except Exception as e:
             print("[FB] accumulator build error: {}".format(e))
             acca_dict = {}
