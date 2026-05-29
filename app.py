@@ -1552,6 +1552,7 @@ def _v2_calc_limit_price(book_ask, confidence):
 # ═══════════════════════════════════════════════════════════
 
 _SB_LMTS_DIAG = [0]  # cap Limitless resolution diagnostics per process
+_POLY_RESOLVE_DIAG = [0]  # cap Polymarket resolution diagnostics per process
 
 
 def _v2_resolve_trades():
@@ -1606,11 +1607,23 @@ def _v2_resolve_trades():
                     # Query Gamma API for the market by slug
                     r = req.get("{}/markets".format(POLY_GAMMA_API),
                                 params={"slug": slug}, timeout=8)
+                    _diag_poly = _POLY_RESOLVE_DIAG[0] < 12
                     if r.status_code == 200:
                         markets = r.json()
                         market = markets[0] if isinstance(markets, list) and markets else markets if isinstance(markets, dict) else None
                         if market:
                             closed = market.get("closed", False)
+                            if _diag_poly:
+                                _POLY_RESOLVE_DIAG[0] += 1
+                                _age = 0
+                                try:
+                                    _age = (datetime.now(timezone.utc) - fired).total_seconds() / 60
+                                except Exception:
+                                    pass
+                                print("[POLY-RESOLVE-DIAG] {} {} age={:.0f}min closed={} "
+                                      "outcomes={} prices={}".format(
+                                          t["timeframe"], slug[:42], _age, closed,
+                                          market.get("outcomes"), market.get("outcomePrices")))
                             if closed:
                                 outcome_prices = market.get("outcomePrices")
                                 if isinstance(outcome_prices, str):
@@ -1636,6 +1649,14 @@ def _v2_resolve_trades():
                                         actual = None  # Not clearly resolved yet
                             else:
                                 pass  # not closed yet — let gated fallback decide
+                        elif _diag_poly:
+                            _POLY_RESOLVE_DIAG[0] += 1
+                            print("[POLY-RESOLVE-DIAG] {} {} — slug NOT FOUND in Gamma".format(
+                                t["timeframe"], slug[:42]))
+                    elif _diag_poly:
+                        _POLY_RESOLVE_DIAG[0] += 1
+                        print("[POLY-RESOLVE-DIAG] {} {} — Gamma HTTP {}".format(
+                            t["timeframe"], slug[:42], r.status_code))
                 except Exception as e:
                     print("[V2] Poly resolve check error {}: {}".format(slug[:30], e))
 
