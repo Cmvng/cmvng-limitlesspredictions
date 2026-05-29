@@ -1313,6 +1313,9 @@ def _v2_get_live_odds(market_data, direction):
 # LIMITLESS MARKET DISCOVERY + ORDERBOOK
 # ═══════════════════════════════════════════════════════════
 
+_LMTS_TF_DIAG = [0]  # cap Limitless timeframe-detection diagnostics
+
+
 def _limitless_fetch_markets():
     """Fetch active crypto Up/Down markets from Limitless Exchange.
     Uses GET /markets/active/slugs for lightweight discovery,
@@ -1372,23 +1375,41 @@ def _limitless_fetch_markets():
                 except:
                     pass
 
-            # Detect timeframe from slug patterns or deadline proximity
+            # Detect timeframe from slug patterns or deadline proximity.
+            # Limitless slugs look like: {asset}-up-or-down-{period}-{ts}
             timeframe = None
             if "hourly" in slug_lower or "-1h-" in slug_lower:
                 timeframe = "1H"
-            elif "daily" in slug_lower or "on-" in slug_lower:
+            elif "daily" in slug_lower or "-1d-" in slug_lower:
                 timeframe = "DAILY"
-            elif "-15m" in slug_lower:
+            elif any(k in slug_lower for k in ("-15m", "15-min", "15min", "quarter")):
                 timeframe = "15M"
+            elif any(k in slug_lower for k in ("-5m", "5-min", "5min")):
+                timeframe = "5M"
+            elif any(k in slug_lower for k in ("weekly", "-1w-", "-7d-")):
+                timeframe = "WEEKLY"
+            elif "-on-" in slug_lower or slug_lower.endswith("-on") or "daily" in slug_lower:
+                timeframe = "DAILY"
 
-            # Fallback: estimate from time remaining
+            # Fallback: estimate from time remaining (only if slug gave nothing)
             if not timeframe:
-                if 3 <= mins_left <= 65:
+                if mins_left <= 1:
+                    continue
+                elif mins_left <= 7:
+                    timeframe = "5M"
+                elif mins_left <= 20:
+                    timeframe = "15M"
+                elif mins_left <= 75:
                     timeframe = "1H"
-                elif 65 < mins_left <= 1500:
+                elif mins_left <= 1500:
                     timeframe = "DAILY"
-                elif mins_left <= 3:
-                    continue  # Too close to expiry
+                else:
+                    timeframe = "WEEKLY"
+                # One-time visibility into real slug patterns we couldn't name
+                if _LMTS_TF_DIAG[0] < 10:
+                    _LMTS_TF_DIAG[0] += 1
+                    print("[LMTS-TF-DIAG] slug='{}' mins_left={:.0f} -> guessed {}".format(
+                        slug[:50], mins_left, timeframe))
 
             if not timeframe:
                 continue
@@ -1530,6 +1551,9 @@ def _v2_calc_limit_price(book_ask, confidence):
 # V2 RESOLUTION — Check outcomes of paper trades
 # ═══════════════════════════════════════════════════════════
 
+_SB_LMTS_DIAG = [0]  # cap Limitless resolution diagnostics per process
+
+
 def _v2_resolve_trades():
     """Resolve paper trades by checking the ACTUAL platform outcome.
     Polymarket: Gamma API outcomePrices → [1.0, 0.0] = UP won, [0.0, 1.0] = DOWN won
@@ -1611,7 +1635,7 @@ def _v2_resolve_trades():
                                     else:
                                         actual = None  # Not clearly resolved yet
                             else:
-                                continue  # Market not closed yet
+                                pass  # not closed yet — let gated fallback decide
                 except Exception as e:
                     print("[V2] Poly resolve check error {}: {}".format(slug[:30], e))
 
@@ -1620,30 +1644,58 @@ def _v2_resolve_trades():
                     r = req.get("{}/markets/{}".format(LIMITLESS_API, slug), timeout=8)
                     if r.status_code == 200:
                         market = r.json()
-                        status = market.get("status", "")
-                        if status in ("resolved", "closed"):
-                            winner = market.get("winningOutcome") or market.get("winner") or ""
-                            if str(winner).lower() in ("yes", "up", "above", "0"):
+                        status = str(market.get("status", "")).lower()
+                        is_done = (status in ("resolved", "closed", "settled", "expired", "ended")
+                                   or market.get("closed") is True
+                                   or market.get("resolved") is True
+                                   or market.get("expired") is True
+                                   or market.get("winningOutcomeIndex") is not None
+                                   or market.get("winningOutcome") not in (None, ""))
+                        if is_done:
+                            winner = (market.get("winningOutcome") or market.get("winner") or "")
+                            widx = market.get("winningOutcomeIndex")
+                            if str(winner).lower() in ("yes", "up", "above"):
                                 actual = "UP"
-                            elif str(winner).lower() in ("no", "down", "below", "1"):
+                            elif str(winner).lower() in ("no", "down", "below"):
                                 actual = "DOWN"
+                            elif widx is not None:
+                                actual = "UP" if int(widx) == 0 else "DOWN"
                             else:
-                                # Try outcomePrices
                                 op = market.get("outcomePrices") or market.get("prices")
                                 if isinstance(op, list) and len(op) >= 2:
                                     if float(op[0]) > 0.9: actual = "UP"
                                     elif float(op[0]) < 0.1: actual = "DOWN"
-                        else:
-                            continue  # Not resolved yet
+                        if not actual and _SB_LMTS_DIAG[0] < 6:
+                            _SB_LMTS_DIAG[0] += 1
+                            print("[LMTS-RESOLVE-DIAG] {} status={} keys={} winner={} widx={}".format(
+                                slug[:40], status, list(market.keys())[:14],
+                                market.get("winningOutcome"), market.get("winningOutcomeIndex")))
+                        # NOTE: no 'continue' here — if undetermined, the gated
+                        # price fallback below resolves genuinely stuck trades.
                 except Exception as e:
                     print("[V2] Limitless resolve check error {}: {}".format(slug[:30], e))
 
-            # METHOD 2: Fallback — Binance price vs PTB (only if platform check failed)
+            # METHOD 2: Fallback — ONLY for genuinely stuck trades. The platform
+            # (Polymarket/Limitless) is authoritative and matches what you see on
+            # the market page. We only guess from price if the platform hasn't
+            # resolved well past expiry (3x the timeframe) — otherwise we WAIT,
+            # so we never post a wrong result before the real one is available.
             if not actual:
+                tf_min = {"15M": 15, "1H": 60, "DAILY": 1440}.get(t["timeframe"], 60)
+                age_min = 0
+                if t.get("fired_at"):
+                    try:
+                        age_min = (datetime.now(timezone.utc) - fired).total_seconds() / 60
+                    except Exception:
+                        age_min = 0
+                if age_min < tf_min * 3:
+                    continue  # give the platform time to resolve correctly
                 close_price = _get_binance_price(asset)
                 ptb = t.get("ptb")
                 if not close_price or not ptb or ptb <= 0:
                     continue
+                print("[V2] FALLBACK resolve {} {} {} (platform unresolved {:.0f}min) close={} ptb={}".format(
+                    t["timeframe"], asset, t["direction"], age_min, close_price, ptb))
                 if close_price > ptb:
                     actual = "UP"
                 elif close_price < ptb:
@@ -2261,11 +2313,19 @@ def _v2_fill_checker():
 
                 limit = o.get("limit_price", 0) or 0
 
-                # FILL if current ask <= our limit price AND ask is sane (>= 10c)
-                # Below 10c means stale/dead market data — not a real fill
+                # FILL LOGIC (guaranteed fills so we never miss a fast market):
+                #  • first 30s: only fill if the ask drops to our limit (better price)
+                #  • after 30s: fill at the live market ask (1:1) — don't miss it
+                # Only a sane ask (>= 10c) counts; <10c = stale/dead data.
                 if current_ask < 10:
                     continue
-                if current_ask <= limit:
+                try:
+                    age_sec = (datetime.now(timezone.utc) - fired).total_seconds()
+                except Exception:
+                    age_sec = 999
+                GRACE_SEC = 30
+                should_fill = (current_ask <= limit) or (age_sec >= GRACE_SEC)
+                if should_fill:
                     try:
                         conn2 = get_db()
                         conn2.run("""
@@ -2275,8 +2335,9 @@ def _v2_fill_checker():
                             WHERE id = :tid
                         """, odds=current_ask, bask=current_ask, tid=o["id"])
                         conn2.close()
-                        print("[V2] FILLED: {} {} {} @ {:.0f}c (limit was {:.0f}c)".format(
-                            o["timeframe"], o["asset"], o["direction"], current_ask, limit))
+                        fill_kind = "limit" if current_ask <= limit else "market"
+                        print("[V2] FILLED ({}): {} {} {} @ {:.0f}c (limit was {:.0f}c)".format(
+                            fill_kind, o["timeframe"], o["asset"], o["direction"], current_ask, limit))
 
                         send_telegram(
                             "✅ V2 FILLED {} {} {} @ {:.0f}c (limit {:.0f}c)\n"
