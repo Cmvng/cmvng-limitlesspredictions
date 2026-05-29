@@ -6427,19 +6427,126 @@ def _espn_scoreboard(slug, yyyymmdd):
     return out
 
 
+def _thesportsdb_day(yyyymmdd):
+    """All soccer for a day from TheSportsDB (free, broad lower-league + friendly
+    coverage, one call per day). Returns rich game dicts like _espn_scoreboard."""
+    if _req is None:
+        return []
+    d = "{}-{}-{}".format(yyyymmdd[:4], yyyymmdd[4:6], yyyymmdd[6:8])
+    url = "https://www.thesportsdb.com/api/v1/json/3/eventsday.php?d={}&s=Soccer".format(d)
+    out = []
+    try:
+        r = _req.get(url, timeout=12, headers={"User-Agent": "Mozilla/5.0"})
+        if r.status_code != 200:
+            return []
+        for ev in (r.json().get("events") or []):
+            home = ev.get("strHomeTeam")
+            away = ev.get("strAwayTeam")
+            if not (home and away):
+                continue
+            status = str(ev.get("strStatus") or "").lower().strip()
+            hs, aw = ev.get("intHomeScore"), ev.get("intAwayScore")
+            try:
+                hs_i = int(hs) if hs not in (None, "") else None
+                aw_i = int(aw) if aw not in (None, "") else None
+            except (ValueError, TypeError):
+                hs_i = aw_i = None
+            completed = status in ("match finished", "ft", "finished", "aet", "pen",
+                                   "after extra time", "after penalties")
+            if status in ("1h", "2h", "ht", "live", "et", "bt", "p"):
+                state = "in"
+            elif completed:
+                state = "post"
+            else:
+                state = "pre"
+            out.append({"home": home, "away": away, "hs": hs_i, "aw": aw_i,
+                        "state": state, "completed": completed,
+                        "detail": ev.get("strStatus") or "",
+                        "league": ev.get("strLeague") or ""})
+    except Exception:
+        return []
+    return out
+
+
+def _livescore_day(yyyymmdd):
+    """All football for a day from Livescore.com's PUBLIC json endpoint (no key,
+    not the encrypted CDN one) — broadest single-call coverage incl. lower
+    leagues and friendlies. Endpoint pattern per the Simatwa/livescore-api repo.
+    Returns rich game dicts like the other feeds."""
+    if _req is None:
+        return []
+    url = ("https://prod-public-api.livescore.com/v1/api/app/date/soccer/{}/3?MD=1".format(yyyymmdd))
+    out = []
+    try:
+        r = _req.get(url, timeout=12, headers={
+            "User-Agent": "Mozilla/5.0", "Referer": "https://www.livescore.com/"})
+        if r.status_code != 200:
+            return []
+        data = r.json()
+        for stage in (data.get("Stages") or []):
+            league = stage.get("Snm") or ""
+            country = stage.get("Cnm") or ""
+            if country and country.lower() not in league.lower():
+                league_full = "{}: {}".format(country, league)
+            else:
+                league_full = league
+            for ev in (stage.get("Events") or []):
+                t1 = ev.get("T1") or [{}]
+                t2 = ev.get("T2") or [{}]
+                home = (t1[0].get("Nm") if t1 else "") or ""
+                away = (t2[0].get("Nm") if t2 else "") or ""
+                if not (home and away):
+                    continue
+                hs, aw = ev.get("Tr1"), ev.get("Tr2")
+                try:
+                    hs_i = int(hs) if hs not in (None, "") else None
+                    aw_i = int(aw) if aw not in (None, "") else None
+                except (ValueError, TypeError):
+                    hs_i = aw_i = None
+                eps = str(ev.get("Eps") or "").upper().strip()
+                completed = eps in ("FT", "AET", "AP", "PEN", "FT_PEN", "AWD", "ABD")
+                if eps in ("NS", "", "POSTP", "CANC", "TBD"):
+                    state = "pre"
+                elif completed:
+                    state = "post"
+                else:
+                    state = "in"      # HT or a live minute like "63'"
+                out.append({"home": home, "away": away, "hs": hs_i, "aw": aw_i,
+                            "state": state, "completed": completed,
+                            "detail": ("FT" if state == "post" else eps),
+                            "league": league_full})
+    except Exception:
+        return []
+    return out
+
+
 def _fb_espn_index(dates):
-    """Rich index of all games (pre/in/post) across leagues for given dates."""
+    """Rich index of all games (pre/in/post) for given dates. Livescore.com is
+    the primary feed (one broad call/day); TheSportsDB + ESPN fill any gaps."""
     index = []
+    ls_n = tsdb_n = espn_n = 0
     for d in dates:
+        ls = _livescore_day(d)
+        if ls:
+            index.extend(ls)
+            ls_n += len(ls)
+        time.sleep(0.1)
+        rows = _thesportsdb_day(d)
+        if rows:
+            index.extend(rows)
+            tsdb_n += len(rows)
+        time.sleep(0.1)
         for slug in ESPN_SOCCER_LEAGUES:
-            rows = _espn_scoreboard(slug, d)
-            if rows:
-                index.extend(rows)
-            time.sleep(0.05)
+            erows = _espn_scoreboard(slug, d)
+            if erows:
+                index.extend(erows)
+                espn_n += len(erows)
+            time.sleep(0.04)
     fin = sum(1 for r in index if r.get("completed"))
     live = sum(1 for r in index if r.get("state") == "in")
-    print("[FB] ESPN index: {} games ({} finished, {} live) across {} dates".format(
-        len(index), fin, live, len(dates)))
+    print("[FB] score index: {} games ({} finished, {} live) "
+          "[Livescore {}, TheSportsDB {}, ESPN {}] across {} dates".format(
+              len(index), fin, live, ls_n, tsdb_n, espn_n, len(dates)))
     return index
 
 
@@ -6502,17 +6609,25 @@ def _fb_live_status(home, away):
 
 
 def _fb_live_refresh_thread():
-    """Refresh the live ESPN index (today ± 1 day) every ~3 minutes."""
+    """Refresh the live match index (today ± 1) every ~3 minutes. Uses the cheap
+    TheSportsDB feed (one call per day, all live/finished soccer) so the picks
+    page can show league + LIVE/FT + scores without hammering ESPN."""
     def loop():
         time.sleep(45)
         while True:
             try:
                 today = _dt.date.today()
-                dates = [(today + _dt.timedelta(days=i)).strftime("%Y%m%d") for i in (-1, 0, 1)]
-                idx = _fb_espn_index(dates)
+                idx = []
+                for i in (-1, 0, 1):
+                    d = (today + _dt.timedelta(days=i)).strftime("%Y%m%d")
+                    day = _livescore_day(d) or _thesportsdb_day(d)
+                    idx.extend(day)
+                    time.sleep(0.2)
                 if idx:
                     _FB_LIVE["index"] = idx
                     _FB_LIVE["ts"] = int(time.time())
+                    live = sum(1 for g in idx if g.get("state") == "in")
+                    print("[FB] live index: {} games ({} live)".format(len(idx), live))
             except Exception as e:
                 print("[FB] live refresh error: {}".format(e))
             time.sleep(180)
@@ -6550,24 +6665,26 @@ def _fb_settle_accumulators(get_db):
         except Exception:
             return None
 
-    due_dates = set()
     due_slips = []
     for acc_id, md, sj in pend:
         d = _as_date(md)
         if d and d <= today:
             due_slips.append((acc_id, d, sj))
-            # games can settle on match day or spill to the next UTC day
-            due_dates.add(d.strftime("%Y%m%d"))
-            due_dates.add((d + _dt.timedelta(days=1)).strftime("%Y%m%d"))
 
     if not due_slips:
         return
 
-    print("[FB] settle: {} pending slips due, fetching ESPN scores for {} dates".format(
-        len(due_slips), len(due_dates)))
-    index = _fb_build_score_index(sorted(due_dates))
+    # Fetch a window that covers games played recently AND this weekend.
+    # Slips store their creation date, but the games inside can be several days
+    # later (e.g. Segunda fixtures created Thu but played Sat), so we scan a
+    # band around today rather than the slip's creation date.
+    dates = [(today + _dt.timedelta(days=i)).strftime("%Y%m%d")
+             for i in (-3, -2, -1, 0, 1, 2, 3)]
+    print("[FB] settle: {} pending slips due, fetching scores for {} dates".format(
+        len(due_slips), len(dates)))
+    index = _fb_build_score_index(dates)
     if not index:
-        print("[FB] settle: ESPN returned no finished games yet")
+        print("[FB] settle: no finished games available yet")
         return
 
     settled_count = 0
@@ -6603,8 +6720,8 @@ def _fb_settle_accumulators(get_db):
             new_result = "lost"
         elif all_known and evaluable > 0:
             new_result = "won"
-        elif md < today - _dt.timedelta(days=2):
-            # 3+ days old and still can't resolve every leg → stop showing pending
+        elif md < today - _dt.timedelta(days=7):
+            # a week old and still unresolvable → stop showing pending
             new_result = "void"
 
         if new_result:
