@@ -1555,6 +1555,80 @@ _SB_LMTS_DIAG = [0]  # cap Limitless resolution diagnostics per process
 _POLY_RESOLVE_DIAG = [0]  # cap Polymarket resolution diagnostics per process
 
 
+def _v2_resolve_short_from_candle(asset, slug, ptb):
+    """Resolve a synthetic 15M/5M Polymarket up/down trade from the ACTUAL
+    closed Binance candle — this matches how the market resolves (price at the
+    candle boundary vs the price-to-beat / Chainlink open). The slug encodes the
+    window start, e.g. 'btc-updown-15m-1780049700'. Returns
+    ('UP'|'DOWN'|'FLAT', close_price) once that candle has closed, else None
+    (caller then leaves it for the gated price fallback)."""
+    import re as _re
+    m = _re.search(r"-updown-(5m|15m)-(\d+)", slug or "")
+    if not m or not ptb or ptb <= 0:
+        return None
+    tf_slug = m.group(1)
+    ws = int(m.group(2))
+    tf_sec = 900 if tf_slug == "15m" else 300
+    interval = "15m" if tf_slug == "15m" else "5m"
+    candle_close_ts = ws + tf_sec
+    if int(time.time()) < candle_close_ts:
+        return None  # the candle hasn't closed yet — wait
+    candles = _fetch_binance_candles(asset, interval=interval, limit=30)
+    if not candles:
+        return None
+    target_open_ms = ws * 1000
+    close_px = None
+    for c in candles:
+        if c["t"] == target_open_ms:
+            close_px = c["c"]
+            break
+    if close_px is None:
+        return None  # candle not in the returned window — let fallback handle
+    # Binance may not be the oracle the platform used (some pairs resolve via
+    # Chainlink). On a decisive move every source agrees; only TIGHT moves are
+    # dangerous, so we refuse to call those from Binance and leave them to the
+    # authoritative platform read. ~0.05% margin ≈ wider than normal cross-oracle
+    # deviation for majors.
+    margin = abs(close_px - ptb) / ptb if ptb else 0
+    if margin < 0.0005:
+        return None  # too close to call from Binance — wait for the platform
+    if close_px > ptb:
+        return ("UP", close_px)
+    if close_px < ptb:
+        return ("DOWN", close_px)
+    return ("FLAT", close_px)
+
+
+def _poly_outcome_from_market(market):
+    """Read the resolved winner from a Polymarket market object.
+    Returns 'UP'|'DOWN' if the market has closed with a clear winner, else None."""
+    if not market or not market.get("closed"):
+        return None
+    outcome_prices = market.get("outcomePrices")
+    if isinstance(outcome_prices, str):
+        try: outcome_prices = json.loads(outcome_prices)
+        except: outcome_prices = None
+    if not (isinstance(outcome_prices, list) and len(outcome_prices) >= 2):
+        return None
+    outcomes_raw = market.get("outcomes")
+    if isinstance(outcomes_raw, str):
+        try: outcomes_raw = json.loads(outcomes_raw)
+        except: outcomes_raw = None
+    up_idx = 0
+    if isinstance(outcomes_raw, list) and len(outcomes_raw) >= 2:
+        if str(outcomes_raw[0]).lower().strip() in ("no", "down", "below"):
+            up_idx = 1
+    try:
+        up_price = float(outcome_prices[up_idx])
+    except (ValueError, TypeError):
+        return None
+    if up_price > 0.9:
+        return "UP"
+    if up_price < 0.1:
+        return "DOWN"
+    return None
+
+
 def _v2_resolve_trades():
     """Resolve paper trades by checking the ACTUAL platform outcome.
     Polymarket: Gamma API outcomePrices → [1.0, 0.0] = UP won, [0.0, 1.0] = DOWN won
@@ -1565,13 +1639,14 @@ def _v2_resolve_trades():
         conn = get_db()
         rows = conn.run("""
             SELECT id, platform, timeframe, asset, direction, ptb, entry_odds,
-                   stake, market_id, slug, fired_at, hedged, hedge_odds, hedge_direction
+                   stake, market_id, slug, fired_at, hedged, hedge_odds, hedge_direction,
+                   condition_id
             FROM v2_paper_trades WHERE status = 'OPEN'
             AND (order_status = 'FILLED' OR order_status IS NULL)
         """)
         cols = ["id", "platform", "timeframe", "asset", "direction", "ptb",
                 "entry_odds", "stake", "market_id", "slug", "fired_at",
-                "hedged", "hedge_odds", "hedge_direction"]
+                "hedged", "hedge_odds", "hedge_direction", "condition_id"]
         trades = [dict(zip(cols, r)) for r in rows]
         conn.close()
 
@@ -1592,7 +1667,7 @@ def _v2_resolve_trades():
                     fired = fired.replace(tzinfo=timezone.utc)
                 now = datetime.now(timezone.utc)
                 tf = t["timeframe"]
-                min_age = {"15M": 16, "1H": 61, "DAILY": 1441}.get(tf, 61)
+                min_age = {"5M": 1, "15M": 2, "1H": 61, "DAILY": 1441}.get(tf, 61)
                 if (now - fired).total_seconds() / 60 < min_age:
                     continue
 
@@ -1600,9 +1675,32 @@ def _v2_resolve_trades():
             slug = t.get("slug", "")
             platform = t["platform"]
             actual = None
+            cond_id = t.get("condition_id", "") or ""
 
-            # METHOD 1: Check platform for actual resolution
-            if platform == "polymarket" and slug:
+            # METHOD 1: Read the ACTUAL result from the platform.
+            # 1a) By condition_id — the permanent on-chain id. Unlike the slug
+            #     lookup, the Gamma condition_ids query keeps returning a market
+            #     AFTER it closes, so we can read the real resolved outcome (the
+            #     same result shown on the Polymarket page you'd click).
+            if platform == "polymarket" and cond_id:
+                try:
+                    r = req.get("{}/markets".format(POLY_GAMMA_API),
+                                params={"condition_ids": cond_id}, timeout=8)
+                    if r.status_code == 200:
+                        mk = r.json()
+                        market = mk[0] if isinstance(mk, list) and mk else (mk if isinstance(mk, dict) else None)
+                        if market:
+                            actual = _poly_outcome_from_market(market)
+                            if _POLY_RESOLVE_DIAG[0] < 12:
+                                _POLY_RESOLVE_DIAG[0] += 1
+                                print("[POLY-RESOLVE-DIAG] {} cond={} closed={} prices={} -> {}".format(
+                                    t["timeframe"], cond_id[:22], market.get("closed"),
+                                    market.get("outcomePrices"), actual))
+                except Exception as e:
+                    print("[V2] Poly cond resolve error {}: {}".format(cond_id[:20], e))
+
+            # 1b) By slug — works for 1H/DAILY markets that are still queryable.
+            if platform == "polymarket" and slug and not actual:
                 try:
                     # Query Gamma API for the market by slug
                     r = req.get("{}/markets".format(POLY_GAMMA_API),
@@ -1696,6 +1794,21 @@ def _v2_resolve_trades():
                 except Exception as e:
                     print("[V2] Limitless resolve check error {}: {}".format(slug[:30], e))
 
+            # METHOD 1c: Safety net for synthetic 15M/5M markets the platform
+            # lookups couldn't read — resolve from the closed Binance candle the
+            # slug points to (price at the boundary vs PTB), which is exactly how
+            # these markets settle. Accurate and available the moment the candle
+            # closes, so we don't sit in the slow fallback below.
+            if not actual and platform == "polymarket" and slug and (
+                    "-updown-15m-" in slug or "-updown-5m-" in slug):
+                cres = _v2_resolve_short_from_candle(asset, slug, t.get("ptb"))
+                if cres:
+                    actual, _cpx = cres
+                    if _POLY_RESOLVE_DIAG[0] < 12:
+                        _POLY_RESOLVE_DIAG[0] += 1
+                        print("[POLY-RESOLVE-DIAG] {} {} candle-resolved close={} ptb={} -> {}".format(
+                            t["timeframe"], slug[:42], _cpx, t.get("ptb"), actual))
+
             # METHOD 2: Fallback — ONLY for genuinely stuck trades. The platform
             # (Polymarket/Limitless) is authoritative and matches what you see on
             # the market page. We only guess from price if the platform hasn't
@@ -1714,6 +1827,11 @@ def _v2_resolve_trades():
                 close_price = _get_binance_price(asset)
                 ptb = t.get("ptb")
                 if not close_price or not ptb or ptb <= 0:
+                    continue
+                # Don't post a guess on a tight move — Binance may not be the
+                # platform's oracle (some pairs use Chainlink), and only decisive
+                # moves are safe to call from price. Keep waiting for the platform.
+                if abs(close_price - ptb) / ptb < 0.0005:
                     continue
                 print("[V2] FALLBACK resolve {} {} {} (platform unresolved {:.0f}min) close={} ptb={}".format(
                     t["timeframe"], asset, t["direction"], age_min, close_price, ptb))
