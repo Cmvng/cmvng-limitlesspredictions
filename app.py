@@ -6555,24 +6555,46 @@ def _fb_build_score_index(dates):
     return _fb_espn_index(dates)
 
 
+def _fb_norm_team(s):
+    s = (s or "").lower().strip()
+    s = s.replace("&", " and ")
+    for junk in (" fc", " cf", " sc", " ac", " afc", " cd", " ud", " club",
+                 " calcio", " 1929", " 1913", " 04", " 05", " 09", ".",
+                 " and ", " de ", " of "):
+        s = s.replace(junk, " ")
+    s = (s.replace("á", "a").replace("é", "e").replace("í", "i")
+           .replace("ó", "o").replace("ú", "u").replace("ñ", "n")
+           .replace("ç", "c").replace("ü", "u").replace("ö", "o")
+           .replace("ä", "a").replace("ø", "o").replace("å", "a"))
+    return " ".join(s.split())
+
+
 def _fb_teams_match(a, b):
     """Fuzzy team-name match tolerant of suffixes, accents, reserve sides."""
-    def norm(s):
-        s = (s or "").lower().strip()
-        for junk in (" fc", " cf", " sc", " ac", " afc", " cd", " ud", " club",
-                     " calcio", " 1929", " 1913", " 04", " 05", " 09", "."):
-            s = s.replace(junk, " ")
-        s = (s.replace("á", "a").replace("é", "e").replace("í", "i")
-               .replace("ó", "o").replace("ú", "u").replace("ñ", "n")
-               .replace("ç", "c").replace("ü", "u").replace("ö", "o"))
-        return " ".join(s.split())
-    a, b = norm(a), norm(b)
+    a, b = _fb_norm_team(a), _fb_norm_team(b)
     if not a or not b:
         return False
     if a == b or a in b or b in a:
         return True
     wa, wb = set(a.split()), set(b.split())
     return any(len(w) >= 4 and w in wb for w in wa)
+
+
+def _fb_closest_team(name, index):
+    """Best-guess feed spelling of a team, for diagnostics. Returns name or ''."""
+    target = set(_fb_norm_team(name).split())
+    best, best_score = "", 0
+    seen = set()
+    for g in index:
+        for t in (g.get("home", ""), g.get("away", "")):
+            if t in seen:
+                continue
+            seen.add(t)
+            toks = set(_fb_norm_team(t).split())
+            overlap = len(target & toks)
+            if overlap > best_score:
+                best, best_score = t, overlap
+    return best if best_score > 0 else ""
 
 
 def _fb_find_game(index, home, away):
@@ -6699,12 +6721,25 @@ def _fb_settle_accumulators(get_db):
         any_lost = False
         all_known = True
         evaluable = 0
-        missing = []
+        upcoming = []   # in the feed but not finished yet (game is future/live)
+        absent = []     # not found in the feed at all (coverage / name mismatch)
         for s in sels:
-            score = _fb_lookup_score(index, s.get("home", ""), s.get("away", ""))
+            home, away = s.get("home", ""), s.get("away", "")
+            score = _fb_lookup_score(index, home, away)
             if score is None:
                 all_known = False
-                missing.append(s.get("match", "{} vs {}".format(s.get("home"), s.get("away"))))
+                g = _fb_find_game(index, home, away)
+                label = s.get("match", "{} vs {}".format(home, away))
+                if g:
+                    st = g.get("state")
+                    upcoming.append("{}[{}]".format(label, "live" if st == "in" else "upcoming"))
+                else:
+                    ch = _fb_closest_team(home, index)
+                    ca = _fb_closest_team(away, index)
+                    hint = ""
+                    if ch or ca:
+                        hint = " (closest in feed: {} / {})".format(ch or "?", ca or "?")
+                    absent.append(label + hint)
                 continue
             hs, aw = score
             outcome = _fb_settle_pick(s.get("market_type", ""), s.get("pick", ""), hs, aw)
@@ -6733,9 +6768,14 @@ def _fb_settle_accumulators(get_db):
                 settled_count += 1
             except Exception as e:
                 print("[FB] settle update error: {}".format(e))
-        elif missing:
-            print("[FB] settle: slip {} still pending, no ESPN score for {}".format(
-                acc_id, ", ".join(missing[:3])))
+        else:
+            bits = []
+            if upcoming:
+                bits.append("not played yet: " + ", ".join(upcoming[:3]))
+            if absent:
+                bits.append("NOT IN FEED: " + ", ".join(absent[:3]))
+            if bits:
+                print("[FB] settle: slip {} pending — {}".format(acc_id, " | ".join(bits)))
 
     if settled_count:
         print("[FB] Settled {} accumulators".format(settled_count))
