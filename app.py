@@ -5533,6 +5533,11 @@ body {
 .match-card .league { font-size:0.68rem; color:#5b8a6e; font-weight:700; text-transform:uppercase; letter-spacing:1px; background:rgba(74,222,128,0.15); padding:3px 10px; border-radius:999px; }
 .match-card .meta { font-family:'JetBrains Mono',monospace; font-size:0.72rem; color:#5b8a6e; margin-bottom:12px; }
 .match-card .meta .inj { color:#c2410c; }
+.match-card .status { display:inline-block; font-family:'JetBrains Mono',monospace; font-size:0.74rem; font-weight:800; padding:3px 10px; border-radius:8px; margin-bottom:10px; letter-spacing:0.3px; }
+.match-card .status.live { background:rgba(220,38,38,0.12); color:#dc2626; }
+.match-card .status.live .det { font-weight:600; opacity:0.8; }
+.match-card .status.ft { background:rgba(21,128,61,0.12); color:#15803d; }
+.match-card .status.pre { background:rgba(91,138,110,0.12); color:#5b8a6e; }
 .pickrow { display:flex; align-items:center; gap:10px; padding:9px 0; border-top:1px solid rgba(21,128,61,0.08); }
 .pickrow:first-of-type { border-top:none; }
 .pickrow .rank { width:22px; height:22px; border-radius:50%; background:#15803d; color:#fff; font-size:0.7rem; font-weight:700; display:flex; align-items:center; justify-content:center; }
@@ -5567,6 +5572,9 @@ body {
 .badge.won { background:rgba(21,128,61,0.15); color:#15803d; }
 .badge.lost { background:rgba(220,38,38,0.13); color:#dc2626; }
 .badge.pending { background:rgba(120,120,120,0.12); color:#777; }
+.badge.void { background:rgba(120,120,120,0.12); color:#999; }
+.tier .sel.won .pick { color:#15803d; }
+.tier .sel.lost .pick { color:#dc2626; text-decoration:line-through; opacity:0.75; }
 
 @media (max-width:600px){
   .page-head h1 { font-size:1.7rem; }
@@ -5690,11 +5698,41 @@ def render_picks_page(match_picks, date_str):
                 p["confidence"])
             for i, p in enumerate(picks, 1)
         )
+
+        # Live status + accurate league from ESPN (refreshed in background)
         league = first.get("league", "")
+        status_html = ""
+        try:
+            live = _fb_live_status(first.get("home", ""), first.get("away", ""))
+        except Exception:
+            live = None
+        if live:
+            if live.get("league"):
+                league = live["league"]
+            st = live.get("state")
+            hs, aw = live.get("hs"), live.get("aw")
+            det = live.get("detail", "")
+            if st == "in":
+                status_html = ('<div class="status live">🔴 LIVE {}–{} '
+                               '<span class="det">{}</span></div>').format(
+                    hs if hs is not None else 0, aw if aw is not None else 0, det)
+            elif st == "post":
+                status_html = ('<div class="status ft">✅ FT {}–{}</div>').format(
+                    hs if hs is not None else 0, aw if aw is not None else 0)
+            elif st == "pre" and det:
+                status_html = '<div class="status pre">⏳ {}</div>'.format(det)
+
+        ko = first.get("kickoff_ts")
+        if not status_html and ko:
+            kt = _fb_fmt_kickoff(ko)
+            if kt:
+                status_html = '<div class="status pre">⏳ {}</div>'.format(kt)
+
         blocks.append(
             '<div class="glass match-card"><div class="mhead">'
             '<div class="teams">{}</div><div class="league">{}</div></div>'
-            '<div class="meta">{}</div>{}</div>'.format(match, league, meta, rows)
+            '{}<div class="meta">{}</div>{}</div>'.format(
+                match, league, status_html, meta, rows)
         )
 
     if not blocks:
@@ -5833,16 +5871,25 @@ def render_results_day(date_iso, date_human, accas):
     for a in accas:
         status = (a.get("result") or "pending").lower()
         badge = '<span class="badge {}">{}</span>'.format(
-            status, {"won": "WON", "lost": "LOST"}.get(status, "PENDING"))
+            status, {"won": "WON", "lost": "LOST", "void": "VOID"}.get(status, "PENDING"))
         sels = ""
         try:
             sel_list = a.get("selections", [])
-            sels = "".join(
-                '<div class="sel"><div class="ico">⚽</div><div class="body">'
-                '<div class="match">{}</div><div class="pick">{}</div></div>'
-                '<div class="odds">{}</div></div>'.format(
-                    s.get("match", ""), s.get("pick", ""), s.get("odds", ""))
-                for s in sel_list)
+            parts = []
+            for s in sel_list:
+                lr = (s.get("result") or "").lower()
+                if lr == "won":
+                    ico, cls = "✅", "won"
+                elif lr == "lost":
+                    ico, cls = "❌", "lost"
+                else:
+                    ico, cls = "⚽", "pending"
+                parts.append(
+                    '<div class="sel {}"><div class="ico">{}</div><div class="body">'
+                    '<div class="match">{}</div><div class="pick">{}</div></div>'
+                    '<div class="odds">{}</div></div>'.format(
+                        cls, ico, s.get("match", ""), s.get("pick", ""), s.get("odds", "")))
+            sels = "".join(parts)
         except Exception:
             pass
         code = ""
@@ -6291,36 +6338,70 @@ def sb_get_event_result(event_id, home, away):
     return None
 
 
-# ── ESPN scoreboard: the settlement score feed (free, no key, keeps finished
-#    games — unlike SportyBet which drops them, and livescore.com whose own API
-#    is body-encrypted). One scoreboard call per league per date. ─────────────
+# ── ESPN scoreboard: the match-status + score feed (free, no key, keeps
+#    finished games — unlike SportyBet which drops them, and livescore.com
+#    whose own API is body-encrypted). Powers league labels, live scores,
+#    in-play status AND settlement. One scoreboard call per league per date. ──
 ESPN_SOCCER_LEAGUES = [
-    "eng.1", "eng.2", "esp.1", "esp.2", "ita.1", "ger.1", "fra.1",
-    "ned.1", "por.1", "sco.1", "tur.1", "bel.1",
-    "uefa.champions", "uefa.europa", "uefa.europa_conf",
-    "fifa.friendly", "fifa.friendly.w",
+    "eng.1", "eng.2", "esp.1", "esp.2", "ita.1", "ita.2", "ger.1", "ger.2",
+    "fra.1", "fra.2", "ned.1", "por.1", "sco.1", "tur.1", "bel.1", "gre.1",
+    "usa.1", "mex.1", "aut.1", "sui.1", "rus.1", "ukr.1",
+    "uefa.champions", "uefa.europa", "uefa.europa_conf", "uefa.nations",
+    "fifa.friendly", "fifa.friendly.w", "fifa.world",
     "fifa.worldq.uefa", "fifa.worldq.conmebol", "fifa.worldq.concacaf",
-    "fifa.worldq.afc", "fifa.worldq.caf",
-    "conmebol.libertadores", "conmebol.sudamericana",
+    "fifa.worldq.afc", "fifa.worldq.caf", "fifa.worldq.ofc",
+    "conmebol.libertadores", "conmebol.sudamericana", "conmebol.america",
+    "afc.cup", "aus.1", "jpn.1", "bra.1", "arg.1", "col.1", "chi.1",
 ]
+
+ESPN_LEAGUE_NAMES = {
+    "eng.1": "Premier League", "eng.2": "Championship",
+    "esp.1": "LaLiga", "esp.2": "LaLiga 2", "ita.1": "Serie A", "ita.2": "Serie B",
+    "ger.1": "Bundesliga", "ger.2": "Bundesliga 2", "fra.1": "Ligue 1", "fra.2": "Ligue 2",
+    "ned.1": "Eredivisie", "por.1": "Primeira Liga", "sco.1": "Scottish Prem",
+    "tur.1": "Süper Lig", "bel.1": "Belgian Pro", "gre.1": "Super League Greece",
+    "usa.1": "MLS", "mex.1": "Liga MX", "aut.1": "Austrian Bundesliga",
+    "sui.1": "Swiss Super League", "rus.1": "Russian Premier", "ukr.1": "Ukrainian Premier",
+    "uefa.champions": "Champions League", "uefa.europa": "Europa League",
+    "uefa.europa_conf": "Conference League", "uefa.nations": "Nations League",
+    "fifa.friendly": "International Friendly", "fifa.friendly.w": "Int'l Friendly (W)",
+    "fifa.world": "World Cup",
+    "fifa.worldq.uefa": "WC Qualifier (UEFA)", "fifa.worldq.conmebol": "WC Qualifier (CONMEBOL)",
+    "fifa.worldq.concacaf": "WC Qualifier (CONCACAF)", "fifa.worldq.afc": "WC Qualifier (AFC)",
+    "fifa.worldq.caf": "WC Qualifier (CAF)", "fifa.worldq.ofc": "WC Qualifier (OFC)",
+    "conmebol.libertadores": "Copa Libertadores", "conmebol.sudamericana": "Copa Sudamericana",
+    "conmebol.america": "Copa América", "afc.cup": "AFC Cup", "aus.1": "A-League",
+    "jpn.1": "J1 League", "bra.1": "Brasileirão", "arg.1": "Liga Argentina",
+    "col.1": "Liga Colombiana", "chi.1": "Primera Chile",
+}
 
 
 def _espn_scoreboard(slug, yyyymmdd):
-    """Fetch one ESPN league+date scoreboard. Returns finished/in-play games."""
+    """One ESPN league+date scoreboard. Returns rich game dicts:
+    {home, away, hs, aw, state(pre|in|post), completed, detail, league}."""
     if _req is None:
         return []
     url = ("https://site.api.espn.com/apis/site/v2/sports/soccer/{}"
            "/scoreboard?dates={}".format(slug, yyyymmdd))
     out = []
+    league_name = ESPN_LEAGUE_NAMES.get(slug, slug)
     try:
         r = _req.get(url, timeout=12, headers={"User-Agent": "Mozilla/5.0"})
         if r.status_code != 200:
             return []
         data = r.json()
+        # ESPN also reports a precise league name at the top level
+        try:
+            lg = (data.get("leagues") or [{}])[0]
+            league_name = lg.get("name") or lg.get("abbreviation") or league_name
+        except Exception:
+            pass
         for ev in data.get("events", []):
             comp = (ev.get("competitions") or [{}])[0]
             stype = ((ev.get("status") or {}).get("type")) or {}
+            state = stype.get("state") or ""          # pre | in | post
             completed = bool(stype.get("completed"))
+            detail = stype.get("shortDetail") or stype.get("detail") or ""
             home = away = None
             hs = aw = None
             for c in comp.get("competitors", []):
@@ -6331,105 +6412,166 @@ def _espn_scoreboard(slug, yyyymmdd):
                     home, hs = nm, sc
                 else:
                     away, aw = nm, sc
-            if home and away and hs is not None and aw is not None:
-                try:
-                    out.append({"home": home, "away": away,
-                                "hs": int(hs), "aw": int(aw), "completed": completed})
-                except (ValueError, TypeError):
-                    pass
+            if not (home and away):
+                continue
+            try:
+                hs_i = int(hs) if hs is not None else None
+                aw_i = int(aw) if aw is not None else None
+            except (ValueError, TypeError):
+                hs_i = aw_i = None
+            out.append({"home": home, "away": away, "hs": hs_i, "aw": aw_i,
+                        "state": state, "completed": completed,
+                        "detail": detail, "league": league_name})
     except Exception:
         return []
     return out
 
 
-def _fb_build_score_index(dates):
-    """Build a list of finished-game results across all leagues for given dates."""
+def _fb_espn_index(dates):
+    """Rich index of all games (pre/in/post) across leagues for given dates."""
     index = []
     for d in dates:
         for slug in ESPN_SOCCER_LEAGUES:
             rows = _espn_scoreboard(slug, d)
             if rows:
                 index.extend(rows)
-            time.sleep(0.08)
-    fin = sum(1 for r in index if r["completed"])
-    print("[FB] ESPN score index: {} games found ({} finished) across {} dates".format(
-        len(index), fin, len(dates)))
+            time.sleep(0.05)
+    fin = sum(1 for r in index if r.get("completed"))
+    live = sum(1 for r in index if r.get("state") == "in")
+    print("[FB] ESPN index: {} games ({} finished, {} live) across {} dates".format(
+        len(index), fin, live, len(dates)))
     return index
 
 
-def _fb_lookup_score(index, home, away):
-    """Find a finished game in the ESPN index matching these teams. -> (hs,aw) or None."""
+# back-compat alias used by the settler
+def _fb_build_score_index(dates):
+    return _fb_espn_index(dates)
+
+
+def _fb_teams_match(a, b):
+    """Fuzzy team-name match tolerant of suffixes, accents, reserve sides."""
     def norm(s):
-        s = (s or "").lower()
+        s = (s or "").lower().strip()
         for junk in (" fc", " cf", " sc", " ac", " afc", " cd", " ud", " club",
-                     "real ", "deportivo ", " calcio", " 1929", " 1913", "."):
+                     " calcio", " 1929", " 1913", " 04", " 05", " 09", "."):
             s = s.replace(junk, " ")
+        s = (s.replace("á", "a").replace("é", "e").replace("í", "i")
+               .replace("ó", "o").replace("ú", "u").replace("ñ", "n")
+               .replace("ç", "c").replace("ü", "u").replace("ö", "o"))
         return " ".join(s.split())
+    a, b = norm(a), norm(b)
+    if not a or not b:
+        return False
+    if a == b or a in b or b in a:
+        return True
+    wa, wb = set(a.split()), set(b.split())
+    return any(len(w) >= 4 and w in wb for w in wa)
 
-    def teams_match(a, b):
-        a, b = norm(a), norm(b)
-        if not a or not b:
-            return False
-        if a == b or a in b or b in a:
-            return True
-        wa, wb = set(a.split()), set(b.split())
-        # share a distinctive (>=4 char) token
-        return any(len(w) >= 4 and w in wb for w in wa)
 
+def _fb_find_game(index, home, away):
+    """Find a game in the index matching these teams. Returns the game dict
+    (with scores possibly home/away-swapped to the caller's orientation)."""
     for g in index:
-        if not g["completed"]:
-            continue
-        if teams_match(home, g["home"]) and teams_match(away, g["away"]):
-            return g["hs"], g["aw"]
-        if teams_match(home, g["away"]) and teams_match(away, g["home"]):
-            return g["aw"], g["hs"]
+        if _fb_teams_match(home, g["home"]) and _fb_teams_match(away, g["away"]):
+            return g
+        if _fb_teams_match(home, g["away"]) and _fb_teams_match(away, g["home"]):
+            sw = dict(g)
+            sw["hs"], sw["aw"] = g["aw"], g["hs"]
+            sw["home"], sw["away"] = g["away"], g["home"]
+            return sw
     return None
 
 
+def _fb_lookup_score(index, home, away):
+    """Final score for a FINISHED game matching these teams. -> (hs,aw) or None."""
+    g = _fb_find_game(index, home, away)
+    if g and g.get("completed") and g.get("hs") is not None and g.get("aw") is not None:
+        return g["hs"], g["aw"]
+    return None
+
+
+# ── Live-status cache: refreshed in the background so the picks page can show
+#    league + kickoff/LIVE/FT + current score without a slow API call per load.
+_FB_LIVE = {"index": [], "ts": 0}
+
+
+def _fb_live_status(home, away):
+    """Return {league, state, detail, hs, aw} for a match, or None."""
+    g = _fb_find_game(_FB_LIVE.get("index", []), home, away)
+    return g
+
+
+def _fb_live_refresh_thread():
+    """Refresh the live ESPN index (today ± 1 day) every ~3 minutes."""
+    def loop():
+        time.sleep(45)
+        while True:
+            try:
+                today = _dt.date.today()
+                dates = [(today + _dt.timedelta(days=i)).strftime("%Y%m%d") for i in (-1, 0, 1)]
+                idx = _fb_espn_index(dates)
+                if idx:
+                    _FB_LIVE["index"] = idx
+                    _FB_LIVE["ts"] = int(time.time())
+            except Exception as e:
+                print("[FB] live refresh error: {}".format(e))
+            time.sleep(180)
+    threading.Thread(target=loop, daemon=True).start()
+    print("[FB] live-status thread started (every 3min)")
+
+
+
+
+
 def _fb_settle_accumulators(get_db):
-    """Settle pending accumulators using ESPN final scores (goal-based legs)."""
-    import time as _t
-    now_ms = int(_t.time() * 1000)
+    """Settle pending accumulators using ESPN final scores. Triggers off the
+    slip's match_date (always stored) rather than per-leg kickoff timestamps."""
+    today = _dt.date.today()
     try:
         conn = get_db()
         rows = conn.run(
-            "SELECT id, selections_json, result FROM sportybet_accumulators "
+            "SELECT id, match_date, selections_json, result FROM sportybet_accumulators "
             "WHERE result IS NULL OR result = 'pending'")
-        cols_rows = [(r[0], r[1], r[2]) for r in rows]
+        pend = [(r[0], r[1], r[2]) for r in rows]
         conn.close()
     except Exception as e:
         print("[FB] settle query error: {}".format(e))
         return
 
-    if not cols_rows:
+    if not pend:
         return
 
-    # Only bother if at least one pending leg has finished (kickoff + 2.5h passed)
-    needs_scores = False
-    for _id, sj, _r in cols_rows:
+    # Which match-dates are due (game day is today or earlier)?
+    def _as_date(v):
+        if isinstance(v, _dt.date):
+            return v
         try:
-            for s in (json.loads(sj) if sj else []):
-                ko = s.get("kickoff_ts") or 0
-                if ko and now_ms > (ko + 2.5 * 3600 * 1000):
-                    needs_scores = True
-                    break
+            return _dt.date.fromisoformat(str(v)[:10])
         except Exception:
-            pass
-        if needs_scores:
-            break
-    if not needs_scores:
+            return None
+
+    due_dates = set()
+    due_slips = []
+    for acc_id, md, sj in pend:
+        d = _as_date(md)
+        if d and d <= today:
+            due_slips.append((acc_id, d, sj))
+            # games can settle on match day or spill to the next UTC day
+            due_dates.add(d.strftime("%Y%m%d"))
+            due_dates.add((d + _dt.timedelta(days=1)).strftime("%Y%m%d"))
+
+    if not due_slips:
         return
 
-    # Build the ESPN score index for the last few days (covers recent kickoffs)
-    today = _dt.datetime.utcnow()
-    dates = [(today - _dt.timedelta(days=i)).strftime("%Y%m%d") for i in (0, 1, 2)]
-    index = _fb_build_score_index(dates)
+    print("[FB] settle: {} pending slips due, fetching ESPN scores for {} dates".format(
+        len(due_slips), len(due_dates)))
+    index = _fb_build_score_index(sorted(due_dates))
     if not index:
-        print("[FB] settle: no scores available yet")
+        print("[FB] settle: ESPN returned no finished games yet")
         return
 
     settled_count = 0
-    for acc_id, sj, _res in cols_rows:
+    for acc_id, md, sj in due_slips:
         try:
             sels = json.loads(sj) if sj else []
         except Exception:
@@ -6440,19 +6582,17 @@ def _fb_settle_accumulators(get_db):
         any_lost = False
         all_known = True
         evaluable = 0
+        missing = []
         for s in sels:
-            ko = s.get("kickoff_ts") or 0
-            if not ko or now_ms < (ko + 2.5 * 3600 * 1000):
-                all_known = False
-                continue
             score = _fb_lookup_score(index, s.get("home", ""), s.get("away", ""))
             if score is None:
                 all_known = False
+                missing.append(s.get("match", "{} vs {}".format(s.get("home"), s.get("away"))))
                 continue
             hs, aw = score
             outcome = _fb_settle_pick(s.get("market_type", ""), s.get("pick", ""), hs, aw)
             if outcome is None:
-                continue  # corners/cards — can't grade from score
+                continue  # corners/cards — can't grade from final score
             evaluable += 1
             s["result"] = "won" if outcome else "lost"
             if not outcome:
@@ -6463,6 +6603,9 @@ def _fb_settle_accumulators(get_db):
             new_result = "lost"
         elif all_known and evaluable > 0:
             new_result = "won"
+        elif md < today - _dt.timedelta(days=2):
+            # 3+ days old and still can't resolve every leg → stop showing pending
+            new_result = "void"
 
         if new_result:
             try:
@@ -6473,9 +6616,12 @@ def _fb_settle_accumulators(get_db):
                 settled_count += 1
             except Exception as e:
                 print("[FB] settle update error: {}".format(e))
+        elif missing:
+            print("[FB] settle: slip {} still pending, no ESPN score for {}".format(
+                acc_id, ", ".join(missing[:3])))
 
     if settled_count:
-        print("[FB] Settled {} accumulators (won/lost)".format(settled_count))
+        print("[FB] Settled {} accumulators".format(settled_count))
 
 
 def fb_settle_thread(get_db):
@@ -6533,7 +6679,10 @@ def _fb_enrich_and_filter_upcoming(fixtures, max_lookup=60):
         # Keep only games that haven't started and still have markets
         not_started = ("not start" in status) or (status == "" and (not ko or now_ms < ko))
         future_ok = (not ko) or (now_ms < ko)
-        if not has_markets or not not_started or not future_ok:
+        # Reject far-future fixtures (e.g. next-season openers SportyBet lists
+        # months out) — only keep games within the next ~4 days.
+        near_term = (not ko) or (ko < now_ms + 4 * 24 * 3600 * 1000)
+        if not has_markets or not not_started or not future_ok or not near_term:
             continue
         fx["sb_event_id"] = eid
         fx["kickoff_ts"] = ko
@@ -7150,19 +7299,24 @@ def fb_results_page():
         try:
             conn = get_db()
             rows = conn.run(
-                "SELECT label, total_odds, selections_json, sportybet_code, result, tier "
-                "FROM sportybet_accumulators WHERE match_date = :d ORDER BY target_odds ASC",
+                "SELECT label, total_odds, selections_json, sportybet_code, result, tier, id "
+                "FROM sportybet_accumulators WHERE match_date = :d ORDER BY id DESC",
                 d=date_q)
             conn.close()
             order = {"2_odds": 0, "3_odds": 1, "5_odds": 2, "10_odds": 3, "1000_odds": 4}
+            seen_tiers = set()
             for r in rows:
+                tier = r[5]
+                if tier in seen_tiers:   # keep only the latest run's slip per tier
+                    continue
+                seen_tiers.add(tier)
                 try:
                     sels = json.loads(r[2]) if r[2] else []
                 except Exception:
                     sels = []
                 accas.append({"label": r[0], "total_odds": r[1] or 0,
                               "selections": sels, "sportybet_code": r[3],
-                              "result": r[4], "tier": r[5]})
+                              "result": r[4], "tier": tier})
             accas.sort(key=lambda a: order.get(a.get("tier"), 9))
         except Exception as e:
             print("[FB] day results error: {}".format(e))
@@ -7298,6 +7452,12 @@ try:
     fb_settle_thread(get_db)
 except Exception as e:
     print("[FB] settle thread error: {}".format(e))
+
+# Football live-status thread (league + LIVE/FT + scores for the picks page)
+try:
+    _fb_live_refresh_thread()
+except Exception as e:
+    print("[FB] live-status thread error: {}".format(e))
 
 print("[V2] All threads launched — engine running")
 print("=" * 60)
