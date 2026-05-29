@@ -1575,6 +1575,9 @@ def _v2_resolve_short_from_candle(asset, slug, ptb):
         return None  # the candle hasn't closed yet — wait
     candles = _fetch_binance_candles(asset, interval=interval, limit=30)
     if not candles:
+        if _POLY_RESOLVE_DIAG[0] < 12:
+            _POLY_RESOLVE_DIAG[0] += 1
+            print("[POLY-RESOLVE-DIAG] candle: no Binance candles for {} {}".format(asset, interval))
         return None
     target_open_ms = ws * 1000
     close_px = None
@@ -1583,7 +1586,12 @@ def _v2_resolve_short_from_candle(asset, slug, ptb):
             close_px = c["c"]
             break
     if close_px is None:
-        return None  # candle not in the returned window — let fallback handle
+        if _POLY_RESOLVE_DIAG[0] < 12:
+            _POLY_RESOLVE_DIAG[0] += 1
+            ts = [c["t"] // 1000 for c in candles]
+            print("[POLY-RESOLVE-DIAG] candle: window {} not in feed (have {}..{}) for {}".format(
+                ws, min(ts), max(ts), asset))
+        return None
     # Binance may not be the oracle the platform used (some pairs resolve via
     # Chainlink). On a decisive move every source agrees; only TIGHT moves are
     # dangerous, so we refuse to call those from Binance and leave them to the
@@ -1591,7 +1599,11 @@ def _v2_resolve_short_from_candle(asset, slug, ptb):
     # deviation for majors.
     margin = abs(close_px - ptb) / ptb if ptb else 0
     if margin < 0.0005:
-        return None  # too close to call from Binance — wait for the platform
+        if _POLY_RESOLVE_DIAG[0] < 12:
+            _POLY_RESOLVE_DIAG[0] += 1
+            print("[POLY-RESOLVE-DIAG] candle: {} too tight ({:.3f}%) close={} ptb={} — waiting".format(
+                asset, margin * 100, close_px, ptb))
+        return None
     if close_px > ptb:
         return ("UP", close_px)
     if close_px < ptb:
@@ -1627,6 +1639,45 @@ def _poly_outcome_from_market(market):
     if up_price < 0.1:
         return "DOWN"
     return None
+
+
+def _poly_read_resolution(slug, cond_id):
+    """Read the resolved winner from Polymarket for a market that has CLOSED.
+    Per Gamma docs, list queries default to closed=false and silently exclude
+    resolved markets, so we must pass closed=true / use the slug path endpoints.
+    Returns ('UP'|'DOWN', market) or (None, market|None)."""
+    import requests as req
+    urls = []
+    if slug:
+        urls.append(("{}/markets".format(POLY_GAMMA_API), {"slug": slug, "closed": "true"}))
+        urls.append(("{}/markets/slug/{}".format(POLY_GAMMA_API, slug), None))
+        urls.append(("{}/events/slug/{}".format(POLY_GAMMA_API, slug), None))
+    if cond_id:
+        urls.append(("{}/markets".format(POLY_GAMMA_API),
+                     {"condition_ids": cond_id, "closed": "true"}))
+    last_market = None
+    for url, params in urls:
+        try:
+            r = req.get(url, params=params, timeout=8) if params is not None else req.get(url, timeout=8)
+            if r.status_code != 200:
+                continue
+            data = r.json()
+            market = None
+            if isinstance(data, list) and data:
+                market = data[0]
+            elif isinstance(data, dict):
+                if data.get("markets"):
+                    market = data["markets"][0]
+                elif "outcomePrices" in data or "closed" in data:
+                    market = data
+            if market:
+                last_market = market
+                out = _poly_outcome_from_market(market)
+                if out:
+                    return out, market
+        except Exception:
+            continue
+    return None, last_market
 
 
 def _v2_resolve_trades():
@@ -1677,88 +1728,26 @@ def _v2_resolve_trades():
             actual = None
             cond_id = t.get("condition_id", "") or ""
 
-            # METHOD 1: Read the ACTUAL result from the platform.
-            # 1a) By condition_id — the permanent on-chain id. Unlike the slug
-            #     lookup, the Gamma condition_ids query keeps returning a market
-            #     AFTER it closes, so we can read the real resolved outcome (the
-            #     same result shown on the Polymarket page you'd click).
-            if platform == "polymarket" and cond_id:
+            # METHOD 1: Read the ACTUAL resolved result from Polymarket.
+            # Closed markets are excluded by Gamma's default closed=false filter,
+            # so the reader explicitly requests closed=true across the slug /
+            # condition_id endpoints — this is the result shown on the market page.
+            if platform == "polymarket":
                 try:
-                    r = req.get("{}/markets".format(POLY_GAMMA_API),
-                                params={"condition_ids": cond_id}, timeout=8)
-                    if r.status_code == 200:
-                        mk = r.json()
-                        market = mk[0] if isinstance(mk, list) and mk else (mk if isinstance(mk, dict) else None)
-                        if market:
-                            actual = _poly_outcome_from_market(market)
-                            if _POLY_RESOLVE_DIAG[0] < 12:
-                                _POLY_RESOLVE_DIAG[0] += 1
-                                print("[POLY-RESOLVE-DIAG] {} cond={} closed={} prices={} -> {}".format(
-                                    t["timeframe"], cond_id[:22], market.get("closed"),
-                                    market.get("outcomePrices"), actual))
-                except Exception as e:
-                    print("[V2] Poly cond resolve error {}: {}".format(cond_id[:20], e))
-
-            # 1b) By slug — works for 1H/DAILY markets that are still queryable.
-            if platform == "polymarket" and slug and not actual:
-                try:
-                    # Query Gamma API for the market by slug
-                    r = req.get("{}/markets".format(POLY_GAMMA_API),
-                                params={"slug": slug}, timeout=8)
-                    _diag_poly = _POLY_RESOLVE_DIAG[0] < 12
-                    if r.status_code == 200:
-                        markets = r.json()
-                        market = markets[0] if isinstance(markets, list) and markets else markets if isinstance(markets, dict) else None
-                        if market:
-                            closed = market.get("closed", False)
-                            if _diag_poly:
-                                _POLY_RESOLVE_DIAG[0] += 1
-                                _age = 0
-                                try:
-                                    _age = (datetime.now(timezone.utc) - fired).total_seconds() / 60
-                                except Exception:
-                                    pass
-                                print("[POLY-RESOLVE-DIAG] {} {} age={:.0f}min closed={} "
-                                      "outcomes={} prices={}".format(
-                                          t["timeframe"], slug[:42], _age, closed,
-                                          market.get("outcomes"), market.get("outcomePrices")))
-                            if closed:
-                                outcome_prices = market.get("outcomePrices")
-                                if isinstance(outcome_prices, str):
-                                    try: outcome_prices = json.loads(outcome_prices)
-                                    except: outcome_prices = None
-                                if isinstance(outcome_prices, list) and len(outcome_prices) >= 2:
-                                    # Check outcome ordering
-                                    outcomes_raw = market.get("outcomes")
-                                    if isinstance(outcomes_raw, str):
-                                        try: outcomes_raw = json.loads(outcomes_raw)
-                                        except: outcomes_raw = None
-                                    up_idx = 0
-                                    if isinstance(outcomes_raw, list) and len(outcomes_raw) >= 2:
-                                        o0 = str(outcomes_raw[0]).lower().strip()
-                                        if o0 in ("no", "down", "below"):
-                                            up_idx = 1
-                                    up_price = float(outcome_prices[up_idx])
-                                    if up_price > 0.9:
-                                        actual = "UP"
-                                    elif up_price < 0.1:
-                                        actual = "DOWN"
-                                    else:
-                                        actual = None  # Not clearly resolved yet
-                            else:
-                                pass  # not closed yet — let gated fallback decide
-                        elif _diag_poly:
-                            _POLY_RESOLVE_DIAG[0] += 1
-                            print("[POLY-RESOLVE-DIAG] {} {} — slug NOT FOUND in Gamma".format(
-                                t["timeframe"], slug[:42]))
-                    elif _diag_poly:
+                    actual, _mk = _poly_read_resolution(slug, cond_id)
+                    if _POLY_RESOLVE_DIAG[0] < 12:
                         _POLY_RESOLVE_DIAG[0] += 1
-                        print("[POLY-RESOLVE-DIAG] {} {} — Gamma HTTP {}".format(
-                            t["timeframe"], slug[:42], r.status_code))
+                        if _mk:
+                            print("[POLY-RESOLVE-DIAG] {} {} closed={} prices={} -> {}".format(
+                                t["timeframe"], (slug or cond_id)[:42],
+                                _mk.get("closed"), _mk.get("outcomePrices"), actual))
+                        else:
+                            print("[POLY-RESOLVE-DIAG] {} {} — not found even with closed=true".format(
+                                t["timeframe"], (slug or cond_id)[:42]))
                 except Exception as e:
-                    print("[V2] Poly resolve check error {}: {}".format(slug[:30], e))
+                    print("[V2] Poly resolve error {}: {}".format((slug or cond_id)[:24], e))
 
-            elif platform == "limitless" and slug:
+            if platform == "limitless" and slug:
                 try:
                     r = req.get("{}/markets/{}".format(LIMITLESS_API, slug), timeout=8)
                     if r.status_code == 200:
