@@ -9465,6 +9465,35 @@ def fb_builder_page():
                                _FB_CACHE.get("date") or _fb_today_human())
 
 
+@app.route("/app/sofa-test")
+def sofa_test():
+    """Instant proxy test — hit Sofascore through the current proxy and report
+    the exact result, so you can try different SCRAPE_PROXY values without
+    waiting for a full engine run. 200 = unblocked; 403 = still challenged."""
+    url = "{}/search/all?q=arsenal".format(SOFA)
+    out = {"proxy": "set" if _SCRAPE_PROXY else "none",
+           "impersonate": _CF_IMPERSONATE,
+           "cloudscraper": bool(_cloudscraper)}
+    try:
+        r = _scrape_get(url, timeout=15)
+        if r is None:
+            out["status"] = None
+            out["result"] = "no response"
+        else:
+            out["status"] = r.status_code
+            try:
+                out["body"] = (r.text or "")[:160]
+            except Exception:
+                out["body"] = ""
+            out["result"] = ("UNBLOCKED — Sofascore is reachable, methodology can go live"
+                             if r.status_code == 200
+                             else "still blocked — try a residential proxy in SCRAPE_PROXY")
+    except Exception as e:
+        out["status"] = "error"
+        out["result"] = "{}: {}".format(type(e).__name__, e)
+    return jsonify(out)
+
+
 @app.route("/app/results")
 def fb_results_page():
     date_q = request.args.get("date")
