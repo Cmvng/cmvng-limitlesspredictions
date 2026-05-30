@@ -4640,6 +4640,58 @@ def analyze_fixture(fx):
     clear_game = goal_margin >= 1.0
     low_scoring = exp_total_goals < 2.6
 
+    # ── USER METHODOLOGY: last-10 granular form rules ──
+    hfs = fx.get("home_form_stats") or {}
+    afs = fx.get("away_form_stats") or {}
+    # Over 1.5: safe when BOTH teams hit it in >=75% of recent games, OR the
+    # stronger side is a high-scoring team.
+    both_over15 = (hfs.get("over15_pct", 0) >= 0.75 and afs.get("over15_pct", 0) >= 0.75)
+    stronger_high_scoring = max(hfs.get("avg_gf", 0), afs.get("avg_gf", 0)) >= 1.8
+    over15_safe = both_over15 or stronger_high_scoring
+    # Under 3.5 / unders: safe when both sides keep recent games under it.
+    both_under35 = (hfs.get("under35_pct", 0) >= 0.70 and afs.get("under35_pct", 0) >= 0.70)
+    # TACTICAL STYLE (Understat PPDA): low PPDA = aggressive high press, high =
+    # passive low block. Two high-press sides => transitions/space => more goals;
+    # two low blocks => controlled, fewer goals.
+    h_ppda = _safe(fx, "home_ppda", 0) or 0
+    a_ppda = _safe(fx, "away_ppda", 0) or 0
+    both_high_press = 0 < h_ppda <= 9.0 and 0 < a_ppda <= 9.0
+    both_low_block = h_ppda >= 13.0 and a_ppda >= 13.0
+    if both_high_press:
+        over15_safe = True
+    if both_low_block:
+        both_under35 = True
+    # Universal fallback (works for ALL leagues, incl. those Understat doesn't
+    # cover): read game tempo from each side's last-10 total goals/game. Two
+    # high-tempo sides => open game => overs; two low-tempo => closed => unders.
+    if not (h_ppda and a_ppda):
+        h_tempo = hfs.get("avg_gf", 0) + hfs.get("avg_ga", 0)
+        a_tempo = afs.get("avg_gf", 0) + afs.get("avg_ga", 0)
+        if h_tempo and a_tempo:
+            if h_tempo >= 3.0 and a_tempo >= 3.0:
+                over15_safe = True
+            elif h_tempo <= 2.2 and a_tempo <= 2.2:
+                both_under35 = True
+    # Universal fallback (ALL leagues): when PPDA is unavailable, read open-vs-
+    # closed from recent goal volume — Sofascore form covers every league.
+    if not (h_ppda or a_ppda) and hfs.get("played") and afs.get("played"):
+        h_tot = hfs.get("avg_gf", 0) + hfs.get("avg_ga", 0)
+        a_tot = afs.get("avg_gf", 0) + afs.get("avg_ga", 0)
+        if h_tot >= 3.0 and a_tot >= 3.0:      # both play open, high-volume games
+            over15_safe = True
+        elif h_tot <= 2.2 and a_tot <= 2.2:    # both play tight, low-volume games
+            both_under35 = True
+    # Straight win only for the clearly stronger side; away win needs to be
+    # OVERWHELMING. Otherwise the safe pick is the double chance.
+    home_clearly_stronger = (home_win_raw >= 0.56 and hfs.get("ppg", 0) >= 1.6
+                             and home_inj <= away_inj + 1)
+    away_overwhelming = (away_win_raw >= 0.62 and afs.get("ppg", 0) >= 1.8)
+    form_note = ""
+    if hfs.get("played") and afs.get("played"):
+        form_note = " | last{}: {} o1.5 {:.0f}%/{:.0f}%".format(
+            hfs.get("played"), afs.get("played", 0),
+            hfs.get("over15_pct", 0) * 100, afs.get("over15_pct", 0) * 100)
+
     picks = []
 
     def add(market_type, pick_label, confidence, reasoning):
@@ -4695,6 +4747,15 @@ def analyze_fixture(fx):
         home_win_conf *= 0.85
         away_win_conf *= 0.85
 
+    # USER RULE: a straight win is only a real pick for the clearly stronger
+    # side; an away win must be OVERWHELMING. Otherwise it stays low so the
+    # double chance (home/away or draw) is what surfaces.
+    if not home_clearly_stronger:
+        home_win_conf *= 0.80
+    if not away_overwhelming:
+        away_win_conf *= 0.72
+    _win_reason += form_note
+
     add("home_win", "{} to Win".format(home), home_win_conf,
         "{}: {}".format(home, _win_reason))
     add("away_win", "{} to Win".format(away), away_win_conf,
@@ -4740,10 +4801,16 @@ def analyze_fixture(fx):
         over_45 *= 0.55
         over_55 *= 0.50
         over_15 = min(over_15, 82)  # 1.5 still usually fine, but don't overstate
+    # USER RULE: recent-form override for the goals ladder
+    if over15_safe:
+        over_15 = max(over_15, 88)   # both sides reliably clear 1.5 (or one is high-scoring)
+    if both_under35:
+        under_35 = max(100 - over_35, 85)
+        under_45 = max(100 - over_45, 92)
     under_15 = 100 - over_15
     under_25 = 100 - over_25
-    under_35 = 100 - over_35
-    under_45 = 100 - over_45
+    under_35 = 100 - over_35 if not both_under35 else max(100 - over_35, 85)
+    under_45 = 100 - over_45 if not both_under35 else max(100 - over_45, 92)
 
     add("over_0.5", "Over 0.5 Goals", over_05,
         "Expected {:.1f} total goals".format(exp_total_goals))
@@ -4893,6 +4960,18 @@ def _sb_board_explore(fx, home, away, exp_home, exp_away, exp_total):
     p_away_to_nil = _sum_grid(lambda i, j: j > i and i == 0)
     p_home_cs = _sum_grid(lambda i, j: j == 0)                     # clean sheet
     p_away_cs = _sum_grid(lambda i, j: i == 0)
+    # 1UP (early payout the moment your team leads by 1). "Ever leads" is
+    # path-dependent and not exactly derivable from the final-score grid, so we
+    # use a sound proxy: always a win, plus most draws (likely led at some point)
+    # and a slice of narrow losses (led then conceded). Strictly safer than a
+    # straight win — which is exactly why 1UP is the preferred win market.
+    p_home_win_ft = _sum_grid(lambda i, j: i > j)
+    p_away_win_ft = _sum_grid(lambda i, j: j > i)
+    p_draw_goals = _sum_grid(lambda i, j: i == j and i >= 1)
+    p_home_loss1 = _sum_grid(lambda i, j: j - i == 1)
+    p_away_loss1 = _sum_grid(lambda i, j: i - j == 1)
+    p_home_1up = min(96.0, p_home_win_ft + 0.55 * p_draw_goals + 0.22 * p_home_loss1)
+    p_away_1up = min(96.0, p_away_win_ft + 0.55 * p_draw_goals + 0.22 * p_away_loss1)
 
     # ── Per-half model: goals split ~45% 1st half / 55% 2nd, halves independent ──
     def _win_half(lh, la):
@@ -4954,6 +5033,7 @@ def _sb_board_explore(fx, home, away, exp_home, exp_away, exp_total):
         is_winhalf = ("win" in desc and "half" in desc) and not is_fh
         is_tonil = "to nil" in desc or "win to nil" in desc
         is_cleansheet = "clean sheet" in desc
+        is_1up = "1up" in desc or "1 up" in desc
 
         def _side(*texts):
             for t in texts:
@@ -5098,6 +5178,18 @@ def _sb_board_explore(fx, home, away, exp_home, exp_away, exp_total):
                     mtype = "cleansheet_{}_{}".format(side, yn or "y")
                     comment = "{} clean sheet ~{:.0f}% (opp proj {:.1f})".format(
                         tname, base, exp_away if side == "home" else exp_home)
+            elif is_1up:
+                # 1UP — pays the instant your side leads by one. Recognise the
+                # team outcome (and the double-chance variants 1X/X2 if present).
+                side = _side(od) or _side(desc)
+                if side:
+                    base = p_home_1up if side == "home" else p_away_1up
+                    tname = home if side == "home" else away
+                    label = "{} 1UP".format(tname)
+                    mtype = "oneup_{}".format(side)
+                    comment = "{} 1UP (ever leads ~{:.0f}%, safer than a straight win)".format(
+                        tname, base)
+                    prob = base
 
             if prob is None or not label:
                 continue
@@ -5141,9 +5233,9 @@ TIER_CONFIG = {
         # BANKER: only the lowest-variance markets. No BTTS, no corners, no
         # outright win — those are coin-flips on a 2-odds slip.
         "allow": ["double_chance_1X", "double_chance_X2", "over_0.5",
-                  "over_1.5", "under_3.5", "under_4.5"],
-        "prefer": ["double_chance_1X", "double_chance_X2", "over_1.5",
-                   "under_4.5", "under_3.5", "over_0.5"],
+                  "over_1.5", "under_3.5", "under_4.5", "oneup_home", "oneup_away"],
+        "prefer": ["oneup_home", "oneup_away", "double_chance_1X", "double_chance_X2",
+                   "over_1.5", "under_4.5", "under_3.5", "over_0.5"],
         "label": "2 ODDS — BANKER", "emoji": "🟢",
     },
     "3_odds": {
@@ -5154,9 +5246,9 @@ TIER_CONFIG = {
         # BTTS or corners here — too unreliable for a "safe" slip.
         "allow": ["double_chance_1X", "double_chance_X2", "over_1.5",
                   "under_3.5", "under_2.5", "under_4.5", "over_2.5", "home_win", "away_win",
-                  "dnb_home", "dnb_away"],
-        "prefer": ["double_chance_1X", "double_chance_X2", "over_1.5",
-                   "under_3.5", "home_win", "away_win", "under_2.5"],
+                  "dnb_home", "dnb_away", "oneup_home", "oneup_away"],
+        "prefer": ["oneup_home", "oneup_away", "double_chance_1X", "double_chance_X2",
+                   "over_1.5", "under_3.5", "home_win", "away_win", "under_2.5"],
         "label": "3 ODDS — SAFE", "emoji": "🟢",
     },
     "5_odds": {
@@ -5455,6 +5547,53 @@ def sofa_todays_fixtures(date_str=None, max_leagues=None):
     return fixtures
 
 
+def sofa_team_form_stats(team_id, limit=10):
+    """Last-N granular form for a team, computed from the same events feed as
+    sofa_team_form (which already has each match's full score). Returns the
+    per-match breakdowns the pick rules need:
+      over15_pct / over25_pct / under35_pct : share of recent games hitting it
+      scored_pct / cs_pct / btts_pct        : attack/defence reliability
+      avg_gf / avg_ga / ppg                 : strength signals
+      form (WWDLW), played
+    Returns {} on no data so callers fall back gracefully."""
+    if not team_id:
+        return {}
+    data = _get_json("{}/team/{}/events/last/0".format(SOFA, team_id))
+    if not data or "events" not in data:
+        return {}
+    events = [e for e in data.get("events", [])
+              if e.get("homeScore", {}).get("current") is not None
+              and e.get("awayScore", {}).get("current") is not None][-limit:]
+    n = len(events)
+    if n == 0:
+        return {}
+    over15 = over25 = under35 = scored = cs = btts = pts = 0
+    gf = ga = 0
+    form = []
+    for ev in reversed(events):  # most recent first
+        hs = ev["homeScore"]["current"]
+        as_ = ev["awayScore"]["current"]
+        is_home = ev.get("homeTeam", {}).get("id") == team_id
+        my, opp = (hs, as_) if is_home else (as_, hs)
+        tot = hs + as_
+        gf += my; ga += opp
+        if tot > 1.5: over15 += 1
+        if tot > 2.5: over25 += 1
+        if tot < 3.5: under35 += 1
+        if my > 0: scored += 1
+        if opp == 0: cs += 1
+        if hs > 0 and as_ > 0: btts += 1
+        if my > opp: form.append("W"); pts += 3
+        elif my < opp: form.append("L")
+        else: form.append("D"); pts += 1
+    return {
+        "played": n, "form": "".join(form),
+        "over15_pct": over15 / n, "over25_pct": over25 / n, "under35_pct": under35 / n,
+        "scored_pct": scored / n, "cs_pct": cs / n, "btts_pct": btts / n,
+        "avg_gf": round(gf / n, 2), "avg_ga": round(ga / n, 2), "ppg": round(pts / n, 2),
+    }
+
+
 def sofa_team_form(team_id, limit=5):
     """Get last N results for a team as a form string like 'WWDLW'."""
     if not team_id:
@@ -5496,16 +5635,45 @@ def sofa_h2h(event_id):
 
 
 def sofa_injuries(team_id):
-    """Get count of injured/suspended players for a team."""
+    """Team-news signal weighted by player IMPORTANCE, not a raw count — a
+    missing star hurts far more than a missing squad player. Sofascore's injury
+    feed carries each absent player; we weight by how central they are (rating /
+    market value when present), so 'key injuries' reflects real squad damage."""
     if not team_id:
         return 0
     data = _get_json("{}/team/{}/player/injuries".format(SOFA, team_id))
     if not data:
         return 0
     injuries = data.get("playerInjuries", data.get("injuries", []))
-    if isinstance(injuries, list):
-        return len(injuries)
-    return 0
+    if not isinstance(injuries, list):
+        return 0
+    weight = 0.0
+    for inj in injuries:
+        p = inj.get("player", inj) if isinstance(inj, dict) else {}
+        # importance proxy: market value (€) or recent rating; fall back to 1
+        mv = p.get("proposedMarketValue") or p.get("marketValue") or 0
+        rating = _to_num(p.get("rating") or p.get("avgRating") or 0)
+        if mv and mv >= 40_000_000:
+            weight += 2.0          # genuine star
+        elif mv and mv >= 12_000_000:
+            weight += 1.3
+        elif rating and rating >= 7.3:
+            weight += 1.5          # high performer
+        else:
+            weight += 0.6          # squad/fringe player
+    # Return an integer "key-injury equivalent" the strength calc already uses
+    return int(round(weight))
+
+
+def sofa_injuries_count(team_id):
+    """Raw count of absences (kept for any callers that want the plain number)."""
+    if not team_id:
+        return 0
+    data = _get_json("{}/team/{}/player/injuries".format(SOFA, team_id))
+    if not data:
+        return 0
+    inj = data.get("playerInjuries", data.get("injuries", []))
+    return len(inj) if isinstance(inj, list) else 0
 
 
 def sofa_match_stats_summary(event_id):
@@ -5584,10 +5752,19 @@ def understat_team_xg(league_name, season="2025"):
             xg_for = sum(_to_num(h.get("xG")) for h in history)
             xg_against = sum(_to_num(h.get("xGA")) for h in history)
             played = len(history)
+            # PPDA = opponent passes allowed per defensive action. LOW = aggressive
+            # high press; HIGH = passive low block. This is the tactical-style signal.
+            ppda_att = ppda_def = 0.0
+            for h in history:
+                pp = h.get("ppda") or {}
+                ppda_att += _to_num(pp.get("att"))
+                ppda_def += _to_num(pp.get("def"))
+            ppda = round(ppda_att / ppda_def, 2) if ppda_def else None
             if played > 0:
                 out[name] = {
                     "xg_for": round(xg_for / played, 2),
                     "xg_against": round(xg_against / played, 2),
+                    "ppda": ppda,
                     "played": played,
                 }
     except Exception:
@@ -5662,6 +5839,13 @@ def build_fixture_dataset(date_str=None, rate_limit=1.5, max_fixtures=30):
             fx["away_form"] = sofa_team_form(fx.get("away_id"))
             time.sleep(rate_limit)
 
+            # Granular last-10 stats (over1.5%, under3.5%, clean-sheet%, avg goals,
+            # ppg) — same events feed, drives the over/under + ranking rules.
+            fx["home_form_stats"] = sofa_team_form_stats(fx.get("home_id"))
+            time.sleep(rate_limit)
+            fx["away_form_stats"] = sofa_team_form_stats(fx.get("away_id"))
+            time.sleep(rate_limit)
+
             # Injuries (2 calls)
             fx["home_key_injuries"] = sofa_injuries(fx.get("home_id"))
             fx["away_key_injuries"] = sofa_injuries(fx.get("away_id"))
@@ -5674,9 +5858,13 @@ def build_fixture_dataset(date_str=None, rate_limit=1.5, max_fixtures=30):
             if home_xg:
                 fx["home_xg_for"] = home_xg["xg_for"]
                 fx["home_xg_against"] = home_xg["xg_against"]
+                if home_xg.get("ppda") is not None:
+                    fx["home_ppda"] = home_xg["ppda"]
             if away_xg:
                 fx["away_xg_for"] = away_xg["xg_for"]
                 fx["away_xg_against"] = away_xg["xg_against"]
+                if away_xg.get("ppda") is not None:
+                    fx["away_ppda"] = away_xg["ppda"]
 
             enriched.append(fx)
         except Exception as e:
@@ -7092,10 +7280,30 @@ def _espn_match_stats(slug, espn_id):
                     r_tot += n; found_card = True
         corners = c_tot if found_c else None
         cards = (y_tot + r_tot) if found_card else None
+        # Goal timeline → did each side EVER lead? (for airtight 1UP settlement)
+        # ESPN keyEvents carry the running homeScore/awayScore after each goal.
+        esp_home_led = esp_away_led = None
+        kev = data.get("keyEvents") or data.get("commentary") or []
+        if kev:
+            esp_home_led = esp_away_led = False
+            for e in kev:
+                is_goal = (e.get("scoringPlay") is True
+                           or "goal" in str((e.get("type") or {}).get("text", "")).lower())
+                if not is_goal:
+                    continue
+                try:
+                    hsc = int(e.get("homeScore")); asc = int(e.get("awayScore"))
+                except (TypeError, ValueError):
+                    continue
+                if hsc > asc:
+                    esp_home_led = True
+                if asc > hsc:
+                    esp_away_led = True
     except Exception:
         _FB_STATS_CACHE[key] = None
         return None
-    res = {"corners": corners, "cards": cards}
+    res = {"corners": corners, "cards": cards,
+           "home_ever_led": esp_home_led, "away_ever_led": esp_away_led}
     _FB_STATS_CACHE[key] = res
     return res
 
@@ -7117,6 +7325,11 @@ def _fb_settle_stat_pick(market_type, stats):
         if c is None:
             return None
         return c > float(m.group(2)) if m.group(1) == "over" else c < float(m.group(2))
+    # 1UP — settle from the goal timeline: did the side EVER lead by one?
+    m = _sports_re.match(r'^oneup_(home|away)$', mt)
+    if m:
+        return (stats.get("home_ever_led") if m.group(1) == "home"
+                else stats.get("away_ever_led"))
     return None
 
 
@@ -7181,6 +7394,14 @@ def _fb_settle_pick(market_type, pick_text, hs, aw, h1h=None, h1a=None):
         mar = margin if m.group(1) == "home" else -margin
         hit = mar >= int(m.group(2))
         return hit if m.group(3) == "yes" else not hit
+
+    # ── 1UP early-payout (board): oneup_home / oneup_away ──
+    m = _re.match(r'^oneup_(home|away)$', mt)
+    if m:
+        won = (hs > aw) if m.group(1) == "home" else (aw > hs)
+        # A final win guarantees they led; a draw/loss can't be confirmed either
+        # way from the final score alone (they may have led then been pegged back).
+        return True if won else None
 
     # ── win to nil (board): tonil_home_y / _n ──
     m = _re.match(r'^tonil_(home|away)_(y|n)$', mt)
@@ -7562,6 +7783,7 @@ def _fb_find_game(index, home, away):
             sw = dict(g)
             sw["hs"], sw["aw"] = g["aw"], g["hs"]
             sw["home"], sw["away"] = g["away"], g["home"]
+            sw["_swapped"] = True
             return sw
     return None
 
@@ -7708,6 +7930,16 @@ def _fb_settle_accumulators(get_db):
                 if g and g.get("espn_id"):
                     stats = _espn_match_stats(g.get("espn_slug"), g.get("espn_id"))
                     outcome = _fb_settle_stat_pick(mt, stats)
+            if outcome is None and mt.startswith("oneup"):
+                # 1UP on a non-win: confirm from the goal timeline whether the
+                # side ever led (early payout would have triggered).
+                if g and g.get("espn_id"):
+                    stats = _espn_match_stats(g.get("espn_slug"), g.get("espn_id"))
+                    if stats:
+                        el_h, el_a = stats.get("home_ever_led"), stats.get("away_ever_led")
+                        if g.get("_swapped"):
+                            el_h, el_a = el_a, el_h
+                        outcome = el_h if mt == "oneup_home" else el_a
             if outcome is None:
                 continue  # still ungradeable (no stats / half-no-HT) — skip leg
             evaluable += 1
