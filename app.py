@@ -4138,6 +4138,62 @@ def _sports_score_pick(insights, market):
 _sports_market_cache = {"polymarket": [], "limitless": []}
 
 
+def _sports_pick_outcome(insights, market):
+    """Return the EXPLICIT recommended pick for THIS specific market, phrased so
+    the user knows exactly what to back — 'Burgos to Win', 'Under 2.5 Goals',
+    'Both Teams to Score — Yes', 'Draw'. Returns None when there's no confident,
+    specific recommendation (so we never surface a vague pick)."""
+    q = ((market.get("question", "") or "") + " " +
+         (market.get("title", "") or "")).lower()
+    smt = (market.get("sports_market_type", "") or "").lower()
+    win = insights.get("consensus_winner")
+    btts = insights.get("consensus_btts")
+    avg = None
+    if insights.get("total_goals_predicted"):
+        vals = insights["total_goals_predicted"]
+        avg = sum(vals) / len(vals)
+
+    # ── Totals / Over-Under goals: state the side AND the line ──
+    if "total" in smt or (("over" in q or "under" in q) and "goal" in q):
+        ln = _sports_re.search(r'(\d+\.?\d*)\s*goal', q) or _sports_re.search(r'(\d+\.\d+)', q)
+        line = ln.group(1) if ln else "2.5"
+        if avg is None:
+            return None  # no goals signal — don't guess a direction
+        try:
+            return ("Over {} Goals".format(line) if avg > float(line)
+                    else "Under {} Goals".format(line))
+        except ValueError:
+            return None
+
+    # ── Both Teams To Score ──
+    if "btts" in smt or "both_teams" in smt or ("both" in q and "score" in q):
+        if btts == "YES":
+            return "Both Teams to Score — Yes"
+        if btts == "NO":
+            return "Both Teams to Score — No"
+        if avg is not None and avg >= 2.4:
+            return "Both Teams to Score — Yes"
+        return None
+
+    # ── Correct score ──
+    if "correct" in smt or "correct score" in q:
+        if insights.get("scores"):
+            sc = insights["scores"][0].get("score")
+            if sc:
+                return "Correct Score {}".format(sc)
+        return None
+
+    # ── Moneyline / match winner (default) ──
+    if "moneyline" in smt or "win" in q or "winner" in q or not smt:
+        if win == "DRAW":
+            return "Draw"
+        if win:
+            return "{} to Win".format(win)
+        return None
+
+    return None
+
+
 def _sports_scan_and_alert():
     """Main sports scanning function. Scrapes all sites, finds consensus, matches markets, sends alerts."""
     print("[SPORTS] Starting scan...")
@@ -4234,6 +4290,7 @@ def _sports_scan_and_alert():
         sources = set(p["source"] for p in preds)
         match_alerts = 0  # Track alerts for this match
         seen_alert_keys = set()  # Deduplicate same market appearing twice
+        game_candidates = []  # collect all scored markets, then surface the best
 
         # Extract insights
         insights = _sports_extract_insights(preds, home, away)
@@ -4289,106 +4346,87 @@ def _sports_scan_and_alert():
                         home, away, market.get("question", "")[:50],
                         pick_score, ", ".join(reasons[:3])))
 
-                if pick_score >= SPORTS_MIN_SCORE and match_alerts < MAX_ALERTS_PER_MATCH:
-                    # Build market type label
-                    smt = market.get("sports_market_type", "")
-                    smt_labels = {
-                        "moneyline": "🏆 Match Winner",
-                        "total": "⚽ Over/Under Goals",
-                        "totals": "⚽ Over/Under Goals",
-                        "btts": "🎯 Both Teams To Score",
-                        "both_teams_to_score": "🎯 Both Teams To Score",
-                        "spread": "📊 Handicap/Spread",
-                        "total_corners": "🔲 Total Corners",
-                        "correct_score": "🎯 Correct Score",
-                        "first_goal": "1️⃣ First Goal Scorer",
-                        "anytime_goal": "⚽ Anytime Goal Scorer",
-                    }
-                    market_label = smt_labels.get(smt, "📊 {}".format(smt.replace("_", " ").title() if smt else "Market"))
-                    mq = market.get("question", "") or market.get("title", "")
+                if pick_score >= SPORTS_MIN_SCORE:
+                    pick_outcome = _sports_pick_outcome(insights, market)
+                    if not pick_outcome:
+                        continue  # no explicit, confident side — never surface a vague pick
+                    game_candidates.append({
+                        "score": pick_score, "market": market, "reasons": reasons,
+                        "pick_outcome": pick_outcome, "smt": smt,
+                    })
 
-                    # Build odds string from outcome prices
-                    odds_str = ""
-                    op = market.get("outcome_prices", [])
-                    oc = market.get("outcomes", [])
-                    if op and oc and len(op) == len(oc):
-                        odds_parts = []
-                        for i, (outcome, price) in enumerate(zip(oc, op)):
-                            try:
-                                pct = float(price) * 100
-                                odds_parts.append("{}: {:.0f}%".format(outcome, pct))
-                            except:
-                                pass
-                        if odds_parts:
-                            odds_str = " | ".join(odds_parts)
+        # ── Surface the BEST market(s) for this game, each with an EXPLICIT pick ──
+        game_candidates.sort(key=lambda c: -c["score"])
+        for cand in game_candidates[:2]:
+            if match_alerts >= MAX_ALERTS_PER_MATCH:
+                break
+            market = cand["market"]; pick_score = cand["score"]
+            reasons = cand["reasons"]; pick_outcome = cand["pick_outcome"]; smt = cand["smt"]
+            smt_labels = {
+                "moneyline": "🏆 Match Winner", "total": "⚽ Over/Under Goals",
+                "totals": "⚽ Over/Under Goals", "btts": "🎯 Both Teams To Score",
+                "both_teams_to_score": "🎯 Both Teams To Score", "spread": "📊 Handicap/Spread",
+                "total_corners": "🔲 Total Corners", "correct_score": "🎯 Correct Score",
+                "first_goal": "1️⃣ First Goal Scorer", "anytime_goal": "⚽ Anytime Goal Scorer",
+            }
+            market_label = smt_labels.get(smt, "📊 {}".format(
+                smt.replace("_", " ").title() if smt else "Market"))
+            mq = market.get("question", "") or market.get("title", "")
+            url = market.get("url", "")
 
-                    # Build prediction context
-                    scores_str = ", ".join("{}: {}".format(s["source"].split(".")[0], s["score"])
-                                          for s in insights["scores"][:3])
-                    consensus_parts = []
-                    if insights["consensus_winner"]:
-                        consensus_parts.append("Winner: {}".format(insights["consensus_winner"]))
-                    if insights["consensus_goals"]:
-                        consensus_parts.append("Goals: {} 2.5".format(insights["consensus_goals"]))
-                    if insights["consensus_btts"]:
-                        consensus_parts.append("BTTS: {}".format(insights["consensus_btts"]))
-
-                    msg = (
-                        "⚽ <b>SPORTS PICK</b>\n"
-                        "🏟 <b>{home} vs {away}</b>\n\n"
-                        "{market_label}\n"
-                        "📊 <b>{question}</b>\n"
-                        "{odds_line}"
-                        "🔗 {url}\n\n"
-                        "📈 Prediction ({n_sites} site{s}):\n"
-                        "{consensus}\n"
-                        "{scores_line}"
-                        "💡 {reasons}\n"
-                        "⭐ Confidence: {score}/100"
-                    ).format(
-                        home=home, away=away,
-                        market_label=market_label,
-                        question=mq,
-                        odds_line="💰 Odds: {}\n".format(odds_str) if odds_str else "",
-                        url=market.get("url", ""),
-                        n_sites=len(sources),
-                        s="" if len(sources) == 1 else "s",
-                        consensus=" | ".join(consensus_parts) if consensus_parts else "N/A",
-                        scores_line="🎯 Score predictions: {}\n".format(scores_str) if scores_str else "",
-                        reasons=" | ".join(reasons[:4]),
-                        score=pick_score,
-                    )
-                    send_telegram(msg)
+            odds_str = ""
+            op = market.get("outcome_prices", []); oc = market.get("outcomes", [])
+            if op and oc and len(op) == len(oc):
+                parts = []
+                for outcome, price in zip(oc, op):
                     try:
-                        _u = market.get('url', '')
-                        _plat = 'limitless' if 'limitless' in _u else 'polymarket'
-                        _winner = insights.get('consensus_winner') or ''
-                        _pick_txt = market_label
-                        _sports_market_cache.setdefault(_plat, [])
-                        _sports_market_cache[_plat].insert(0, {
-                            'home': home, 'away': away,
-                            'winner': _winner,
-                            'market': _pick_txt,
-                            'question': (mq or '')[:90],
-                            'url': _u,
-                            'score': pick_score,
-                            'odds': odds_str,
-                        })
-                        # Dedup by match, keep newest 30
-                        _seen = set(); _clean = []
-                        for _it in _sports_market_cache[_plat]:
-                            _k = (_it.get('home'), _it.get('away'), _it.get('market'))
-                            if _k in _seen:
-                                continue
-                            _seen.add(_k); _clean.append(_it)
-                        _sports_market_cache[_plat] = _clean[:30]
-                    except Exception:
+                        parts.append("{}: {:.0f}%".format(outcome, float(price) * 100))
+                    except (ValueError, TypeError):
                         pass
-                    alerts_sent += 1
-                    match_alerts += 1
-                    print("[SPORTS] ALERT: {} vs {} — {} — score {}/100 | {}".format(
-                        home, away, smt or "general", pick_score,
-                        market.get("url", "")[:50]))
+                odds_str = " | ".join(parts)
+
+            scores_str = ", ".join("{}: {}".format(s["source"].split(".")[0], s["score"])
+                                   for s in insights["scores"][:3])
+            msg = (
+                "⚽ <b>SPORTS PICK</b>\n"
+                "🏟 <b>{home} vs {away}</b>\n\n"
+                "✅ <b>BEST PICK: {pick}</b>\n"
+                "{market_label}\n"
+                "{odds_line}"
+                '🔗 <a href="{url}">Place this bet</a>\n\n'
+                "📈 From {n_sites} prediction site{s}\n"
+                "{scores_line}"
+                "💡 {reasons}\n"
+                "⭐ Confidence: {score}/100"
+            ).format(
+                home=home, away=away, pick=pick_outcome, market_label=market_label,
+                odds_line="💰 Market odds: {}\n".format(odds_str) if odds_str else "",
+                url=url, n_sites=len(sources), s="" if len(sources) == 1 else "s",
+                scores_line="🎯 Score reads: {}\n".format(scores_str) if scores_str else "",
+                reasons=" | ".join(reasons[:4]), score=pick_score,
+            )
+            send_telegram(msg)
+            try:
+                _plat = 'limitless' if 'limitless' in url else 'polymarket'
+                _sports_market_cache.setdefault(_plat, [])
+                _sports_market_cache[_plat].insert(0, {
+                    'home': home, 'away': away, 'pick': pick_outcome,
+                    'market': market_label, 'question': (mq or '')[:90],
+                    'url': url, 'score': pick_score, 'odds': odds_str,
+                })
+                _seen = set(); _clean = []
+                for _it in _sports_market_cache[_plat]:
+                    _k = (_it.get('home'), _it.get('away'), _it.get('pick'))
+                    if _k in _seen:
+                        continue
+                    _seen.add(_k); _clean.append(_it)
+                _sports_market_cache[_plat] = _clean[:30]
+            except Exception:
+                pass
+            alerts_sent += 1
+            match_alerts += 1
+            print("[SPORTS] ALERT: {} vs {} — {} → {} — {}/100".format(
+                home, away, smt or "general", pick_outcome, pick_score))
 
     print("[SPORTS] Scan complete — {} predictions matched to markets, {} alerts sent".format(
         matched_count, alerts_sent))
@@ -7440,7 +7478,7 @@ def _fb_build_score_index(dates):
 
 def _fb_norm_team(s):
     s = (s or "").lower().strip()
-    s = s.replace("&", " and ")
+    s = s.replace("&", " and ").replace("-", " ").replace("/", " ").replace("'", "")
     for junk in (" fc", " cf", " sc", " ac", " afc", " cd", " ud", " club",
                  " calcio", " 1929", " 1913", " 04", " 05", " 09", ".",
                  " and ", " de ", " of "):
@@ -7452,8 +7490,42 @@ def _fb_norm_team(s):
     return " ".join(s.split())
 
 
+_FB_CANON = {}
+for _canon, _variants in {
+    "paris saint germain": ["psg", "paris sg", "paris s g", "paris"],
+    "manchester united": ["man united", "man utd", "man u", "manchester utd"],
+    "manchester city": ["man city"],
+    "tottenham hotspur": ["tottenham", "spurs"],
+    "internazionale": ["inter", "inter milan"],
+    "wolverhampton wanderers": ["wolves", "wolverhampton"],
+    "borussia monchengladbach": ["gladbach", "monchengladbach", "b monchengladbach"],
+    "borussia dortmund": ["dortmund", "bvb"],
+    "bayern munich": ["bayern", "bayern munchen"],
+    "atletico madrid": ["atletico", "atletico de madrid", "atleti"],
+    "real betis": ["betis"],
+    "sporting cp": ["sporting", "sporting lisbon"],
+    "saudi arabia": ["ksa"],
+    "united states": ["usa", "usmnt"],
+    "south korea": ["korea republic", "korea south"],
+}.items():
+    _FB_CANON[_canon] = _canon
+    for _v in _variants:
+        _FB_CANON[_v] = _canon
+
+
+def _fb_canon(name):
+    """Normalize + collapse known abbreviations to one canonical spelling so
+    'Psg' matches 'Paris Saint-Germain', 'Man Utd' matches 'Manchester United'."""
+    n = _fb_norm_team(name)
+    return _FB_CANON.get(n, n)
+
+
 def _fb_teams_match(a, b):
-    """Fuzzy team-name match tolerant of suffixes, accents, reserve sides."""
+    """Fuzzy team-name match tolerant of suffixes, accents, reserve sides,
+    and common abbreviations (PSG, Man Utd, Spurs, ...)."""
+    ca, cb = _fb_canon(a), _fb_canon(b)
+    if ca and cb and ca == cb:
+        return True
     a, b = _fb_norm_team(a), _fb_norm_team(b)
     if not a or not b:
         return False
@@ -8015,15 +8087,14 @@ def _send_sports(tg_token, chat_id, platform, getter):
             if isinstance(m, dict):
                 home = m.get("home", "")
                 away = m.get("away", "")
-                winner = m.get("winner", "")
+                pick = m.get("pick", "") or m.get("winner", "")
                 market = m.get("market", "")
                 url = m.get("url", "")
                 score = m.get("score", "")
                 lines.append("⚽ <b>{} vs {}</b>".format(home, away))
-                if winner and winner.upper() != "DRAW":
-                    lines.append("🏆 Pick: <b>{}</b>".format(winner))
-                elif winner:
-                    lines.append("🏆 Pick: <b>Draw</b>")
+                if pick:
+                    lines.append("✅ Pick: <b>{}</b>".format(
+                        "Draw" if pick.upper() == "DRAW" else pick))
                 if market:
                     lines.append("📍 {}".format(market.replace("🏆 ", "").replace("⚽ ", "")))
                 if score:
