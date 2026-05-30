@@ -4972,6 +4972,15 @@ def _sb_board_explore(fx, home, away, exp_home, exp_away, exp_total):
     p_away_loss1 = _sum_grid(lambda i, j: i - j == 1)
     p_home_1up = min(96.0, p_home_win_ft + 0.55 * p_draw_goals + 0.22 * p_home_loss1)
     p_away_1up = min(96.0, p_away_win_ft + 0.55 * p_draw_goals + 0.22 * p_away_loss1)
+    # Double-Chance 1UP (marketId 60110): 1X/X2 with early payout. A DC-1UP side
+    # wins whenever the plain DC wins PLUS when its team led at some point (the
+    # early payout), so it's strictly >= the plain double chance.
+    p_1x = _sum_grid(lambda i, j: i >= j)
+    p_x2 = _sum_grid(lambda i, j: j >= i)
+    p_00 = grid[0][0] * 100.0
+    p_dc1up_1x = min(98.0, p_1x + 0.30 * p_home_loss1)   # +edge: home led then lost
+    p_dc1up_x2 = min(98.0, p_x2 + 0.30 * p_away_loss1)
+    p_dc1up_12 = min(99.0, 100.0 - p_00)                 # loses only on 0-0
 
     # ── Per-half model: goals split ~45% 1st half / 55% 2nd, halves independent ──
     def _win_half(lh, la):
@@ -5179,17 +5188,35 @@ def _sb_board_explore(fx, home, away, exp_home, exp_away, exp_total):
                     comment = "{} clean sheet ~{:.0f}% (opp proj {:.1f})".format(
                         tname, base, exp_away if side == "home" else exp_home)
             elif is_1up:
-                # 1UP — pays the instant your side leads by one. Recognise the
-                # team outcome (and the double-chance variants 1X/X2 if present).
-                side = _side(od) or _side(desc)
-                if side:
-                    base = p_home_1up if side == "home" else p_away_1up
-                    tname = home if side == "home" else away
-                    label = "{} 1UP".format(tname)
-                    mtype = "oneup_{}".format(side)
-                    comment = "{} 1UP (ever leads ~{:.0f}%, safer than a straight win)".format(
-                        tname, base)
-                    prob = base
+                # 1UP — early payout the instant a side leads by one. SportyBet
+                # ships this as BOTH single-team (1X2-1UP) and Double-Chance-1UP
+                # (marketId 60110, outcomes 'Home or Draw' etc.) — they settle
+                # differently, so they must NOT be conflated.
+                if " or " in odl or "/" in odl:        # Double-Chance 1UP
+                    has_home = "home" in odl or (h_tok and h_tok in odl)
+                    has_away = "away" in odl or (a_tok and a_tok in odl)
+                    has_draw = "draw" in odl
+                    if has_home and has_draw:
+                        prob, mtype = p_dc1up_1x, "dc1up_1x"
+                        label = "{} or Draw (1UP)".format(home)
+                        comment = "1X with early payout — wins if {} ever leads or it's 1X (~{:.0f}%)".format(home, prob)
+                    elif has_away and has_draw:
+                        prob, mtype = p_dc1up_x2, "dc1up_x2"
+                        label = "{} or Draw (1UP)".format(away)
+                        comment = "X2 with early payout — wins if {} ever leads or it's X2 (~{:.0f}%)".format(away, prob)
+                    elif has_home and has_away:
+                        prob, mtype = p_dc1up_12, "dc1up_12"
+                        label = "{} or {} (1UP)".format(home, away)
+                        comment = "12 with early payout — loses only on 0-0 (~{:.0f}%)".format(prob)
+                else:                                   # single-team 1UP
+                    side = _side(od) or _side(desc)
+                    if side:
+                        prob = p_home_1up if side == "home" else p_away_1up
+                        tname = home if side == "home" else away
+                        label = "{} 1UP".format(tname)
+                        mtype = "oneup_{}".format(side)
+                        comment = "{} 1UP (ever leads ~{:.0f}%, safer than a straight win)".format(
+                            tname, prob)
 
             if prob is None or not label:
                 continue
@@ -5233,8 +5260,10 @@ TIER_CONFIG = {
         # BANKER: only the lowest-variance markets. No BTTS, no corners, no
         # outright win — those are coin-flips on a 2-odds slip.
         "allow": ["double_chance_1X", "double_chance_X2", "over_0.5",
-                  "over_1.5", "under_3.5", "under_4.5", "oneup_home", "oneup_away"],
-        "prefer": ["oneup_home", "oneup_away", "double_chance_1X", "double_chance_X2",
+                  "over_1.5", "under_3.5", "under_4.5", "oneup_home", "oneup_away",
+                  "dc1up_1x", "dc1up_x2", "dc1up_12"],
+        "prefer": ["dc1up_1x", "dc1up_x2", "oneup_home", "oneup_away",
+                   "double_chance_1X", "double_chance_X2",
                    "over_1.5", "under_4.5", "under_3.5", "over_0.5"],
         "label": "2 ODDS — BANKER", "emoji": "🟢",
     },
@@ -5246,8 +5275,10 @@ TIER_CONFIG = {
         # BTTS or corners here — too unreliable for a "safe" slip.
         "allow": ["double_chance_1X", "double_chance_X2", "over_1.5",
                   "under_3.5", "under_2.5", "under_4.5", "over_2.5", "home_win", "away_win",
-                  "dnb_home", "dnb_away", "oneup_home", "oneup_away"],
-        "prefer": ["oneup_home", "oneup_away", "double_chance_1X", "double_chance_X2",
+                  "dnb_home", "dnb_away", "oneup_home", "oneup_away",
+                  "dc1up_1x", "dc1up_x2", "dc1up_12"],
+        "prefer": ["dc1up_1x", "dc1up_x2", "oneup_home", "oneup_away",
+                   "double_chance_1X", "double_chance_X2",
                    "over_1.5", "under_3.5", "home_win", "away_win", "under_2.5"],
         "label": "3 ODDS — SAFE", "emoji": "🟢",
     },
@@ -7413,6 +7444,11 @@ def _fb_settle_stat_pick(market_type, stats):
     if m:
         return (stats.get("home_ever_led") if m.group(1) == "home"
                 else stats.get("away_ever_led"))
+    # DC-1UP on a non-trivial result: 1X/X2 win via the team's early payout
+    if mt == "dc1up_1x":
+        return bool(stats.get("home_ever_led"))
+    if mt == "dc1up_x2":
+        return bool(stats.get("away_ever_led"))
     return None
 
 
@@ -7485,6 +7521,14 @@ def _fb_settle_pick(market_type, pick_text, hs, aw, h1h=None, h1a=None):
         # A final win guarantees they led; a draw/loss can't be confirmed either
         # way from the final score alone (they may have led then been pegged back).
         return True if won else None
+
+    # ── Double-Chance 1UP (board): dc1up_1x / dc1up_x2 / dc1up_12 ──
+    if mt == "dc1up_1x":
+        return True if hs >= aw else None    # else: won iff home ever led (timeline)
+    if mt == "dc1up_x2":
+        return True if aw >= hs else None    # else: won iff away ever led (timeline)
+    if mt == "dc1up_12":
+        return (hs != aw) or (hs > 0)        # loses only on 0-0 (any goal => a side led)
 
     # ── win to nil (board): tonil_home_y / _n ──
     m = _re.match(r'^tonil_(home|away)_(y|n)$', mt)
@@ -8013,16 +8057,22 @@ def _fb_settle_accumulators(get_db):
                 if g and g.get("espn_id"):
                     stats = _espn_match_stats(g.get("espn_slug"), g.get("espn_id"))
                     outcome = _fb_settle_stat_pick(mt, stats)
-            if outcome is None and mt.startswith("oneup"):
-                # 1UP on a non-win: confirm from the goal timeline whether the
-                # side ever led (early payout would have triggered).
+            if outcome is None and (mt.startswith("oneup") or mt.startswith("dc1up")):
+                # 1UP / DC-1UP on a non-win: confirm from the goal timeline whether
+                # the relevant side ever led (early payout would have triggered).
                 if g and g.get("espn_id"):
                     stats = _espn_match_stats(g.get("espn_slug"), g.get("espn_id"))
                     if stats:
                         el_h, el_a = stats.get("home_ever_led"), stats.get("away_ever_led")
                         if g.get("_swapped"):
                             el_h, el_a = el_a, el_h
-                        outcome = el_h if mt == "oneup_home" else el_a
+                            stats = dict(stats, home_ever_led=el_h, away_ever_led=el_a)
+                        if mt == "oneup_home":
+                            outcome = el_h
+                        elif mt == "oneup_away":
+                            outcome = el_a
+                        else:  # dc1up_*
+                            outcome = _fb_settle_stat_pick(mt, stats)
             if outcome is None:
                 continue  # still ungradeable (no stats / half-no-HT) — skip leg
             evaluable += 1
