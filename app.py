@@ -7013,6 +7013,7 @@ def _nav(active):
         ("home", "/", "🏠", "Home"),
         ("picks", "/app/picks", "⚽", "Picks"),
         ("codes", "/app/codes", "🎫", "Codes"),
+        ("builder", "/app/builder", "⭐", "Builder"),
         ("crypto", "/app/paper-poly", "💰", "Crypto"),
         ("results", "/app/results", "📈", "Results"),
     ]
@@ -7077,6 +7078,29 @@ def _fb_builder_blocks(builders):
             'picks, one match</span></div>' + "".join(cards))
 
 
+def render_builder_page(builders, date_str):
+    """Dedicated Bet Builder page — premium single-match correlated slips."""
+    if builders:
+        body = _fb_builder_blocks(builders)
+    else:
+        body = ('<div class="glass empty"><div class="big">⭐</div>'
+                '<div>No bet builders yet. The engine builds them for the '
+                'richest-board matches each run — check back after the next scan.</div></div>')
+    return """<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bet Builders — Cmvng Bot</title><style>{css}</style></head><body>
+{nav}
+<div class="wrap">
+<div class="page-head"><h1>Bet Builders</h1>
+<div class="sub">3 correlated picks per premium match, one code</div>
+<div class="date">{date}</div></div>
+{body}
+<div class="disclaimer">Bet builders combine correlated picks on a single match.
+Combined odds shown are SportyBet's where available, otherwise an estimate. Always
+review the slip in your SportyBet app before staking. No bet is guaranteed.</div>
+</div></body></html>""".format(css=FB_CSS, nav=_nav("builder"), date=date_str, body=body)
+
+
 def render_codes_page(accumulators, date_str, builders=None):
     """Render the SportyBet codes page. accumulators = list of dicts with code info."""
     blocks = []
@@ -7119,8 +7143,6 @@ def render_codes_page(accumulators, date_str, builders=None):
     else:
         body = "".join(blocks)
 
-    builder_html = _fb_builder_blocks(builders or [])
-
     return """<!DOCTYPE html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>SportyBet Codes — Cmvng Bot</title><style>{css}</style></head><body>
@@ -7129,11 +7151,10 @@ def render_codes_page(accumulators, date_str, builders=None):
 <div class="page-head"><h1>Today's Codes</h1>
 <div class="sub">Accumulator booking codes for SportyBet</div>
 <div class="date">{date}</div></div>
-{builder_html}
 {body}
 <div class="disclaimer">Codes are auto-generated from data analysis. Odds may shift before kickoff.
 Always review selections in your SportyBet app before staking. No bet is guaranteed.</div>
-</div></body></html>""".format(css=FB_CSS, nav=_nav("codes"), date=date_str, body=body, builder_html=builder_html)
+</div></body></html>""".format(css=FB_CSS, nav=_nav("codes"), date=date_str, body=body)
 
 
 def render_picks_page(match_picks, date_str):
@@ -8536,6 +8557,28 @@ def fb_settle_thread(get_db):
 #   tg_send (+ token/chat), fmt_codes, fmt_picks
 # ═══════════════════════════════════════════════════════════════════
 
+def _sofa_probe():
+    """One diagnostic call so we KNOW the cause before buying anything:
+    403/503 = Cloudflare IP-reputation block (needs residential proxy);
+    200 = reachable (then any 0-hits is a parsing/coverage issue, not a block);
+    exception = curl_cffi/transport problem."""
+    url = "{}/search/all?q=arsenal".format(SOFA)
+    try:
+        r = _scrape_get(url, timeout=12)
+        if r is None:
+            print("[SOFA-PROBE] no response (curl_cffi+requests both failed)")
+            return
+        body = ""
+        try:
+            body = (r.text or "")[:100].replace("\n", " ")
+        except Exception:
+            pass
+        print("[SOFA-PROBE] status={} via={} body={}".format(
+            r.status_code, "curl_cffi" if _cf else "requests", body))
+    except Exception as e:
+        print("[SOFA-PROBE] exception: {}: {}".format(type(e).__name__, e))
+
+
 def _fb_apply_methodology(fixtures):
     """Attach xG/PPDA (Understat) and possession (FBref) to the LIVE prediction
     fixtures — these were previously only added on the Sofascore path, which
@@ -8545,6 +8588,7 @@ def _fb_apply_methodology(fixtures):
     needs a non-datacenter IP (proxy/VPS) and is handled separately."""
     if not fixtures:
         return
+    _sofa_probe()  # one diagnostic call to log Sofascore's exact response
     def _us_key(lg):
         lg = (lg or "").lower()
         for k in UNDERSTAT_LEAGUES:
@@ -9286,8 +9330,13 @@ def fb_picks_page():
 @app.route("/app/codes")
 def fb_codes_page():
     return render_codes_page(_FB_CACHE.get("accumulators", []),
-                             _FB_CACHE.get("date") or _fb_today_human(),
-                             _FB_CACHE.get("bet_builders", []))
+                             _FB_CACHE.get("date") or _fb_today_human())
+
+
+@app.route("/app/builder")
+def fb_builder_page():
+    return render_builder_page(_FB_CACHE.get("bet_builders", []),
+                               _FB_CACHE.get("date") or _fb_today_human())
 
 
 @app.route("/app/results")
