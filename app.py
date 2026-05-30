@@ -5500,6 +5500,14 @@ try:
 except ImportError:
     _cf = None
 
+# Cloudscraper solves Cloudflare's JS/IUAM challenge in pure Python (no browser).
+# This is what ScraperFC uses for FBref; it's the light fix for the 'challenge'
+# 403 that TLS impersonation alone can't clear.
+try:
+    import cloudscraper as _cloudscraper
+except ImportError:
+    _cloudscraper = None
+
 try:
     from bs4 import BeautifulSoup as _BS
 except ImportError:
@@ -5508,8 +5516,8 @@ except ImportError:
 _SCRAPE_PROXY = (_os.environ.get("SCRAPE_PROXY", "").strip()
                  or _os.environ.get("POLY_PROXY_URL", "").strip())
 _CF_IMPERSONATE = _os.environ.get("CF_IMPERSONATE", "chrome131").strip() or "chrome131"
-print("[SCRAPE] curl_cffi={} impersonate={} proxy={}".format(
-    "yes" if _cf else "NO (fallback to requests)", _CF_IMPERSONATE,
+print("[SCRAPE] curl_cffi={} cloudscraper={} impersonate={} proxy={}".format(
+    "yes" if _cf else "NO", "yes" if _cloudscraper else "NO", _CF_IMPERSONATE,
     "set" if _SCRAPE_PROXY else "none"))
 
 # Browser-like headers to avoid trivial blocks
@@ -5545,7 +5553,23 @@ def _scrape_referer(url):
 
 
 _CF_SESSION = None
+_CS_SESSION = None
 _WARMED = set()
+
+
+def _cs_session():
+    """Cloudscraper session (solves Cloudflare JS challenge in pure Python),
+    routed through the proxy if set."""
+    global _CS_SESSION
+    if _CS_SESSION is None and _cloudscraper is not None:
+        try:
+            _CS_SESSION = _cloudscraper.create_scraper(
+                browser={"browser": "chrome", "platform": "windows", "mobile": False})
+            if _SCRAPE_PROXY:
+                _CS_SESSION.proxies = {"http": _SCRAPE_PROXY, "https": _SCRAPE_PROXY}
+        except Exception:
+            _CS_SESSION = None
+    return _CS_SESSION
 
 
 def _cf_session():
@@ -5597,6 +5621,17 @@ def _scrape_get(url, timeout=15):
     if ref:
         headers["Referer"] = ref
     proxies = {"http": _SCRAPE_PROXY, "https": _SCRAPE_PROXY} if _SCRAPE_PROXY else None
+    # Cloudflare-challenged hosts: try cloudscraper first (solves the JS challenge)
+    challenged = any(h in url for h in ("sofascore", "fbref", "understat"))
+    if challenged and _cloudscraper is not None:
+        cs = _cs_session()
+        if cs is not None:
+            try:
+                r = cs.get(url, headers=headers, timeout=timeout)
+                if r is not None and r.status_code == 200:
+                    return r
+            except Exception:
+                pass
     if _cf is not None:
         s = _cf_session()
         if s is not None:
