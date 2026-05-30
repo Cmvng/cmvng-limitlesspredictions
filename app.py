@@ -4417,6 +4417,17 @@ def analyze_fixture(fx):
     exp_away_goals = (away_gf + home_ga) / 2.0
     exp_total_goals = exp_home_goals + exp_away_goals
 
+    # ── How the match PROJECTS: tight or clear? ──
+    # A predicted scoreline like 2-1 is really a "tight game" signal — it does
+    # NOT mean Over 2.5 is safe (the match could land 1-0, 1-1, 0-0). Only a
+    # clear margin (2-0, 3-1) justifies backing a winner + goals. So we read the
+    # margin and total, and temper the risky reads on close games — worst-case
+    # thinking rather than taking the headline scoreline at face value.
+    goal_margin = abs(exp_home_goals - exp_away_goals)
+    tight_game = goal_margin < 0.65 and exp_total_goals < 3.0
+    clear_game = goal_margin >= 1.0
+    low_scoring = exp_total_goals < 2.6
+
     picks = []
 
     def add(market_type, pick_label, confidence, reasoning):
@@ -4466,6 +4477,12 @@ def analyze_fixture(fx):
         _win_reason = "form {:.1f} vs {:.1f}, table {} vs {}".format(
             home_form_pts, away_form_pts, home_pos, away_pos)
 
+    # On a genuinely tight projection, a clean win is less safe than the raw
+    # probability suggests — shade outright wins down and double chance up.
+    if tight_game:
+        home_win_conf *= 0.85
+        away_win_conf *= 0.85
+
     add("home_win", "{} to Win".format(home), home_win_conf,
         "{}: {}".format(home, _win_reason))
     add("away_win", "{} to Win".format(away), away_win_conf,
@@ -4476,10 +4493,24 @@ def analyze_fixture(fx):
     # ── DOUBLE CHANCE (much safer than straight win) ──
     dc_1x = (home_win_raw + (draw_conf/100)) * 100 * 0.92
     dc_x2 = (away_win_raw + (draw_conf/100)) * 100 * 0.92
+    if tight_game:
+        # safest market in a close game — nudge up
+        dc_1x = min(96, dc_1x * 1.05)
+        dc_x2 = min(96, dc_x2 * 1.05)
     add("double_chance_1X", "{} or Draw".format(home), dc_1x,
         "{} home + draw cover, form {:.1f}pts".format(home, home_form_pts))
     add("double_chance_X2", "{} or Draw".format(away), dc_x2,
         "{} + draw cover".format(away))
+
+    # ── DRAW NO BET (win, stake refunded on a draw — safer than a straight win) ──
+    dnb_base = home_win_raw + away_win_raw
+    if dnb_base > 0:
+        dnb_home = (home_win_raw / dnb_base) * 100 * 0.95
+        dnb_away = (away_win_raw / dnb_base) * 100 * 0.95
+        add("dnb_home", "{} Draw No Bet".format(home), dnb_home,
+            "{} to win, stake back on draw".format(home))
+        add("dnb_away", "{} Draw No Bet".format(away), dnb_away,
+            "{} to win, stake back on draw".format(away))
 
     # ── OVER/UNDER GOALS ──
     # Poisson-ish heuristic from expected total goals
@@ -4487,8 +4518,20 @@ def analyze_fixture(fx):
     over_15 = min(96, 45 + exp_total_goals * 13)
     over_25 = min(90, 20 + exp_total_goals * 16)
     over_35 = min(80, exp_total_goals * 15)
+    over_45 = min(68, exp_total_goals * 11)
+    over_55 = min(52, exp_total_goals * 8)
+    # A tight/low-scoring projection should NOT look like a confident Over 2.5 —
+    # the headline scoreline (e.g. 2-1) means "close", not "3 goals are coming".
+    if tight_game or low_scoring:
+        over_25 *= 0.70
+        over_35 *= 0.60
+        over_45 *= 0.55
+        over_55 *= 0.50
+        over_15 = min(over_15, 82)  # 1.5 still usually fine, but don't overstate
+    under_15 = 100 - over_15
     under_25 = 100 - over_25
     under_35 = 100 - over_35
+    under_45 = 100 - over_45
 
     add("over_0.5", "Over 0.5 Goals", over_05,
         "Expected {:.1f} total goals".format(exp_total_goals))
@@ -4499,10 +4542,18 @@ def analyze_fixture(fx):
         "Expected {:.1f} goals, both attacks active".format(exp_total_goals))
     add("over_3.5", "Over 3.5 Goals", over_35,
         "High-scoring projection {:.1f}".format(exp_total_goals))
+    add("over_4.5", "Over 4.5 Goals", over_45,
+        "Very high-scoring projection {:.1f}".format(exp_total_goals))
+    add("over_5.5", "Over 5.5 Goals", over_55,
+        "Goal-fest projection {:.1f}".format(exp_total_goals))
+    add("under_1.5", "Under 1.5 Goals", under_15,
+        "Low-scoring projection {:.1f}".format(exp_total_goals))
     add("under_2.5", "Under 2.5 Goals", under_25,
         "Lower-scoring projection {:.1f}".format(exp_total_goals))
     add("under_3.5", "Under 3.5 Goals", under_35,
         "Defensive projection {:.1f}".format(exp_total_goals))
+    add("under_4.5", "Under 4.5 Goals", under_45,
+        "Unlikely to see 5+ goals (proj {:.1f})".format(exp_total_goals))
 
     # ── BTTS ──
     btts_yes = (home_btts + away_btts) / 2.0
@@ -4567,7 +4618,301 @@ def analyze_fixture(fx):
     add("correct_score", "{} {}-{} {}".format(home, h, a, away), cs_conf,
         "Most likely scoreline from xG ({:.1f}-{:.1f})".format(exp_home_goals, exp_away_goals))
 
+    # ── MARKET-DRIVEN EXPLORATION ──
+    # Walk SportyBet's ACTUAL market board for this game and score the extra
+    # families our fixed list doesn't cover (team totals, multigoal ranges,
+    # 1st-half goals) straight from the team analysis. These come pre-mapped
+    # with REAL SportyBet odds + a comment, and feed the exploratory tiers.
+    try:
+        picks.extend(_sb_board_explore(
+            fx, home, away, exp_home_goals, exp_away_goals, exp_total_goals))
+    except Exception as e:
+        print("[FB] board explore error: {}".format(e))
+
     return picks
+
+
+def _sb_board_explore(fx, home, away, exp_home, exp_away, exp_total):
+    """
+    Market-driven scorer. Reads the game's real SportyBet market board (cached
+    during enrichment) and estimates the probability of outcomes in the
+    families our fixed list doesn't model — team totals, multigoal ranges, and
+    1st-half goals — using a Poisson model on the expected goals. Each returned
+    pick carries the REAL SportyBet odds, the exact marketId/specifier/outcomeId
+    (so it bypasses name-matching entirely — no decoy risk) and a comment.
+    """
+    import math as _math
+    import re as _re
+    eid = fx.get("sb_event_id")
+    if not eid:
+        return []
+    markets = _SB_MARKET_CACHE.get(eid) or []
+    if not markets:
+        return []
+
+    def pmf(k, lam):
+        try:
+            return _math.exp(-lam) * (lam ** k) / _math.factorial(k)
+        except Exception:
+            return 0.0
+
+    def p_range(lo, hi, lam):
+        return sum(pmf(k, lam) for k in range(lo, hi + 1)) * 100.0
+
+    def p_atleast(n, lam):
+        return (1.0 - sum(pmf(k, lam) for k in range(0, n))) * 100.0
+
+    # ── Joint full-time scoreline grid (independent Poisson per side) ──
+    # Lets us derive win/margin/clean-sheet/win-to-nil probabilities that the
+    # single-lambda totals model can't express.
+    MAXG = 9
+    grid = [[pmf(i, exp_home) * pmf(j, exp_away)
+             for j in range(MAXG + 1)] for i in range(MAXG + 1)]
+
+    def _sum_grid(cond):
+        return sum(grid[i][j] for i in range(MAXG + 1)
+                   for j in range(MAXG + 1) if cond(i, j)) * 100.0
+
+    p_margin_home = lambda n: _sum_grid(lambda i, j: i - j >= n)   # home wins by n+
+    p_margin_away = lambda n: _sum_grid(lambda i, j: j - i >= n)
+    p_exact_home = lambda n: _sum_grid(lambda i, j: i - j == n)    # win by exactly n
+    p_exact_away = lambda n: _sum_grid(lambda i, j: j - i == n)
+    p_home_to_nil = _sum_grid(lambda i, j: i > j and j == 0)       # win, opp 0
+    p_away_to_nil = _sum_grid(lambda i, j: j > i and i == 0)
+    p_home_cs = _sum_grid(lambda i, j: j == 0)                     # clean sheet
+    p_away_cs = _sum_grid(lambda i, j: i == 0)
+
+    # ── Per-half model: goals split ~45% 1st half / 55% 2nd, halves independent ──
+    def _win_half(lh, la):
+        return sum(pmf(i, lh) * pmf(j, la)
+                   for i in range(MAXG + 1) for j in range(MAXG + 1) if i > j) * 100.0
+    h1h, h1a = exp_home * 0.45, exp_away * 0.45
+    h2h, h2a = exp_home * 0.55, exp_away * 0.55
+    p_home_win_h1, p_home_win_h2 = _win_half(h1h, h1a), _win_half(h2h, h2a)
+    p_away_win_h1, p_away_win_h2 = _win_half(h1a, h1h), _win_half(h2a, h2h)
+    p_home_either = (1 - (1 - p_home_win_h1 / 100) * (1 - p_home_win_h2 / 100)) * 100
+    p_away_either = (1 - (1 - p_away_win_h1 / 100) * (1 - p_away_win_h2 / 100)) * 100
+    p_home_both = (p_home_win_h1 / 100) * (p_home_win_h2 / 100) * 100
+    p_away_both = (p_away_win_h1 / 100) * (p_away_win_h2 / 100) * 100
+
+    def first_num(*texts):
+        for t in texts:
+            m = _re.search(r'(\d+(?:\.\d+)?)', str(t))
+            if m:
+                return float(m.group(1))
+        return None
+
+    hl = home.lower()
+    al = away.lower()
+    h_tok = hl.split()[0] if hl.split() else hl
+    a_tok = al.split()[0] if al.split() else al
+    match_label = "{} vs {}".format(home, away)
+    out = []
+    seen = set()
+
+    CORE = ("1x2", "double chance", "gg/ng", "both teams to score",
+            "over/under", "draw no bet", "1x2 1up", "1x2 2up")
+
+    for mk in markets:
+        desc = (mk.get("desc") or mk.get("name")
+                or mk.get("marketName") or "").lower().strip()
+        if not desc or desc in CORE:
+            continue
+        spec = str(mk.get("specifier") or "")
+        mid = str(mk.get("id", ""))
+        ocs = mk.get("outcomes") or mk.get("outcome") or []
+
+        # classify the family
+        is_range = any(_re.match(r'^\s*\d+\s*-\s*\d+\s*$',
+                       (o.get("desc") or o.get("name") or "")) for o in ocs)
+        is_multigoal = is_range and ("goal" in desc or "multigoal" in desc
+                                     or "total" in desc)
+        is_fh = ("1st half" in desc or "first half" in desc) and \
+                ("over" in desc or "under" in desc or "total" in desc)
+        team_for = None
+        if not is_multigoal and ("over" in desc or "under" in desc or "total" in desc):
+            if h_tok and h_tok in desc:
+                team_for = "home"
+            elif a_tok and a_tok in desc:
+                team_for = "away"
+
+        # result-derived families (use the joint grid, not the totals model)
+        is_winmargin = ("winning margin" in desc or "win by" in desc
+                        or "goals ahead" in desc or "to lead by" in desc)
+        is_winhalf = ("win" in desc and "half" in desc) and not is_fh
+        is_tonil = "to nil" in desc or "win to nil" in desc
+        is_cleansheet = "clean sheet" in desc
+
+        def _side(*texts):
+            for t in texts:
+                t = (t or "").lower()
+                if "home" in t or (h_tok and h_tok in t):
+                    return "home"
+                if "away" in t or (a_tok and a_tok in t):
+                    return "away"
+            return None
+
+        for o in ocs:
+            od = (o.get("desc") or o.get("name") or "").strip()
+            odl = od.lower()
+            try:
+                odds = float(o.get("odds"))
+            except (TypeError, ValueError):
+                continue
+            if odds <= 1.0:
+                continue
+
+            prob = label = comment = mtype = None
+
+            if is_multigoal:
+                m = _re.match(r'^\s*(\d+)\s*-\s*(\d+)\s*$', od)
+                if m:
+                    lo, hi = int(m.group(1)), int(m.group(2))
+                    prob = p_range(lo, hi, exp_total)
+                    label = "{}-{} Total Goals".format(lo, hi)
+                    mtype = "multigoal_{}_{}".format(lo, hi)
+                    comment = "Proj {:.1f} goals; band {}-{} ~{:.0f}%".format(
+                        exp_total, lo, hi, prob)
+            elif team_for:
+                line = first_num(spec, od)
+                if line is not None:
+                    lam = exp_home if team_for == "home" else exp_away
+                    tname = home if team_for == "home" else away
+                    need = int(line) + 1
+                    if "over" in odl or odl.startswith("o"):
+                        prob = p_atleast(need, lam)
+                        label = "{} Over {:g} Goals".format(tname, line)
+                        mtype = "team_{}_over_{:g}".format(team_for, line)
+                        comment = "{} proj {:.1f} goals; Over {:g} ~{:.0f}%".format(
+                            tname, lam, line, prob)
+                    elif "under" in odl or odl.startswith("u"):
+                        prob = 100.0 - p_atleast(need, lam)
+                        label = "{} Under {:g} Goals".format(tname, line)
+                        mtype = "team_{}_under_{:g}".format(team_for, line)
+                        comment = "{} proj {:.1f} goals; Under {:g} ~{:.0f}%".format(
+                            tname, lam, line, prob)
+            elif is_fh:
+                line = first_num(spec, od)
+                if line is not None:
+                    lam1h = exp_total * 0.42  # ~42% of goals fall in the 1st half
+                    need = int(line) + 1
+                    if "over" in odl or odl.startswith("o"):
+                        prob = p_atleast(need, lam1h)
+                        label = "1st Half Over {:g} Goals".format(line)
+                        mtype = "fh_over_{:g}".format(line)
+                        comment = "1H proj {:.1f} goals; Over {:g} ~{:.0f}%".format(
+                            lam1h, line, prob)
+                    elif "under" in odl or odl.startswith("u"):
+                        prob = 100.0 - p_atleast(need, lam1h)
+                        label = "1st Half Under {:g} Goals".format(line)
+                        mtype = "fh_under_{:g}".format(line)
+                        comment = "1H proj {:.1f} goals; Under {:g} ~{:.0f}%".format(
+                            lam1h, line, prob)
+            elif is_winmargin:
+                side = _side(od) or _side(desc)
+                num = first_num(od)
+                yn = "yes" if odl in ("yes", "gg") else ("no" if odl == "no" else None)
+                if side and num is not None:
+                    n = int(num)
+                    plus = ("+" in od or "more" in odl or "least" in odl)
+                    tname = home if side == "home" else away
+                    if plus:
+                        prob = (p_margin_home if side == "home" else p_margin_away)(n)
+                        label = "{} to win by {}+".format(tname, n)
+                    else:
+                        prob = (p_exact_home if side == "home" else p_exact_away)(n)
+                        label = "{} to win by exactly {}".format(tname, n)
+                    prob *= 0.95  # model-uncertainty haircut on margin estimates
+                    mtype = "winmargin_{}_{}{}".format(side, n, "p" if plus else "e")
+                    comment = "{} proj {:.1f}-{:.1f}; {} ~{:.0f}%".format(
+                        tname, exp_home, exp_away, label, prob)
+                elif yn is not None and ("goals ahead" in desc or "lead by" in desc):
+                    side2 = _side(desc)
+                    num2 = first_num(desc)
+                    if side2 and num2 is not None:
+                        n = int(num2)
+                        base = (p_margin_home if side2 == "home" else p_margin_away)(n) * 0.95
+                        prob = base if yn == "yes" else 100.0 - base
+                        tname = home if side2 == "home" else away
+                        label = "{} {} goals ahead: {}".format(tname, n, yn.upper())
+                        mtype = "leadby_{}_{}_{}".format(side2, n, yn)
+                        comment = "{} proj {:.1f}-{:.1f}; lead by {} ~{:.0f}%".format(
+                            tname, exp_home, exp_away, n, prob)
+            elif is_winhalf:
+                side = _side(od) or _side(desc)
+                yn = "yes" if odl in ("yes", "gg") else ("no" if odl == "no" else None)
+                if side:
+                    if "either" in desc:
+                        base, kind = (p_home_either if side == "home" else p_away_either), "either half"
+                    elif "both" in desc:
+                        base, kind = (p_home_both if side == "home" else p_away_both), "both halves"
+                    elif "1st" in desc or "first" in desc:
+                        base, kind = (p_home_win_h1 if side == "home" else p_away_win_h1), "1st half"
+                    elif "2nd" in desc or "second" in desc:
+                        base, kind = (p_home_win_h2 if side == "home" else p_away_win_h2), "2nd half"
+                    else:
+                        base, kind = None, None
+                    if base is not None:
+                        base *= 0.95
+                        prob = base if (yn != "no") else 100.0 - base
+                        tname = home if side == "home" else away
+                        label = "{} to win {}{}".format(
+                            tname, kind, "" if yn != "no" else " — No")
+                        mtype = "winhalf_{}_{}_{}".format(
+                            side, kind.replace(" ", ""), yn or "y")
+                        comment = "{} win {} ~{:.0f}% (proj {:.1f}-{:.1f})".format(
+                            tname, kind, prob, exp_home, exp_away)
+            elif is_tonil:
+                side = _side(od) or _side(desc)
+                yn = "yes" if odl in ("yes", "gg") else ("no" if odl == "no" else None)
+                if side:
+                    base = (p_home_to_nil if side == "home" else p_away_to_nil)
+                    prob = base if (yn != "no") else 100.0 - base
+                    tname = home if side == "home" else away
+                    label = "{} to win to nil{}".format(
+                        tname, "" if yn != "no" else " — No")
+                    mtype = "tonil_{}_{}".format(side, yn or "y")
+                    comment = "{} win-to-nil ~{:.0f}% (proj {:.1f}-{:.1f})".format(
+                        tname, base, exp_home, exp_away)
+            elif is_cleansheet:
+                side = _side(od) or _side(desc)
+                yn = "yes" if odl in ("yes", "gg") else ("no" if odl == "no" else None)
+                if side:
+                    base = (p_home_cs if side == "home" else p_away_cs)
+                    prob = base if (yn != "no") else 100.0 - base
+                    tname = home if side == "home" else away
+                    label = "{} clean sheet{}".format(
+                        tname, "" if yn != "no" else " — No")
+                    mtype = "cleansheet_{}_{}".format(side, yn or "y")
+                    comment = "{} clean sheet ~{:.0f}% (opp proj {:.1f})".format(
+                        tname, base, exp_away if side == "home" else exp_home)
+
+            if prob is None or not label:
+                continue
+            if not (1.0 < prob < 99.5):
+                continue
+            key = (mtype, mid, str(o.get("id", "")))
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append({
+                "match": match_label, "home": home, "away": away,
+                "league": fx.get("league", ""), "kickoff": fx.get("kickoff", ""),
+                "kickoff_ts": fx.get("kickoff_ts", 0),
+                "market_type": mtype, "pick": label,
+                "confidence": round(max(1.0, min(99.0, prob)), 1),
+                "odds": round(odds, 2),          # REAL SportyBet odds
+                "reasoning": comment,
+                "result": "pending",
+                "sb_event_id": eid,
+                "sb_market_id": mid,
+                "sb_specifier": mk.get("specifier") or None,
+                "sb_outcome_id": str(o.get("id", "")),
+            })
+    if out:
+        print("[FB] board-explore: +{} extra markets for {}".format(
+            len(out), match_label))
+    return out
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -4580,28 +4925,40 @@ TIER_CONFIG = {
     "2_odds": {
         "target": 2.0, "min_conf": 78, "min_sel": 4, "max_sel": 8,
         "odds_lo": 1.04, "odds_hi": 1.32,
-        "prefer": ["over_1.5", "double_chance_1X", "double_chance_X2", "btts_yes",
-                   "over_0.5", "under_3.5", "btts_no"],
+        # BANKER: only the lowest-variance markets. No BTTS, no corners, no
+        # outright win — those are coin-flips on a 2-odds slip.
+        "allow": ["double_chance_1X", "double_chance_X2", "over_0.5",
+                  "over_1.5", "under_3.5", "under_4.5"],
+        "prefer": ["double_chance_1X", "double_chance_X2", "over_1.5",
+                   "under_4.5", "under_3.5", "over_0.5"],
         "label": "2 ODDS — BANKER", "emoji": "🟢",
     },
     "3_odds": {
         "target": 3.0, "min_conf": 70, "min_sel": 4, "max_sel": 7,
         "odds_lo": 1.12, "odds_hi": 1.48,
-        "prefer": ["double_chance_1X", "over_1.5", "home_win", "btts_yes",
-                   "over_2.5", "double_chance_X2", "corners_over_7.5", "under_2.5"],
+        # SAFE: double chance + goals lines + outright wins ONLY when the match
+        # projects clear (tight games shade wins below the 70 floor). Still no
+        # BTTS or corners here — too unreliable for a "safe" slip.
+        "allow": ["double_chance_1X", "double_chance_X2", "over_1.5",
+                  "under_3.5", "under_2.5", "under_4.5", "over_2.5", "home_win", "away_win",
+                  "dnb_home", "dnb_away"],
+        "prefer": ["double_chance_1X", "double_chance_X2", "over_1.5",
+                   "under_3.5", "home_win", "away_win", "under_2.5"],
         "label": "3 ODDS — SAFE", "emoji": "🟢",
     },
     "5_odds": {
         "target": 5.0, "min_conf": 58, "min_sel": 3, "max_sel": 6,
         "odds_lo": 1.22, "odds_hi": 1.80,
-        "prefer": ["home_win", "over_2.5", "btts_yes", "corners_over_8.5",
-                   "dc_over_1.5", "cards_over_2.5", "away_win", "home_win_btts"],
+        # VALUE: this is where BTTS / corners are allowed to enter.
+        "exclude": ["correct_score"],
+        "prefer": ["home_win", "away_win", "over_2.5", "btts_yes",
+                   "dc_over_1.5", "corners_over_7.5", "home_win_btts"],
         "label": "5 ODDS — VALUE", "emoji": "🟡",
     },
     "10_odds": {
         "target": 10.0, "min_conf": 48, "min_sel": 4, "max_sel": 6,
         "odds_lo": 1.38, "odds_hi": 2.40,
-        "prefer": ["home_win", "away_win", "home_win_btts", "corners_over_9.5",
+        "prefer": ["home_win", "away_win", "home_win_btts", "corners_over_8.5",
                    "handicap_home_-1.5", "cards_over_3.5", "over_2.5",
                    "home_win_over_2.5", "over_3.5"],
         "label": "10 ODDS — RISK", "emoji": "🟠",
@@ -4631,11 +4988,15 @@ def build_accumulator(all_picks, tier_key):
     cfg = TIER_CONFIG[tier_key]
     target = cfg["target"]
     prefer_set = set(cfg["prefer"])
+    allow_set = set(cfg.get("allow", []))      # if set, ONLY these market types
+    exclude_set = set(cfg.get("exclude", []))  # never these market types
 
     eligible = [
         p for p in all_picks
         if p["confidence"] >= cfg["min_conf"]
         and cfg["odds_lo"] <= p["odds"] <= cfg["odds_hi"]
+        and (not allow_set or p["market_type"] in allow_set)
+        and p["market_type"] not in exclude_set
     ]
     if not eligible:
         return None
@@ -5368,12 +5729,18 @@ SB_MARKET_MAP = {
     "draw":                (["1x2"], None, "draw"),
     "double_chance_1X":    (["double chance"], None, "1X"),
     "double_chance_X2":    (["double chance"], None, "X2"),
+    "dnb_home":            (["draw no bet"], None, "home"),
+    "dnb_away":            (["draw no bet"], None, "away"),
     "over_0.5":            (["over/under"], "0.5", "over"),
     "over_1.5":            (["over/under"], "1.5", "over"),
     "over_2.5":            (["over/under"], "2.5", "over"),
     "over_3.5":            (["over/under"], "3.5", "over"),
+    "over_4.5":            (["over/under"], "4.5", "over"),
+    "over_5.5":            (["over/under"], "5.5", "over"),
+    "under_1.5":           (["over/under"], "1.5", "under"),
     "under_2.5":           (["over/under"], "2.5", "under"),
     "under_3.5":           (["over/under"], "3.5", "under"),
+    "under_4.5":           (["over/under"], "4.5", "under"),
     "btts_yes":            (["gg/ng", "both teams to score"], None, "yes"),
     "btts_no":             (["gg/ng", "both teams to score"], None, "no"),
     "corners_over_7.5":    (["corner"], "7.5", "over"),
@@ -5394,6 +5761,16 @@ def sb_map_pick_to_selection(pick, markets):
     mt = pick["market_type"]
     home = pick["home"]
     away = pick["away"]
+
+    # Board-explored picks already carry the exact SportyBet IDs they were
+    # read from (no name-matching needed, no decoy risk). Trust them directly.
+    if pick.get("sb_market_id") and pick.get("sb_outcome_id"):
+        return {
+            "eventId": pick.get("sb_event_id", ""),
+            "marketId": str(pick["sb_market_id"]),
+            "specifier": pick.get("sb_specifier") or None,
+            "outcomeId": str(pick["sb_outcome_id"]),
+        }
 
     mapping = SB_MARKET_MAP.get(mt)
     if not mapping:
@@ -5640,6 +6017,7 @@ body {
 .sel .body { flex:1; min-width:0; }
 .sel .match { font-weight:700; font-size:0.88rem; color:#0f2417; }
 .sel .pick { font-size:0.82rem; color:#2f6347; margin-top:1px; }
+.sel .why { font-size:0.68rem; color:#7a9b88; margin-top:2px; font-style:italic; line-height:1.3; }
 .sel .reason { font-size:0.72rem; color:#6b9580; margin-top:3px; font-style:italic; }
 .sel .odds { font-family:'JetBrains Mono',monospace; font-weight:700; font-size:0.95rem; color:#15803d; white-space:nowrap; }
 .sel .conf { font-family:'JetBrains Mono',monospace; font-size:0.68rem; color:#5b8a6e; text-align:right; }
@@ -6014,9 +6392,11 @@ def render_results_day(date_iso, date_human, accas):
                     ico, cls = "⚽", "pending"
                 parts.append(
                     '<div class="sel {}"><div class="ico">{}</div><div class="body">'
-                    '<div class="match">{}</div><div class="pick">{}</div></div>'
+                    '<div class="match">{}</div><div class="pick">{}</div>'
+                    '<div class="why">{}</div></div>'
                     '<div class="odds">{}</div></div>'.format(
-                        cls, ico, s.get("match", ""), s.get("pick", ""), s.get("odds", "")))
+                        cls, ico, s.get("match", ""), s.get("pick", ""),
+                        s.get("reasoning", ""), s.get("odds", "")))
             sels = "".join(parts)
         except Exception:
             pass
