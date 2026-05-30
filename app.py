@@ -5544,16 +5544,67 @@ def _scrape_referer(url):
         return None
 
 
+_CF_SESSION = None
+_WARMED = set()
+
+
+def _cf_session():
+    """Persistent curl_cffi session so Cloudflare clearance cookies (set after a
+    homepage visit) carry into subsequent API calls."""
+    global _CF_SESSION
+    if _CF_SESSION is None and _cf is not None:
+        try:
+            kw = {"impersonate": _CF_IMPERSONATE}
+            if _SCRAPE_PROXY:
+                kw["proxies"] = {"http": _SCRAPE_PROXY, "https": _SCRAPE_PROXY}
+            _CF_SESSION = _cf.Session(**kw)
+        except Exception:
+            _CF_SESSION = None
+    return _CF_SESSION
+
+
+def _warmup(api_url):
+    """Visit the site's homepage once to collect the cf_clearance cookie, then
+    reuse the same session for the protected API endpoint. This clears the
+    cookie-based 'challenge' that a cold request trips."""
+    ref = _scrape_referer(api_url)  # e.g. https://www.sofascore.com/
+    if not ref:
+        return
+    try:
+        from urllib.parse import urlparse
+        host = urlparse(ref).netloc
+    except Exception:
+        host = ref
+    if host in _WARMED:
+        return
+    _WARMED.add(host)
+    s = _cf_session()
+    if s is None:
+        return
+    try:
+        s.get(ref, headers=_HEADERS, timeout=15)
+        time.sleep(1.2)  # let the clearance cookie settle
+    except Exception:
+        pass
+
+
 def _scrape_get(url, timeout=15):
-    """One GET that beats Cloudflare's TLS-fingerprint layer via curl_cffi Chrome
-    impersonation (falls back to plain requests if the lib isn't present), and
-    routes through SCRAPE_PROXY when set. Returns the response object or None."""
+    """One GET that beats Cloudflare via curl_cffi Chrome impersonation + a warmed
+    session (homepage visit → clearance cookie → API call), routing through
+    SCRAPE_PROXY when set. Falls back to plain requests if curl_cffi is absent."""
     headers = dict(_HEADERS)
     ref = _scrape_referer(url)
     if ref:
         headers["Referer"] = ref
     proxies = {"http": _SCRAPE_PROXY, "https": _SCRAPE_PROXY} if _SCRAPE_PROXY else None
     if _cf is not None:
+        s = _cf_session()
+        if s is not None:
+            try:
+                _warmup(url)  # one homepage hit per host to pick up cf cookies
+                return s.get(url, headers=headers, timeout=timeout)
+            except Exception:
+                pass
         try:
             kw = {"headers": headers, "timeout": timeout, "impersonate": _CF_IMPERSONATE}
             if proxies:
