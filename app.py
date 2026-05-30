@@ -6018,6 +6018,10 @@ def sb_search_event(home_team, away_team):
                 ev_away = (ev.get("awayTeamName") or ev.get("away")
                            or ev.get("awayTeam") or "").lower()
                 if _team_match(home_team, ev_home) and _team_match(away_team, ev_away):
+                    if not _sb_is_real_soccer(ev):
+                        print("[SB] skip non-football event for {} vs {} ({})".format(
+                            home_team, away_team, ev.get("sportId") or ev.get("tournamentName") or "?"))
+                        continue
                     eid = ev.get("eventId") or ev.get("id")
                     # Capture kickoff time + status for display and settlement
                     try:
@@ -6061,25 +6065,71 @@ def sb_search_event(home_team, away_team):
 
 
 def _extract_events_from_search(data):
-    """Recursively pull event dicts (with eventId + team names) from any shape."""
+    """Recursively pull event dicts (with eventId + team names) from any shape.
+    Propagates sport/tournament context DOWN so a nested event that lacks its own
+    sportId/tournament still carries its parent's — essential for filtering SRL /
+    eSoccer, whose markers often sit on a parent grouping, not the event itself."""
     found = []
+    _ctx_keys = ("sportId", "sport", "sportName", "tournamentName",
+                 "categoryName", "category", "tournament", "leagueName")
 
-    def walk(obj, depth=0):
-        if depth > 6:
+    def walk(obj, depth=0, ctx=None):
+        if depth > 7:
             return
+        ctx = ctx or {}
         if isinstance(obj, dict):
-            # An event-like dict has an id and team names
+            newctx = dict(ctx)
+            for k in _ctx_keys:
+                v = obj.get(k)
+                if v and not isinstance(v, (dict, list)):
+                    newctx[k] = v
             if (obj.get("eventId") or obj.get("id")) and \
                (obj.get("homeTeamName") or obj.get("home") or obj.get("homeTeam")):
-                found.append(obj)
+                merged = dict(obj)
+                for k, v in newctx.items():
+                    merged.setdefault(k, v)  # event's own fields win; inherit gaps
+                found.append(merged)
             for v in obj.values():
-                walk(v, depth + 1)
+                walk(v, depth + 1, newctx)
         elif isinstance(obj, list):
             for it in obj:
-                walk(it, depth + 1)
+                walk(it, depth + 1, ctx)
 
     walk(data.get("data", data))
     return found
+
+
+def _sb_is_real_soccer(ev):
+    """Reject simulated / eSoccer / non-football events that SportyBet's search
+    returns alongside real fixtures. Two distinct fakes use real club names:
+
+      • eSoccer (FIFA-style): sportId sr:sport:202120001, long 15-digit match IDs.
+      • SRL (Simulated Reality League): Sportradar virtual matches that run during
+        off-seasons under the NORMAL sr:sport:1 sport with 8-digit IDs — so the
+        only tell is the 'SRL' suffix on team names / 'Simulated Reality' in the
+        competition name (e.g. 'Manchester United SRL', 'Premier League SRL').
+
+    Because SRL shares sportId and ID format with real games, the NAME markers —
+    not the sportId — are what actually catch it."""
+    sid = str(ev.get("sportId") or ev.get("sport") or "")
+    if "202120001" in sid:                       # eSoccer / virtual
+        return False
+    if sid and ("sport:" in sid) and not sid.endswith(":1"):
+        return False                             # a different real sport entirely
+
+    # Pull every name-ish field, INCLUDING the team names (where 'SRL' lives).
+    blob = " ".join(str(ev.get(k) or "") for k in (
+        "homeTeamName", "awayTeamName", "home", "away", "homeTeam", "awayTeam",
+        "sportName", "tournamentName", "categoryName", "category",
+        "tournament", "name", "leagueName", "sport")).lower()
+    # 'srl' as a standalone token (suffix on team/league names)
+    toks = set(blob.replace(".", " ").replace("-", " ").split())
+    if "srl" in toks:
+        return False
+    markers = ("esoccer", "e-soccer", "esport", "cyber", "simulated reality",
+               "simulated", "mins play", "min play", "gg league", "ggleague",
+               "battle", "volta", "adriatic", "virtual", "(srl)")
+    return not any(m in blob for m in markers)
 
 
 def _team_match(name, candidate):
@@ -6092,6 +6142,12 @@ def _team_match(name, candidate):
         return True
     n_words = set(n.split())
     c_words = set(c.split())
+    # Guard against same-city different-club matches (United vs City, etc.)
+    _suffix = {"united", "city", "town", "rovers", "wanderers", "albion",
+               "hotspur", "county", "athletic", "wednesday"}
+    n_suf, c_suf = n_words & _suffix, c_words & _suffix
+    if n_suf and c_suf and not (n_suf & c_suf):
+        return False
     return bool(n_words & c_words)
 
 
