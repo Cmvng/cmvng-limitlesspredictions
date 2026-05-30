@@ -2721,46 +2721,190 @@ def _v2_dashboard_html(platform, trades, bal):
 # LANDING PAGE
 # ═══════════════════════════════════════════════════════════
 
-LANDING_HTML = """<!DOCTYPE html><html><head>
+LANDING_HTML = """<!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Cmvng Bot v2</title>
+<title>Cmvng Bot — Confirmation Trading Engine</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Sora:wght@400;600;700;800&family=DM+Sans:wght@400;500;600&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet">
 <style>
-@import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;700;900&family=JetBrains+Mono:wght@400;500&display=swap');
-* { margin:0; padding:0; box-sizing:border-box; }
-body { font-family:'DM Sans',sans-serif; background:#0a0f0d; color:#e8ede9; min-height:100vh; }
-.hero { max-width:800px; margin:0 auto; padding:80px 20px 40px; text-align:center; }
-.hero h1 { font-size:3rem; font-weight:900; background:linear-gradient(135deg,#4ade80,#22c55e); -webkit-background-clip:text; -webkit-text-fill-color:transparent; margin-bottom:12px; }
-.hero p { color:#6b8f74; font-size:1.1rem; max-width:500px; margin:0 auto 32px; line-height:1.6; }
-.hero .tagline { font-family:'JetBrains Mono',monospace; color:#4ade80; font-size:0.9rem; border:1px solid #1a2e1f; display:inline-block; padding:8px 20px; border-radius:20px; margin-bottom:40px; }
-.cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:16px; max-width:800px; margin:0 auto 40px; padding:0 20px; }
-.card { background:#111a14; border:1px solid #1a2e1f; border-radius:12px; padding:24px; }
-.card h3 { color:#4ade80; font-size:1rem; margin-bottom:8px; }
-.card p { color:#6b8f74; font-size:0.85rem; line-height:1.5; }
-.cta { text-align:center; padding:20px; }
-.cta a { color:#0a0f0d; background:#4ade80; padding:12px 32px; border-radius:8px; text-decoration:none; font-weight:700; font-size:0.95rem; }
-.cta a:hover { background:#22c55e; }
-.stats-row { display:flex; justify-content:center; gap:40px; margin:30px 0; }
-.stat { text-align:center; }
-.stat .num { font-family:'JetBrains Mono',monospace; font-size:1.8rem; font-weight:700; color:#4ade80; }
-.stat .lab { font-size:0.75rem; color:#6b8f74; text-transform:uppercase; letter-spacing:0.5px; }
+:root{
+  --bg:#05080a; --green:#4ade80; --green2:#22c55e; --green-deep:#15803d;
+  --ink:#eaf3ee; --muted:#7d9788; --line:rgba(74,222,128,0.14);
+  --panel:rgba(255,255,255,0.035);
+}
+*{margin:0;padding:0;box-sizing:border-box;}
+html{scroll-behavior:smooth;}
+body{
+  font-family:'DM Sans',sans-serif; color:var(--ink); background:var(--bg);
+  min-height:100vh; overflow-x:hidden; position:relative;
+}
+/* layered atmosphere */
+body::before{
+  content:""; position:fixed; inset:0; z-index:0; pointer-events:none;
+  background:
+    radial-gradient(900px 520px at 18% -8%, rgba(74,222,128,0.16), transparent 60%),
+    radial-gradient(760px 520px at 88% 4%, rgba(34,197,94,0.12), transparent 58%),
+    radial-gradient(700px 700px at 50% 120%, rgba(21,128,61,0.10), transparent 60%);
+  animation:drift 16s ease-in-out infinite alternate;
+}
+body::after{
+  content:""; position:fixed; inset:0; z-index:0; pointer-events:none; opacity:.5;
+  background-image:
+    linear-gradient(rgba(74,222,128,0.05) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(74,222,128,0.05) 1px, transparent 1px);
+  background-size:46px 46px;
+  mask-image:radial-gradient(circle at 50% 30%, black, transparent 78%);
+  -webkit-mask-image:radial-gradient(circle at 50% 30%, black, transparent 78%);
+}
+@keyframes drift{ from{transform:translate3d(0,0,0);} to{transform:translate3d(0,-18px,0);} }
+.shell{position:relative; z-index:1; max-width:1080px; margin:0 auto; padding:30px 22px 40px;}
+
+/* top bar */
+.bar{display:flex; align-items:center; justify-content:space-between;}
+.brand{font-family:'Sora',sans-serif; font-weight:800; font-size:1.05rem; letter-spacing:-.5px; color:var(--ink);}
+.brand b{color:var(--green);}
+.bar .live{
+  display:inline-flex; align-items:center; gap:7px; font-family:'JetBrains Mono',monospace;
+  font-size:.66rem; letter-spacing:1.5px; color:var(--green); text-transform:uppercase;
+  border:1px solid var(--line); border-radius:999px; padding:6px 12px; background:var(--panel);
+}
+.dot{width:7px; height:7px; border-radius:50%; background:var(--green); box-shadow:0 0 0 0 rgba(74,222,128,.6); animation:pulse 1.8s infinite;}
+@keyframes pulse{0%{box-shadow:0 0 0 0 rgba(74,222,128,.55);}70%{box-shadow:0 0 0 9px rgba(74,222,128,0);}100%{box-shadow:0 0 0 0 rgba(74,222,128,0);}}
+
+/* hero */
+.hero{padding:64px 0 26px; text-align:center;}
+.hero .kicker{
+  font-family:'JetBrains Mono',monospace; font-size:.72rem; letter-spacing:3px;
+  color:var(--muted); text-transform:uppercase; opacity:0;
+  animation:rise .7s .05s forwards;
+}
+.hero h1{
+  font-family:'Sora',sans-serif; font-weight:800; letter-spacing:-2.5px; line-height:.96;
+  font-size:clamp(3.2rem,11vw,6.4rem); margin:14px 0 6px; opacity:0;
+  background:linear-gradient(180deg,#ffffff 0%, #b9f3cf 55%, var(--green2) 100%);
+  -webkit-background-clip:text; background-clip:text; -webkit-text-fill-color:transparent;
+  filter:drop-shadow(0 10px 40px rgba(74,222,128,.22));
+  animation:rise .8s .12s forwards;
+}
+.hero h1 sup{font-size:.26em; color:var(--green); -webkit-text-fill-color:var(--green); vertical-align:super; letter-spacing:0;}
+.hero .lede{
+  max-width:560px; margin:18px auto 0; color:#9fbdac; font-size:1.05rem; line-height:1.6; opacity:0;
+  animation:rise .8s .2s forwards;
+}
+@keyframes rise{from{opacity:0; transform:translateY(16px);} to{opacity:1; transform:translateY(0);}}
+
+/* equity curve */
+.curve{margin:34px auto 0; max-width:620px; opacity:0; animation:rise .9s .3s forwards;}
+.curve svg{width:100%; height:90px; display:block;}
+.curve path.line{fill:none; stroke:url(--g); stroke:var(--green); stroke-width:2.4;
+  stroke-linecap:round; stroke-dasharray:1400; stroke-dashoffset:1400; animation:draw 2.2s .5s ease-out forwards;
+  filter:drop-shadow(0 4px 14px rgba(74,222,128,.4));}
+.curve path.fill{fill:url(#grad); opacity:0; animation:fade 1.4s 1.6s forwards;}
+@keyframes draw{to{stroke-dashoffset:0;}}
+@keyframes fade{to{opacity:1;}}
+
+/* stats */
+.stats{display:flex; justify-content:center; gap:14px; flex-wrap:wrap; margin:38px 0 4px;}
+.stat{
+  flex:1; min-width:150px; max-width:230px; padding:20px 18px; border-radius:18px;
+  background:linear-gradient(180deg, rgba(74,222,128,0.07), rgba(255,255,255,0.02));
+  border:1px solid var(--line); backdrop-filter:blur(8px);
+  opacity:0; animation:rise .7s forwards;
+}
+.stats .stat:nth-child(1){animation-delay:.34s;}
+.stats .stat:nth-child(2){animation-delay:.42s;}
+.stats .stat:nth-child(3){animation-delay:.5s;}
+.stat .num{font-family:'JetBrains Mono',monospace; font-weight:700; font-size:2.05rem; color:#fff; letter-spacing:-1px;}
+.stat .lab{font-size:.7rem; color:var(--muted); text-transform:uppercase; letter-spacing:1.5px; margin-top:6px;}
+
+/* feature cards */
+.grid{display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:16px; margin:46px 0 0;}
+.feat{
+  position:relative; padding:24px 22px; border-radius:20px; overflow:hidden;
+  background:var(--panel); border:1px solid rgba(255,255,255,0.06);
+  transition:transform .25s cubic-bezier(.2,.8,.2,1), border-color .25s, box-shadow .25s;
+  opacity:0; animation:rise .7s forwards;
+}
+.grid .feat:nth-child(1){animation-delay:.56s;}
+.grid .feat:nth-child(2){animation-delay:.63s;}
+.grid .feat:nth-child(3){animation-delay:.7s;}
+.feat::before{content:""; position:absolute; inset:0 0 auto 0; height:2px;
+  background:linear-gradient(90deg, transparent, var(--green), transparent); opacity:.5;}
+.feat:hover{transform:translateY(-5px); border-color:var(--line); box-shadow:0 18px 50px rgba(0,0,0,.45), 0 0 0 1px var(--line);}
+.feat .ico{font-size:1.5rem; display:inline-block; margin-bottom:12px;}
+.feat h3{font-family:'Sora',sans-serif; font-weight:700; font-size:1.02rem; color:var(--green); margin-bottom:8px;}
+.feat p{color:#8fae9c; font-size:.85rem; line-height:1.55;}
+
+/* CTA */
+.cta{display:flex; flex-wrap:wrap; gap:12px; justify-content:center; margin:44px 0 0; opacity:0; animation:rise .7s .8s forwards;}
+.btn{
+  display:inline-flex; align-items:center; gap:8px; text-decoration:none; font-weight:700;
+  font-size:.92rem; padding:15px 28px; border-radius:14px; transition:transform .2s, box-shadow .2s, background .2s;
+}
+.btn.primary{color:#04140a; background:linear-gradient(135deg, var(--green), var(--green2));
+  box-shadow:0 10px 30px rgba(74,222,128,.32);}
+.btn.primary:hover{transform:translateY(-2px); box-shadow:0 16px 40px rgba(74,222,128,.45);}
+.btn.ghost{color:var(--green); background:var(--panel); border:1px solid var(--line);}
+.btn.ghost:hover{transform:translateY(-2px); background:rgba(74,222,128,.1);}
+.foot{text-align:center; margin:54px 0 10px; color:#52685b; font-size:.74rem; font-family:'JetBrains Mono',monospace; letter-spacing:.5px;}
 </style></head><body>
-<div class="hero">
-<div class="tagline">CONFIRMATION TRADING ENGINE</div>
-<h1>Cmvng Bot v2</h1>
-<p>Not prediction. Confirmation. Wait for the candle to form. Confirm direction won't reverse. Enter late at high odds.</p>
-<div class="stats-row">
-<div class="stat"><div class="num">{{ paper_total }}</div><div class="lab">Paper Trades</div></div>
-<div class="stat"><div class="num">{{ wr }}%</div><div class="lab">Win Rate</div></div>
-<div class="stat"><div class="num">${{ balance }}</div><div class="lab">Paper Balance</div></div>
+<div class="shell">
+  <div class="bar">
+    <div class="brand">CMVNG<b>BOT</b></div>
+    <div class="live"><span class="dot"></span>Engine Live</div>
+  </div>
+
+  <div class="hero">
+    <div class="kicker">Confirmation Trading Engine</div>
+    <h1>Cmvng Bot<sup>v2</sup></h1>
+    <p class="lede">Not prediction — confirmation. Wait for the candle to form, confirm the move won't reverse, then enter late at high odds.</p>
+
+    <div class="curve">
+      <svg viewBox="0 0 620 90" preserveAspectRatio="none">
+        <defs><linearGradient id="grad" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0%" stop-color="rgba(74,222,128,0.28)"/>
+          <stop offset="100%" stop-color="rgba(74,222,128,0)"/>
+        </linearGradient></defs>
+        <path class="fill" d="M0,74 L40,70 L90,72 L140,58 L190,62 L240,46 L300,50 L350,34 L410,40 L470,22 L530,26 L580,12 L620,16 L620,90 L0,90 Z"/>
+        <path class="line" d="M0,74 L40,70 L90,72 L140,58 L190,62 L240,46 L300,50 L350,34 L410,40 L470,22 L530,26 L580,12 L620,16"/>
+      </svg>
+    </div>
+
+    <div class="stats">
+      <div class="stat"><div class="num" data-target="{{ paper_total }}" data-dec="0">0</div><div class="lab">Paper Trades</div></div>
+      <div class="stat"><div class="num" data-target="{{ wr }}" data-dec="1" data-suffix="%">0</div><div class="lab">Win Rate</div></div>
+      <div class="stat"><div class="num" data-target="{{ balance }}" data-dec="2" data-prefix="$">0</div><div class="lab">Paper Balance</div></div>
+    </div>
+  </div>
+
+  <div class="grid">
+    <div class="feat"><span class="ico">🕐</span><h3>Hourly</h3><p>5-minute intra-hour candles. HH/HL structure across Polymarket + Limitless, flat staking per entry.</p></div>
+    <div class="feat"><span class="ico">⚡</span><h3>15-Minute</h3><p>1-minute candle structure with stricter confirmation. Both venues — enter only when the move is obvious.</p></div>
+    <div class="feat"><span class="ico">⚽</span><h3>Football</h3><p>Full-board market scoring across 20+ fixtures. Safest legs surfaced into ready-to-play SportyBet codes.</p></div>
+  </div>
+
+  <div class="cta">
+    <a class="btn primary" href="/app/codes">View Today's Codes →</a>
+    <a class="btn ghost" href="/app/picks">⚽ Football Picks</a>
+    <a class="btn ghost" href="/app/paper-poly">💰 Crypto Dashboard</a>
+  </div>
+
+  <div class="foot">CMVNG BOT · accuracy over coverage · auto-generated, always verify before staking</div>
 </div>
-</div>
-<div class="cards">
-<div class="card"><h3>🕐 Hourly</h3><p>5M intra-hour candles. HH/HL structure. Scans both Polymarket + Limitless. $3 flat per entry.</p></div>
-<div class="card"><h3>⚡ 15-Min</h3><p>1M candle structure. Stricter confidence. Both platforms. Enter when the move is obvious.</p></div>
-<div class="card"><h3>📅 Daily</h3><p>Hourly candles for intra-day structure. Both platforms. Session-safe. Scans every 10 minutes.</p></div>
-</div>
-<div class="cta"><a href="/app/paper-poly">View Dashboard →</a></div>
-<div class="cta" style="padding-top:0"><a href="/app/picks" style="background:transparent;border:1px solid #1a2e1f;color:#4ade80;margin:0 4px">⚽ Football Picks</a><a href="/app/codes" style="background:transparent;border:1px solid #1a2e1f;color:#4ade80;margin:0 4px">🎫 SportyBet Codes</a></div>
+<script>
+window.addEventListener('load',function(){
+  document.querySelectorAll('.num').forEach(function(el){
+    var t=parseFloat(el.dataset.target)||0, dec=parseInt(el.dataset.dec||'0',10),
+        pre=el.dataset.prefix||'', suf=el.dataset.suffix||'', start=null, dur=1200;
+    function step(ts){ if(!start)start=ts; var p=Math.min((ts-start)/dur,1);
+      var e=0.5-Math.cos(Math.PI*p)/2; var v=t*e;
+      el.textContent=pre+v.toFixed(dec)+suf;
+      if(p<1)requestAnimationFrame(step); }
+    requestAnimationFrame(step);
+  });
+});
+</script>
 </body></html>"""
 
 
