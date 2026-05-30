@@ -8654,7 +8654,7 @@ def _sofa_probe():
         r = _scrape_get(url, timeout=12)
         if r is None:
             print("[SOFA-PROBE] no response (curl_cffi+requests both failed)")
-            return
+            return False
         body = ""
         try:
             body = (r.text or "")[:100].replace("\n", " ")
@@ -8662,8 +8662,10 @@ def _sofa_probe():
             pass
         print("[SOFA-PROBE] status={} via={} body={}".format(
             r.status_code, "curl_cffi" if _cf else "requests", body))
+        return r.status_code == 200
     except Exception as e:
         print("[SOFA-PROBE] exception: {}: {}".format(type(e).__name__, e))
+        return False
 
 
 def _fb_apply_methodology(fixtures):
@@ -8675,7 +8677,7 @@ def _fb_apply_methodology(fixtures):
     needs a non-datacenter IP (proxy/VPS) and is handled separately."""
     if not fixtures:
         return
-    _sofa_probe()  # one diagnostic call to log Sofascore's exact response
+    sofa_ok = _sofa_probe()  # one diagnostic call; gates the form loop below
     def _us_key(lg):
         lg = (lg or "").lower()
         for k in UNDERSTAT_LEAGUES:
@@ -8720,7 +8722,10 @@ def _fb_apply_methodology(fixtures):
     sofa_hits = 0
     sofa_reached = False
     sofa_attempts = 0
-    for fx in fixtures:
+    # Only attempt the per-fixture Sofascore form pull if the probe got through.
+    # It's confirmed Cloudflare-blocked from this IP, so skipping it saves ~30-60s
+    # of guaranteed-fail calls per run; form_stats already come from predictions.
+    for fx in (fixtures if sofa_ok else []):
         try:
             hid, hok = sofa_search_team(fx.get("home_team", ""))
             time.sleep(0.4)
@@ -8746,9 +8751,10 @@ def _fb_apply_methodology(fixtures):
             pass
 
     print("[FB] methodology enrich: FBref {} hits, Understat {} hits, "
-          "Sofascore {}/{} hits (reachable={}) across {} fixtures".format(
-              fb_hits, us_hits, sofa_hits, sofa_attempts,
-              "yes" if sofa_reached else "NO", len(fixtures)))
+          "Sofascore {} (form_stats from predictions) across {} fixtures".format(
+              fb_hits, us_hits,
+              "{}/{} hits".format(sofa_hits, sofa_attempts) if sofa_ok else "skipped (blocked)",
+              len(fixtures)))
 
 
 def _fb_enrich_and_filter_upcoming(fixtures, max_lookup=60):
@@ -9295,6 +9301,39 @@ def _fb_fixtures_from_predictions(max_fixtures=40):
             "_pred_score": "{:.0f}-{:.0f}".format(round(avg_h), round(avg_a)),
             "_n_sources": len(set(p.get("source") for p in md["preds"])),
         }
+
+        # ── Path 2: activate the methodology from data we ALREADY scrape ──
+        # The prediction sites tag each match with its tip type (over-2-5, btts,
+        # correct-score). Combine that tip signal with the predicted goals to
+        # build the form_stats dict the over/under + ranking rules read — so the
+        # methodology fires without Sofascore (Cloudflare-blocked) or any API.
+        pred_types = set((p.get("type") or "").lower() for p in md["preds"])
+        over_tipped = any(("over-2" in t or "over2" in t or "over_2" in t)
+                          for t in pred_types)
+        btts_tipped = any("btts" in t for t in pred_types)
+        total_goals = avg_h + avg_a
+        if over_tipped or total_goals >= 2.8:
+            o15, o25, u35 = 0.85, 0.72, 0.42      # goals-likely → Over 1.5 safe
+        elif total_goals <= 2.0 and not btts_tipped:
+            o15, o25, u35 = 0.55, 0.28, 0.82      # low-scoring → Under 3.5 safe
+        else:
+            o15, o25, u35 = 0.70, 0.50, 0.62      # neutral
+        btts_p = 0.70 if (btts_tipped or both_score) else 0.38
+
+        def _mk_form(gf, ga, won, drew=False):
+            return {
+                "played": 10,
+                "form": hf if won else (af if not drew else "DDDDD"),
+                "over15_pct": o15, "over25_pct": o25, "under35_pct": u35,
+                "scored_pct": 0.80 if gf >= 1.2 else 0.55,
+                "cs_pct": 0.35 if ga <= 0.9 else 0.20,
+                "btts_pct": btts_p,
+                "avg_gf": round(gf, 2), "avg_ga": round(ga, 2),
+                "ppg": 2.0 if won else (1.0 if drew else 0.9),
+            }
+        fx["home_form_stats"] = _mk_form(avg_h, avg_a, margin > 0.3, abs(margin) <= 0.3)
+        fx["away_form_stats"] = _mk_form(avg_a, avg_h, margin < -0.3, abs(margin) <= 0.3)
+        fx["_form_source"] = "predictions"
 
         # Overlay real xG from Understat where the league is supported
         try:
