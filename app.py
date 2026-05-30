@@ -6077,6 +6077,138 @@ def fbref_lookup(stats, team_name):
             return v
     return None
 
+
+# ═══════════════════════════════════════════════════════════════════
+# API-FOOTBALL (api-sports.io) — real last-N form/goals/over-under, from any
+# IP, no Cloudflare. Uses a key already in the user's Railway variables. Auto-
+# detects the var name AND the access method (direct api-sports vs RapidAPI).
+# ═══════════════════════════════════════════════════════════════════
+
+_APIFB = {"checked": False, "base": None, "headers": None, "calls": 0,
+          "day": "", "today": 0}
+_APIFB_TEAM_IDS = {}
+# Hard daily ceiling so the free tier can never be blown — fallback only.
+APIFB_DAILY_CAP = int(_os.environ.get("APIFB_DAILY_CAP", "60") or 60)
+
+
+def _apifootball_key():
+    for name in ("API_FOOTBALL_KEY", "APIFOOTBALL_KEY", "API_FOOTBALL",
+                 "API_SPORTS_KEY", "APISPORTS_KEY", "FOOTBALL_API_KEY",
+                 "RAPIDAPI_KEY", "X_RAPIDAPI_KEY"):
+        v = _os.environ.get(name, "").strip()
+        if v:
+            return name, v
+    return None, None
+
+
+def _apifootball_setup():
+    """Probe both access methods once; remember whichever returns a valid body."""
+    if _APIFB["checked"]:
+        return _APIFB["base"] is not None
+    _APIFB["checked"] = True
+    name, key = _apifootball_key()
+    if not key:
+        print("[APIFB] no API-Football key found in env")
+        return False
+    candidates = [
+        ("https://v3.football.api-sports.io", {"x-apisports-key": key}),
+        ("https://api-football-v1.p.rapidapi.com/v3",
+         {"x-rapidapi-key": key, "x-rapidapi-host": "api-football-v1.p.rapidapi.com"}),
+    ]
+    for base, headers in candidates:
+        try:
+            r = _req.get(base + "/status", headers=headers, timeout=15)
+            if r.status_code == 200 and isinstance(r.json(), dict) and "response" in r.json():
+                _APIFB["base"], _APIFB["headers"] = base, headers
+                print("[APIFB] connected via {} (key var: {})".format(
+                    "rapidapi" if "rapidapi" in base else "api-sports", name))
+                return True
+        except Exception:
+            pass
+    print("[APIFB] key found ({}) but neither access method validated".format(name))
+    return False
+
+
+def _apifootball_get(path, params):
+    if not _apifootball_setup():
+        return None
+    # daily budget guard — never exceed the free-tier ceiling
+    today = _dt.date.today().isoformat()
+    if _APIFB["day"] != today:
+        _APIFB["day"] = today
+        _APIFB["today"] = 0
+    if _APIFB["today"] >= APIFB_DAILY_CAP:
+        return None
+    try:
+        _APIFB["calls"] += 1
+        _APIFB["today"] += 1
+        r = _req.get(_APIFB["base"] + path, headers=_APIFB["headers"],
+                     params=params, timeout=20)
+        if r.status_code == 200:
+            return r.json()
+    except Exception:
+        pass
+    return None
+
+
+def _apifootball_team_id(name):
+    if not name:
+        return None
+    key = name.lower().strip()
+    if key in _APIFB_TEAM_IDS:
+        return _APIFB_TEAM_IDS[key]
+    data = _apifootball_get("/teams", {"search": name})
+    tid = None
+    if data and data.get("response"):
+        tid = (data["response"][0].get("team") or {}).get("id")
+    _APIFB_TEAM_IDS[key] = tid
+    return tid
+
+
+def apifootball_form_stats(team_name):
+    """Real last-10 form computed from API-Football fixtures — same shape the
+    methodology rules read (over15_pct, under35_pct, avg_gf/ga, ppg, form...)."""
+    tid = _apifootball_team_id(team_name)
+    if not tid:
+        return {}
+    data = _apifootball_get("/fixtures", {"team": tid, "last": 10})
+    if not data or not data.get("response"):
+        return {}
+    evs = []
+    for ev in data["response"]:
+        g = ev.get("goals") or {}
+        hs, as_ = g.get("home"), g.get("away")
+        st = ((ev.get("fixture") or {}).get("status") or {}).get("short", "")
+        if hs is None or as_ is None or st not in ("FT", "AET", "PEN"):
+            continue
+        home_id = ((ev.get("teams") or {}).get("home") or {}).get("id")
+        evs.append((hs, as_, home_id))
+    n = len(evs)
+    if n == 0:
+        return {}
+    over15 = over25 = under35 = scored = cs = btts = pts = gf = ga = 0
+    form = []
+    for hs, as_, home_id in evs:
+        is_home = (home_id == tid)
+        my, opp = (hs, as_) if is_home else (as_, hs)
+        tot = hs + as_
+        gf += my; ga += opp
+        if tot > 1.5: over15 += 1
+        if tot > 2.5: over25 += 1
+        if tot < 3.5: under35 += 1
+        if my > 0: scored += 1
+        if opp == 0: cs += 1
+        if hs > 0 and as_ > 0: btts += 1
+        if my > opp: form.append("W"); pts += 3
+        elif my < opp: form.append("L")
+        else: form.append("D"); pts += 1
+    return {
+        "played": n, "form": "".join(form),
+        "over15_pct": over15 / n, "over25_pct": over25 / n, "under35_pct": under35 / n,
+        "scored_pct": scored / n, "cs_pct": cs / n, "btts_pct": btts / n,
+        "avg_gf": round(gf / n, 2), "avg_ga": round(ga / n, 2), "ppg": round(pts / n, 2),
+    }
+
 def footystats_team(team_slug):
     """
     Scrape FootyStats team page for corners/cards/btts stats.
@@ -8678,6 +8810,31 @@ def _fb_apply_methodology(fixtures):
     if not fixtures:
         return
     sofa_ok = _sofa_probe()  # one diagnostic call; gates the form loop below
+
+    # API-Football is a BUDGET-CAPPED FALLBACK (free tier): tips are primary, so
+    # we only spend real-form calls on fixtures the tips couldn't read clearly
+    # (neutral), and stop at the daily cap. Clear over/under matches cost 0 calls.
+    apifb_hits = 0
+    if _apifootball_setup():
+        neutral = [fx for fx in fixtures if fx.get("_tip_neutral")]
+        for fx in neutral:
+            if _APIFB["today"] >= APIFB_DAILY_CAP:
+                break
+            try:
+                hs = apifootball_form_stats(fx.get("home_team", ""))
+                if hs:
+                    fx["home_form_stats"] = hs
+                    fx["_form_source"] = "api-football"
+                as_ = apifootball_form_stats(fx.get("away_team", ""))
+                if as_:
+                    fx["away_form_stats"] = as_
+                if hs or as_:
+                    apifb_hits += 1
+            except Exception:
+                pass
+        print("[APIFB] fallback: {}/{} neutral fixtures enriched ({} calls today, cap {})".format(
+            apifb_hits, len(neutral), _APIFB["today"], APIFB_DAILY_CAP))
+
     def _us_key(lg):
         lg = (lg or "").lower()
         for k in UNDERSTAT_LEAGUES:
@@ -9314,10 +9471,13 @@ def _fb_fixtures_from_predictions(max_fixtures=40):
         total_goals = avg_h + avg_a
         if over_tipped or total_goals >= 2.8:
             o15, o25, u35 = 0.85, 0.72, 0.42      # goals-likely → Over 1.5 safe
+            tip_neutral = False
         elif total_goals <= 2.0 and not btts_tipped:
             o15, o25, u35 = 0.55, 0.28, 0.82      # low-scoring → Under 3.5 safe
+            tip_neutral = False
         else:
-            o15, o25, u35 = 0.70, 0.50, 0.62      # neutral
+            o15, o25, u35 = 0.70, 0.50, 0.62      # neutral — uncertain read
+            tip_neutral = True
         btts_p = 0.70 if (btts_tipped or both_score) else 0.38
 
         def _mk_form(gf, ga, won, drew=False):
@@ -9334,6 +9494,7 @@ def _fb_fixtures_from_predictions(max_fixtures=40):
         fx["home_form_stats"] = _mk_form(avg_h, avg_a, margin > 0.3, abs(margin) <= 0.3)
         fx["away_form_stats"] = _mk_form(avg_a, avg_h, margin < -0.3, abs(margin) <= 0.3)
         fx["_form_source"] = "predictions"
+        fx["_tip_neutral"] = tip_neutral
 
         # Overlay real xG from Understat where the league is supported
         try:
