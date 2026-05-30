@@ -4356,8 +4356,18 @@ def _sports_scan_and_alert():
                     })
 
         # ── Surface the BEST market(s) for this game, each with an EXPLICIT pick ──
+        # Dedup by the explicit pick first, so a game can't fire the same call
+        # twice (e.g. moneyline→Draw and general→Draw).
         game_candidates.sort(key=lambda c: -c["score"])
-        for cand in game_candidates[:2]:
+        _seen_picks = set()
+        _unique_cands = []
+        for c in game_candidates:
+            pk = (c.get("pick_outcome") or "").strip().lower()
+            if pk in _seen_picks:
+                continue
+            _seen_picks.add(pk)
+            _unique_cands.append(c)
+        for cand in _unique_cands[:2]:
             if match_alerts >= MAX_ALERTS_PER_MATCH:
                 break
             market = cand["market"]; pick_score = cand["score"]
