@@ -4904,6 +4904,7 @@ def _sb_board_explore(fx, home, away, exp_home, exp_away, exp_total):
                 "odds": round(odds, 2),          # REAL SportyBet odds
                 "reasoning": comment,
                 "result": "pending",
+                "explore": True,                 # board-explored: prefer in 5/10/1000
                 "sb_event_id": eid,
                 "sb_market_id": mid,
                 "sb_specifier": mk.get("specifier") or None,
@@ -4974,11 +4975,13 @@ TIER_CONFIG = {
 }
 
 
-def build_accumulator(all_picks, tier_key):
+def build_accumulator(all_picks, tier_key, used_selections=None):
     """
     Build one accumulator tier with a DIVERSE mix of market types.
     Strategy:
-      1. Filter picks to this tier's confidence floor + odds band
+      1. Filter picks to this tier's confidence floor + odds band, and drop any
+         exact selection already placed in an earlier tier (used_selections), so
+         no two slips repeat the identical leg
       2. Greedily pack (max 1 per match) but cap how many of each market
          type can appear, so a slip is a genuine mix (not all "win or draw"
          or all "over 8.5 corners")
@@ -4990,6 +4993,7 @@ def build_accumulator(all_picks, tier_key):
     prefer_set = set(cfg["prefer"])
     allow_set = set(cfg.get("allow", []))      # if set, ONLY these market types
     exclude_set = set(cfg.get("exclude", []))  # never these market types
+    used_selections = used_selections or set()  # (match, market_type) already used
 
     eligible = [
         p for p in all_picks
@@ -4997,6 +5001,7 @@ def build_accumulator(all_picks, tier_key):
         and cfg["odds_lo"] <= p["odds"] <= cfg["odds_hi"]
         and (not allow_set or p["market_type"] in allow_set)
         and p["market_type"] not in exclude_set
+        and (p["match"], p["market_type"]) not in used_selections
     ]
     if not eligible:
         return None
@@ -5009,9 +5014,18 @@ def build_accumulator(all_picks, tier_key):
     if distinct_types >= cfg["max_sel"]:
         max_per_type = 1  # plenty of variety -> force every leg a different type
 
+    # 5/10/1000 have no banker whitelist — those are the exploratory tiers
+    # where the market-driven board picks should surface, not sit behind the
+    # fixed core list. Treat them as preferred there so the highest-confidence
+    # board outcomes get packed (the odds band routes safe ones to 5-odds and
+    # wild ones to 1000-odds on its own).
+    explore_tier = not allow_set
+
     def base_rank(p):
         # Preferred types first, then by confidence
-        return (0 if p["market_type"] in prefer_set else 1, -p["confidence"])
+        preferred = (p["market_type"] in prefer_set
+                     or (explore_tier and p.get("explore")))
+        return (0 if preferred else 1, -p["confidence"])
 
     remaining = sorted(eligible, key=base_rank)
 
@@ -5068,10 +5082,17 @@ def build_accumulator(all_picks, tier_key):
 
 
 def build_all_accumulators(all_picks):
-    """Build all 5 tiers. Returns dict of {tier_key: accumulator or None}."""
+    """Build all 5 tiers, each distinct. Returns {tier_key: accumulator|None}.
+    Tiers are built safest-first; every selection placed in one tier is barred
+    from later tiers so no two slips share the identical leg."""
     result = {}
+    used = set()  # (match, market_type) selections already placed in a slip
     for tier_key in ["2_odds", "3_odds", "5_odds", "10_odds", "1000_odds"]:
-        result[tier_key] = build_accumulator(all_picks, tier_key)
+        acc = build_accumulator(all_picks, tier_key, used)
+        result[tier_key] = acc
+        if acc:
+            for s in acc["selections"]:
+                used.add((s["match"], s["market_type"]))
     return result
 
 
