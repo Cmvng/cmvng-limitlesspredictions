@@ -2561,6 +2561,35 @@ tbody tr:hover { background: rgba(74,222,128,0.10); }
 """
 
 
+def _tabbar_dark(active):
+    """Self-contained bottom tab bar (own styles) for the dark-themed landing +
+    crypto pages, so navigation is consistent app-wide."""
+    tabs = [("home", "/", "🏠", "Home"), ("picks", "/app/picks", "⚽", "Picks"),
+            ("codes", "/app/codes", "🎫", "Codes"),
+            ("crypto", "/app/paper-poly", "💰", "Crypto"),
+            ("results", "/app/results", "📈", "Results")]
+    items = "".join(
+        '<a href="{}" class="{}"><span class="ic">{}</span>'
+        '<span class="tl">{}</span></a>'.format(
+            u, "active" if k == active else "", ic, l)
+        for k, u, ic, l in tabs)
+    css = (
+        '<style>'
+        '.cb-tabbar{position:fixed;bottom:0;left:0;right:0;z-index:9999;display:flex;'
+        'justify-content:space-around;background:rgba(10,15,13,0.93);'
+        'backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px);'
+        'border-top:1px solid #1f3a28;padding:6px 4px calc(6px + env(safe-area-inset-bottom));}'
+        '.cb-tabbar a{flex:1;display:flex;flex-direction:column;align-items:center;gap:3px;'
+        'text-decoration:none;color:#6b8f74;padding:6px 2px;border-radius:12px;}'
+        '.cb-tabbar a .ic{font-size:1.3rem;line-height:1;}'
+        '.cb-tabbar a .tl{font-size:0.62rem;font-weight:700;letter-spacing:0.2px;}'
+        '.cb-tabbar a.active{color:#4ade80;}'
+        '.cb-tabbar a.active .tl{font-weight:900;}'
+        'body{padding-bottom:88px !important;}'
+        '</style>')
+    return css + '<div class="cb-tabbar">' + items + '</div>'
+
+
 def _v2_dashboard_html(platform, trades, bal):
     """Build dashboard HTML for a platform."""
     import html as _html
@@ -2684,7 +2713,7 @@ def _v2_dashboard_html(platform, trades, bal):
             h += '<td class="note-cell" title="{}">{}</td>'.format(note, note[:60])
             h += '</tr>'
 
-    h += '</tbody></table></div></div></body></html>'
+    h += '</tbody></table></div></div>' + _tabbar_dark("crypto") + '</body></html>'
     return h
 
 
@@ -2755,8 +2784,9 @@ def landing():
     wr = round(wins / resolved * 100, 1) if resolved > 0 else 0
     balance = _v2_balances.get("polymarket", {}).get("balance", 100)
 
-    return render_template_string(LANDING_HTML,
+    html = render_template_string(LANDING_HTML,
         paper_total=paper_total, wr=wr, balance="{:.2f}".format(balance))
+    return html.replace("</body>", _tabbar_dark("home") + "</body>")
 
 
 @app.route("/app/paper-poly")
@@ -5986,25 +6016,39 @@ body {
     radial-gradient(1200px 600px at 10% -10%, rgba(74,222,128,0.12), transparent 60%),
     radial-gradient(1000px 500px at 90% 0%, rgba(34,197,94,0.10), transparent 55%),
     linear-gradient(160deg, #eafaf0 0%, #dff5e8 35%, #d2f0de 100%);
-  color:#0f2417; min-height:100vh; padding-bottom:60px;
+  color:#0f2417; min-height:100vh; padding-bottom:84px;
 }
 .nav {
   position:sticky; top:0; z-index:50;
   display:flex; align-items:center; justify-content:space-between;
-  padding:16px 22px;
-  background:rgba(255,255,255,0.55);
+  padding:14px 20px;
+  background:rgba(255,255,255,0.7);
   backdrop-filter:blur(18px); -webkit-backdrop-filter:blur(18px);
   border-bottom:1px solid rgba(74,222,128,0.25);
 }
-.nav .logo { font-weight:900; font-size:1.15rem; color:#15803d; letter-spacing:-0.5px; }
+.nav .logo { font-weight:900; font-size:1.1rem; color:#15803d; letter-spacing:-0.5px; text-decoration:none; }
 .nav .logo span { color:#0f2417; }
-.nav .tabs { display:flex; gap:6px; flex-wrap:wrap; }
-.nav .tabs a {
-  font-size:0.8rem; font-weight:700; text-decoration:none; color:#356148;
-  padding:8px 14px; border-radius:999px; transition:all .15s;
+.nav .nav-page { font-size:0.82rem; font-weight:700; color:#42795a; }
+/* bottom tab bar — mobile-app style, always reachable */
+.tabbar {
+  position:fixed; bottom:0; left:0; right:0; z-index:60;
+  display:flex; justify-content:space-around; align-items:stretch;
+  background:rgba(255,255,255,0.9);
+  backdrop-filter:blur(22px); -webkit-backdrop-filter:blur(22px);
+  border-top:1px solid rgba(74,222,128,0.3);
+  padding:6px 4px calc(6px + env(safe-area-inset-bottom));
+  box-shadow:0 -4px 22px rgba(21,128,61,0.10);
 }
-.nav .tabs a:hover { background:rgba(74,222,128,0.18); }
-.nav .tabs a.active { background:#15803d; color:#fff; }
+.tabbar a {
+  flex:1; display:flex; flex-direction:column; align-items:center; gap:3px;
+  text-decoration:none; color:#6b9580; padding:6px 2px; border-radius:12px;
+  transition:color .15s, background .15s;
+}
+.tabbar a .ic { font-size:1.3rem; line-height:1; }
+.tabbar a .tl { font-size:0.62rem; font-weight:700; letter-spacing:0.2px; }
+.tabbar a.active { color:#15803d; }
+.tabbar a.active .tl { font-weight:900; }
+.tabbar a:active { background:rgba(74,222,128,0.16); }
 .wrap { max-width:980px; margin:0 auto; padding:28px 18px 0; }
 .page-head { margin:18px 4px 22px; }
 .page-head h1 { font-size:2.1rem; font-weight:900; letter-spacing:-1px; color:#0f2417; }
@@ -6120,19 +6164,24 @@ body {
 
 
 def _nav(active):
+    page_names = {"home": "Home", "picks": "Picks", "codes": "Codes",
+                  "crypto": "Crypto", "sports": "Markets", "results": "Results"}
+    top = ('<div class="nav"><a href="/" class="logo">CMVNG<span>BOT</span></a>'
+           '<div class="nav-page">{}</div></div>').format(page_names.get(active, ""))
     tabs = [
-        ("picks", "/app/picks", "⚽ Picks"),
-        ("codes", "/app/codes", "🎫 Codes"),
-        ("crypto", "/app/paper-poly", "💰 Crypto"),
-        ("sports", "/app/sports", "📊 Markets"),
-        ("results", "/app/results", "📈 Results"),
+        ("home", "/", "🏠", "Home"),
+        ("picks", "/app/picks", "⚽", "Picks"),
+        ("codes", "/app/codes", "🎫", "Codes"),
+        ("crypto", "/app/paper-poly", "💰", "Crypto"),
+        ("results", "/app/results", "📈", "Results"),
     ]
     items = "".join(
-        '<a href="{}" class="{}">{}</a>'.format(url, "active" if key == active else "", label)
-        for key, url, label in tabs
-    )
-    return ('<div class="nav"><div class="logo">CMVNG<span>BOT</span></div>'
-            '<div class="tabs">{}</div></div>').format(items)
+        '<a href="{}" class="{}"><span class="ic">{}</span>'
+        '<span class="tl">{}</span></a>'.format(
+            url, "active" if key == active else "", ic, label)
+        for key, url, ic, label in tabs)
+    bottom = '<div class="tabbar">{}</div>'.format(items)
+    return top + bottom
 
 
 def _fb_fmt_kickoff(ts):
@@ -6812,34 +6861,178 @@ def fb_save_run(get_db, date_str, all_picks, accumulators):
 # SETTLEMENT — mark accumulators won/lost from final scores
 # ═══════════════════════════════════════════════════════════════════
 
-def _fb_settle_pick(market_type, pick_text, hs, aw):
-    """Evaluate a pick against a final score. Returns True/False/None (unknown)."""
-    total = hs + aw
+_FB_STATS_CACHE = {}  # espn_id -> {"corners": int|None, "cards": int|None}
+
+
+def _espn_match_stats(slug, espn_id):
+    """Fetch corner-kick + card totals for a finished game from ESPN's summary
+    endpoint (same free, keyless API as the scoreboard). Returns
+    {"corners": int|None, "cards": int|None} or None. Cached per event."""
+    if not slug or not espn_id or _req is None:
+        return None
+    key = str(espn_id)
+    if key in _FB_STATS_CACHE:
+        return _FB_STATS_CACHE[key]
+    url = ("https://site.api.espn.com/apis/site/v2/sports/soccer/{}"
+           "/summary?event={}".format(slug, espn_id))
+    corners = cards = None
+    try:
+        r = _req.get(url, timeout=12, headers={"User-Agent": "Mozilla/5.0"})
+        if r.status_code != 200:
+            _FB_STATS_CACHE[key] = None
+            return None
+        data = r.json()
+        # boxscore.teams[].statistics[] -> match by name OR label (defensive:
+        # ESPN soccer uses name='wonCorners'/'yellowCards'/'redCards', but we
+        # also match the human label so a field rename can't silently break us).
+        c_tot = y_tot = r_tot = 0
+        found_c = found_card = False
+        for team in ((data.get("boxscore") or {}).get("teams") or []):
+            for st in (team.get("statistics") or []):
+                nm = str(st.get("name") or "").lower()
+                lbl = str(st.get("label") or st.get("displayName") or "").lower()
+                val = st.get("displayValue") or st.get("value")
+                try:
+                    n = int(float(str(val)))
+                except (ValueError, TypeError):
+                    continue
+                if "woncorners" in nm or "corner" in lbl:
+                    c_tot += n; found_c = True
+                elif "yellowcard" in nm or "yellow card" in lbl:
+                    y_tot += n; found_card = True
+                elif "redcard" in nm or "red card" in lbl:
+                    r_tot += n; found_card = True
+        corners = c_tot if found_c else None
+        cards = (y_tot + r_tot) if found_card else None
+    except Exception:
+        _FB_STATS_CACHE[key] = None
+        return None
+    res = {"corners": corners, "cards": cards}
+    _FB_STATS_CACHE[key] = res
+    return res
+
+
+def _fb_settle_stat_pick(market_type, stats):
+    """Grade a corners_*/cards_* pick from ESPN match stats. True/False/None."""
+    if not stats:
+        return None
     mt = market_type
+    m = _sports_re.match(r'^corners_(over|under)_(\d+(?:\.\d+)?)$', mt)
+    if m:
+        c = stats.get("corners")
+        if c is None:
+            return None
+        return c > float(m.group(2)) if m.group(1) == "over" else c < float(m.group(2))
+    m = _sports_re.match(r'^cards_(over|under)_(\d+(?:\.\d+)?)$', mt)
+    if m:
+        c = stats.get("cards")
+        if c is None:
+            return None
+        return c > float(m.group(2)) if m.group(1) == "over" else c < float(m.group(2))
+    return None
+
+
+def _fb_settle_pick(market_type, pick_text, hs, aw, h1h=None, h1a=None):
+    """Evaluate a pick against a final score (and 1st-half score if available).
+    Returns True/False/None (can't grade from available data).
+    h1h/h1a = 1st-half home/away goals (optional; only needed for half markets)."""
+    total = hs + aw
+    margin = hs - aw  # home margin (negative => away ahead)
+    mt = market_type
+    _re = _sports_re
+
+    # ── core result markets ──
     if mt == "home_win":            return hs > aw
     if mt == "away_win":            return aw > hs
     if mt == "draw":                return hs == aw
     if mt == "double_chance_1X":    return hs >= aw
     if mt == "double_chance_X2":    return aw >= hs
-    if mt == "over_0.5":            return total > 0.5
-    if mt == "over_1.5":            return total > 1.5
-    if mt == "over_2.5":            return total > 2.5
-    if mt == "over_3.5":            return total > 3.5
-    if mt == "under_2.5":           return total < 2.5
-    if mt == "under_3.5":           return total < 3.5
     if mt == "btts_yes":            return hs > 0 and aw > 0
     if mt == "btts_no":             return not (hs > 0 and aw > 0)
     if mt == "home_win_btts":       return hs > aw and hs > 0 and aw > 0
     if mt == "home_win_over_2.5":   return hs > aw and total > 2.5
     if mt == "dc_over_1.5":         return hs >= aw and total > 1.5
-    if mt == "handicap_home_-1.5":  return (hs - aw) > 1.5
-    if mt == "handicap_away_-1.5":  return (aw - hs) > 1.5
+
+    # ── draw no bet (stake back on a draw -> void leg, returns None) ──
+    if mt == "dnb_home":            return None if hs == aw else hs > aw
+    if mt == "dnb_away":            return None if hs == aw else aw > hs
+
+    # ── over/under goals, ANY line (over_0.5 ... over_5.5, under_1.5 ...) ──
+    m = _re.match(r'^over_(\d+(?:\.\d+)?)$', mt)
+    if m:                           return total > float(m.group(1))
+    m = _re.match(r'^under_(\d+(?:\.\d+)?)$', mt)
+    if m:                           return total < float(m.group(1))
+
+    # ── handicap (-1.5 lines) ──
+    if mt == "handicap_home_-1.5":  return margin > 1.5
+    if mt == "handicap_away_-1.5":  return (-margin) > 1.5
+
+    # ── multigoal range (board): "1-3 total goals" etc. ──
+    m = _re.match(r'^multigoal_(\d+)_(\d+)$', mt)
+    if m:
+        lo, hi = int(m.group(1)), int(m.group(2))
+        return lo <= total <= hi
+
+    # ── team totals (board): team_home_over_2.5 / team_away_under_1.5 ──
+    m = _re.match(r'^team_(home|away)_(over|under)_(\d+(?:\.\d+)?)$', mt)
+    if m:
+        g = hs if m.group(1) == "home" else aw
+        line = float(m.group(3))
+        return g > line if m.group(2) == "over" else g < line
+
+    # ── winning margin (board): winmargin_home_2p (by 2+), _2e (exactly 2) ──
+    m = _re.match(r'^winmargin_(home|away)_(\d+)(p|e)$', mt)
+    if m:
+        mar = margin if m.group(1) == "home" else -margin
+        n = int(m.group(2))
+        return mar >= n if m.group(3) == "p" else mar == n
+
+    # ── lead-by-N (board): final-margin proxy, leadby_home_2_yes ──
+    m = _re.match(r'^leadby_(home|away)_(\d+)_(yes|no)$', mt)
+    if m:
+        mar = margin if m.group(1) == "home" else -margin
+        hit = mar >= int(m.group(2))
+        return hit if m.group(3) == "yes" else not hit
+
+    # ── win to nil (board): tonil_home_y / _n ──
+    m = _re.match(r'^tonil_(home|away)_(y|n)$', mt)
+    if m:
+        hit = (hs > aw and aw == 0) if m.group(1) == "home" else (aw > hs and hs == 0)
+        return hit if m.group(2) == "y" else not hit
+
+    # ── clean sheet (board): cleansheet_home_y / _n ──
+    m = _re.match(r'^cleansheet_(home|away)_(y|n)$', mt)
+    if m:
+        hit = (aw == 0) if m.group(1) == "home" else (hs == 0)
+        return hit if m.group(2) == "y" else not hit
+
+    # ── correct score ──
     if mt == "correct_score":
-        m = _sports_re.search(r'(\d+)-(\d+)', pick_text or "")
+        m = _re.search(r'(\d+)-(\d+)', pick_text or "")
         if m:
             return hs == int(m.group(1)) and aw == int(m.group(2))
         return None
-    # corners_* / cards_* can't be settled from the goal score alone
+
+    # ── 1st-half markets: only gradeable when half-time score is known ──
+    if h1h is not None and h1a is not None:
+        h1total = h1h + h1a
+        m = _re.match(r'^fh_over_(\d+(?:\.\d+)?)$', mt)
+        if m:                       return h1total > float(m.group(1))
+        m = _re.match(r'^fh_under_(\d+(?:\.\d+)?)$', mt)
+        if m:                       return h1total < float(m.group(1))
+        m = _re.match(r'^winhalf_(home|away)_(1sthalf|2ndhalf|eitherhalf|bothhalves)_(y|n)$', mt)
+        if m:
+            h2h, h2a = hs - h1h, aw - h1a            # 2nd half = full - 1st
+            if m.group(1) == "home":
+                w1, w2 = h1h > h1a, h2h > h2a
+            else:
+                w1, w2 = h1a > h1h, h2a > h2h
+            kind = m.group(2)
+            hit = (w1 if kind == "1sthalf" else w2 if kind == "2ndhalf"
+                   else (w1 or w2) if kind == "eitherhalf" else (w1 and w2))
+            return hit if m.group(3) == "y" else not hit
+
+    # corners_* / cards_* (and half markets without HT data) can't be graded
     return None
 
 
@@ -6933,14 +7126,23 @@ def _espn_scoreboard(slug, yyyymmdd):
             detail = stype.get("shortDetail") or stype.get("detail") or ""
             home = away = None
             hs = aw = None
+            h1h = h1a = None
             for c in comp.get("competitors", []):
                 team = c.get("team") or {}
                 nm = team.get("displayName") or team.get("name") or team.get("shortDisplayName") or ""
                 sc = c.get("score")
+                # 1st-half goals from per-period linescores ([0] = 1st half)
+                h1 = None
+                ls = c.get("linescores") or []
+                if ls:
+                    try:
+                        h1 = int(float(ls[0].get("value")))
+                    except (ValueError, TypeError, AttributeError, IndexError):
+                        h1 = None
                 if c.get("homeAway") == "home":
-                    home, hs = nm, sc
+                    home, hs, h1h = nm, sc, h1
                 else:
-                    away, aw = nm, sc
+                    away, aw, h1a = nm, sc, h1
             if not (home and away):
                 continue
             try:
@@ -6949,8 +7151,10 @@ def _espn_scoreboard(slug, yyyymmdd):
             except (ValueError, TypeError):
                 hs_i = aw_i = None
             out.append({"home": home, "away": away, "hs": hs_i, "aw": aw_i,
+                        "h1h": h1h, "h1a": h1a,
                         "state": state, "completed": completed,
-                        "detail": detail, "league": league_name})
+                        "detail": detail, "league": league_name,
+                        "espn_id": ev.get("id"), "espn_slug": slug})
     except Exception:
         return []
     return out
@@ -7271,9 +7475,18 @@ def _fb_settle_accumulators(get_db):
                     absent.append(label + hint)
                 continue
             hs, aw = score
-            outcome = _fb_settle_pick(s.get("market_type", ""), s.get("pick", ""), hs, aw)
+            g = _fb_find_game(index, home, away)
+            h1h = g.get("h1h") if g else None
+            h1a = g.get("h1a") if g else None
+            mt = s.get("market_type", "")
+            outcome = _fb_settle_pick(mt, s.get("pick", ""), hs, aw, h1h, h1a)
+            if outcome is None and (mt.startswith("corners") or mt.startswith("cards")):
+                # goal score can't grade these — pull corner/card stats from ESPN
+                if g and g.get("espn_id"):
+                    stats = _espn_match_stats(g.get("espn_slug"), g.get("espn_id"))
+                    outcome = _fb_settle_stat_pick(mt, stats)
             if outcome is None:
-                continue  # corners/cards — can't grade from final score
+                continue  # still ungradeable (no stats / half-no-HT) — skip leg
             evaluable += 1
             s["result"] = "won" if outcome else "lost"
             if not outcome:
