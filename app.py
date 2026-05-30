@@ -5665,6 +5665,29 @@ def sofa_todays_fixtures(date_str=None, max_leagues=None):
     return fixtures
 
 
+def sofa_search_team(name):
+    """Resolve a team name to its Sofascore ID via the search endpoint. Returns
+    (team_id, reachable): reachable distinguishes 'Sofascore answered but no
+    match' from 'Sofascore blocked/unreachable' so we can diagnose Cloudflare."""
+    if not name:
+        return None, False
+    try:
+        from urllib.parse import quote
+        q = quote(name)
+    except Exception:
+        q = name.replace(" ", "%20")
+    data = _get_json("{}/search/all?q={}".format(SOFA, q))
+    if data is None:
+        return None, False  # unreachable / blocked
+    results = data.get("results", []) if isinstance(data, dict) else []
+    for r in results:
+        if r.get("type") == "team":
+            ent = r.get("entity", {}) or {}
+            if ent.get("id"):
+                return ent["id"], True
+    return None, True  # reachable, just no team match
+
+
 def sofa_team_form_stats(team_id, limit=10):
     """Last-N granular form for a team, computed from the same events feed as
     sofa_team_form (which already has each match's full score). Returns the
@@ -6891,6 +6914,10 @@ body::after{ content:""; position:fixed; inset:0; z-index:0; pointer-events:none
 .tier-title h2 { font-family:'Sora',sans-serif; font-size:1.12rem; font-weight:800; letter-spacing:-0.3px; color:var(--ink); }
 .tier-odds { font-family:'JetBrains Mono',monospace; font-weight:700; font-size:1.45rem; color:var(--green); }
 .tier-odds .lbl { font-size:0.62rem; color:var(--muted); display:block; text-align:right; font-weight:500; letter-spacing:1.5px; }
+.section-head { display:flex; align-items:baseline; gap:10px; margin:6px 2px 14px; font-family:'Sora',sans-serif;
+  font-size:1.15rem; font-weight:800; letter-spacing:-0.4px; color:var(--ink); }
+.section-head span { font-family:'Inter',sans-serif; font-size:0.72rem; font-weight:500; color:var(--muted);
+  letter-spacing:0.3px; }
 .sel { display:flex; align-items:flex-start; gap:12px; padding:12px 0; border-top:1px solid rgba(255,255,255,0.06); }
 .sel:first-of-type { border-top:none; }
 .sel .ico { font-size:1.05rem; margin-top:1px; opacity:.9; }
@@ -7009,7 +7036,48 @@ def _fb_fmt_kickoff(ts):
         return ""
 
 
-def render_codes_page(accumulators, date_str):
+def _fb_builder_blocks(builders):
+    """Render premium bet-builder cards (3 correlated legs on one match, one code)."""
+    if not builders:
+        return ""
+    cards = []
+    for b in builders:
+        legs = []
+        for l in b.get("legs", []):
+            conf = l.get("conf") or 0
+            legs.append(
+                '<div class="sel"><div class="ico">✅</div>'
+                '<div class="body"><div class="pick">{}</div></div>'
+                '<div><div class="conf">{:.0f}%</div></div></div>'.format(
+                    l.get("pick", ""), conf))
+        legs_html = "".join(legs)
+        odds = b.get("sb_odds") or b.get("est_odds") or 0
+        odds_lbl = "COMBINED ODDS" if b.get("sb_odds") else "EST. ODDS"
+        if b.get("code"):
+            code_box = (
+                '<div class="code-box"><div><div class="label">Bet Builder Code</div>'
+                '<div class="code">{}</div></div>'
+                '<a href="https://www.sportybet.com/ng/sport/football?shareCode={}" '
+                'target="_blank">Open →</a></div>').format(b["code"], b["code"])
+        else:
+            eid = str(b.get("event_id", ""))
+            eid = eid.split(":")[-1] if ":" in eid else eid
+            code_box = (
+                '<div class="code-box pending"><div><div class="label">Bet Builder Code</div>'
+                '<div class="code">build on SportyBet</div></div>'
+                '<a href="https://www.sportybet.com/ng/sport/football/sr:match:{}" '
+                'target="_blank">Open →</a></div>').format(eid)
+        cards.append(
+            '<div class="glass tier"><div class="tier-head"><div class="tier-title">'
+            '<div class="dot" style="background:#7c3aed"></div><h2>⭐ {} vs {}</h2></div>'
+            '<div class="tier-odds">{:.2f}<span class="lbl">{}</span></div></div>'
+            '{}{}</div>'.format(
+                b.get("home", ""), b.get("away", ""), odds, odds_lbl, legs_html, code_box))
+    return ('<div class="section-head">⭐ Premium Bet Builders<span>3 correlated '
+            'picks, one match</span></div>' + "".join(cards))
+
+
+def render_codes_page(accumulators, date_str, builders=None):
     """Render the SportyBet codes page. accumulators = list of dicts with code info."""
     blocks = []
     for acca in accumulators:
@@ -7051,6 +7119,8 @@ def render_codes_page(accumulators, date_str):
     else:
         body = "".join(blocks)
 
+    builder_html = _fb_builder_blocks(builders or [])
+
     return """<!DOCTYPE html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>SportyBet Codes — Cmvng Bot</title><style>{css}</style></head><body>
@@ -7059,10 +7129,11 @@ def render_codes_page(accumulators, date_str):
 <div class="page-head"><h1>Today's Codes</h1>
 <div class="sub">Accumulator booking codes for SportyBet</div>
 <div class="date">{date}</div></div>
+{builder_html}
 {body}
 <div class="disclaimer">Codes are auto-generated from data analysis. Odds may shift before kickoff.
 Always review selections in your SportyBet app before staking. No bet is guaranteed.</div>
-</div></body></html>""".format(css=FB_CSS, nav=_nav("codes"), date=date_str, body=body)
+</div></body></html>""".format(css=FB_CSS, nav=_nav("codes"), date=date_str, body=body, builder_html=builder_html)
 
 
 def render_picks_page(match_picks, date_str):
@@ -8509,8 +8580,44 @@ def _fb_apply_methodology(fixtures):
             fx["away_xg_for"] = ax["xg_for"]; fx["away_xg_against"] = ax["xg_against"]
             if ax.get("ppda") is not None:
                 fx["away_ppda"] = ax["ppda"]
-    print("[FB] methodology enrich: FBref {} hits, Understat {} hits across {} fixtures".format(
-        fb_hits, us_hits, len(fixtures)))
+
+    # Sofascore last-10 form — the UNIVERSAL backbone (every league, incl.
+    # internationals/lower divisions Understat & FBref don't cover). Needs a
+    # team-ID search per side; track reachability separately from match count
+    # so we can tell a Cloudflare block (sofa_reached=False) apart from a slate
+    # with no Sofascore coverage.
+    sofa_hits = 0
+    sofa_reached = False
+    sofa_attempts = 0
+    for fx in fixtures:
+        try:
+            hid, hok = sofa_search_team(fx.get("home_team", ""))
+            time.sleep(0.4)
+            aid, aok = sofa_search_team(fx.get("away_team", ""))
+            time.sleep(0.4)
+            sofa_attempts += 1
+            sofa_reached = sofa_reached or hok or aok
+            if hid:
+                hs = sofa_team_form_stats(hid)
+                if hs:
+                    fx["home_form_stats"] = hs
+                fx["home_key_injuries"] = sofa_injuries(hid)
+                time.sleep(0.4)
+            if aid:
+                as_ = sofa_team_form_stats(aid)
+                if as_:
+                    fx["away_form_stats"] = as_
+                fx["away_key_injuries"] = sofa_injuries(aid)
+                time.sleep(0.4)
+            if fx.get("home_form_stats") or fx.get("away_form_stats"):
+                sofa_hits += 1
+        except Exception:
+            pass
+
+    print("[FB] methodology enrich: FBref {} hits, Understat {} hits, "
+          "Sofascore {}/{} hits (reachable={}) across {} fixtures".format(
+              fb_hits, us_hits, sofa_hits, sofa_attempts,
+              "yes" if sofa_reached else "NO", len(fixtures)))
 
 
 def _fb_enrich_and_filter_upcoming(fixtures, max_lookup=60):
@@ -9179,7 +9286,8 @@ def fb_picks_page():
 @app.route("/app/codes")
 def fb_codes_page():
     return render_codes_page(_FB_CACHE.get("accumulators", []),
-                             _FB_CACHE.get("date") or _fb_today_human())
+                             _FB_CACHE.get("date") or _fb_today_human(),
+                             _FB_CACHE.get("bet_builders", []))
 
 
 @app.route("/app/results")
