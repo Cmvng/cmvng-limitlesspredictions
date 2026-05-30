@@ -4696,6 +4696,16 @@ def analyze_fixture(fx):
     home_clearly_stronger = (home_win_raw >= 0.56 and hfs.get("ppg", 0) >= 1.6
                              and home_inj <= away_inj + 1)
     away_overwhelming = (away_win_raw >= 0.62 and afs.get("ppg", 0) >= 1.8)
+    # FBref (Opta) possession: a big season possession edge is a control/strength
+    # signal — it reinforces an already-favoured side's win, but never creates a
+    # favourite on its own (dominating the ball isn't the same as winning).
+    h_poss = _safe(fx, "home_possession", 0) or 0
+    a_poss = _safe(fx, "away_possession", 0) or 0
+    if h_poss and a_poss:
+        if (h_poss - a_poss) >= 12 and home_win_raw >= 0.50:
+            home_clearly_stronger = True
+        elif (a_poss - h_poss) >= 12 and away_win_raw >= 0.58:
+            away_overwhelming = True
     form_note = ""
     if hfs.get("played") and afs.get("played"):
         form_note = " | last{}: {} o1.5 {:.0f}%/{:.0f}%".format(
@@ -5815,8 +5825,80 @@ def understat_team_xg(league_name, season="2025"):
 
 
 # ═══════════════════════════════════════════════════════════════════
-# FOOTYSTATS — corners, cards, BTTS (HTML tables)
+# FBREF — Opta-sourced team style (possession, progressive play). One
+# Big-5 page covers every top-5-league team; cached for the whole run.
 # ═══════════════════════════════════════════════════════════════════
+
+_FBREF_CACHE = {}
+
+
+def fbref_big5_possession():
+    """Scrape FBref's Big-5 squad possession table once (Opta-sourced data):
+    season possession %, progressive passes/carries per team. FBref hides some
+    tables inside HTML comments, so we strip comment markers before parsing.
+    Returns {normalized_team: {possession, prog_passes, prog_carries}}; {} on
+    any failure (engine degrades gracefully — these are bonus signals)."""
+    if _FBREF_CACHE.get("loaded"):
+        return _FBREF_CACHE.get("data", {})
+    out = {}
+    _FBREF_CACHE["loaded"] = True  # only attempt once per process
+    if _BS is None:
+        _FBREF_CACHE["data"] = out
+        return out
+    html = _get_html(
+        "https://fbref.com/en/comps/Big5/possession/squads/Big-5-European-Leagues-Stats")
+    if not html:
+        _FBREF_CACHE["data"] = out
+        return out
+    try:
+        # un-hide comment-wrapped tables
+        html = html.replace("<!--", "").replace("-->", "")
+        soup = _BS(html, "html.parser")
+        table = soup.find("table", id=lambda x: x and "possession" in x) \
+            or soup.find("table", id=lambda x: x and "stats_squads" in x)
+        if not table:
+            _FBREF_CACHE["data"] = out
+            return out
+        for row in table.select("tbody tr"):
+            tcell = row.find(attrs={"data-stat": "team"})
+            if not tcell:
+                continue
+            name = tcell.get_text(strip=True)
+            if not name or name.lower() == "squad":
+                continue
+
+            def g(stat):
+                c = row.find(attrs={"data-stat": stat})
+                if not c:
+                    return None
+                try:
+                    return float(c.get_text(strip=True))
+                except (ValueError, TypeError):
+                    return None
+            out[_fb_norm_team(name)] = {
+                "possession": g("possession"),
+                "prog_passes": g("progressive_passes"),
+                "prog_carries": g("progressive_carries"),
+            }
+        print("[FBREF] loaded {} teams (possession/progressive)".format(len(out)))
+    except Exception as e:
+        print("[FBREF] parse error: {}".format(e))
+    _FBREF_CACHE["data"] = out
+    return out
+
+
+def fbref_lookup(stats, team_name):
+    """Name-match a fixture team into the FBref table (uses the same canon/alias
+    logic as score matching, so 'Man Utd' -> 'Manchester Utd' etc.)."""
+    if not stats or not team_name:
+        return None
+    key = _fb_norm_team(team_name)
+    if key in stats:
+        return stats[key]
+    for k, v in stats.items():
+        if _fb_teams_match(team_name, k):
+            return v
+    return None
 
 def footystats_team(team_slug):
     """
@@ -5871,6 +5953,9 @@ def build_fixture_dataset(date_str=None, rate_limit=1.5, max_fixtures=30):
             xg_cache[lg] = understat_team_xg(lg)
             time.sleep(rate_limit)
 
+    # Pre-fetch FBref Big-5 possession/progressive once (covers all top-5 teams)
+    fbref_stats = fbref_big5_possession()
+
     enriched = []
     for fx in fixtures:
         try:
@@ -5906,6 +5991,16 @@ def build_fixture_dataset(date_str=None, rate_limit=1.5, max_fixtures=30):
                 fx["away_xg_against"] = away_xg["xg_against"]
                 if away_xg.get("ppda") is not None:
                     fx["away_ppda"] = away_xg["ppda"]
+
+            # FBref possession / progressive play (Opta-sourced style signal)
+            hf = fbref_lookup(fbref_stats, fx["home_team"])
+            af = fbref_lookup(fbref_stats, fx["away_team"])
+            if hf and hf.get("possession") is not None:
+                fx["home_possession"] = hf["possession"]
+                fx["home_prog"] = hf.get("prog_passes")
+            if af and af.get("possession") is not None:
+                fx["away_possession"] = af["possession"]
+                fx["away_prog"] = af.get("prog_passes")
 
             enriched.append(fx)
         except Exception as e:
@@ -6413,6 +6508,158 @@ def sb_create_code(selections):
         data = resp.get("data", {}) or {}
         return data.get("shareCode") or data.get("code") or data.get("shareURL", "").split("shareCode=")[-1] or None
     return None
+
+
+def sb_create_bet_builder(event_id, selections):
+    """Attempt to create a SAME-MATCH bet-builder code on SportyBet and learn the
+    real mechanism empirically (their bet-builder endpoint isn't documented).
+
+    A bet builder differs from an accumulator: all legs are on ONE event and the
+    combined price is correlation-adjusted server-side. We try the known share
+    endpoint first (it may auto-detect same-event legs as a builder), then a small
+    set of likely bet-builder endpoints, logging each raw response verbatim so a
+    live deploy reveals exactly what SportyBet expects. Returns
+    (code, combined_odds) on success, else (None, None)."""
+    if not event_id or len(selections) < 2:
+        return None, None
+    # ensure every leg is the same event (bet builders are single-match)
+    sels = [dict(s, eventId=event_id) for s in selections]
+
+    # strategy 1: plain share with same-event legs (does it auto-build?)
+    attempts = [
+        ("share", "{}/orders/share".format(SB_BASE), {"selections": sels}),
+        # strategy 2: share with an explicit bet-builder grouping flag
+        ("share+flag", "{}/orders/share".format(SB_BASE),
+         {"selections": [dict(s, parentBetBuilderMarketId="1") for s in sels],
+          "betBuilder": True}),
+        # strategy 3: a dedicated bet-builder calc endpoint (guess, may 404)
+        ("bb-calc", "{}/factsCenter/calculateOdds".format(SB_BASE),
+         {"selections": sels, "betBuilder": True}),
+    ]
+    for name, url, payload in attempts:
+        resp = _sb_post(url, payload, diag=True)
+        if not resp:
+            print("[SB-BB] {} -> no response".format(name))
+            continue
+        # log the raw shape so we can see what SportyBet actually returns
+        print("[SB-BB] {} -> bizCode={} msg={} keys={}".format(
+            name, resp.get("bizCode"), str(resp.get("message"))[:40],
+            list((resp.get("data") or {}).keys())[:8]))
+        ok = str(resp.get("message", "")).lower() == "success" or resp.get("bizCode") == 10000
+        if ok:
+            data = resp.get("data", {}) or {}
+            code = (data.get("shareCode") or data.get("code")
+                    or data.get("shareURL", "").split("shareCode=")[-1] or None)
+            odds = data.get("totalOdds") or data.get("odds") or data.get("price")
+            if code:
+                # CONFIRM: decode the code and verify every leg is the SAME event
+                # (that's what makes it a bet builder, not a normal accumulator).
+                confirmed = None
+                try:
+                    decoded = sb_decode_code(code)
+                    if isinstance(decoded, list) and decoded:
+                        eids = {str(s.get("eventId") or s.get("event_id") or "")
+                                for s in decoded}
+                        confirmed = (len(eids) == 1 and event_id in eids)
+                        print("[SB-BB] decode {} -> {} legs, {} event(s) -> {}".format(
+                            code, len(decoded), len(eids),
+                            "CONFIRMED bet builder" if confirmed else "NOT same-match"))
+                except Exception as e:
+                    print("[SB-BB] decode check failed: {}".format(e))
+                print("[SB-BB] SUCCESS via {} -> code={} odds={} confirmed={}".format(
+                    name, code, odds, confirmed))
+                if confirmed is not False:   # accept True or unknown; reject only proven-wrong
+                    return code, odds
+    return None, None
+
+
+def _sb_build_bet_builders(build_picks, max_matches=3, min_board=38):
+    """Premium-match bet builders: for the richest-board matches, let the engine
+    pick the 3 safest correlated legs (highest-confidence, one per market family)
+    and attempt a single SportyBet bet-builder code for each."""
+    def _fam(mt):
+        if mt.startswith("double_chance") or mt.startswith("dc1up"):
+            return "dc"
+        if mt in ("home_win", "away_win", "dnb_home", "dnb_away") or mt.startswith("oneup"):
+            return "win"
+        if mt.startswith("over_") or mt.startswith("under_"):
+            return "ou"
+        if mt.startswith("corners"):
+            return "corners"
+        if mt.startswith("btts"):
+            return "btts"
+        if mt.startswith("tt_") or "team" in mt:
+            return "tt"
+        return mt
+
+    by_event = {}
+    for p in build_picks:
+        eid = p.get("sb_event_id")
+        if eid:
+            by_event.setdefault(eid, []).append(p)
+
+    ranked = []
+    for eid, ps in by_event.items():
+        n = len(_SB_MARKET_CACHE.get(eid, []))
+        if n >= min_board:
+            ranked.append((n, eid, ps))
+    ranked.sort(key=lambda t: -t[0])
+
+    builders = []
+    for n, eid, ps in ranked[:max_matches]:
+        mkts = _SB_MARKET_CACHE.get(eid, [])
+        legs, seen = [], set()
+        for p in sorted(ps, key=lambda x: -x.get("confidence", 0)):
+            f = _fam(p.get("market_type", ""))
+            if f in seen:
+                continue
+            sel = sb_map_pick_to_selection(p, mkts)
+            if not sel:
+                continue
+            seen.add(f)
+            legs.append({"pick": p.get("pick"), "conf": p.get("confidence"),
+                         "odds": p.get("odds"), "sel": sel,
+                         "mt": p.get("market_type")})
+            if len(legs) >= 3:
+                break
+        if len(legs) < 3:
+            continue
+        est = 1.0
+        for l in legs:
+            try:
+                est *= float(l["odds"] or 1)
+            except (ValueError, TypeError):
+                pass
+        code, sb_odds = sb_create_bet_builder(eid, [l["sel"] for l in legs])
+        builders.append({
+            "event_id": eid, "markets": n,
+            "home": ps[0].get("home", ""), "away": ps[0].get("away", ""),
+            "legs": legs, "est_odds": round(est, 2),
+            "code": code, "sb_odds": sb_odds,
+        })
+    return builders
+
+
+def fmt_bet_builders(builders):
+    """Telegram section for premium-match bet builders."""
+    if not builders:
+        return ""
+    lines = ["⭐ <b>PREMIUM BET BUILDERS</b>", "<i>Correlated same-match picks</i>", ""]
+    for b in builders:
+        lines.append("⚽ <b>{} vs {}</b>".format(b["home"], b["away"]))
+        for l in b["legs"]:
+            lines.append("  ✅ {} <i>({:.0f}%)</i>".format(l["pick"], l["conf"]))
+        odds = b.get("sb_odds") or b.get("est_odds")
+        approx = "" if b.get("sb_odds") else " (est.)"
+        lines.append("  💰 ~{}{}".format(odds, approx))
+        if b.get("code"):
+            lines.append('  🎟 Code: <b>{}</b>'.format(b["code"]))
+            lines.append('  🔗 <a href="https://www.sportybet.com/ng/sport/football?shareCode={}">Open in SportyBet</a>'.format(b["code"]))
+        else:
+            lines.append('  🔗 <a href="https://www.sportybet.com/ng/sport/football/sr:match:{}">Build on SportyBet</a>'.format(
+                b["event_id"].split(":")[-1] if ":" in str(b["event_id"]) else b["event_id"]))
+        lines.append("")
+    return "\n".join(lines)
 
 
 def sb_decode_code(code):
@@ -8313,9 +8560,24 @@ def run_football_engine(get_db, tg_token, tg_chat, send_telegram,
 
         # 5. Cache + persist
         match_picks = top_picks_per_match(all_picks, 3)
+
+        # 4b. Premium-match bet builders (top 2-3 rich-board matches, 3 correlated legs)
+        bet_builders = []
+        if generate_codes:
+            try:
+                bet_builders = _sb_build_bet_builders(build_picks, max_matches=3)
+                print("[FB] bet builders: {} premium matches".format(len(bet_builders)))
+                for b in bet_builders:
+                    print("[FB] builder {} vs {} — {} legs, code={}, odds={}".format(
+                        b["home"], b["away"], len(b["legs"]),
+                        b.get("code") or "—", b.get("sb_odds") or b.get("est_odds")))
+            except Exception as e:
+                print("[FB] bet builder error: {}".format(e))
+
         _FB_CACHE["date"] = date_human
         _FB_CACHE["match_picks"] = match_picks
         _FB_CACHE["accumulators"] = accumulators
+        _FB_CACHE["bet_builders"] = bet_builders
         _FB_CACHE["last_run"] = _dt.datetime.now()
 
         try:
@@ -8330,6 +8592,13 @@ def run_football_engine(get_db, tg_token, tg_chat, send_telegram,
                 send_telegram(msg)
             except Exception as e:
                 print("[FB] announce error: {}".format(e))
+            if bet_builders:
+                try:
+                    bb_msg = fmt_bet_builders(bet_builders)
+                    if bb_msg:
+                        send_telegram(bb_msg)
+                except Exception as e:
+                    print("[FB] bet builder announce error: {}".format(e))
 
         print("[FB] ═══ Engine run complete ═══")
     finally:
