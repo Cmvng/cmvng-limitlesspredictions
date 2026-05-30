@@ -6019,8 +6019,10 @@ def sb_search_event(home_team, away_team):
                            or ev.get("awayTeam") or "").lower()
                 if _team_match(home_team, ev_home) and _team_match(away_team, ev_away):
                     if not _sb_is_real_soccer(ev):
-                        print("[SB] skip non-football event for {} vs {} ({})".format(
-                            home_team, away_team, ev.get("sportId") or ev.get("tournamentName") or "?"))
+                        _sp = ev.get("sport")
+                        _sid = (ev.get("sportId") or (_sp.get("id") if isinstance(_sp, dict) else _sp) or "?")
+                        print("[SB] skip non-football event for {} vs {} (sport={})".format(
+                            home_team, away_team, _sid))
                         continue
                     eid = ev.get("eventId") or ev.get("id")
                     # Capture kickoff time + status for display and settlement
@@ -6105,30 +6107,55 @@ def _sb_is_real_soccer(ev):
 
       • eSoccer (FIFA-style): sportId sr:sport:202120001, long 15-digit match IDs.
       • SRL (Simulated Reality League): Sportradar virtual matches that run during
-        off-seasons under the NORMAL sr:sport:1 sport with 8-digit IDs — so the
-        only tell is the 'SRL' suffix on team names / 'Simulated Reality' in the
-        competition name (e.g. 'Manchester United SRL', 'Premier League SRL').
+        off-seasons under the NORMAL sr:sport:1 sport with 8-digit IDs — the tell
+        is 'Simulated Reality' in the competition name or an 'SRL' suffix on team
+        names ('Manchester United SRL', 'Premier League SRL').
 
-    Because SRL shares sportId and ID format with real games, the NAME markers —
-    not the sportId — are what actually catch it."""
-    sid = str(ev.get("sportId") or ev.get("sport") or "")
+    SportyBet nests sport/category/tournament as DICTS (sport.category.tournament),
+    so we descend into them rather than stringifying — and we FAIL OPEN: anything
+    that isn't positively identified as fake is treated as real, so a missing field
+    never blocks a genuine fixture."""
+    # ── resolve sportId + competition name from the (possibly nested) structure ──
+    sid = str(ev.get("sportId") or "")
+    comp = ""              # competition/tournament/category names
+    sport = ev.get("sport")
+    if isinstance(sport, dict):
+        sid = sid or str(sport.get("id") or sport.get("sportId") or "")
+        cat = sport.get("category") if isinstance(sport.get("category"), dict) else {}
+        comp += " " + str(cat.get("name") or "")
+        tour = cat.get("tournament") if isinstance(cat.get("tournament"), dict) else {}
+        comp += " " + str(tour.get("name") or "")
+    elif isinstance(sport, str):
+        sid = sid or sport
+    for k in ("tournamentName", "categoryName", "tournament", "category",
+              "leagueName", "name"):
+        v = ev.get(k)
+        if isinstance(v, str):
+            comp += " " + v
+        elif isinstance(v, dict):
+            comp += " " + str(v.get("name") or "")
+
+    # ── sportId checks (only reject KNOWN-bad; unknown/blank => keep) ──
     if "202120001" in sid:                       # eSoccer / virtual
         return False
-    if sid and ("sport:" in sid) and not sid.endswith(":1"):
+    if sid.startswith("sr:sport:") and not sid.endswith(":1"):
         return False                             # a different real sport entirely
 
-    # Pull every name-ish field, INCLUDING the team names (where 'SRL' lives).
-    blob = " ".join(str(ev.get(k) or "") for k in (
-        "homeTeamName", "awayTeamName", "home", "away", "homeTeam", "awayTeam",
-        "sportName", "tournamentName", "categoryName", "category",
-        "tournament", "name", "leagueName", "sport")).lower()
-    # 'srl' as a standalone token (suffix on team/league names)
+    # ── name markers (string team names + resolved competition name) ──
+    names = []
+    for k in ("homeTeamName", "awayTeamName"):
+        v = ev.get(k)
+        if isinstance(v, str):
+            names.append(v)
+        elif isinstance(v, dict):
+            names.append(str(v.get("name") or ""))
+    blob = (" ".join(names) + " " + comp).lower()
     toks = set(blob.replace(".", " ").replace("-", " ").split())
-    if "srl" in toks:
+    if "srl" in toks:                            # 'SRL' suffix on team/league name
         return False
     markers = ("esoccer", "e-soccer", "esport", "cyber", "simulated reality",
                "simulated", "mins play", "min play", "gg league", "ggleague",
-               "battle", "volta", "adriatic", "virtual", "(srl)")
+               "(srl)")
     return not any(m in blob for m in markers)
 
 
