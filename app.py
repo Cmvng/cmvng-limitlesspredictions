@@ -5513,8 +5513,22 @@ try:
 except ImportError:
     _BS = None
 
-_SCRAPE_PROXY = (_os.environ.get("SCRAPE_PROXY", "").strip()
-                 or _os.environ.get("POLY_PROXY_URL", "").strip())
+def _sanitize_proxy(raw):
+    """Pull a clean proxy URL out of whatever was set — tolerates a pasted
+    `curl --proxy "..."` command, surrounding quotes, whitespace, or a trailing
+    slash. Returns scheme://[user:pass@]host:port or '' if nothing usable."""
+    if not raw:
+        return ""
+    raw = raw.strip().strip('"').strip("'")
+    m = re.search(r'(socks5h|socks5|socks4|https?)://[^\s"\']+', raw)
+    if not m:
+        return ""
+    url = m.group(0).rstrip("/")
+    return url
+
+
+_SCRAPE_PROXY = _sanitize_proxy(_os.environ.get("SCRAPE_PROXY", "")
+                                or _os.environ.get("POLY_PROXY_URL", ""))
 _CF_IMPERSONATE = _os.environ.get("CF_IMPERSONATE", "chrome131").strip() or "chrome131"
 print("[SCRAPE] curl_cffi={} cloudscraper={} impersonate={} proxy={}".format(
     "yes" if _cf else "NO", "yes" if _cloudscraper else "NO", _CF_IMPERSONATE,
