@@ -5505,7 +5505,8 @@ try:
 except ImportError:
     _BS = None
 
-_SCRAPE_PROXY = _os.environ.get("SCRAPE_PROXY", "").strip()
+_SCRAPE_PROXY = (_os.environ.get("SCRAPE_PROXY", "").strip()
+                 or _os.environ.get("POLY_PROXY_URL", "").strip())
 _CF_IMPERSONATE = _os.environ.get("CF_IMPERSONATE", "chrome131").strip() or "chrome131"
 print("[SCRAPE] curl_cffi={} impersonate={} proxy={}".format(
     "yes" if _cf else "NO (fallback to requests)", _CF_IMPERSONATE,
