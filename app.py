@@ -5482,38 +5482,105 @@ and need one round of Railway validation. Failures degrade gracefully.
 import time
 import json
 import datetime as _dt
+import os as _os
 
 try:
     import requests as _req
 except ImportError:
     _req = None
 
+# Cloudflare bypass: curl_cffi sends a real Chrome TLS/JA3 fingerprint, which
+# defeats the fingerprint layer that auto-blocks plain `requests` from a server.
+# That's the layer blocking Sofascore/FBref from Railway. If IP-reputation
+# blocking ALSO persists (datacenter ASNs are pre-scored as bots), set the
+# SCRAPE_PROXY env var to a residential/ISP proxy URL and every scrape routes
+# through it — covering both Cloudflare layers.
+try:
+    from curl_cffi import requests as _cf
+except ImportError:
+    _cf = None
+
 try:
     from bs4 import BeautifulSoup as _BS
 except ImportError:
     _BS = None
 
+_SCRAPE_PROXY = _os.environ.get("SCRAPE_PROXY", "").strip()
+_CF_IMPERSONATE = _os.environ.get("CF_IMPERSONATE", "chrome131").strip() or "chrome131"
+print("[SCRAPE] curl_cffi={} impersonate={} proxy={}".format(
+    "yes" if _cf else "NO (fallback to requests)", _CF_IMPERSONATE,
+    "set" if _SCRAPE_PROXY else "none"))
+
 # Browser-like headers to avoid trivial blocks
 _HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                  "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                  "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
     "Accept": "application/json, text/plain, */*",
     "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
 }
 
 SOFA = "https://api.sofascore.com/api/v1"
 
 
+def _scrape_referer(url):
+    """Pick a believable Referer/Origin for the host (Cloudflare checks these)."""
+    try:
+        from urllib.parse import urlparse
+        host = urlparse(url).netloc.lower()
+    except Exception:
+        return None
+    if "sofascore" in host:
+        return "https://www.sofascore.com/"
+    if "fbref" in host:
+        return "https://fbref.com/"
+    if "understat" in host:
+        return "https://understat.com/"
+    try:
+        p = urlparse(url)
+        return "{}://{}/".format(p.scheme, p.netloc)
+    except Exception:
+        return None
+
+
+def _scrape_get(url, timeout=15):
+    """One GET that beats Cloudflare's TLS-fingerprint layer via curl_cffi Chrome
+    impersonation (falls back to plain requests if the lib isn't present), and
+    routes through SCRAPE_PROXY when set. Returns the response object or None."""
+    headers = dict(_HEADERS)
+    ref = _scrape_referer(url)
+    if ref:
+        headers["Referer"] = ref
+    proxies = {"http": _SCRAPE_PROXY, "https": _SCRAPE_PROXY} if _SCRAPE_PROXY else None
+    if _cf is not None:
+        try:
+            kw = {"headers": headers, "timeout": timeout, "impersonate": _CF_IMPERSONATE}
+            if proxies:
+                kw["proxies"] = proxies
+            return _cf.get(url, **kw)
+        except Exception:
+            pass
+    if _req is not None:
+        try:
+            kw = {"headers": headers, "timeout": timeout}
+            if proxies:
+                kw["proxies"] = proxies
+            return _req.get(url, **kw)
+        except Exception:
+            pass
+    return None
+
+
 def _get_json(url, timeout=12, retries=2):
     """GET a URL and parse JSON. Returns None on any failure."""
-    if _req is None:
+    if _req is None and _cf is None:
         return None
     for attempt in range(retries):
         try:
-            r = _req.get(url, headers=_HEADERS, timeout=timeout)
-            if r.status_code == 200:
+            r = _scrape_get(url, timeout=timeout)
+            if r is not None and r.status_code == 200:
                 return r.json()
-            if r.status_code == 429:
+            if r is not None and r.status_code == 429:
                 time.sleep(3)  # rate limited, back off
         except Exception:
             pass
@@ -5523,11 +5590,11 @@ def _get_json(url, timeout=12, retries=2):
 
 def _get_html(url, timeout=12):
     """GET a URL and return text. Returns None on any failure."""
-    if _req is None:
+    if _req is None and _cf is None:
         return None
     try:
-        r = _req.get(url, headers=_HEADERS, timeout=timeout)
-        if r.status_code == 200:
+        r = _scrape_get(url, timeout=timeout)
+        if r is not None and r.status_code == 200:
             return r.text
     except Exception:
         pass
@@ -8398,6 +8465,54 @@ def fb_settle_thread(get_db):
 #   tg_send (+ token/chat), fmt_codes, fmt_picks
 # ═══════════════════════════════════════════════════════════════════
 
+def _fb_apply_methodology(fixtures):
+    """Attach xG/PPDA (Understat) and possession (FBref) to the LIVE prediction
+    fixtures — these were previously only added on the Sofascore path, which
+    Railway can't reach, so the methodology never influenced real picks. Sources
+    are name-matched (no IDs needed). Logs per-source hit counts so we can see
+    what's actually reachable from the Railway IP. Sofascore last-10 form still
+    needs a non-datacenter IP (proxy/VPS) and is handled separately."""
+    if not fixtures:
+        return
+    def _us_key(lg):
+        lg = (lg or "").lower()
+        for k in UNDERSTAT_LEAGUES:
+            if k.lower() in lg or k.lower().replace(" ", "") in lg.replace(" ", ""):
+                return k
+        return None
+
+    fbref_stats = fbref_big5_possession()
+    us_cache = {}
+    for fx in fixtures:
+        k = _us_key(fx.get("league", ""))
+        if k and k not in us_cache:
+            us_cache[k] = understat_team_xg(k)
+            time.sleep(1.0)
+
+    fb_hits = us_hits = 0
+    for fx in fixtures:
+        hf = fbref_lookup(fbref_stats, fx.get("home_team", ""))
+        af = fbref_lookup(fbref_stats, fx.get("away_team", ""))
+        if hf and hf.get("possession") is not None:
+            fx["home_possession"] = hf["possession"]; fb_hits += 1
+        if af and af.get("possession") is not None:
+            fx["away_possession"] = af["possession"]
+        lgxg = us_cache.get(_us_key(fx.get("league", "")), {})
+        hx = _match_team_xg(lgxg, fx.get("home_team", ""))
+        ax = _match_team_xg(lgxg, fx.get("away_team", ""))
+        if hx:
+            fx["home_xg_for"] = hx["xg_for"]; fx["home_xg_against"] = hx["xg_against"]
+            if hx.get("ppda") is not None:
+                fx["home_ppda"] = hx["ppda"]
+            us_hits += 1
+        if ax:
+            fx["away_xg_for"] = ax["xg_for"]; fx["away_xg_against"] = ax["xg_against"]
+            if ax.get("ppda") is not None:
+                fx["away_ppda"] = ax["ppda"]
+    print("[FB] methodology enrich: FBref {} hits, Understat {} hits across {} fixtures".format(
+        fb_hits, us_hits, len(fixtures)))
+
+
 def _fb_enrich_and_filter_upcoming(fixtures, max_lookup=60):
     """
     Look each fixture up on SportyBet and keep ONLY upcoming, not-started
@@ -8491,6 +8606,13 @@ def run_football_engine(get_db, tg_token, tg_chat, send_telegram,
                 fixtures, event_cache = _fb_enrich_and_filter_upcoming(fixtures)
             except Exception as e:
                 print("[FB] enrich/filter error: {}".format(e))
+
+        # 1c. Apply the methodology data (xG/PPDA/possession) to the LIVE fixtures
+        #     — connects Understat + FBref to the picks that actually get bet.
+        try:
+            _fb_apply_methodology(fixtures)
+        except Exception as e:
+            print("[FB] methodology enrich error: {}".format(e))
 
         if not fixtures:
             print("[FB] No upcoming bettable fixtures right now — nothing to post")
