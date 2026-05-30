@@ -9628,30 +9628,63 @@ def fb_builder_page():
 
 @app.route("/app/sofa-test")
 def sofa_test():
-    """Instant proxy test — hit Sofascore through the current proxy and report
-    the exact result, so you can try different SCRAPE_PROXY values without
-    waiting for a full engine run. 200 = unblocked; 403 = still challenged."""
-    url = "{}/search/all?q=arsenal".format(SOFA)
-    out = {"proxy": "set" if _SCRAPE_PROXY else "none",
-           "impersonate": _CF_IMPERSONATE,
-           "cloudscraper": bool(_cloudscraper)}
-    try:
-        r = _scrape_get(url, timeout=15)
-        if r is None:
-            out["status"] = None
-            out["result"] = "no response"
-        else:
-            out["status"] = r.status_code
+    """Instant proxy + Sofascore diagnostic. Reports WHY a request failed
+    (exception detail), checks the proxy against a neutral IP-echo first to
+    isolate 'proxy broken' from 'Sofascore blocking', and shows the proxy in
+    masked form so you can verify the URL/credentials are set correctly."""
+    out = {"impersonate": _CF_IMPERSONATE, "cloudscraper": bool(_cloudscraper)}
+
+    # masked view of the proxy so you can confirm it's set right (no secrets leaked)
+    if _SCRAPE_PROXY:
+        try:
+            from urllib.parse import urlparse
+            p = urlparse(_SCRAPE_PROXY)
+            host = p.hostname or "?"
+            port = p.port or "?"
+            scheme = p.scheme or "?"
+            has_auth = bool(p.username)
+            out["proxy"] = "{}://{}***@{}:{}".format(
+                scheme, (p.username[:2] + "…") if p.username else "", host, port) \
+                if has_auth else "{}://{}:{}".format(scheme, host, port)
+            out["proxy_scheme"] = scheme
+            out["proxy_has_auth"] = has_auth
+        except Exception:
+            out["proxy"] = "set (unparseable)"
+    else:
+        out["proxy"] = "none"
+
+    proxies = {"http": _SCRAPE_PROXY, "https": _SCRAPE_PROXY} if _SCRAPE_PROXY else None
+
+    # Test 1 — does the PROXY itself work? Hit a neutral IP-echo and report the IP.
+    def _probe(url):
+        if _cf is not None:
             try:
-                out["body"] = (r.text or "")[:160]
-            except Exception:
-                out["body"] = ""
-            out["result"] = ("UNBLOCKED — Sofascore is reachable, methodology can go live"
-                             if r.status_code == 200
-                             else "still blocked — try a residential proxy in SCRAPE_PROXY")
-    except Exception as e:
-        out["status"] = "error"
-        out["result"] = "{}: {}".format(type(e).__name__, e)
+                kw = {"timeout": 15, "impersonate": _CF_IMPERSONATE, "headers": _HEADERS}
+                if proxies:
+                    kw["proxies"] = proxies
+                r = _cf.get(url, **kw)
+                return {"status": r.status_code, "body": (r.text or "")[:140]}
+            except Exception as e:
+                return {"error": "{}: {}".format(type(e).__name__, str(e)[:160])}
+        return {"error": "curl_cffi unavailable"}
+
+    out["proxy_check"] = _probe("https://api.ipify.org?format=json")
+    out["sofascore"] = _probe("{}/search/all?q=arsenal".format(SOFA))
+
+    # plain-English verdict
+    pc, sc = out["proxy_check"], out["sofascore"]
+    if pc.get("error"):
+        out["verdict"] = ("PROXY IS FAILING — the request can't get out through it. "
+                          "Check the SCRAPE_PROXY URL format (http://user:pass@host:port), "
+                          "credentials, and that this server's IP is whitelisted if your "
+                          "provider uses IP auth. Error: " + pc["error"])
+    elif sc.get("status") == 200:
+        out["verdict"] = "WORKING — proxy is fine AND Sofascore is reachable. We can use Sofascore."
+    elif sc.get("status") in (403, 503):
+        out["verdict"] = ("Proxy works (got an IP) but Sofascore still challenges it — "
+                          "this IP isn't trusted enough; try a cleaner residential IP.")
+    else:
+        out["verdict"] = "Proxy works; Sofascore returned status {}".format(sc.get("status"))
     return jsonify(out)
 
 
