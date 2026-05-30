@@ -1,9 +1,11 @@
-flask
-pg8000
-requests
-yfinance
-eth-account
-eth-abi
-web3
-websocket-client
-py-clob-client-v2
+# Cmvng Bot — Railway deploy requirements
+# These four are imported at module level: if any is missing the app
+# fails to BOOT (not just a degraded feature). Keep them in your repo.
+Flask>=3.0
+pg8000>=1.30
+requests>=2.31
+beautifulsoup4>=4.12
+
+# Imported inside the Chainlink RTDS thread only — if missing, the app
+# still boots and trades; only the real-time price stream is disabled.
+websocket-client>=1.7
