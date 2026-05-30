@@ -13,3 +13,6 @@ websocket-client>=1.7
 # Cloudflare bypass for Sofascore/FBref (real Chrome TLS fingerprint).
 # Graceful fallback to plain requests if missing — app still boots either way.
 curl_cffi>=0.7.0
+
+# Cloudflare JS-challenge solver (pure Python, no browser) for FBref/Sofascore.
+cloudscraper>=1.2.71
