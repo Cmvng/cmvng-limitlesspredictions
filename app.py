@@ -3974,6 +3974,7 @@ def _sports_extract_insights(predictions, home, away):
     """From all predictions for a match, extract actionable insights."""
     insights = {
         "match": "{} vs {}".format(home, away),
+        "home": home, "away": away,
         "sources": [],
         "scores": [],
         "home_wins": 0, "draws": 0, "away_wins": 0,
@@ -4138,6 +4139,57 @@ def _sports_score_pick(insights, market):
 _sports_market_cache = {"polymarket": [], "limitless": []}
 
 
+def _sports_model_cc_pick(insights, market, is_card):
+    """If the proven club model covers this match, price the corner/card market's
+    line from the model and return a Yes/No pick ONLY when worst-case-safe
+    (model >=75% on the side) AND positive edge (>=5pp vs the market's own price).
+    Otherwise None (the market stays list-only). Domestic-league matches only."""
+    try:
+        import math as _m
+        home = insights.get("home")
+        away = insights.get("away")
+        if not home or not away:
+            return None
+        season = _model_season()
+        code = _model_detect_league(home, away, season)
+        if not code:
+            return None  # model covers domestic-league matches only
+        m = model_club_match(home, away, code, season)
+        if not m:
+            return None
+        lam = m.get("cards_exp" if is_card else "corners_exp")
+        if not lam:
+            return None
+        q = ((market.get("question", "") or "") + " "
+             + (market.get("title", "") or "")).lower()
+        mnum = (_sports_re.search(r'(\d+)\s*(?:\+|or more)', q)
+                or _sports_re.search(r'over\s*(\d+\.?\d*)', q)
+                or _sports_re.search(r'(\d+\.?\d*)', q))
+        if not mnum:
+            return None
+        thr = float(mnum.group(1))
+        # "11+"/"11 or more" -> need >=11 ; "over 10.5" -> need >=11
+        need = int(thr) if thr == int(thr) else int(_m.floor(thr)) + 1
+        p_over = 1.0 - sum(_poisson_pmf(k, lam) for k in range(0, need))
+        op = market.get("outcome_prices") or []
+        yes_imp = None
+        try:
+            yes_imp = float(op[0])            # Limitless/Poly: [Yes, No]
+        except (IndexError, ValueError, TypeError):
+            ba = market.get("best_ask")
+            yes_imp = float(ba) if ba else None
+        noun = "cards" if is_card else "corners"
+        if p_over >= 0.75 and yes_imp is not None and (p_over - yes_imp) >= 0.05:
+            return "Yes — {:g}+ {} (model {:.0f}%)".format(thr, noun, p_over * 100)
+        p_under = 1.0 - p_over
+        no_imp = (1.0 - yes_imp) if yes_imp is not None else None
+        if p_under >= 0.75 and no_imp is not None and (p_under - no_imp) >= 0.05:
+            return "No — under {:g} {} (model {:.0f}%)".format(thr, noun, p_under * 100)
+        return None
+    except Exception:
+        return None
+
+
 def _sports_pick_outcome(insights, market):
     """Return the EXPLICIT recommended pick for THIS specific market, phrased so
     the user knows exactly what to back — 'Burgos to Win', 'Under 2.5 Goals',
@@ -4147,13 +4199,21 @@ def _sports_pick_outcome(insights, market):
          (market.get("title", "") or "")).lower()
     smt = (market.get("sports_market_type", "") or "").lower()
 
-    # Markets the bot has NO data to judge (corners, cards, bookings, player props).
-    # Must come before the totals branch — 'total_corners' contains 'total' and would
-    # otherwise be mis-picked as a goals line. These get listed, never picked.
-    if (any(w in smt for w in ("corner", "card", "booking", "first_goal",
-                               "anytime_goal", "goalscorer", "player"))
-            or any(w in q for w in ("corner", "booking", "red card",
-                                    "yellow card", "cards", "sent off", "to start"))):
+    # Corners/cards: pickable ONLY when the proven club model covers the match
+    # AND there's worst-case-safe edge vs the market's price (references the real
+    # Limitless/Polymarket market). Player props stay list-only. Must come before
+    # the totals branch — 'total_corners' contains 'total'.
+    _is_corner = ("corner" in smt or "corner" in q)
+    _is_card = (("card" in smt or "cards" in q or "booking" in q
+                 or "yellow card" in q or "red card" in q) and not _is_corner)
+    if (_is_corner or _is_card
+            or any(w in smt for w in ("first_goal", "anytime_goal",
+                                      "goalscorer", "player"))
+            or any(w in q for w in ("sent off", "to start"))):
+        if _is_corner or _is_card:
+            _mp = _sports_model_cc_pick(insights, market, _is_card)
+            if _mp:
+                return _mp
         return None
 
     win = insights.get("consensus_winner")
@@ -9742,7 +9802,9 @@ def run_football_engine(get_db, tg_token, tg_chat, send_telegram,
 
         # 7. Model extras (additive, isolated — proven club-data model)
         try:
-            _model_extras_run(fixtures, announce=announce)
+            # Standalone MODEL EXTRAS cards are OFF — the model surfaces only via
+            # SportyBet code legs, Limitless/Polymarket alerts, or the app on demand.
+            _model_extras_run(fixtures, announce=False)
         except Exception as e:
             print("[MODEL] extras run error: {}".format(e))
 
