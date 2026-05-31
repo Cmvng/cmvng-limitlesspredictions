@@ -4162,12 +4162,22 @@ def _sports_model_cc_pick(insights, market, is_card):
             return None
         q = ((market.get("question", "") or "") + " "
              + (market.get("title", "") or "")).lower()
+        # Only price genuine TEAM-TOTAL corner/card markets. Reject player props
+        # ("most cards", named players, bookings, scorer markets) — the model
+        # prices team totals, not individuals.
+        if any(w in q for w in ("most ", "record", "player", "carded",
+                                "booked", "anytime", "top ", "to score",
+                                "scorer", "sent off")):
+            return None
         mnum = (_sports_re.search(r'(\d+)\s*(?:\+|or more)', q)
                 or _sports_re.search(r'over\s*(\d+\.?\d*)', q)
-                or _sports_re.search(r'(\d+\.?\d*)', q))
+                or _sports_re.search(r'(\d+\.?\d*)\s*(?:total\s+)?(?:corner|card)', q))
         if not mnum:
             return None
         thr = float(mnum.group(1))
+        # Sane team-total line only — kills years (e.g. 2025) and junk numbers.
+        if not (0.0 < thr <= 20.0):
+            return None
         # "11+"/"11 or more" -> need >=11 ; "over 10.5" -> need >=11
         need = int(thr) if thr == int(thr) else int(_m.floor(thr)) + 1
         p_over = 1.0 - sum(_poisson_pmf(k, lam) for k in range(0, need))
@@ -7966,16 +7976,44 @@ def render_codes_page(accumulators, date_str, builders=None):
         if not acca:
             continue
         rows = []
+        started = 0
         for s in acca["selections"]:
-            ko = _fb_fmt_kickoff(s.get("kickoff_ts"))
-            ko_html = '<div class="reason">🕐 {}</div>'.format(ko) if ko else ""
+            # Live status so the page reflects games that have kicked off since
+            # this code was built (codes are snapshots from the last engine run).
+            _hm, _, _aw = (s.get("match", "") or "").partition(" vs ")
+            _live = None
+            try:
+                _live = _fb_live_status(_hm.strip(), _aw.strip())
+            except Exception:
+                _live = None
+            _st = (_live or {}).get("state")
+            if _st == "in":
+                started += 1
+                _hs, _as = _live.get("hs"), _live.get("aw")
+                status_html = ('<div class="reason" style="color:#dc2626;font-weight:600">'
+                               '🔴 LIVE {}–{} {}</div>').format(
+                    _hs if _hs is not None else 0, _as if _as is not None else 0,
+                    _live.get("detail", "") or "")
+            elif _st == "post":
+                started += 1
+                _hs, _as = _live.get("hs"), _live.get("aw")
+                status_html = ('<div class="reason" style="color:#16a34a;font-weight:600">'
+                               '✅ FT {}–{}</div>').format(
+                    _hs if _hs is not None else 0, _as if _as is not None else 0)
+            else:
+                ko = _fb_fmt_kickoff(s.get("kickoff_ts"))
+                status_html = '<div class="reason">🕐 {}</div>'.format(ko) if ko else ""
             rows.append(
                 '<div class="sel"><div class="ico">⚽</div>'
                 '<div class="body"><div class="match">{}</div>'
                 '<div class="pick">{}</div>{}</div>'
                 '<div><div class="odds">{}</div><div class="conf">{:.0f}%</div></div></div>'.format(
-                    s["match"], s["pick"], ko_html, s["odds"], s["confidence"]))
+                    s["match"], s["pick"], status_html, s["odds"], s["confidence"]))
         sels = "".join(rows)
+        if started:
+            sels = ('<div class="reason" style="color:#ea580c;font-weight:600;'
+                    'padding:8px 0">⚠️ {} leg(s) already kicked off — this code '
+                    'can no longer be placed in full.</div>'.format(started)) + sels
         if acca.get("code"):
             code_box = (
                 '<div class="code-box"><div><div class="label">SportyBet Code</div>'
