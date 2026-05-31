@@ -230,25 +230,39 @@ def reset_db():
 # ═══════════════════════════════════════════════════════════
 
 def send_telegram(message):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+    if not TELEGRAM_TOKEN:
         return
-    # Optional channel filter: set env TELEGRAM_CODES_ONLY=1 to post ONLY
-    # SportyBet code messages (accumulator codes + bet builders) and suppress
-    # everything else (sports picks, crypto alerts, startup notice, etc.).
-    if os.environ.get("TELEGRAM_CODES_ONLY", "").strip().lower() in (
-            "1", "true", "yes", "on"):
-        _m = message or ""
-        if not ("SPORTYBET CODES" in _m or "PREMIUM BET BUILDERS" in _m
-                or "shareCode=" in _m):
-            return
+    _m = message or ""
+    is_code = ("SPORTYBET CODES" in _m or "PREMIUM BET BUILDERS" in _m
+               or "shareCode=" in _m)
+    codes_only = os.environ.get("TELEGRAM_CODES_ONLY", "").strip().lower() in (
+        "1", "true", "yes", "on")
+    picks_chat = os.environ.get("TELEGRAM_PICKS_CHAT_ID", "").strip()
+    # Routing:
+    #  - SportyBet codes  -> main channel (TELEGRAM_CHAT_ID)
+    #  - everything else  -> picks chat if TELEGRAM_PICKS_CHAT_ID is set;
+    #    otherwise the main channel, unless TELEGRAM_CODES_ONLY hides it.
+    targets = []
+    if is_code:
+        if TELEGRAM_CHAT_ID:
+            targets.append(TELEGRAM_CHAT_ID)
+    else:
+        if picks_chat:
+            targets.append(picks_chat)
+        elif TELEGRAM_CHAT_ID and not codes_only:
+            targets.append(TELEGRAM_CHAT_ID)
+    if not targets:
+        return
+
     def _send():
         try:
             import requests
-            requests.post(
-                "https://api.telegram.org/bot{}/sendMessage".format(TELEGRAM_TOKEN),
-                json={"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"},
-                timeout=10
-            )
+            for _chat in targets:
+                requests.post(
+                    "https://api.telegram.org/bot{}/sendMessage".format(TELEGRAM_TOKEN),
+                    json={"chat_id": _chat, "text": message, "parse_mode": "HTML"},
+                    timeout=10
+                )
         except Exception as e:
             print("Telegram error: {}".format(e))
     threading.Thread(target=_send, daemon=True).start()
@@ -8825,9 +8839,9 @@ def _fb_settle_pick(market_type, pick_text, hs, aw, h1h=None, h1a=None):
     if mt == "home_win_over_2.5":   return hs > aw and total > 2.5
     if mt == "dc_over_1.5":         return hs >= aw and total > 1.5
 
-    # ── draw no bet (stake back on a draw -> void leg, returns None) ──
-    if mt == "dnb_home":            return None if hs == aw else hs > aw
-    if mt == "dnb_away":            return None if hs == aw else aw > hs
+    # ── draw no bet (stake back on a draw -> VOID leg, removed from slip) ──
+    if mt == "dnb_home":            return "void" if hs == aw else hs > aw
+    if mt == "dnb_away":            return "void" if hs == aw else aw > hs
 
     # ── over/under goals, ANY line (over_0.5 ... over_5.5, under_1.5 ...) ──
     m = _re.match(r'^over_(\d+(?:\.\d+)?)$', mt)
@@ -9378,6 +9392,8 @@ def _fb_settle_accumulators(get_db):
         any_lost = False
         all_known = True
         evaluable = 0
+        ungradeable = 0  # match finished but this leg's market can't be graded
+        voided = 0       # genuine void (e.g. draw-no-bet on a draw) — leg removed
         upcoming = []   # in the feed but not finished yet (game is future/live)
         absent = []     # not found in the feed at all (coverage / name mismatch)
         for s in sels:
@@ -9425,8 +9441,18 @@ def _fb_settle_accumulators(get_db):
                             outcome = el_a
                         else:  # dc1up_*
                             outcome = _fb_settle_stat_pick(mt, stats)
+            if outcome == "void":
+                # genuine void (stake-back) leg — remove it from the slip;
+                # it neither wins nor loses and does not block a WON.
+                s["result"] = "void"
+                voided += 1
+                continue
             if outcome is None:
-                continue  # still ungradeable (no stats / half-no-HT) — skip leg
+                # match finished but this leg can't be graded (no stats /
+                # half-no-HT). Outcome UNKNOWN — must block a WON so we never
+                # call a slip won on legs we never actually checked.
+                ungradeable += 1
+                continue
             evaluable += 1
             s["result"] = "won" if outcome else "lost"
             if not outcome:
@@ -9435,7 +9461,9 @@ def _fb_settle_accumulators(get_db):
         new_result = None
         if any_lost:
             new_result = "lost"
-        elif all_known and evaluable > 0:
+        elif all_known and ungradeable == 0 and evaluable > 0:
+            # WON only when every leg is accounted for: each leg either won or
+            # was voided, all matches finished, no losses, >=1 real winning leg.
             new_result = "won"
         elif md < today - _dt.timedelta(days=7):
             # a week old and still unresolvable → stop showing pending
@@ -9449,8 +9477,8 @@ def _fb_settle_accumulators(get_db):
                 conn.close()
                 settled_count += 1
                 tally[new_result] = tally.get(new_result, 0) + 1
-                print("[FB] settle: slip {} -> {} ({}/{} legs graded)".format(
-                    acc_id, new_result.upper(), evaluable, len(sels)))
+                print("[FB] settle: slip {} -> {} ({} won, {} void, {} ungradeable of {} legs)".format(
+                    acc_id, new_result.upper(), evaluable, voided, ungradeable, len(sels)))
             except Exception as e:
                 print("[FB] settle update error: {}".format(e))
         else:
@@ -9459,6 +9487,8 @@ def _fb_settle_accumulators(get_db):
                 bits.append("not played yet: " + ", ".join(upcoming[:3]))
             if absent:
                 bits.append("NOT IN FEED: " + ", ".join(absent[:3]))
+            if ungradeable:
+                bits.append("{} leg(s) finished but ungradeable (need stats)".format(ungradeable))
             if bits:
                 print("[FB] settle: slip {} pending — {}".format(acc_id, " | ".join(bits)))
 
