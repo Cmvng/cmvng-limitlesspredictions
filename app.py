@@ -4146,6 +4146,16 @@ def _sports_pick_outcome(insights, market):
     q = ((market.get("question", "") or "") + " " +
          (market.get("title", "") or "")).lower()
     smt = (market.get("sports_market_type", "") or "").lower()
+
+    # Markets the bot has NO data to judge (corners, cards, bookings, player props).
+    # Must come before the totals branch — 'total_corners' contains 'total' and would
+    # otherwise be mis-picked as a goals line. These get listed, never picked.
+    if (any(w in smt for w in ("corner", "card", "booking", "first_goal",
+                               "anytime_goal", "goalscorer", "player"))
+            or any(w in q for w in ("corner", "booking", "red card",
+                                    "yellow card", "cards", "sent off", "to start"))):
+        return None
+
     win = insights.get("consensus_winner")
     btts = insights.get("consensus_btts")
     avg = None
@@ -4183,8 +4193,11 @@ def _sports_pick_outcome(insights, market):
                 return "Correct Score {}".format(sc)
         return None
 
-    # ── Moneyline / match winner (default) ──
-    if "moneyline" in smt or "win" in q or "winner" in q or not smt:
+    # ── Moneyline / match winner ──
+    # Require an explicit winner signal — don't treat every blank/unknown-type
+    # market as a winner pick (that would mis-pick props as 'Team to Win').
+    if ("moneyline" in smt or "win" in q or "winner" in q
+            or "vs" in q or " or " in q or "outcome" in q):
         if win == "DRAW":
             return "Draw"
         if win:
@@ -4291,6 +4304,8 @@ def _sports_scan_and_alert():
         match_alerts = 0  # Track alerts for this match
         seen_alert_keys = set()  # Deduplicate same market appearing twice
         game_candidates = []  # collect all scored markets, then surface the best
+        other_markets = []    # markets that matched but the bot can't judge (corners,
+        #                       cards, player props) — listed for the user, no fake pick
 
         # Extract insights
         insights = _sports_extract_insights(preds, home, away)
@@ -4349,7 +4364,10 @@ def _sports_scan_and_alert():
                 if pick_score >= SPORTS_MIN_SCORE:
                     pick_outcome = _sports_pick_outcome(insights, market)
                     if not pick_outcome:
-                        continue  # no explicit, confident side — never surface a vague pick
+                        # Bot has no basis to pick this market (corners, cards, player
+                        # props). Record it as an available option — never fake a pick.
+                        other_markets.append({"market": market, "smt": smt})
+                        continue
                     game_candidates.append({
                         "score": pick_score, "market": market, "reasons": reasons,
                         "pick_outcome": pick_outcome, "smt": smt,
@@ -4367,18 +4385,21 @@ def _sports_scan_and_alert():
                 continue
             _seen_picks.add(pk)
             _unique_cands.append(c)
-        for cand in _unique_cands[:2]:
+        # Surface a pick for EVERY distinct market we have a confident read on
+        # (moneyline + over/under + BTTS + correct score where the platform lists
+        # them), not just the single highest-scoring one. Capped per match below.
+        smt_labels = {
+            "moneyline": "🏆 Match Winner", "total": "⚽ Over/Under Goals",
+            "totals": "⚽ Over/Under Goals", "btts": "🎯 Both Teams To Score",
+            "both_teams_to_score": "🎯 Both Teams To Score", "spread": "📊 Handicap/Spread",
+            "total_corners": "🔲 Total Corners", "correct_score": "🎯 Correct Score",
+            "first_goal": "1️⃣ First Goal Scorer", "anytime_goal": "⚽ Anytime Goal Scorer",
+        }
+        for cand in _unique_cands[:MAX_ALERTS_PER_MATCH]:
             if match_alerts >= MAX_ALERTS_PER_MATCH:
                 break
             market = cand["market"]; pick_score = cand["score"]
             reasons = cand["reasons"]; pick_outcome = cand["pick_outcome"]; smt = cand["smt"]
-            smt_labels = {
-                "moneyline": "🏆 Match Winner", "total": "⚽ Over/Under Goals",
-                "totals": "⚽ Over/Under Goals", "btts": "🎯 Both Teams To Score",
-                "both_teams_to_score": "🎯 Both Teams To Score", "spread": "📊 Handicap/Spread",
-                "total_corners": "🔲 Total Corners", "correct_score": "🎯 Correct Score",
-                "first_goal": "1️⃣ First Goal Scorer", "anytime_goal": "⚽ Anytime Goal Scorer",
-            }
             market_label = smt_labels.get(smt, "📊 {}".format(
                 smt.replace("_", " ").title() if smt else "Market"))
             mq = market.get("question", "") or market.get("title", "")
@@ -4437,6 +4458,34 @@ def _sports_scan_and_alert():
             match_alerts += 1
             print("[SPORTS] ALERT: {} vs {} — {} → {} — {}/100".format(
                 home, away, smt or "general", pick_outcome, pick_score))
+
+        # ── Other markets the bot can't judge — list them so the user sees every
+        # option (corners, cards, player props), clearly marked as no-pick. Only
+        # when we already alerted a real pick for this match, to avoid noise.
+        if other_markets and match_alerts > 0:
+            seen_lbl = set()
+            om_lines = []
+            for om in other_markets:
+                smt2 = om.get("smt") or "general"
+                lbl = smt_labels.get(smt2, "📊 {}".format(
+                    smt2.replace("_", " ").title() if smt2 else "Market"))
+                mq2 = (om["market"].get("question", "") or
+                       om["market"].get("title", "") or "")
+                key2 = (lbl, mq2[:50])
+                if key2 in seen_lbl:
+                    continue
+                seen_lbl.add(key2)
+                om_url = om["market"].get("url", "")
+                if om_url:
+                    om_lines.append('• {} — <a href="{}">{}</a>'.format(
+                        lbl, om_url, mq2[:60]))
+                else:
+                    om_lines.append("• {} — {}".format(lbl, mq2[:60]))
+            if om_lines:
+                send_telegram(
+                    "📋 <b>Other markets for {} vs {}</b>\n"
+                    "<i>No bot pick — your call</i>\n\n".format(home, away)
+                    + "\n".join(om_lines[:6]))
 
     print("[SPORTS] Scan complete — {} predictions matched to markets, {} alerts sent".format(
         matched_count, alerts_sent))
@@ -6222,6 +6271,279 @@ def apifootball_form_stats(team_name):
         "scored_pct": scored / n, "cs_pct": cs / n, "btts_pct": btts / n,
         "avg_gf": round(gf / n, 2), "avg_ga": round(ga / n, 2), "ppg": round(pts / n, 2),
     }
+
+
+# ═══════════════════════════════════════════════════════════════════
+# NEW MODEL (additive, isolated) — ClubElo + football-data.co.uk + Dixon-Coles.
+# Produces EXTRA options (corners, cards, correct score, value flags) for CLUB
+# matches only. Fully wrapped: if any source is down it returns {} and the
+# existing engine is untouched. Proven sources: football-data.co.uk (Joseph
+# Buchdahl, since 2001) and the Dixon-Coles 1997 model (Journal of the Royal
+# Statistical Society).
+# ═══════════════════════════════════════════════════════════════════
+
+_FD_CACHE = {}      # football-data.co.uk league CSVs, per (code, season)
+_CE_CACHE = {}      # ClubElo day ratings
+
+
+def _poisson_pmf(k, lam):
+    import math
+    if lam <= 0:
+        return 1.0 if k == 0 else 0.0
+    return math.exp(-lam) * (lam ** k) / math.factorial(k)
+
+
+def _dc_tau(x, y, lh, la, rho):
+    # Dixon-Coles low-score dependency adjustment
+    if x == 0 and y == 0:
+        return 1.0 - lh * la * rho
+    if x == 0 and y == 1:
+        return 1.0 + lh * rho
+    if x == 1 and y == 0:
+        return 1.0 + la * rho
+    if x == 1 and y == 1:
+        return 1.0 - rho
+    return 1.0
+
+
+def _dc_matrix(lh, la, rho=-0.13, max_goals=8):
+    m = [[0.0] * (max_goals + 1) for _ in range(max_goals + 1)]
+    s = 0.0
+    for x in range(max_goals + 1):
+        for y in range(max_goals + 1):
+            p = _poisson_pmf(x, lh) * _poisson_pmf(y, la) * _dc_tau(x, y, lh, la, rho)
+            if p < 0:
+                p = 0.0
+            m[x][y] = p
+            s += p
+    if s > 0:
+        for x in range(max_goals + 1):
+            for y in range(max_goals + 1):
+                m[x][y] /= s
+    return m
+
+
+def _dc_markets(m):
+    """Derive 1X2, over/under, BTTS and most-likely correct score from the matrix."""
+    mg = len(m)
+    home = draw = away = btts = 0.0
+    over = {1.5: 0.0, 2.5: 0.0, 3.5: 0.0}
+    best = (0, 0, 0.0)
+    for x in range(mg):
+        for y in range(mg):
+            p = m[x][y]
+            if x > y:
+                home += p
+            elif x == y:
+                draw += p
+            else:
+                away += p
+            if x > 0 and y > 0:
+                btts += p
+            tot = x + y
+            for ln in over:
+                if tot > ln:
+                    over[ln] += p
+            if p > best[2]:
+                best = (x, y, p)
+    return {
+        "home": round(home, 3), "draw": round(draw, 3), "away": round(away, 3),
+        "btts_yes": round(btts, 3), "btts_no": round(1 - btts, 3),
+        "over": {k: round(v, 3) for k, v in over.items()},
+        "under": {k: round(1 - v, 3) for k, v in over.items()},
+        "correct_score": "{}-{}".format(best[0], best[1]),
+        "cs_prob": round(best[2], 3),
+    }
+
+
+def _poisson_over(lam, line):
+    """P(total > line) for a Poisson count (corners, cards)."""
+    import math
+    cum = sum(_poisson_pmf(k, lam) for k in range(0, int(math.floor(line)) + 1))
+    return max(0.0, min(1.0, 1.0 - cum))
+
+
+def _fd_norm(name):
+    return "".join(c for c in (name or "").lower() if c.isalnum())
+
+
+def _fd_match_name(a, b):
+    na, nb = _fd_norm(a), _fd_norm(b)
+    if not na or not nb:
+        return False
+    return na == nb or na in nb or nb in na
+
+
+def _fd_league(code, season):
+    """Fetch + cache one football-data.co.uk league CSV (historical results with
+    goals, corners HC/AC, cards HY/AY/HR/AR and bookmaker odds)."""
+    key = (code, season)
+    if key in _FD_CACHE:
+        return _FD_CACHE[key]
+    rows = []
+    try:
+        import csv as _csv
+        import io as _io
+        url = "https://www.football-data.co.uk/mmz4281/{}/{}.csv".format(season, code)
+        r = _req.get(url, timeout=25)
+        if r.status_code == 200 and r.text:
+            rd = _csv.DictReader(_io.StringIO(r.text))
+            for row in rd:
+                if row.get("HomeTeam") and row.get("FTHG") not in (None, ""):
+                    rows.append(row)
+    except Exception as e:
+        print("[MODEL] football-data fetch error {}/{}: {}".format(code, season, e))
+    _FD_CACHE[key] = rows
+    return rows
+
+
+def _fd_team_stats(rows, team, last=12):
+    """Recent averages for one team: goals for/against, corners for/against, cards."""
+    def _f(v):
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return 0.0
+    games = []
+    for row in rows:
+        h, a = row.get("HomeTeam", ""), row.get("AwayTeam", "")
+        if _fd_match_name(team, h):
+            games.append(("H", row))
+        elif _fd_match_name(team, a):
+            games.append(("A", row))
+    games = games[-last:]
+    if not games:
+        return {}
+    gf = ga = cf = ca = cards = 0.0
+    for side, row in games:
+        if side == "H":
+            gf += _f(row.get("FTHG")); ga += _f(row.get("FTAG"))
+            cf += _f(row.get("HC")); ca += _f(row.get("AC"))
+            cards += _f(row.get("HY")) + _f(row.get("HR"))
+        else:
+            gf += _f(row.get("FTAG")); ga += _f(row.get("FTHG"))
+            cf += _f(row.get("AC")); ca += _f(row.get("HC"))
+            cards += _f(row.get("AY")) + _f(row.get("AR"))
+    n = len(games)
+    return {
+        "games": n, "gf": gf / n, "ga": ga / n,
+        "cf": cf / n, "ca": ca / n, "cards": cards / n,
+    }
+
+
+def _fd_league_avgs(rows):
+    def _f(v):
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return 0.0
+    if not rows:
+        return None
+    h = sum(_f(r.get("FTHG")) for r in rows) / len(rows)
+    a = sum(_f(r.get("FTAG")) for r in rows) / len(rows)
+    return {"home_goals": h or 1.4, "away_goals": a or 1.1}
+
+
+def model_club_match(home, away, code, season, odds=None):
+    """Build the EXTRA-options model for one club match. Returns {} if no data
+    (so callers degrade silently). `odds` optional dict for value flags:
+    {'home','draw','away'} decimal odds."""
+    rows = _fd_league(code, season)
+    if not rows:
+        return {}
+    lg = _fd_league_avgs(rows)
+    hs = _fd_team_stats(rows, home)
+    as_ = _fd_team_stats(rows, away)
+    if not hs or not as_ or not lg:
+        return {}
+
+    # Attack/defense strengths relative to league average → goal expectancies
+    lhg, lag = lg["home_goals"] or 1.4, lg["away_goals"] or 1.1
+    h_att = hs["gf"] / lhg if lhg else 1.0
+    h_def = hs["ga"] / lag if lag else 1.0
+    a_att = as_["gf"] / lag if lag else 1.0
+    a_def = as_["ga"] / lhg if lhg else 1.0
+    lh = max(0.2, lhg * h_att * a_def)
+    la = max(0.2, lag * a_att * h_def)
+
+    matrix = _dc_matrix(lh, la)
+    goals = _dc_markets(matrix)
+
+    # Corners + cards via Poisson on combined recent averages
+    corners_lam = hs["cf"] + as_["cf"]
+    cards_lam = hs["cards"] + as_["cards"]
+    corners = {ln: round(_poisson_over(corners_lam, ln), 3) for ln in (8.5, 9.5, 10.5)}
+    cards = {ln: round(_poisson_over(cards_lam, ln), 3) for ln in (3.5, 4.5, 5.5)}
+
+    out = {
+        "home": home, "away": away, "code": code, "season": season,
+        "exp_goals": {"home": round(lh, 2), "away": round(la, 2)},
+        "result": {"home": goals["home"], "draw": goals["draw"], "away": goals["away"]},
+        "over": goals["over"], "under": goals["under"],
+        "btts": {"yes": goals["btts_yes"], "no": goals["btts_no"]},
+        "correct_score": {"score": goals["correct_score"], "prob": goals["cs_prob"]},
+        "corners_over": corners, "corners_exp": round(corners_lam, 1),
+        "cards_over": cards, "cards_exp": round(cards_lam, 1),
+        "games_used": {"home": hs["games"], "away": as_["games"]},
+    }
+
+    # Value flags vs supplied odds (model thinks the price is generous)
+    if odds:
+        try:
+            oh, od, oa = float(odds["home"]), float(odds["draw"]), float(odds["away"])
+            ph, pd, pa = 1 / oh, 1 / od, 1 / oa
+            s = ph + pd + pa
+            fair = {"home": ph / s, "draw": pd / s, "away": pa / s}
+            val = {}
+            for k in ("home", "draw", "away"):
+                edge = out["result"][k] - fair[k]
+                if edge > 0.05:   # model 5pp+ above fair → flag value
+                    val[k] = {"edge": round(edge, 3), "odds": odds[k]}
+            out["value"] = val
+        except Exception:
+            pass
+    return out
+
+
+# Spelling-tolerant ClubElo strength cross-check (optional, supplementary)
+def _ce_day_ratings(date_str=None):
+    import datetime as _dtm
+    d = date_str or _dtm.date.today().isoformat()
+    if d in _CE_CACHE:
+        return _CE_CACHE[d]
+    table = {}
+    try:
+        import csv as _csv
+        import io as _io
+        r = _req.get("http://api.clubelo.com/{}".format(d), timeout=20)
+        if r.status_code == 200 and r.text:
+            rd = _csv.DictReader(_io.StringIO(r.text))
+            for row in rd:
+                club = row.get("Club")
+                elo = row.get("Elo")
+                if club and elo:
+                    try:
+                        table[_fd_norm(club)] = float(elo)
+                    except ValueError:
+                        pass
+    except Exception as e:
+        print("[MODEL] ClubElo fetch error: {}".format(e))
+    _CE_CACHE[d] = table
+    return table
+
+
+def _ce_elo(name, table=None):
+    table = table if table is not None else _ce_day_ratings()
+    if not table or not name:
+        return None
+    k = _fd_norm(name)
+    if k in table:
+        return table[k]
+    for tk, v in table.items():
+        if k and (k in tk or tk in k):
+            return v
+    return None
+
 
 def footystats_team(team_slug):
     """
@@ -9669,6 +9991,42 @@ def fb_codes_page():
 def fb_builder_page():
     return render_builder_page(_FB_CACHE.get("bet_builders", []),
                                _FB_CACHE.get("date") or _fb_today_human())
+
+
+@app.route("/app/model-test")
+def model_test():
+    """Live validation for the new ClubElo + football-data + Dixon-Coles model.
+    Usage: /app/model-test?home=Burgos&away=Eibar&code=SP2&season=2526
+    Confirms the proven sources reach Railway and shows the extra-options output."""
+    home = request.args.get("home", "")
+    away = request.args.get("away", "")
+    code = request.args.get("code", "SP2")
+    season = request.args.get("season", "2526")
+    out = {"home": home, "away": away, "code": code, "season": season}
+    try:
+        rows = _fd_league(code, season)
+        out["football_data_rows"] = len(rows)
+        if not rows:
+            out["verdict"] = ("football-data.co.uk returned no rows — check the league "
+                              "code/season, or it's unreachable from here.")
+            return jsonify(out)
+        if not home or not away:
+            out["verdict"] = ("football-data reachable ({} matches loaded). Add "
+                              "?home=&away= to model a fixture.".format(len(rows)))
+            return jsonify(out)
+        model = model_club_match(home, away, code, season)
+        if not model:
+            out["verdict"] = ("Loaded the league but couldn't match one of the team "
+                              "names — check spelling against football-data.co.uk.")
+            return jsonify(out)
+        out["model"] = model
+        ce = _ce_day_ratings()
+        out["clubelo"] = {"reachable": bool(ce), "teams_loaded": len(ce),
+                          "home_elo": _ce_elo(home, ce), "away_elo": _ce_elo(away, ce)}
+        out["verdict"] = "WORKING — proven sources reached Railway and the model produced output."
+    except Exception as e:
+        out["verdict"] = "error: {}: {}".format(type(e).__name__, str(e)[:200])
+    return jsonify(out)
 
 
 @app.route("/app/sofa-test")
