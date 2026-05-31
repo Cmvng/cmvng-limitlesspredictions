@@ -232,6 +232,15 @@ def reset_db():
 def send_telegram(message):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         return
+    # Optional channel filter: set env TELEGRAM_CODES_ONLY=1 to post ONLY
+    # SportyBet code messages (accumulator codes + bet builders) and suppress
+    # everything else (sports picks, crypto alerts, startup notice, etc.).
+    if os.environ.get("TELEGRAM_CODES_ONLY", "").strip().lower() in (
+            "1", "true", "yes", "on"):
+        _m = message or ""
+        if not ("SPORTYBET CODES" in _m or "PREMIUM BET BUILDERS" in _m
+                or "shareCode=" in _m):
+            return
     def _send():
         try:
             import requests
