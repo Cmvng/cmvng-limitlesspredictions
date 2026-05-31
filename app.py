@@ -5001,6 +5001,7 @@ def _sb_board_explore(fx, home, away, exp_home, exp_away, exp_total):
     markets = _SB_MARKET_CACHE.get(eid) or []
     if not markets:
         return []
+    mdl = fx.get("_model") or {}   # proven club model (corners/cards), if covered
 
     def pmf(k, lam):
         try:
@@ -5138,7 +5139,39 @@ def _sb_board_explore(fx, home, away, exp_home, exp_away, exp_total):
 
             prob = label = comment = mtype = None
 
-            if is_multigoal:
+            # ── Model-driven corners/cards (market 166 etc.) ──
+            # STRATEGY: only the best picks — worst-case-safe (model >=75% on the
+            # side) AND positive edge (model beats SportyBet's implied by >=5pp).
+            # Priced from the model's expected corners/cards via Poisson, so it
+            # works for whatever line SportyBet offers. Only fires for covered
+            # club fixtures (mdl present); internationals have no mdl -> skipped.
+            if mdl and ("corner" in desc or "card" in desc or "booking" in desc):
+                _is_card = ("card" in desc or "booking" in desc)
+                _exp = mdl.get("cards_exp" if _is_card else "corners_exp")
+                _noun = "Cards" if _is_card else "Corners"
+                _line = first_num(spec, od)
+                if _exp and _line is not None:
+                    _over_p = p_atleast(int(_math.floor(_line)) + 1, _exp)
+                    if "over" in odl or odl.startswith("o"):
+                        _cand, _sd = _over_p, "Over"
+                    elif "under" in odl or odl.startswith("u"):
+                        _cand, _sd = 100.0 - _over_p, "Under"
+                    else:
+                        _cand, _sd = None, None
+                    if _cand is not None:
+                        _implied = 100.0 / odds
+                        _edge = _cand - _implied
+                        if _cand >= 75.0 and _edge >= 5.0:
+                            prob = _cand
+                            label = "{} {:g} {}".format(_sd, _line, _noun)
+                            mtype = "{}_{}_{:g}".format(_noun.lower(), _sd.lower(), _line)
+                            comment = ("Model {} ~{:.1f}; {} {:.0f}% vs market {:.0f}% "
+                                       "(edge +{:.0f}%)").format(_noun.lower(), _exp,
+                                                                 label, prob, _implied, _edge)
+                            print("[MODEL-PICK] {} | {} — model {:.0f}% vs mkt {:.0f}% "
+                                  "(edge +{:.0f}%) @ {:.2f}".format(match_label, label,
+                                                                    prob, _implied, _edge, odds))
+            elif is_multigoal:
                 m = _re.match(r'^\s*(\d+)\s*-\s*(\d+)\s*$', od)
                 if m:
                     lo, hi = int(m.group(1)), int(m.group(2))
@@ -6690,9 +6723,38 @@ def _model_code_legs(fx, m, threshold=0.70):
     return [best] if best else []
 
 
+def _model_attach(fixtures):
+    """Pre-scoring: detect each club fixture's league, run the proven model and
+    attach it as fx['_model'] so board-explore can price corners/cards from it.
+    No Telegram, no codes — just attaches. Internationals/cross-league get no
+    match and are skipped. Fully isolated."""
+    season = _model_season()
+    n = 0
+    for fx in fixtures:
+        try:
+            if fx.get("_model"):
+                continue
+            home = fx.get("home_team", "")
+            away = fx.get("away_team", "")
+            if not home or not away:
+                continue
+            code = _model_detect_league(home, away, season)
+            if not code:
+                continue
+            m = model_club_match(home, away, code, season)
+            if m:
+                fx["_model"] = m
+                n += 1
+        except Exception as e:
+            print("[MODEL] attach error for {}: {}".format(
+                fx.get("home_team", "?"), e))
+    print("[MODEL] attached model to {} club fixtures (pre-scoring)".format(n))
+    return n
+
+
 def _model_extras_run(fixtures, announce=True):
-    """Additive: for each covered club fixture, run the proven model and send a
-    MODEL EXTRAS Telegram card. Fully isolated — never affects picks/codes."""
+    """Additive: for each covered club fixture, send a MODEL EXTRAS Telegram
+    card from the already-attached model. Isolated — never affects picks/codes."""
     season = _model_season()
     extras = []
     for fx in fixtures:
@@ -6701,13 +6763,15 @@ def _model_extras_run(fixtures, announce=True):
             away = fx.get("away_team", "")
             if not home or not away:
                 continue
-            code = _model_detect_league(home, away, season)
-            if not code:
-                continue  # not a covered club league (e.g. international)
-            m = model_club_match(home, away, code, season)
+            m = fx.get("_model")
             if not m:
-                continue
-            fx["_model"] = m
+                code = _model_detect_league(home, away, season)
+                if not code:
+                    continue  # not a covered club league (e.g. international)
+                m = model_club_match(home, away, code, season)
+                if not m:
+                    continue
+                fx["_model"] = m
             extras.append(m)
             if announce:
                 try:
@@ -6721,57 +6785,6 @@ def _model_extras_run(fixtures, announce=True):
     _FB_CACHE["model_extras"] = extras
     print("[MODEL] extras: {} club matches enriched (season {})".format(
         len(extras), season))
-
-    # Build an additive corners/cards code from high-win-chance model legs.
-    # Separate from the main 2/3/5/10/1000 codes — never touches them.
-    try:
-        try:
-            thr = float(os.environ.get("MODEL_CODE_THRESHOLD", "0.70"))
-        except (TypeError, ValueError):
-            thr = 0.70
-        legs = []
-        for fx in fixtures:
-            mm = fx.get("_model")
-            if not mm:
-                continue
-            legs.extend(_model_code_legs(fx, mm, thr))
-        legs.sort(key=lambda x: x[0], reverse=True)
-        picked = legs[:6]  # cap to keep the combined chance sane
-        if picked:
-            sels = [s for _, s, _ in picked]
-            code = None
-            try:
-                code = sb_create_code(sels)
-            except Exception as e:
-                print("[MODEL] code create error: {}".format(e))
-            if code:
-                _FB_CACHE["model_code"] = {
-                    "code": code,
-                    "legs": [d for _, _, d in picked],
-                    "ts": _dt.datetime.now(),
-                }
-                print("[MODEL] code {} built from {} legs (thr {:.0f}%)".format(
-                    code, len(sels), thr * 100))
-                if announce:
-                    out = ["🧮 MODEL CODE — corners & cards",
-                           "(each leg win chance \u2265 {:.0f}% \u00b7 your call)".format(thr * 100),
-                           ""]
-                    for _, _, d in picked:
-                        out.append("\u2022 " + d)
-                    out += ["", "SportyBet code: {}".format(code)]
-                    try:
-                        send_telegram("\n".join(out))
-                    except Exception as e:
-                        print("[MODEL] code telegram error: {}".format(e))
-            else:
-                print("[MODEL] code: {} qualifying legs but SportyBet rejected "
-                      "the selections".format(len(picked)))
-        else:
-            print("[MODEL] code: no legs cleared the {:.0f}% win-chance "
-                  "threshold this run".format(thr * 100))
-    except Exception as e:
-        print("[MODEL] code block error: {}".format(e))
-
     return extras
 
 
@@ -9616,6 +9629,13 @@ def run_football_engine(get_db, tg_token, tg_chat, send_telegram,
             print("[FB] No upcoming bettable fixtures right now — nothing to post")
             _FB_CACHE["running"] = False
             return
+
+        # 1b. Attach the proven club model (corners/cards) BEFORE scoring, so
+        #     board-explore can inject qualifying corner/card legs into the codes.
+        try:
+            _model_attach(fixtures)
+        except Exception as e:
+            print("[MODEL] attach run error: {}".format(e))
 
         # 2. Analyze
         all_picks = []
