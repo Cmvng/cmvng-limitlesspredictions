@@ -4124,11 +4124,11 @@ def _sports_score_pick(insights, market):
         max_prob = max(p.get("prob_home", 0) or 0, p.get("prob_away", 0) or 0)
         if max_prob > 70:
             score += 15
-            reasons.append("Forebet {}% confidence".format(max_prob))
+            reasons.append("{}% win probability".format(max_prob))
             break
         elif max_prob > 55:
             score += 8
-            reasons.append("Forebet {}%".format(max_prob))
+            reasons.append("{}% win probability".format(max_prob))
             break
 
     return score, reasons
@@ -6543,6 +6543,121 @@ def _ce_elo(name, table=None):
         if k and (k in tk or tk in k):
             return v
     return None
+
+
+# ── Model extras wiring (additive, isolated) ──────────────────────────────
+_MODEL_LEAGUES = ["E0", "E1", "SP1", "SP2", "I1", "I2", "D1", "D2",
+                  "F1", "F2", "B1", "N1", "P1", "SC0", "T1", "G1"]
+
+
+def _model_season():
+    """football-data season code for today, e.g. '2526' for 2025/26."""
+    n = _dt.date.today()
+    sy = n.year if n.month >= 8 else n.year - 1
+    return "{:02d}{:02d}".format(sy % 100, (sy + 1) % 100)
+
+
+def _model_detect_league(home, away, season):
+    """Find which covered league CSV contains BOTH teams. Auto-detect — no
+    manual league mapping. Returns code, or None when not a covered club
+    league (e.g. internationals)."""
+    for code in _MODEL_LEAGUES:
+        rows = _fd_league(code, season)
+        if not rows:
+            continue
+        has_h = any(_fd_match_name(home, r.get("HomeTeam", "")) or
+                    _fd_match_name(home, r.get("AwayTeam", "")) for r in rows)
+        if not has_h:
+            continue
+        has_a = any(_fd_match_name(away, r.get("HomeTeam", "")) or
+                    _fd_match_name(away, r.get("AwayTeam", "")) for r in rows)
+        if has_a:
+            return code
+    return None
+
+
+def _best_line(over_dict):
+    """Pick the highest-confidence Over/Under side across all lines.
+    Returns (line_str, side, prob) or None."""
+    best = None
+    for ln, op in (over_dict or {}).items():
+        try:
+            op = float(op)
+        except (TypeError, ValueError):
+            continue
+        for side, p in (("Over", op), ("Under", 1.0 - op)):
+            if best is None or p > best[2]:
+                best = (ln, side, p)
+    return best
+
+
+def _model_card(m):
+    """Concise Telegram card for one club match's model extras."""
+    home, away = m.get("home", "Home"), m.get("away", "Away")
+    res = m.get("result", {})
+    fav = max((("home", res.get("home", 0)), ("draw", res.get("draw", 0)),
+               ("away", res.get("away", 0))), key=lambda x: x[1])
+    favlbl = {"home": home + " win", "draw": "Draw",
+              "away": away + " win"}[fav[0]]
+    cs = m.get("correct_score", {})
+    ov = m.get("over", {})
+    btts = m.get("btts", {})
+    cob = _best_line(m.get("corners_over", {}))
+    cab = _best_line(m.get("cards_over", {}))
+    gu = m.get("games_used", {})
+    lines = ["📊 MODEL EXTRAS — {} vs {}".format(home, away),
+             "(model estimate · your call)", ""]
+    lines.append("Result: {} ({:.0f}%)".format(favlbl, fav[1] * 100))
+    if cs.get("score"):
+        lines.append("Likely score: {} ({:.0f}%)".format(
+            cs["score"], cs.get("prob", 0) * 100))
+    if ov.get("2.5") is not None:
+        lines.append("Over 2.5 goals: {:.0f}%".format(ov["2.5"] * 100))
+    if btts.get("yes") is not None:
+        lines.append("BTTS: Yes {:.0f}%".format(btts["yes"] * 100))
+    if cob:
+        lines.append("Corners: {} {} ({:.0f}%)".format(cob[1], cob[0],
+                                                        cob[2] * 100))
+    if cab:
+        lines.append("Cards: {} {} ({:.0f}%)".format(cab[1], cab[0],
+                                                      cab[2] * 100))
+    lines += ["", "Form: {} games each".format(
+        min(gu.get("home", 0) or 0, gu.get("away", 0) or 0))]
+    return "\n".join(lines)
+
+
+def _model_extras_run(fixtures, announce=True):
+    """Additive: for each covered club fixture, run the proven model and send a
+    MODEL EXTRAS Telegram card. Fully isolated — never affects picks/codes."""
+    season = _model_season()
+    extras = []
+    for fx in fixtures:
+        try:
+            home = fx.get("home_team", "")
+            away = fx.get("away_team", "")
+            if not home or not away:
+                continue
+            code = _model_detect_league(home, away, season)
+            if not code:
+                continue  # not a covered club league (e.g. international)
+            m = model_club_match(home, away, code, season)
+            if not m:
+                continue
+            fx["_model"] = m
+            extras.append(m)
+            if announce:
+                try:
+                    send_telegram(_model_card(m))
+                except Exception as e:
+                    print("[MODEL] telegram error: {}".format(e))
+        except Exception as e:
+            print("[MODEL] extras error for {}: {}".format(
+                fx.get("home_team", "?"), e))
+            continue
+    _FB_CACHE["model_extras"] = extras
+    print("[MODEL] extras: {} club matches enriched (season {})".format(
+        len(extras), season))
+    return extras
 
 
 def footystats_team(team_slug):
@@ -9489,6 +9604,12 @@ def run_football_engine(get_db, tg_token, tg_chat, send_telegram,
                         send_telegram(bb_msg)
                 except Exception as e:
                     print("[FB] bet builder announce error: {}".format(e))
+
+        # 7. Model extras (additive, isolated — proven club-data model)
+        try:
+            _model_extras_run(fixtures, announce=announce)
+        except Exception as e:
+            print("[MODEL] extras run error: {}".format(e))
 
         print("[FB] ═══ Engine run complete ═══")
     finally:
