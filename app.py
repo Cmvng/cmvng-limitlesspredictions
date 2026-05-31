@@ -7580,57 +7580,85 @@ def render_results_calendar(year, month, day_data, tier_stats, today_iso):
         css=FB_CSS, nav=_nav("results"), cal=cal_card, summary=summary_html)
 
 
-def render_results_day(date_iso, date_human, accas):
-    """Detail view for one day's accumulators."""
-    blocks = []
-    for a in accas:
+def render_results_day(date_iso, date_human, sets):
+    """Detail view for one day's accumulators, grouped by engine run (newest first).
+    `sets` = list of {run_id, created_at, accas:[...]} groups."""
+
+    def _run_time(grp):
+        raw = grp.get("run_id") or (str(grp.get("created_at")) if grp.get("created_at") else "")
+        m = re.search(r'(\d{2}):(\d{2})', raw or "")
+        return "{}:{}".format(m.group(1), m.group(2)) if m else ""
+
+    def _acca_block(a):
         status = (a.get("result") or "pending").lower()
         badge = '<span class="badge {}">{}</span>'.format(
             status, {"won": "WON", "lost": "LOST", "void": "VOID"}.get(status, "PENDING"))
-        sels = ""
-        try:
-            sel_list = a.get("selections", [])
-            parts = []
-            for s in sel_list:
-                lr = (s.get("result") or "").lower()
-                if lr == "won":
-                    ico, cls = "✅", "won"
-                elif lr == "lost":
-                    ico, cls = "❌", "lost"
-                else:
-                    ico, cls = "⚽", "pending"
-                parts.append(
-                    '<div class="sel {}"><div class="ico">{}</div><div class="body">'
-                    '<div class="match">{}</div><div class="pick">{}</div>'
-                    '<div class="why">{}</div></div>'
-                    '<div class="odds">{}</div></div>'.format(
-                        cls, ico, s.get("match", ""), s.get("pick", ""),
-                        s.get("reasoning", ""), s.get("odds", "")))
-            sels = "".join(parts)
-        except Exception:
-            pass
+        parts = []
+        for s in a.get("selections", []):
+            lr = (s.get("result") or "").lower()
+            if lr == "won":
+                ico, cls = "✅", "won"
+            elif lr == "lost":
+                ico, cls = "❌", "lost"
+            else:
+                ico, cls = "⚽", "pending"
+            parts.append(
+                '<div class="sel {}"><div class="ico">{}</div><div class="body">'
+                '<div class="match">{}</div><div class="pick">{}</div>'
+                '<div class="why">{}</div></div>'
+                '<div class="odds">{}</div></div>'.format(
+                    cls, ico, s.get("match", ""), s.get("pick", ""),
+                    s.get("reasoning", ""), s.get("odds", "")))
         code = ""
         if a.get("sportybet_code"):
             code = ('<div class="code-box"><div><div class="label">SportyBet Code</div>'
                     '<div class="code">{}</div></div></div>'.format(a["sportybet_code"]))
-        blocks.append(
-            '<div class="glass tier"><div class="tier-head"><div class="tier-title">'
-            '<h2>{}</h2>{}</div><div class="tier-odds">{:.2f}'
-            '<span class="lbl">TOTAL ODDS</span></div></div>{}{}</div>'.format(
-                a.get("label", ""), badge, a.get("total_odds", 0), sels, code))
+        return ('<div class="glass tier"><div class="tier-head"><div class="tier-title">'
+                '<h2>{}</h2>{}</div><div class="tier-odds">{:.2f}'
+                '<span class="lbl">TOTAL ODDS</span></div></div>{}{}</div>'.format(
+                    a.get("label", ""), badge, a.get("total_odds", 0), "".join(parts), code))
 
-    body = "".join(blocks) if blocks else (
+    set_blocks = []
+    for i, grp in enumerate(sets or []):
+        accas = grp.get("accas", [])
+        if not accas:
+            continue
+        t = _run_time(grp)
+        if i == 0:
+            head_lbl = "🟢 LATEST SET" + (" · {}".format(t) if t else "")
+            cls = "latest"
+        else:
+            head_lbl = "EARLIER SET" + (" · {}".format(t) if t else "")
+            cls = "earlier"
+        inner = "".join(_acca_block(a) for a in accas)
+        set_blocks.append(
+            '<div class="run-set {cls}"><div class="run-head"><span>{head}</span>'
+            '<span class="run-count">{n} slips</span></div>{inner}</div>'.format(
+                cls=cls, head=head_lbl, n=len(accas), inner=inner))
+
+    body = "".join(set_blocks) if set_blocks else (
         '<div class="glass empty"><div class="big">📅</div>'
         '<div>No slips were generated on this day.</div></div>')
 
+    extra = (
+        ".run-set{margin-bottom:30px}"
+        ".run-head{display:flex;align-items:center;justify-content:space-between;"
+        "font-weight:700;font-size:13px;letter-spacing:.05em;margin:20px 0 12px;"
+        "padding:10px 14px;border-radius:12px;background:rgba(255,255,255,.04);"
+        "border:1px solid rgba(255,255,255,.08)}"
+        ".run-set.latest .run-head{color:#16a34a;border-color:rgba(22,163,74,.3);"
+        "background:rgba(22,163,74,.07)}"
+        ".run-set.earlier .run-head{opacity:.75}"
+        ".run-count{font-weight:600;font-size:11px;opacity:.8}")
+
     return """<!DOCTYPE html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{date} Results — Cmvng Bot</title><style>{css}</style></head><body>
+<title>{date} Results — Cmvng Bot</title><style>{css}{extra}</style></head><body>
 {nav}<div class="wrap">
 <a href="/app/results" class="back-link">‹ Back to calendar</a>
-<div class="page-head"><h1>{date}</h1><div class="sub">Slips generated this day</div></div>
+<div class="page-head"><h1>{date}</h1><div class="sub">Each set is one engine run — newest first</div></div>
 {body}</div></body></html>""".format(
-        css=FB_CSS, nav=_nav("results"), date=date_human, body=body)
+        css=FB_CSS, extra=extra, nav=_nav("results"), date=date_human, body=body)
 
 
 """
@@ -7945,6 +7973,7 @@ def fb_init_db(get_db):
             ("target_odds", "REAL"), ("total_odds", "REAL"), ("num_selections", "INT"),
             ("selections_json", "TEXT"), ("sportybet_code", "TEXT"),
             ("status", "TEXT DEFAULT 'pending'"), ("result", "TEXT"),
+            ("run_id", "TEXT"),
             ("created_at", "TIMESTAMPTZ DEFAULT NOW()"),
         ]
         for col, typ in _acc_cols:
@@ -7971,14 +8000,16 @@ def fb_save_run(get_db, date_str, all_picks, accumulators):
                 d=today, h=p["home"], a=p["away"], l=p["league"],
                 mt=p["market_type"], pk=p["pick"], cf=p["confidence"],
                 od=p["odds"], rs=p["reasoning"])
-        # Save accumulators
+        # Save accumulators — tag every slip in this run with one shared run_id
+        # so the history view can group them as a single "set".
+        run_id = _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         for acca in accumulators:
             if not acca:
                 continue
             conn.run("""INSERT INTO sportybet_accumulators
                 (match_date, tier, label, target_odds, total_odds, num_selections,
-                 selections_json, sportybet_code)
-                VALUES (:d,:t,:lb,:tg,:to,:ns,:sj,:cd)""",
+                 selections_json, sportybet_code, run_id)
+                VALUES (:d,:t,:lb,:tg,:to,:ns,:sj,:cd,:ri)""",
                 d=today, t=acca["tier"], lb=acca["label"],
                 tg=acca["target_odds"], to=acca["total_odds"],
                 ns=acca["num_selections"],
@@ -7990,7 +8021,7 @@ def fb_save_run(get_db, date_str, all_picks, accumulators):
                                 "kickoff_ts": s.get("kickoff_ts", 0),
                                 "result": s.get("result", "pending")}
                                for s in acca["selections"]]),
-                cd=acca.get("code"))
+                cd=acca.get("code"), ri=run_id)
         conn.close()
     except Exception as e:
         print("[FB] save error: {}".format(e))
@@ -9709,36 +9740,47 @@ def fb_results_page():
 
     # Day-detail view
     if date_q:
-        accas = []
+        sets = []          # one entry per engine run, newest first
         try:
             conn = get_db()
             rows = conn.run(
-                "SELECT label, total_odds, selections_json, sportybet_code, result, tier, id "
+                "SELECT label, total_odds, selections_json, sportybet_code, result, "
+                "tier, run_id, created_at "
                 "FROM sportybet_accumulators WHERE match_date = :d ORDER BY id DESC",
                 d=date_q)
             conn.close()
             order = {"2_odds": 0, "3_odds": 1, "5_odds": 2, "10_odds": 3, "1000_odds": 4}
-            seen_tiers = set()
+            gmap = {}
             for r in rows:
+                # group key: run_id when present, else fall back to created_at
+                # (legacy rows saved before run_id existed)
+                key = r[6] or (str(r[7])[:16] if r[7] else "legacy")
+                if key not in gmap:
+                    grp = {"key": key, "run_id": r[6], "created_at": r[7],
+                           "accas": [], "_tiers": set()}
+                    gmap[key] = grp
+                    sets.append(grp)        # preserves newest-first order
+                grp = gmap[key]
                 tier = r[5]
-                if tier in seen_tiers:   # keep only the latest run's slip per tier
+                if tier in grp["_tiers"]:    # dedupe accidental repeats within a run
                     continue
-                seen_tiers.add(tier)
+                grp["_tiers"].add(tier)
                 try:
                     sels = json.loads(r[2]) if r[2] else []
                 except Exception:
                     sels = []
-                accas.append({"label": r[0], "total_odds": r[1] or 0,
-                              "selections": sels, "sportybet_code": r[3],
-                              "result": r[4], "tier": tier})
-            accas.sort(key=lambda a: order.get(a.get("tier"), 9))
+                grp["accas"].append({"label": r[0], "total_odds": r[1] or 0,
+                                     "selections": sels, "sportybet_code": r[3],
+                                     "result": r[4], "tier": tier})
+            for grp in sets:
+                grp["accas"].sort(key=lambda a: order.get(a.get("tier"), 9))
         except Exception as e:
             print("[FB] day results error: {}".format(e))
         try:
             human = _dt.date.fromisoformat(date_q).strftime("%A, %B %d, %Y")
         except Exception:
             human = date_q
-        return render_results_day(date_q, human, accas)
+        return render_results_day(date_q, human, sets)
 
     # Calendar view
     today = _dt.date.today()
