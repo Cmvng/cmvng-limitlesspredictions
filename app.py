@@ -4416,8 +4416,12 @@ def _sports_scan_and_alert():
                         pass
                 odds_str = " | ".join(parts)
 
-            scores_str = ", ".join("{}: {}".format(s["source"].split(".")[0], s["score"])
-                                   for s in insights["scores"][:3])
+            _seen_sc = []
+            for s in insights["scores"][:5]:
+                sc = s.get("score")
+                if sc and sc not in _seen_sc:
+                    _seen_sc.append(sc)
+            scores_str = ", ".join(_seen_sc[:3])
             msg = (
                 "⚽ <b>SPORTS PICK</b>\n"
                 "🏟 <b>{home} vs {away}</b>\n\n"
@@ -6626,6 +6630,66 @@ def _model_card(m):
     return "\n".join(lines)
 
 
+def _model_code_legs(fx, m, threshold=0.70):
+    """Read a fixture's cached SportyBet board, find the corners/cards markets,
+    compute the model's win chance for each offered line, and return the single
+    safest qualifying leg for this match (one leg per event keeps the
+    accumulator clean). Each leg carries the exact SportyBet IDs.
+    Returns a list of (prob, selection, description) — 0 or 1 item."""
+    import re as _re
+    eid = fx.get("sb_event_id")
+    if not eid:
+        return []
+    markets = _SB_MARKET_CACHE.get(eid) or []
+    if not markets:
+        return []
+    corners_lam = m.get("corners_exp")
+    cards_lam = m.get("cards_exp")
+    best = None  # (prob, selection, desc)
+    for market in markets:
+        name = (market.get("desc") or market.get("name")
+                or market.get("marketName") or "").lower().strip()
+        spec = str(market.get("specifier") or "")
+        is_corner = "corner" in name
+        is_card = (("card" in name or "booking" in name) and not is_corner)
+        if not (is_corner or is_card):
+            continue
+        lam = corners_lam if is_corner else cards_lam
+        if not lam:
+            continue
+        mm = _re.search(r"total=(\d+\.?\d*)", spec) or _re.search(r"(\d+\.5)", name)
+        if not mm:
+            continue
+        try:
+            line = float(mm.group(1))
+        except (ValueError, TypeError):
+            continue
+        p_over = _poisson_over(lam, line)
+        if p_over >= 0.5:
+            side, prob, want = "Over", p_over, "over"
+        else:
+            side, prob, want = "Under", 1.0 - p_over, "under"
+        if prob < threshold:
+            continue
+        oid = None
+        for oc in (market.get("outcomes") or market.get("outcome") or []):
+            od = (oc.get("desc") or oc.get("name") or "").strip().lower()
+            if want == "over" and ("over" in od or od.startswith("o ") or od == "o"):
+                oid = str(oc.get("id", "")); break
+            if want == "under" and ("under" in od or od.startswith("u ") or od == "u"):
+                oid = str(oc.get("id", "")); break
+        if not oid:
+            continue
+        sel = {"eventId": eid, "marketId": str(market.get("id", "")),
+               "specifier": spec or None, "outcomeId": oid}
+        desc = "{} v {} — {} {} {} ({:.0f}%)".format(
+            m.get("home", "?"), m.get("away", "?"),
+            "corners" if is_corner else "cards", side, line, prob * 100)
+        if best is None or prob > best[0]:
+            best = (prob, sel, desc)
+    return [best] if best else []
+
+
 def _model_extras_run(fixtures, announce=True):
     """Additive: for each covered club fixture, run the proven model and send a
     MODEL EXTRAS Telegram card. Fully isolated — never affects picks/codes."""
@@ -6657,6 +6721,57 @@ def _model_extras_run(fixtures, announce=True):
     _FB_CACHE["model_extras"] = extras
     print("[MODEL] extras: {} club matches enriched (season {})".format(
         len(extras), season))
+
+    # Build an additive corners/cards code from high-win-chance model legs.
+    # Separate from the main 2/3/5/10/1000 codes — never touches them.
+    try:
+        try:
+            thr = float(os.environ.get("MODEL_CODE_THRESHOLD", "0.70"))
+        except (TypeError, ValueError):
+            thr = 0.70
+        legs = []
+        for fx in fixtures:
+            mm = fx.get("_model")
+            if not mm:
+                continue
+            legs.extend(_model_code_legs(fx, mm, thr))
+        legs.sort(key=lambda x: x[0], reverse=True)
+        picked = legs[:6]  # cap to keep the combined chance sane
+        if picked:
+            sels = [s for _, s, _ in picked]
+            code = None
+            try:
+                code = sb_create_code(sels)
+            except Exception as e:
+                print("[MODEL] code create error: {}".format(e))
+            if code:
+                _FB_CACHE["model_code"] = {
+                    "code": code,
+                    "legs": [d for _, _, d in picked],
+                    "ts": _dt.datetime.now(),
+                }
+                print("[MODEL] code {} built from {} legs (thr {:.0f}%)".format(
+                    code, len(sels), thr * 100))
+                if announce:
+                    out = ["🧮 MODEL CODE — corners & cards",
+                           "(each leg win chance \u2265 {:.0f}% \u00b7 your call)".format(thr * 100),
+                           ""]
+                    for _, _, d in picked:
+                        out.append("\u2022 " + d)
+                    out += ["", "SportyBet code: {}".format(code)]
+                    try:
+                        send_telegram("\n".join(out))
+                    except Exception as e:
+                        print("[MODEL] code telegram error: {}".format(e))
+            else:
+                print("[MODEL] code: {} qualifying legs but SportyBet rejected "
+                      "the selections".format(len(picked)))
+        else:
+            print("[MODEL] code: no legs cleared the {:.0f}% win-chance "
+                  "threshold this run".format(thr * 100))
+    except Exception as e:
+        print("[MODEL] code block error: {}".format(e))
+
     return extras
 
 
@@ -10147,6 +10262,87 @@ def model_test():
         out["verdict"] = "WORKING — proven sources reached Railway and the model produced output."
     except Exception as e:
         out["verdict"] = "error: {}: {}".format(type(e).__name__, str(e)[:200])
+    return jsonify(out)
+
+
+@app.route("/app/market-search")
+def market_search():
+    """Diagnostic: search LIVE Poly + Limitless markets for keywords (corner,
+    card, booking) to verify what market types actually exist — both what the
+    bot currently fetches AND a raw unfiltered Limitless category scan.
+    Usage: /app/market-search?q=corner,card,booking"""
+    q = request.args.get("q", "corner,card,booking")
+    kws = [k.strip().lower() for k in q.split(",") if k.strip()]
+    out = {"keywords": kws}
+
+    def _scan(markets):
+        hits = []
+        for m in markets:
+            text = ((m.get("question", "") or m.get("title", "") or "") + " " +
+                    (m.get("sports_market_type", "") or "")).lower()
+            if any(k in text for k in kws):
+                hits.append({"q": (m.get("question") or m.get("title") or "")[:120],
+                             "smt": m.get("sports_market_type", ""),
+                             "url": m.get("url", "")})
+        return hits
+
+    # 1) What the bot currently fetches
+    try:
+        poly = _sports_fetch_polymarket_sports()
+        ph = _scan(poly)
+        out["polymarket_botfetch"] = {"total": len(poly), "hits": len(ph),
+                                      "samples": ph[:15]}
+    except Exception as e:
+        out["polymarket_botfetch"] = {"error": "{}: {}".format(
+            type(e).__name__, str(e)[:150])}
+    try:
+        lim = _sports_fetch_limitless_sports()
+        lh = _scan(lim)
+        out["limitless_botfetch"] = {"total": len(lim), "hits": len(lh),
+                                     "samples": lh[:15]}
+    except Exception as e:
+        out["limitless_botfetch"] = {"error": "{}: {}".format(
+            type(e).__name__, str(e)[:150])}
+
+    # 2) Raw unfiltered Limitless scan (bypass the bot's soccer keyword filter)
+    raw_hits, raw_total = [], 0
+    try:
+        r = _sports_req.get("{}/markets/categories/count".format(LIMITLESS_API),
+                            timeout=10)
+        j = r.json() if r.status_code == 200 else {}
+        cats = (j.get("category", {}) if isinstance(j, dict) else {}) or {}
+        for cat_id, count in list(cats.items())[:30]:
+            try:
+                cr = _sports_req.get("{}/markets/active/{}".format(
+                    LIMITLESS_API, cat_id), params={"page": 1, "limit": 30},
+                    timeout=10)
+                if cr.status_code != 200:
+                    continue
+                cj = cr.json()
+                items = cj.get("data", []) if isinstance(cj, dict) else []
+                for m in items:
+                    raw_total += 1
+                    title = (m.get("title", "") or "").lower()
+                    if any(k in title for k in kws):
+                        slug = m.get("slug", "") or m.get("address", "")
+                        raw_hits.append({"q": (m.get("title") or "")[:120],
+                                         "cat": cat_id,
+                                         "url": "https://limitless.exchange/markets/{}".format(slug) if slug else ""})
+                time.sleep(0.15)
+            except Exception:
+                continue
+        out["limitless_raw"] = {"scanned": raw_total, "hits": len(raw_hits),
+                                "samples": raw_hits[:20]}
+    except Exception as e:
+        out["limitless_raw"] = {"error": "{}: {}".format(
+            type(e).__name__, str(e)[:150])}
+
+    total_hits = ((out.get("polymarket_botfetch", {}).get("hits", 0) or 0) +
+                  (out.get("limitless_botfetch", {}).get("hits", 0) or 0) +
+                  (out.get("limitless_raw", {}).get("hits", 0) or 0))
+    out["verdict"] = (
+        "FOUND {} corner/card markets — they exist; can be linked/picked.".format(total_hits)
+        if total_hits else "No corner/card markets found in this scan.")
     return jsonify(out)
 
 
