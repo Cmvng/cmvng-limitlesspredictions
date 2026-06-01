@@ -235,22 +235,17 @@ def send_telegram(message):
     _m = message or ""
     is_code = ("SPORTYBET CODES" in _m or "PREMIUM BET BUILDERS" in _m
                or "shareCode=" in _m)
-    codes_only = os.environ.get("TELEGRAM_CODES_ONLY", "").strip().lower() in (
-        "1", "true", "yes", "on")
-    picks_chat = os.environ.get("TELEGRAM_PICKS_CHAT_ID", "").strip()
+    codes_channel = os.environ.get("TELEGRAM_CODES_CHANNEL_ID", "").strip()
     # Routing:
-    #  - SportyBet codes  -> main channel (TELEGRAM_CHAT_ID)
-    #  - everything else  -> picks chat if TELEGRAM_PICKS_CHAT_ID is set;
-    #    otherwise the main channel, unless TELEGRAM_CODES_ONLY hides it.
+    #  - TELEGRAM_CHAT_ID (the bot) gets EVERYTHING — codes and every other
+    #    alert — exactly like before any filtering existed.
+    #  - if TELEGRAM_CODES_CHANNEL_ID is set, SportyBet codes are ALSO sent
+    #    there, and ONLY codes — so that channel stays codes-only.
     targets = []
-    if is_code:
-        if TELEGRAM_CHAT_ID:
-            targets.append(TELEGRAM_CHAT_ID)
-    else:
-        if picks_chat:
-            targets.append(picks_chat)
-        elif TELEGRAM_CHAT_ID and not codes_only:
-            targets.append(TELEGRAM_CHAT_ID)
+    if TELEGRAM_CHAT_ID:
+        targets.append(TELEGRAM_CHAT_ID)
+    if is_code and codes_channel and codes_channel != TELEGRAM_CHAT_ID:
+        targets.append(codes_channel)
     if not targets:
         return
 
