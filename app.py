@@ -257,14 +257,54 @@ def send_telegram(message):
     def _send():
         try:
             import requests
-            for _chat in targets:
-                requests.post(
-                    "https://api.telegram.org/bot{}/sendMessage".format(TELEGRAM_TOKEN),
-                    json={"chat_id": _chat, "text": message, "parse_mode": "HTML"},
-                    timeout=10
-                )
         except Exception as e:
-            print("Telegram error: {}".format(e))
+            print("[TG] requests import error: {}".format(e))
+            return
+        # Telegram hard-caps one message at 4096 chars. A full codes set (all
+        # tiers, with a 12-leg 1000-odds slip) exceeds that, so split into
+        # <=3800-char parts on line breaks (every HTML tag is self-contained
+        # within a single line in our formatters, so this stays parse-safe).
+        def _chunks(text, limit=3800):
+            if len(text) <= limit:
+                return [text]
+            out, buf = [], ""
+            for line in text.split("\n"):
+                if len(buf) + len(line) + 1 > limit:
+                    if buf:
+                        out.append(buf)
+                    while len(line) > limit:
+                        out.append(line[:limit]); line = line[limit:]
+                    buf = line
+                else:
+                    buf = line if not buf else buf + "\n" + line
+            if buf:
+                out.append(buf)
+            return out
+        for _chat in targets:
+            for part in _chunks(message):
+                try:
+                    r = requests.post(
+                        "https://api.telegram.org/bot{}/sendMessage".format(TELEGRAM_TOKEN),
+                        json={"chat_id": _chat, "text": part, "parse_mode": "HTML"},
+                        timeout=10
+                    )
+                    ok = False
+                    try:
+                        ok = bool(r.json().get("ok"))
+                    except Exception:
+                        ok = (r.status_code == 200)
+                    if not ok:
+                        print("[TG] send to {} failed (HTTP {}): {}".format(
+                            _chat, r.status_code, (r.text or "")[:200]))
+                        # retry once without HTML in case of an entity-parse error
+                        r2 = requests.post(
+                            "https://api.telegram.org/bot{}/sendMessage".format(TELEGRAM_TOKEN),
+                            json={"chat_id": _chat, "text": part}, timeout=10)
+                        if not (r2.status_code == 200):
+                            print("[TG] plain retry to {} also failed (HTTP {}): {}".format(
+                                _chat, r2.status_code, (r2.text or "")[:200]))
+                except Exception as e:
+                    print("[TG] send error to {}: {}".format(_chat, e))
     threading.Thread(target=_send, daemon=True).start()
 
 
