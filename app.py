@@ -5544,7 +5544,46 @@ TIER_CONFIG = {
 }
 
 
-def build_accumulator(all_picks, tier_key, used_selections=None):
+def _mkt_family(mt):
+    """Group a market_type into a broad bet FAMILY so the accumulator diversity
+    cap treats e.g. 'fh_under_1', 'fh_under_1.5', 'fh_under_2' as ONE kind of
+    bet (first-half goals) instead of three different ones — which is what let
+    a slip stack five near-identical 'under' legs and look repetitive."""
+    mt = mt or ""
+    if mt.startswith("double_chance") or mt.startswith("dc1up"):
+        return "double_chance"
+    if mt.startswith("oneup"):
+        return "oneup"
+    if mt in ("home_win", "away_win") or mt.startswith("dnb"):
+        return "match_winner"
+    if mt.startswith("fh_"):
+        return "first_half_goals"
+    if mt.startswith("team_"):
+        return "team_total"
+    if mt.startswith("multigoal"):
+        return "goal_range"
+    if mt.startswith("over_") or mt.startswith("under_"):
+        return "match_goals"
+    if mt.startswith("winmargin") or mt.startswith("leadby"):
+        return "winning_margin"
+    if mt.startswith("winhalf"):
+        return "win_a_half"
+    if mt.startswith("tonil"):
+        return "win_to_nil"
+    if mt.startswith("cleansheet"):
+        return "clean_sheet"
+    if "btts" in mt:
+        return "btts"
+    if mt.startswith("corners"):
+        return "corners"
+    if mt.startswith("cards"):
+        return "cards"
+    if mt.startswith("correct_score"):
+        return "correct_score"
+    return mt
+
+
+def build_accumulator(all_picks, tier_key, used_selections=None, prior_matches=None):
     """
     Build one accumulator tier with a DIVERSE mix of market types.
     Strategy:
@@ -5563,6 +5602,7 @@ def build_accumulator(all_picks, tier_key, used_selections=None):
     allow_set = set(cfg.get("allow", []))      # if set, ONLY these market types
     exclude_set = set(cfg.get("exclude", []))  # never these market types
     used_selections = used_selections or set()  # (match, market_type) already used
+    prior_matches = prior_matches or set()       # games already placed in an earlier tier
 
     eligible = [
         p for p in all_picks
@@ -5575,26 +5615,31 @@ def build_accumulator(all_picks, tier_key, used_selections=None):
     if not eligible:
         return None
 
-    # How many distinct market types are available? Use it to set a diversity cap.
-    distinct_types = len(set(p["market_type"] for p in eligible))
-    # Allow at most ~ceil(max_sel / distinct_types)+1 of any one type, min 1.
+    # 5/10/1000 have no banker whitelist — those are the exploratory tiers.
+    # They cap diversity by bet FAMILY (so "1st Half Under 1/1.5/2" count as ONE
+    # kind of bet) and spread hard, to reach the full range of SportyBet markets.
+    # The 2/3 banker tiers keep their ORIGINAL behaviour: cap by exact market
+    # type with a +1 slack, so they stay safe and unchanged.
+    explore_tier = not allow_set
+
+    def _div_key(p):
+        return _mkt_family(p["market_type"]) if explore_tier else p["market_type"]
+
     import math as _m
-    max_per_type = max(1, _m.ceil(cfg["max_sel"] / max(1, distinct_types)) + 1)
+    distinct_types = len(set(_div_key(p) for p in eligible))
+    slack = 0 if explore_tier else 1
+    max_per_type = max(1, _m.ceil(cfg["max_sel"] / max(1, distinct_types)) + slack)
     if distinct_types >= cfg["max_sel"]:
         max_per_type = 1  # plenty of variety -> force every leg a different type
 
-    # 5/10/1000 have no banker whitelist — those are the exploratory tiers
-    # where the market-driven board picks should surface, not sit behind the
-    # fixed core list. Treat them as preferred there so the highest-confidence
-    # board outcomes get packed (the odds band routes safe ones to 5-odds and
-    # wild ones to 1000-odds on its own).
-    explore_tier = not allow_set
-
     def base_rank(p):
-        # Preferred types first, then by confidence
+        # 1) games NOT already used in an earlier tier come first, so each tier
+        #    draws on different matches; 2) then preferred market types;
+        #    3) then by confidence.
+        fresh = p["match"] not in prior_matches
         preferred = (p["market_type"] in prefer_set
                      or (explore_tier and p.get("explore")))
-        return (0 if preferred else 1, -p["confidence"])
+        return (0 if fresh else 1, 0 if preferred else 1, -p["confidence"])
 
     remaining = sorted(eligible, key=base_rank)
 
@@ -5613,14 +5658,15 @@ def build_accumulator(all_picks, tier_key, used_selections=None):
             for p in remaining:
                 if p in slip or p["match"] in used_matches:
                     continue
-                if type_count.get(p["market_type"], 0) >= per_type_cap:
+                key = _div_key(p)
+                if type_count.get(key, 0) >= per_type_cap:
                     continue
                 new_running = running * p["odds"]
                 if new_running > target * 1.18 and len(slip) >= cfg["min_sel"]:
                     continue
                 slip.append(p)
                 used_matches.add(p["match"])
-                type_count[p["market_type"]] = type_count.get(p["market_type"], 0) + 1
+                type_count[key] = type_count.get(key, 0) + 1
                 running = new_running
                 progressed = True
                 if running >= target * 0.92 and len(slip) >= cfg["min_sel"]:
@@ -5652,16 +5698,22 @@ def build_accumulator(all_picks, tier_key, used_selections=None):
 
 def build_all_accumulators(all_picks):
     """Build all 5 tiers, each distinct. Returns {tier_key: accumulator|None}.
-    Tiers are built safest-first; every selection placed in one tier is barred
-    from later tiers so no two slips share the identical leg."""
+    Tiers are built safest-first, with two levels of de-duplication:
+      - the identical leg (match, market_type) is never repeated across tiers;
+      - each tier strongly prefers MATCHES not used in an earlier tier, so the
+        slips draw on different games instead of recycling the same handful.
+        (If games run low — e.g. a thin international-break day — a match may
+        reappear in a later tier, but always with a different market.)"""
     result = {}
-    used = set()  # (match, market_type) selections already placed in a slip
+    used = set()           # (match, market_type) legs already placed
+    prior_matches = set()  # games already placed in an earlier tier
     for tier_key in ["2_odds", "3_odds", "5_odds", "10_odds", "1000_odds"]:
-        acc = build_accumulator(all_picks, tier_key, used)
+        acc = build_accumulator(all_picks, tier_key, used, prior_matches)
         result[tier_key] = acc
         if acc:
             for s in acc["selections"]:
                 used.add((s["match"], s["market_type"]))
+                prior_matches.add(s["match"])
     return result
 
 
