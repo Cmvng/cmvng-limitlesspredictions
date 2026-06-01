@@ -4784,6 +4784,15 @@ def analyze_fixture(fx):
     away_corners_against = _safe(fx, "away_corners_against_avg", 5.0)
     home_cards = _safe(fx, "home_cards_avg", 2.0)
     away_cards = _safe(fx, "away_cards_avg", 2.0)
+    # Only emit corner/card picks when the fixture actually carries that data.
+    # No current feed populates these averages, so without this guard every game
+    # defaults to a fixed "10 corners / 4 cards" guess and surfaces false
+    # 60-88% picks (same number for every match). Club corners/cards still come
+    # from the model path in board-explore, which is mdl-gated and edge-checked.
+    _has_corner_data = any(k in fx for k in (
+        "home_corners_for_avg", "home_corners_against_avg",
+        "away_corners_for_avg", "away_corners_against_avg"))
+    _has_card_data = ("home_cards_avg" in fx) or ("away_cards_avg" in fx)
     home_btts = _safe(fx, "home_btts_pct", 50.0)
     away_btts = _safe(fx, "away_btts_pct", 50.0)
     home_cs = _safe(fx, "home_clean_sheet_pct", 30.0)
@@ -5048,27 +5057,29 @@ def analyze_fixture(fx):
         "Clean sheet tendency: {} {:.0f}%, {} {:.0f}%".format(home, home_cs, away, away_cs))
 
     # ── CORNERS ──
-    exp_corners = (home_corners_for + away_corners_against) / 2.0 + \
-                  (away_corners_for + home_corners_against) / 2.0
-    over_75c = min(92, exp_corners * 8)
-    over_85c = min(85, exp_corners * 7)
-    over_95c = min(75, exp_corners * 6)
-    add("corners_over_7.5", "Over 7.5 Corners", over_75c,
-        "Expected {:.1f} corners ({} {:.1f}, {} {:.1f})".format(
-            exp_corners, home, home_corners_for, away, away_corners_for))
-    add("corners_over_8.5", "Over 8.5 Corners", over_85c,
-        "Expected {:.1f} corners".format(exp_corners))
-    add("corners_over_9.5", "Over 9.5 Corners", over_95c,
-        "Expected {:.1f} corners, both teams attack wide".format(exp_corners))
+    if _has_corner_data:
+        exp_corners = (home_corners_for + away_corners_against) / 2.0 + \
+                      (away_corners_for + home_corners_against) / 2.0
+        over_75c = min(92, exp_corners * 8)
+        over_85c = min(85, exp_corners * 7)
+        over_95c = min(75, exp_corners * 6)
+        add("corners_over_7.5", "Over 7.5 Corners", over_75c,
+            "Expected {:.1f} corners ({} {:.1f}, {} {:.1f})".format(
+                exp_corners, home, home_corners_for, away, away_corners_for))
+        add("corners_over_8.5", "Over 8.5 Corners", over_85c,
+            "Expected {:.1f} corners".format(exp_corners))
+        add("corners_over_9.5", "Over 9.5 Corners", over_95c,
+            "Expected {:.1f} corners, both teams attack wide".format(exp_corners))
 
     # ── CARDS ──
-    exp_cards = home_cards + away_cards
-    over_25cards = min(88, exp_cards * 22)
-    over_35cards = min(75, exp_cards * 17)
-    add("cards_over_2.5", "Over 2.5 Cards", over_25cards,
-        "Expected {:.1f} cards combined".format(exp_cards))
-    add("cards_over_3.5", "Over 3.5 Cards", over_35cards,
-        "Expected {:.1f} cards, physical matchup".format(exp_cards))
+    if _has_card_data:
+        exp_cards = home_cards + away_cards
+        over_25cards = min(88, exp_cards * 22)
+        over_35cards = min(75, exp_cards * 17)
+        add("cards_over_2.5", "Over 2.5 Cards", over_25cards,
+            "Expected {:.1f} cards combined".format(exp_cards))
+        add("cards_over_3.5", "Over 3.5 Cards", over_35cards,
+            "Expected {:.1f} cards, physical matchup".format(exp_cards))
 
     # ── COMBOS ──
     home_win_btts = (home_win_conf/100) * (btts_yes/100) * 100 * 1.05
