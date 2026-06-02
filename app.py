@@ -5546,7 +5546,7 @@ TIER_CONFIG = {
     },
     "1000_odds": {
         "target": 1000.0, "min_conf": 55, "min_sel": 8, "max_sel": 16,
-        "odds_lo": 1.45, "odds_hi": 15.0,
+        "odds_lo": 1.01, "odds_hi": 15.0,   # all ranges: best picks, not only longshots
         "prefer": ["correct_score", "home_win_btts", "home_win_over_2.5",
                    "handicap_home_-1.5", "handicap_away_-1.5", "over_3.5",
                    "cards_over_3.5", "away_win", "corners_over_9.5"],
@@ -5594,7 +5594,7 @@ def _mkt_family(mt):
     return mt
 
 
-def build_accumulator(all_picks, tier_key, used_selections=None, prior_matches=None):
+def build_accumulator(all_picks, tier_key, used_selections=None, match_count=None, match_families=None, rotation_seed=0, max_reuse=2, avoid_games=None):
     """
     Build one accumulator tier with a DIVERSE mix of market types.
     Strategy:
@@ -5612,8 +5612,10 @@ def build_accumulator(all_picks, tier_key, used_selections=None, prior_matches=N
     prefer_set = set(cfg["prefer"])
     allow_set = set(cfg.get("allow", []))      # if set, ONLY these market types
     exclude_set = set(cfg.get("exclude", []))  # never these market types
-    used_selections = used_selections or set()  # (match, market_type) already used
-    prior_matches = prior_matches or set()       # games already placed in an earlier tier
+    used_selections = used_selections or set()   # (match, market_type) already used
+    match_count = match_count or {}              # match -> how many tiers it's in already
+    match_families = match_families or {}        # match -> bet families already used for it
+    avoid_games = avoid_games or set()           # games used in the PREVIOUS session
 
     eligible = [
         p for p in all_picks
@@ -5622,6 +5624,12 @@ def build_accumulator(all_picks, tier_key, used_selections=None, prior_matches=N
         and (not allow_set or p["market_type"] in allow_set)
         and p["market_type"] not in exclude_set
         and (p["match"], p["market_type"]) not in used_selections
+        # A game may appear in at most `max_reuse` slips, and any repeat must be a
+        # TOTALLY different bet family — so one result can't sink the board, and a
+        # repeated game is never the same kind of bet twice. max_reuse defaults to
+        # 1 (no repeat) and is only relaxed by the caller when a tier can't build.
+        and match_count.get(p["match"], 0) < max_reuse
+        and _mkt_family(p["market_type"]) not in match_families.get(p["match"], set())
     ]
     if not eligible:
         return None
@@ -5644,13 +5652,19 @@ def build_accumulator(all_picks, tier_key, used_selections=None, prior_matches=N
         max_per_type = 1  # plenty of variety -> force every leg a different type
 
     def base_rank(p):
-        # 1) games NOT already used in an earlier tier come first, so each tier
-        #    draws on different matches; 2) then preferred market types;
-        #    3) then by confidence.
-        fresh = p["match"] not in prior_matches
+        # 1) games from the PREVIOUS session sink to the bottom (only used if the
+        #    slate is too thin to avoid them) — session 2 doesn't repeat session 1;
+        # 2) games NOT already used in an earlier tier this run come next;
+        # 3) preferred market types; 4) confidence BAND (nearest 10) so quality is
+        #    kept; 5) a per-run rotation jitter, so 6am and 2pm aren't identical.
+        avoided = p["match"] in avoid_games
+        fresh = match_count.get(p["match"], 0) == 0
         preferred = (p["market_type"] in prefer_set
                      or (explore_tier and p.get("explore")))
-        return (0 if fresh else 1, 0 if preferred else 1, -p["confidence"])
+        band = -(int(p["confidence"]) // 10)   # 90-99 together, 80-89 together...
+        jitter = hash((rotation_seed, p["match"], p["market_type"])) % 100000
+        return (1 if avoided else 0, 0 if fresh else 1,
+                0 if preferred else 1, band, jitter)
 
     remaining = sorted(eligible, key=base_rank)
 
@@ -5707,24 +5721,43 @@ def build_accumulator(all_picks, tier_key, used_selections=None, prior_matches=N
     }
 
 
-def build_all_accumulators(all_picks):
+def build_all_accumulators(all_picks, avoid_games=None):
     """Build all 5 tiers, each distinct. Returns {tier_key: accumulator|None}.
-    Tiers are built safest-first, with two levels of de-duplication:
+    Tiers are built safest-first, with de-duplication that controls correlation:
       - the identical leg (match, market_type) is never repeated across tiers;
-      - each tier strongly prefers MATCHES not used in an earlier tier, so the
-        slips draw on different games instead of recycling the same handful.
-        (If games run low — e.g. a thin international-break day — a match may
-        reappear in a later tier, but always with a different market.)"""
+      - by DEFAULT a game appears in only ONE slip (no repeat). A tier that can't
+        build under that rule relaxes to allow a game in 2 then 3 slips — but any
+        repeat must be a TOTALLY different bet family, so no one result sinks the
+        board. This keeps thin days from losing the bigger tiers (flexible
+        moonshot) while busy days stay fully spread;
+      - games used in the PREVIOUS session are pushed to the bottom, so the 12h
+        session 2 doesn't repeat session 1 (best-effort: on a very thin slate it
+        may have to reuse some, since the same few games are all that's on)."""
     result = {}
-    used = set()           # (match, market_type) legs already placed
-    prior_matches = set()  # games already placed in an earlier tier
+    used = set()            # (match, market_type) legs already placed
+    match_count = {}        # match -> how many slips it appears in
+    match_families = {}     # match -> set of bet families already used for it
+    avoid_games = avoid_games or set()   # games from the previous session
+    # Per-run rotation: changes each hour so consecutive runs (e.g. 6am vs 6pm)
+    # pick DIFFERENT expressions of the same games rather than the identical slip.
+    rotation_seed = int(time.time() // 3600)
     for tier_key in ["2_odds", "3_odds", "5_odds", "10_odds", "1000_odds"]:
-        acc = build_accumulator(all_picks, tier_key, used, prior_matches)
+        acc = None
+        # Default no-repeat (cap 1). Relax to 2 then 3 ONLY if this tier would
+        # otherwise fail to build on a thin slate.
+        for cap in (1, 2, 3):
+            acc = build_accumulator(all_picks, tier_key, used, match_count,
+                                    match_families, rotation_seed,
+                                    max_reuse=cap, avoid_games=avoid_games)
+            if acc:
+                break
         result[tier_key] = acc
         if acc:
             for s in acc["selections"]:
                 used.add((s["match"], s["market_type"]))
-                prior_matches.add(s["match"])
+                m = s["match"]
+                match_count[m] = match_count.get(m, 0) + 1
+                match_families.setdefault(m, set()).add(_mkt_family(s["market_type"]))
     return result
 
 
@@ -8771,6 +8804,31 @@ def fb_init_db(get_db):
         print("[FB] DB init error: {}".format(e))
 
 
+def _fb_recent_session_games(get_db):
+    """Return the set of games used in the most recent run, so the next session
+    can avoid repeating them. Reads the latest run_id's selections from the
+    sportybet_accumulators table. Safe-returns an empty set on any error."""
+    games = set()
+    try:
+        conn = get_db()
+        rows = conn.run(
+            "SELECT selections_json FROM sportybet_accumulators "
+            "WHERE run_id = (SELECT run_id FROM sportybet_accumulators "
+            "ORDER BY created_at DESC LIMIT 1)")
+        conn.close()
+        for r in (rows or []):
+            try:
+                for s in json.loads(r[0] or "[]"):
+                    m = s.get("match")
+                    if m:
+                        games.add(m)
+            except Exception:
+                continue
+    except Exception as e:
+        print("[FB] recent-session lookup error: {}".format(e))
+    return games
+
+
 def fb_save_run(get_db, date_str, all_picks, accumulators):
     """Persist the day's picks and accumulators."""
     try:
@@ -9464,12 +9522,32 @@ def _fb_settle_accumulators(get_db):
     if not due_slips:
         return
 
-    # Fetch a window that covers games played recently AND this weekend.
-    # Slips store their creation date, but the games inside can be several days
-    # later (e.g. Segunda fixtures created Thu but played Sat), so we scan a
-    # band around today rather than the slip's creation date.
-    dates = [(today + _dt.timedelta(days=i)).strftime("%Y%m%d")
-             for i in (-3, -2, -1, 0, 1, 2, 3)]
+    # Fetch scores for the dates the games are ACTUALLY on — derived from each
+    # due slip's selection kickoff times — plus a band around today for live /
+    # just-finished games and any legacy selection with no kickoff stored.
+    # The old code only scanned today +/- 3, so a slip whose games were played
+    # (or scheduled) 4+ days from today could never be found in the feed and sat
+    # as "NOT IN FEED" forever. kickoff_ts is epoch-MILLISECONDS.
+    date_set = set()
+    floor_date = today - _dt.timedelta(days=10)  # older than this voids anyway
+    ceil_date = today + _dt.timedelta(days=1)
+    for _aid, _md, _sj in due_slips:
+        try:
+            for _s in (json.loads(_sj) if _sj else []):
+                _ko = _s.get("kickoff_ts")
+                if not _ko:
+                    continue
+                _gd = _dt.datetime.fromtimestamp(int(_ko) / 1000, _dt.timezone.utc).date()
+                for _off in (-1, 0, 1):  # timezone + late-finish safety
+                    _d = _gd + _dt.timedelta(days=_off)
+                    if floor_date <= _d <= ceil_date:
+                        date_set.add(_d.strftime("%Y%m%d"))
+        except Exception:
+            pass
+    # Always include a band around today (live/just-finished + legacy slips).
+    for _i in (-3, -2, -1, 0, 1):
+        date_set.add((today + _dt.timedelta(days=_i)).strftime("%Y%m%d"))
+    dates = sorted(date_set)
     print("[FB] settle: {} pending slips due, fetching scores for {} dates".format(
         len(due_slips), len(dates)))
     index = _fb_build_score_index(dates)
@@ -9903,9 +9981,16 @@ def run_football_engine(get_db, tg_token, tg_chat, send_telegram,
             if mappable:
                 build_picks = mappable
 
-        # 3. Build accumulators (from bettable picks)
+        # 3. Build accumulators (from bettable picks). Avoid the previous
+        #    session's games so the 12h session 2 doesn't repeat session 1.
         try:
-            acca_dict = build_all_accumulators(build_picks)
+            avoid_prev = _fb_recent_session_games(get_db)
+            if avoid_prev:
+                print("[FB] avoiding {} games from previous session".format(len(avoid_prev)))
+        except Exception:
+            avoid_prev = set()
+        try:
+            acca_dict = build_all_accumulators(build_picks, avoid_games=avoid_prev)
         except Exception as e:
             print("[FB] accumulator build error: {}".format(e))
             acca_dict = {}
@@ -9988,7 +10073,7 @@ def run_football_engine(get_db, tg_token, tg_chat, send_telegram,
         _FB_CACHE["running"] = False
 
 
-def fb_scanner_thread(get_db, tg_token, tg_chat, send_telegram, interval_hours=6):
+def fb_scanner_thread(get_db, tg_token, tg_chat, send_telegram, interval_hours=12):
     """Background thread: run the engine on a schedule."""
     def loop():
         time.sleep(30)  # let app boot first
@@ -10829,9 +10914,9 @@ try:
 except Exception as e:
     print("[TG] Webhook setup error: {}".format(e))
 
-# Football scanner thread (scrape -> analyze -> build -> codes -> telegram, every 6h)
+# Football scanner thread (scrape -> analyze -> build -> codes -> telegram, every 12h)
 try:
-    fb_scanner_thread(get_db, TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, send_telegram, interval_hours=6)
+    fb_scanner_thread(get_db, TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, send_telegram, interval_hours=12)
 except Exception as e:
     print("[FB] scanner thread error: {}".format(e))
 
