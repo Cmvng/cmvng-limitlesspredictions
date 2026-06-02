@@ -16,3 +16,15 @@ curl_cffi>=0.7.0
 
 # Cloudflare JS-challenge solver (pure Python, no browser) for FBref/Sofascore.
 cloudscraper>=1.2.71
+
+# Polymarket CLOB client — the V2 crypto engine needs this to READ Polymarket
+# prices and PLACE Polymarket trades. WITHOUT it the app still boots and
+# Limitless still works, but the Polymarket price read returns nothing, so the
+# engine skips every Polymarket setup ("no book data, skip") and never enters
+# or notifies — which is exactly why only Limitless has been firing.
+# Pinned to a known-good version that matches the import paths the code uses
+# (py_clob_client.client.ClobClient, py_clob_client.clob_types.ApiCreds).
+# NOTE: this pulls a heavy crypto dependency tree (eth-account, eth-abi, the
+# web3 signing stack, pydantic 2.x), so the Railway build will be noticeably
+# slower. If missing, Polymarket degrades gracefully — it does NOT block boot.
+py-clob-client==0.34.6
