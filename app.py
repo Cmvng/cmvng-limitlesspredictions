@@ -5500,7 +5500,7 @@ def _sb_board_explore(fx, home, away, exp_home, exp_away, exp_total):
 # Tier configuration: per-selection odds band + packing rules
 TIER_CONFIG = {
     "2_odds": {
-        "target": 2.0, "min_conf": 78, "min_sel": 4, "max_sel": 8,
+        "target": 2.0, "min_conf": 90, "min_sel": 4, "max_sel": 8,
         "odds_lo": 1.04, "odds_hi": 1.32,
         # BANKER: only the lowest-variance markets. No BTTS, no corners, no
         # outright win — those are coin-flips on a 2-odds slip.
@@ -5513,7 +5513,7 @@ TIER_CONFIG = {
         "label": "2 ODDS — BANKER", "emoji": "🟢",
     },
     "3_odds": {
-        "target": 3.0, "min_conf": 70, "min_sel": 4, "max_sel": 7,
+        "target": 3.0, "min_conf": 83, "min_sel": 4, "max_sel": 7,
         "odds_lo": 1.12, "odds_hi": 1.48,
         # SAFE: double chance + goals lines + outright wins ONLY when the match
         # projects clear (tight games shade wins below the 70 floor). Still no
@@ -5528,7 +5528,7 @@ TIER_CONFIG = {
         "label": "3 ODDS — SAFE", "emoji": "🟢",
     },
     "5_odds": {
-        "target": 5.0, "min_conf": 58, "min_sel": 3, "max_sel": 6,
+        "target": 5.0, "min_conf": 73, "min_sel": 3, "max_sel": 6,
         "odds_lo": 1.22, "odds_hi": 1.80,
         # VALUE: this is where BTTS / corners are allowed to enter.
         "exclude": ["correct_score"],
@@ -5537,7 +5537,7 @@ TIER_CONFIG = {
         "label": "5 ODDS — VALUE", "emoji": "🟡",
     },
     "10_odds": {
-        "target": 10.0, "min_conf": 48, "min_sel": 4, "max_sel": 6,
+        "target": 10.0, "min_conf": 63, "min_sel": 4, "max_sel": 6,
         "odds_lo": 1.38, "odds_hi": 2.40,
         "prefer": ["home_win", "away_win", "home_win_btts", "corners_over_8.5",
                    "handicap_home_-1.5", "cards_over_3.5", "over_2.5",
@@ -5545,7 +5545,7 @@ TIER_CONFIG = {
         "label": "10 ODDS — RISK", "emoji": "🟠",
     },
     "1000_odds": {
-        "target": 1000.0, "min_conf": 15, "min_sel": 8, "max_sel": 16,
+        "target": 1000.0, "min_conf": 55, "min_sel": 8, "max_sel": 16,
         "odds_lo": 1.45, "odds_hi": 15.0,
         "prefer": ["correct_score", "home_win_btts", "home_win_over_2.5",
                    "handicap_home_-1.5", "handicap_away_-1.5", "over_3.5",
