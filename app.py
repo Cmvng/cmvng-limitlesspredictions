@@ -9846,7 +9846,7 @@ def _fb_apply_methodology(fixtures):
               len(fixtures)))
 
 
-def _fb_enrich_and_filter_upcoming(fixtures, max_lookup=60):
+def _fb_enrich_and_filter_upcoming(fixtures, max_lookup=150):
     """
     Look each fixture up on SportyBet and keep ONLY upcoming, not-started
     games that still have markets. SportyBet removes a game the moment it
@@ -10311,7 +10311,7 @@ def _fb_estimate_goals_from_preds(preds):
     return (round(avg_h, 2), round(avg_a, 2))
 
 
-def _fb_fixtures_from_predictions(max_fixtures=40):
+def _fb_fixtures_from_predictions(max_fixtures=200):
     """
     Build engine fixtures from the prediction scrapers that are PROVEN to
     work on Railway (footballpredictions.com + forebet + fp.net).
