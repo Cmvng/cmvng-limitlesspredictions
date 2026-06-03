@@ -5545,8 +5545,9 @@ TIER_CONFIG = {
         "label": "10 ODDS — RISK", "emoji": "🟠",
     },
     "1000_odds": {
-        "target": 1000.0, "min_conf": 55, "min_sel": 8, "max_sel": 16,
-        "odds_lo": 1.01, "odds_hi": 15.0,   # all ranges: best picks, not only longshots
+        "target": 1000.0, "min_conf": 58, "min_sel": 4, "max_sel": 16,
+        "odds_lo": 1.40, "odds_hi": 15.0,   # real legs only — no 1.01 padding
+        "rank": "odds",                      # build toward big odds, best longshots first
         "prefer": ["correct_score", "home_win_btts", "home_win_over_2.5",
                    "handicap_home_-1.5", "handicap_away_-1.5", "over_3.5",
                    "cards_over_3.5", "away_win", "corners_over_9.5"],
@@ -5651,17 +5652,25 @@ def build_accumulator(all_picks, tier_key, used_selections=None, match_count=Non
     if distinct_types >= cfg["max_sel"]:
         max_per_type = 1  # plenty of variety -> force every leg a different type
 
+    rank_mode = cfg.get("rank", "conf")   # "odds" = moonshot builds toward big odds
+
     def base_rank(p):
         # 1) games from the PREVIOUS session sink to the bottom (only used if the
         #    slate is too thin to avoid them) — session 2 doesn't repeat session 1;
         # 2) games NOT already used in an earlier tier this run come next;
-        # 3) preferred market types; 4) confidence BAND (nearest 10) so quality is
-        #    kept; 5) a per-run rotation jitter, so 6am and 2pm aren't identical.
+        # 3) preferred market types; 4) the MAIN sort:
+        #      - normal tiers: confidence BAND (nearest 10), best picks first;
+        #      - moonshot: ODDS band (highest first), so it actually climbs toward
+        #        the big number using the best available longshots, not 1.01 padding;
+        # 5) a per-run rotation jitter, so 6am and 6pm aren't identical.
         avoided = p["match"] in avoid_games
         fresh = match_count.get(p["match"], 0) == 0
         preferred = (p["market_type"] in prefer_set
                      or (explore_tier and p.get("explore")))
-        band = -(int(p["confidence"]) // 10)   # 90-99 together, 80-89 together...
+        if rank_mode == "odds":
+            band = -int(round(p["odds"] * 2))         # longer odds first (best longshots)
+        else:
+            band = -(int(p["confidence"]) // 10)      # 90-99 together, 80-89 together...
         jitter = hash((rotation_seed, p["match"], p["market_type"])) % 100000
         return (1 if avoided else 0, 0 if fresh else 1,
                 0 if preferred else 1, band, jitter)
@@ -10275,6 +10284,33 @@ _FB_LEAGUE_NAMES = {
 }
 
 
+def _fb_estimate_goals_from_preds(preds):
+    """When a row has no correct-score, estimate expected goals per side from the
+    1X2 win probabilities + average-goals that Forebet publishes for EVERY match.
+    Returns (avg_home, avg_away) or None if there's nothing usable. This is what
+    stops other-league games (which often have probs but no score string) from
+    being silently dropped."""
+    def _nums(key):
+        return [p.get(key) for p in preds
+                if isinstance(p.get(key), (int, float)) and p.get(key) is not None]
+    ph, pa, pd = _nums("prob_home"), _nums("prob_away"), _nums("prob_draw")
+    totals = [t for t in _nums("avg_goals") if t]
+    if not ph or not pa:
+        return None  # no win probabilities -> genuinely no data to work with
+    prob_home = sum(ph) / len(ph)
+    prob_away = sum(pa) / len(pa)
+    prob_draw = (sum(pd) / len(pd)) if pd else max(0.0, 100 - prob_home - prob_away)
+    if totals:
+        total = sum(totals) / len(totals)
+    else:
+        # Higher draw probability -> tighter, lower-scoring game.
+        total = max(1.8, 3.4 - (prob_draw / 100.0) * 2.0)
+    margin = (prob_home - prob_away) / 100.0 * 1.8   # win-prob gap -> goal margin
+    avg_h = max(0.3, (total + margin) / 2.0)
+    avg_a = max(0.3, (total - margin) / 2.0)
+    return (round(avg_h, 2), round(avg_a, 2))
+
+
 def _fb_fixtures_from_predictions(max_fixtures=40):
     """
     Build engine fixtures from the prediction scrapers that are PROVEN to
@@ -10292,7 +10328,9 @@ def _fb_fixtures_from_predictions(max_fixtures=40):
         (_sports_scrape_footballpredictions_net, "fp.net"),
     ]:
         try:
-            all_predictions.extend(scraper() or [])
+            got = scraper() or []
+            all_predictions.extend(got)
+            print("[FB] scraped {} predictions from {}".format(len(got), name))
         except Exception as e:
             print("[FB] {} scrape error: {}".format(name, e))
 
@@ -10352,16 +10390,49 @@ def _fb_fixtures_from_predictions(max_fixtures=40):
         if not placed:
             merged.append(md)
 
+    # ── Funnel diagnostics: show EXACTLY where games are lost ──
+    # A match is kept if it has a score OR (now) usable win-probabilities. Only
+    # rows with neither are dropped. This makes the pipeline fully visible.
+    with_score, recoverable, truly_dropped = [], [], []
+    for md in merged:
+        if any(_fb_parse_score(p.get("score")) for p in md["preds"]):
+            with_score.append(md)
+        elif _fb_estimate_goals_from_preds(md["preds"]):
+            recoverable.append(md)
+        else:
+            truly_dropped.append(md)
+    src_seen = {}
+    for p in all_predictions:
+        s = p.get("source", "?")
+        src_seen[s] = src_seen.get(s, 0) + 1
+    print("[FB] FUNNEL: {} raw preds -> {} unique matches -> {} with score, "
+          "{} recovered from probs, {} dropped (no data)".format(
+              len(all_predictions), len(merged), len(with_score),
+              len(recoverable), len(truly_dropped)))
+    print("[FB] by source: {}".format(src_seen))
+    if truly_dropped:
+        sample = ", ".join("{} vs {}".format(m["home"], m["away"]) for m in truly_dropped[:15])
+        print("[FB] dropped (no data) sample: {}".format(sample))
+
     # Optional: real xG overlay from Understat (best-effort, never fatal)
     xg_cache = {}
 
     fixtures = []
+    recovered = 0
     for md in merged:
         scores = [s for s in (_fb_parse_score(p.get("score")) for p in md["preds"]) if s]
-        if not scores:
-            continue  # need at least one score prediction to analyze
-        avg_h = sum(s[0] for s in scores) / len(scores)
-        avg_a = sum(s[1] for s in scores) / len(scores)
+        if scores:
+            avg_h = sum(s[0] for s in scores) / len(scores)
+            avg_a = sum(s[1] for s in scores) / len(scores)
+        else:
+            # No predicted score on this row — derive expected goals from the
+            # win-probabilities + average-goals Forebet publishes for every match,
+            # so other-league games aren't silently dropped.
+            est = _fb_estimate_goals_from_preds(md["preds"])
+            if not est:
+                continue  # genuinely no usable data (no score AND no probabilities)
+            avg_h, avg_a = est
+            recovered += 1
 
         # League from prediction type tags
         league = ""
@@ -10462,8 +10533,9 @@ def _fb_fixtures_from_predictions(max_fixtures=40):
 
     # Prefer matches confirmed by more sources
     fixtures.sort(key=lambda f: f.get("_n_sources", 0), reverse=True)
-    print("[FB] Built {} fixtures from predictions ({} with multi-source)".format(
-        len(fixtures), sum(1 for f in fixtures if f.get("_n_sources", 0) >= 2)))
+    print("[FB] Built {} fixtures from predictions ({} with multi-source, "
+          "{} recovered from probs without a score)".format(
+        len(fixtures), sum(1 for f in fixtures if f.get("_n_sources", 0) >= 2), recovered))
     return fixtures[:max_fixtures]
 
 
@@ -10857,6 +10929,75 @@ def fb_manual_run():
         args=(get_db, TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, send_telegram),
         daemon=True).start()
     return jsonify({"ok": True, "msg": "Football engine started — check logs and /app/codes in a minute"})
+
+
+@app.route("/app/debug-scrape")
+def fb_debug_scrape():
+    """One-click diagnostic: runs the football scrapers right now and shows, per
+    match, whether it has a score, was recovered from probabilities, or dropped —
+    so you can SEE what the engine receives in your browser, no logs needed.
+    (Runs the scrapers synchronously, so it can take ~15-30s.)"""
+    try:
+        all_predictions, src_counts = [], {}
+        for scraper, name in [
+            (_sports_scrape_footballpredictions_com, "fp.com"),
+            (_sports_scrape_forebet, "forebet"),
+            (_sports_scrape_footballpredictions_net, "fp.net"),
+        ]:
+            try:
+                got = scraper() or []
+            except Exception:
+                got = []
+            all_predictions.extend(got)
+            src_counts[name] = len(got)
+        matches = {}
+        for p in all_predictions:
+            h = _sports_normalize_team(p.get("home", ""))
+            a = _sports_normalize_team(p.get("away", ""))
+            if not h or not a:
+                continue
+            key, rev = (h, a), (a, h)
+            if key in matches:
+                matches[key]["preds"].append(p)
+            elif rev in matches:
+                matches[rev]["preds"].append(p)
+            else:
+                matches[key] = {"home": p.get("home"), "away": p.get("away"), "preds": [p]}
+        rows = []
+        kept = recov = dropped = 0
+        for md in matches.values():
+            score = next((p.get("score") for p in md["preds"]
+                          if _fb_parse_score(p.get("score"))), None)
+            if score:
+                status, cls = "score", "ok"; kept += 1
+            elif _fb_estimate_goals_from_preds(md["preds"]):
+                status, cls = "recovered", "warn"; recov += 1
+            else:
+                status, cls = "DROPPED", "bad"; dropped += 1
+            srcs = ",".join(sorted(set(p.get("source", "?") for p in md["preds"])))
+            rows.append((md["home"], md["away"], score or "—", status, cls, srcs))
+        order = {"bad": 0, "warn": 1, "ok": 2}
+        rows.sort(key=lambda r: order.get(r[4], 3))
+        summary = ("raw={} &nbsp; sources={} &nbsp; unique={} &nbsp;|&nbsp; "
+                   "with&nbsp;score={} &nbsp; recovered={} &nbsp; dropped={}").format(
+                       len(all_predictions), src_counts, len(matches), kept, recov, dropped)
+        html = ["<html><head><meta name=viewport content='width=device-width,initial-scale=1'>",
+                "<style>body{font-family:system-ui;margin:12px;background:#0f1115;color:#e6e6e6}",
+                "table{border-collapse:collapse;width:100%;font-size:13px}",
+                "td,th{border:1px solid #333;padding:4px 6px;text-align:left}",
+                ".ok{color:#7CFC8A}.warn{color:#FFD479}.bad{color:#FF6B6B;font-weight:700}",
+                "h3{margin:8px 0}</style></head><body>",
+                "<h3>Scrape funnel — {}</h3>".format(_fb_today_human()),
+                "<div>{}</div><br>".format(summary),
+                "<table><tr><th>Home</th><th>Away</th><th>Score</th>"
+                "<th>Status</th><th>Sources</th></tr>"]
+        for h, a, sc, st, cls, srcs in rows:
+            html.append("<tr><td>{}</td><td>{}</td><td>{}</td>"
+                        "<td class={}>{}</td><td>{}</td></tr>".format(h, a, sc, cls, st, srcs))
+        html.append("</table></body></html>")
+        return "".join(html)
+    except Exception as e:
+        return "<pre>debug-scrape error: {}</pre>".format(e)
 
 
 # ═══════════════════════════════════════════════════════════
