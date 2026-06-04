@@ -5573,8 +5573,8 @@ TIER_CONFIG = {
         "label": "10 ODDS — RISK", "emoji": "🟠",
     },
     "1000_odds": {
-        "target": 1000.0, "min_conf": 58, "min_sel": 4, "max_sel": 16,
-        "odds_lo": 1.40, "odds_hi": 15.0,   # real legs only — no 1.01 padding
+        "target": 1000.0, "min_conf": 58, "min_sel": 4, "max_sel": 20,
+        "odds_lo": 1.28, "odds_hi": 15.0,   # real legs only — no 1.01 padding
         "rank": "odds",                      # build toward big odds, best longshots first
         "prefer": ["correct_score", "home_win_btts", "home_win_over_2.5",
                    "handicap_home_-1.5", "handicap_away_-1.5", "over_3.5",
@@ -5724,7 +5724,7 @@ def build_accumulator(all_picks, tier_key, used_selections=None, match_count=Non
                 if type_count.get(key, 0) >= per_type_cap:
                     continue
                 new_running = running * p["odds"]
-                if new_running > target * 1.18 and len(slip) >= cfg["min_sel"]:
+                if rank_mode != "odds" and new_running > target * 1.18 and len(slip) >= cfg["min_sel"]:
                     continue
                 slip.append(p)
                 used_matches.add(p["match"])
@@ -5779,18 +5779,33 @@ def build_all_accumulators(all_picks, avoid_games=None):
     # pick DIFFERENT expressions of the same games rather than the identical slip.
     rotation_seed = int(time.time() // 3600)
     for tier_key in ["2_odds", "3_odds", "5_odds", "10_odds", "1000_odds"]:
-        acc = None
-        # Default no-repeat (cap 1). Relax to 2 then 3 ONLY if this tier would
-        # otherwise fail to build on a thin slate.
+        tgt = TIER_CONFIG[tier_key]["target"]
+        if tier_key in ("10_odds", "1000_odds"):
+            # The two highest tiers need the scarce high-odds legs, and on a thin
+            # slate the lower tiers eat them first under no-repeat — which is what
+            # stranded the moonshot on 4 legs. Each of these is a STANDALONE slip
+            # the user plays on its own, so build each from the FULL board (highest
+            # available legs, one per match) rather than the leftovers. They may
+            # share a game with another slip — that's fine across separate slips.
+            result[tier_key] = build_accumulator(
+                all_picks, tier_key, set(), {}, {}, rotation_seed,
+                max_reuse=1, avoid_games=avoid_games)
+            continue
+        # 2/3/5: kept distinct from each other (no-repeat). Relax the cap 1->2->3
+        # so a tier can still REACH ITS TARGET on a thin slate by reusing a game
+        # with a DIFFERENT bet family. Keep the best build across caps.
+        best = None
         for cap in (1, 2, 3):
             acc = build_accumulator(all_picks, tier_key, used, match_count,
                                     match_families, rotation_seed,
                                     max_reuse=cap, avoid_games=avoid_games)
-            if acc:
+            if acc and (best is None or acc["total_odds"] > best["total_odds"]):
+                best = acc
+            if best and best["total_odds"] >= tgt * 0.92:
                 break
-        result[tier_key] = acc
-        if acc:
-            for s in acc["selections"]:
+        result[tier_key] = best
+        if best:
+            for s in best["selections"]:
                 used.add((s["match"], s["market_type"]))
                 m = s["match"]
                 match_count[m] = match_count.get(m, 0) + 1
