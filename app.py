@@ -4760,7 +4760,24 @@ def _lmts_extract_tokens(market):
     if isinstance(clob, list) and len(clob) >= 2:
         return str(clob[0]), str(clob[1])
 
-    # 2) tokens: [{"token_id": "...", "outcome": "YES"}, ...] — Limitless-style
+    # 2) Limitless real schema (confirmed against api.limitless.exchange in
+    #    Jun 2026): tokens is an OBJECT with "yes" / "no" keys, each mapped to
+    #    a numeric ERC-1155 token-id string.
+    #        "tokens": {"yes": "51293...", "no": "88391..."}
+    #    YES = UP, NO = DOWN — matches the prices array convention
+    #    (prices[0] = YES price, prices[1] = NO price).
+    toks = market.get("tokens")
+    if isinstance(toks, dict):
+        up = str(toks.get("yes") or toks.get("YES")
+                 or toks.get("up")  or toks.get("UP") or "")
+        dn = str(toks.get("no")  or toks.get("NO")
+                 or toks.get("down") or toks.get("DOWN") or "")
+        if up or dn:
+            return up, dn
+
+    # 3) Legacy / Polymarket-style: tokens is a LIST of dicts with token_id +
+    #    outcome labels. Kept as a defensive fallback in case Limitless ever
+    #    returns this shape on a different market type.
     toks = market.get("tokens")
     if isinstance(toks, list) and len(toks) >= 2:
         up = dn = ""
