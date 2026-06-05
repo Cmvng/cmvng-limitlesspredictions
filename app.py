@@ -4862,15 +4862,38 @@ def _lmts_place_live(paper_trade_id, market_data, asset, tf_label, direction,
     # NOT include conditionId OR the per-outcome token IDs. The SDK's
     # client.buy() needs token_id; the redeemer needs condition_id. So we
     # lazily fetch the full market once at order time and extract both.
-    # ~1 extra HTTP call per live trade — negligible at <20/day. Best-effort
-    # only; if it fails the trade still attempts to place with whatever
-    # market_data already had.
+    # ~1 extra HTTP call per live trade — negligible at <20/day. We CAPTURE
+    # the raw response (status + body keys + first 2000 chars) so when the
+    # extractor returns ("","") we can see in the dashboard exactly what
+    # Limitless sent back and patch _lmts_extract_tokens against the real
+    # schema.
+    _fetch_debug = None
     if (not condition_id or not token_id) and market_slug:
         try:
             import requests as _req
-            _r = _req.get("{}/markets/{}".format(LIMITLESS_API, market_slug), timeout=6)
-            if _r.status_code == 200:
-                _m = _r.json() or {}
+            _hdrs = {}
+            _api_key = os.environ.get("LIMITLESS_API_KEY", "").strip()
+            if _api_key:
+                # Limitless v2 uses X-API-Key for the docs-shown endpoint; pass
+                # it through if the operator set one. Without it most public
+                # endpoints still work but positionIds may be omitted.
+                _hdrs["X-API-Key"] = _api_key
+            _r = _req.get("{}/markets/{}".format(LIMITLESS_API, market_slug),
+                          headers=_hdrs, timeout=6)
+            _status = _r.status_code
+            try:
+                _m = _r.json() if _status == 200 else {}
+            except Exception:
+                _m = {}
+            _body_text = (_r.text or "")[:2000]
+            _fetch_debug = {
+                "status": _status,
+                "url": "{}/markets/{}".format(LIMITLESS_API, market_slug),
+                "auth_header_sent": bool(_api_key),
+                "top_level_keys": sorted(list(_m.keys())) if isinstance(_m, dict) else None,
+                "body_first_2000": _body_text,
+            }
+            if _status == 200 and isinstance(_m, dict):
                 if not condition_id:
                     condition_id = (_m.get("conditionId")
                                     or _m.get("condition_id") or "")
@@ -4878,15 +4901,24 @@ def _lmts_place_live(paper_trade_id, market_data, asset, tf_label, direction,
                     up_tok, dn_tok = _lmts_extract_tokens(_m)
                     token_id = up_tok if direction == "UP" else dn_tok
         except Exception as _e:
+            _fetch_debug = {"status": None, "exception": str(_e)[:300],
+                            "url": "{}/markets/{}".format(LIMITLESS_API, market_slug)}
             print("[LMTS-LIVE] market fetch failed for {}: {}".format(
                 market_slug[:40], str(_e)[:80]))
 
     # Clamp stake to per-trade cap; reject if essential data missing.
     if not market_slug or not token_id:
+        # Promote the debug info to raw_response so it shows in the dashboard
+        # — without it, "missing slug or token_id" is unactionable.
+        _err = "missing slug or token_id"
+        if _fetch_debug:
+            _err = "missing slug or token_id (HTTP {} keys={})".format(
+                _fetch_debug.get("status"), _fetch_debug.get("top_level_keys"))
         _lmts_record_live_trade(paper_trade_id, asset, tf_label, direction,
                                 market_slug, token_id, limit_price_cents,
                                 stake_usdc, 0.0, "ERROR",
-                                error_message="missing slug or token_id",
+                                error_message=_err,
+                                raw_response=_fetch_debug,
                                 condition_id=condition_id)
         return "ERROR"
 
@@ -7218,6 +7250,60 @@ def live_limitless():
     except Exception:
         trades = []
     return _v2_live_dashboard_html(trades)
+
+
+@app.route("/app/debug-lmts-market")
+def debug_lmts_market():
+    """Hit GET /markets/{slug} on Limitless and dump the raw response. Used
+    once-off to confirm the schema for _lmts_extract_tokens after a live ERROR.
+    Pass ?slug=foo-bar (defaults to the most recent live-attempted slug).
+    Sends X-API-Key if LIMITLESS_API_KEY env var is set. Returns plain JSON."""
+    import requests as _req
+    slug = (request.args.get("slug") or "").strip()
+    if not slug:
+        # Fall back to the most recently attempted slug from v2_live_trades.
+        try:
+            conn = get_db()
+            row = list(conn.run(
+                "SELECT market_slug FROM v2_live_trades "
+                "WHERE market_slug IS NOT NULL AND market_slug <> '' "
+                "ORDER BY id DESC LIMIT 1"))
+            conn.close()
+            if row:
+                slug = row[0][0]
+        except Exception:
+            pass
+    if not slug:
+        return jsonify({"error": "no slug provided and no v2_live_trades row to fall back to"}), 400
+    hdrs = {}
+    api_key = os.environ.get("LIMITLESS_API_KEY", "").strip()
+    if api_key:
+        hdrs["X-API-Key"] = api_key
+    out = {"slug": slug,
+           "url": "{}/markets/{}".format(LIMITLESS_API, slug),
+           "auth_header_sent": bool(api_key)}
+    try:
+        r = _req.get(out["url"], headers=hdrs, timeout=8)
+        out["status"] = r.status_code
+        try:
+            out["body"] = r.json()
+        except Exception:
+            out["body_text"] = (r.text or "")[:4000]
+        if isinstance(out.get("body"), dict):
+            out["top_level_keys"] = sorted(list(out["body"].keys()))
+            # Surface the keys the extractor checks for, so the schema gap is
+            # obvious at a glance.
+            b = out["body"]
+            out["extractor_probe"] = {
+                "clobTokenIds": b.get("clobTokenIds"),
+                "tokens_len": len(b.get("tokens") or []) if isinstance(b.get("tokens"), list) else None,
+                "positionIds": b.get("positionIds"),
+                "venue": b.get("venue"),
+                "conditionId": b.get("conditionId") or b.get("condition_id"),
+            }
+    except Exception as e:
+        out["exception"] = str(e)[:400]
+    return jsonify(out)
 
 
 def _v2_live_dashboard_html(trades):
