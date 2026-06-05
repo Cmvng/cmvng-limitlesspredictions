@@ -20,7 +20,12 @@ cloudscraper>=1.2.71
 # or notifies — which is exactly why only Limitless has been firing.
 # Pinned to a known-good version that matches the import paths the code uses
 # (py_clob_client.client.ClobClient, py_clob_client.clob_types.ApiCreds).
-# NOTE: this pulls a heavy crypto dependency tree (eth-account, eth-abi, the
-# web3 signing stack, pydantic 2.x), so the Railway build will be noticeably
-# slower. If missing, Polymarket degrades gracefully — it does NOT block boot.
+# NOTE: this pulls eth-account>=0.13, web3, eth-abi, eth-utils — exactly the
+# packages the inlined Limitless SDK code needs at runtime. No separate
+# py-limitless install required.
 py-clob-client==0.34.6
+# Limitless SDK is INLINED inside app.py (search for "LIMITLESS EXCHANGE SDK"
+# in the file). py-limitless==0.1.1 used to be here, but its hard pin of
+# eth-account==0.10.0 conflicted with py-clob-client's eth-account>=0.13.0.
+# The SDK code itself works fine on the newer eth-account — only the pip
+# metadata pin was wrong — so we inlined the SDK source.
