@@ -6,7 +6,7 @@
 # MECHANICAL — pure coded rules. Zero API cost. Instant execution.
 # ═══════════════════════════════════════════════════════════════════════════════
 
-from flask import Flask, request, jsonify, render_template_string, redirect
+from flask import Flask, request, jsonify, render_template_string
 import pg8000.native
 import os
 import re
@@ -33,24 +33,6 @@ POLY_API_PASSPHRASE = os.environ.get("POLY_API_PASSPHRASE", "")
 POLY_FUNDER_ADDRESS = os.environ.get("POLY_FUNDER_ADDRESS", "")
 POLY_PROXY_URL     = os.environ.get("POLY_PROXY_URL", "")
 LIMITLESS_PRIV_KEY = os.environ.get("LIMITLESS_PRIVATE_KEY", "")
-
-# ── Limitless LIVE trading (DB-backed toggle; env values below are only
-# defaults for first boot / cap overrides). The live ON/OFF switch lives in
-# the v2_settings table and is flipped from the paper bot page. Per-trade
-# and daily caps gate exposure while the strategy proves out.
-#
-# Prerequisites for live to actually execute (all checked at trade time):
-#   * py-limitless installed
-#   * LIMITLESS_PRIVATE_KEY env present
-#   * Wallet has USDC on Base
-#   * Limitless exchange contract approved as USDC spender (one click in app)
-LIMITLESS_LIVE_BOOTSTRAP = os.environ.get("LIMITLESS_LIVE", "0").strip().lower() in ("1", "true", "yes", "on")
-LIMITLESS_MAX_TRADE_USDC = float(os.environ.get("LIMITLESS_MAX_TRADE_USDC", "1.0"))
-# Balance floor: when wallet USDC drops below this, the bot pauses live trading
-# until winning trades top it back up. Replaces the old daily-cap model — the
-# floor is the natural circuit breaker since balance reflects actual capital.
-LIMITLESS_MIN_BALANCE_USDC = float(os.environ.get("LIMITLESS_MIN_BALANCE_USDC", "2.0"))
-LIMITLESS_BASE_RPC = os.environ.get("LIMITLESS_BASE_RPC", "https://mainnet.base.org")
 
 # ═══════════════════════════════════════════════════════════
 # PROXY PATCH — must happen before ClobClient import
@@ -199,65 +181,6 @@ def init_db():
         conn.run("ALTER TABLE v2_paper_trades ADD COLUMN IF NOT EXISTS order_status TEXT DEFAULT 'FILLED'")
     except:
         pass
-    # ── v2 LIVE trades — real Limitless fills (FOK only). Mirrors paper schema
-    # for easy side-by-side comparison; paper_trade_id links each live trade to
-    # the paper twin so we can measure the adverse-fill gap once real data lands.
-    conn.run("""
-        CREATE TABLE IF NOT EXISTS v2_live_trades (
-            id                  SERIAL PRIMARY KEY,
-            paper_trade_id      INTEGER,
-            platform            TEXT NOT NULL DEFAULT 'limitless',
-            timeframe           TEXT, asset TEXT, direction TEXT,
-            market_slug         TEXT, token_id TEXT, condition_id TEXT,
-            limit_price_cents   REAL,
-            stake_usdc          REAL,
-            size_shares         REAL,
-            fill_status         TEXT,        -- 'FILLED' | 'CANCELLED' | 'ERROR' | 'CAPPED'
-            order_id            TEXT,
-            fill_price_cents    REAL,
-            filled_size         REAL,
-            raw_response        TEXT,
-            error_message       TEXT,
-            fired_at            TIMESTAMPTZ DEFAULT NOW(),
-            -- Resolution lifecycle (filled in by _v2_resolve_live_trades) --
-            actual_result       TEXT,        -- 'UP' | 'DOWN' | 'FLAT'
-            outcome             TEXT,        -- 'WIN' | 'LOSS' | 'PUSH' | NULL (unresolved)
-            pnl                 REAL,
-            resolved_at         TIMESTAMPTZ,
-            -- On-chain redemption (auto-claim for WIN rows) --
-            redeem_status       TEXT,        -- 'PENDING' | 'DONE' | 'FAILED' | 'SKIPPED'
-            redeem_tx_hash      TEXT,
-            redeem_attempts     INTEGER DEFAULT 0,
-            redeem_last_attempt TIMESTAMPTZ
-        )
-    """)
-    # ── Migrations for existing v2_live_trades rows (older deploys won't
-    # have the resolution/redemption columns). Each ALTER is idempotent via
-    # IF NOT EXISTS so re-runs are safe.
-    for _alter in (
-        "ALTER TABLE v2_live_trades ADD COLUMN IF NOT EXISTS condition_id TEXT",
-        "ALTER TABLE v2_live_trades ADD COLUMN IF NOT EXISTS actual_result TEXT",
-        "ALTER TABLE v2_live_trades ADD COLUMN IF NOT EXISTS outcome TEXT",
-        "ALTER TABLE v2_live_trades ADD COLUMN IF NOT EXISTS pnl REAL",
-        "ALTER TABLE v2_live_trades ADD COLUMN IF NOT EXISTS resolved_at TIMESTAMPTZ",
-        "ALTER TABLE v2_live_trades ADD COLUMN IF NOT EXISTS redeem_status TEXT",
-        "ALTER TABLE v2_live_trades ADD COLUMN IF NOT EXISTS redeem_tx_hash TEXT",
-        "ALTER TABLE v2_live_trades ADD COLUMN IF NOT EXISTS redeem_attempts INTEGER DEFAULT 0",
-        "ALTER TABLE v2_live_trades ADD COLUMN IF NOT EXISTS redeem_last_attempt TIMESTAMPTZ",
-    ):
-        try:
-            conn.run(_alter)
-        except Exception as _e:
-            print("[V2-MIGRATE] {} -> {}".format(_alter[:60], str(_e)[:80]))
-    # ── v2 settings (key/value) — DB-backed runtime config so toggles flip
-    # without redeploy and survive restarts. Live ON/OFF lives here.
-    conn.run("""
-        CREATE TABLE IF NOT EXISTS v2_settings (
-            key         TEXT PRIMARY KEY,
-            value       TEXT,
-            updated_at  TIMESTAMPTZ DEFAULT NOW()
-        )
-    """)
     # v2 balance tracking
     conn.run("""
         CREATE TABLE IF NOT EXISTS v2_balances (
@@ -1398,425 +1321,6 @@ def _v2_record_paper_trade(platform, timeframe, asset, direction, ptb,
 
 
 # ═══════════════════════════════════════════════════════════
-# LIMITLESS LIVE EXECUTION  (DB-backed toggle, FOK orders only)
-# ═══════════════════════════════════════════════════════════
-#
-# Behaviour: the v2_settings row {limitless_live=1} flips the scanner into
-# live mode (either-or — paper does NOT record while live is on). On a
-# confirmed Limitless signal we place a FOK BUY at the paper limit price as
-# a slippage cap; FOK fills the full size at <= price, OR cancels entirely
-# — no resting orders, so the GTC adverse-fill dynamic can't occur.
-#
-# Gates (any failure -> CAPPED/ERROR audit row, no exception bubbles up):
-#   * py-limitless installed
-#   * LIMITLESS_PRIVATE_KEY env present
-#   * USDC approved as a spender on the Limitless exchange contract
-#     (one-click from the paper bot page)
-#   * Trade stake within LIMITLESS_MAX_TRADE_USDC
-#   * Wallet USDC balance at or above LIMITLESS_MIN_BALANCE_USDC (the floor —
-#     bot auto-pauses below it and auto-resumes when redemptions top it up)
-
-_lmts_client_singleton = None
-_lmts_client_error_logged = False
-_lmts_live_cache = {"value": None, "ts": 0.0}   # in-process cache, refreshes every few sec
-
-
-def _settings_get(key, default=None):
-    """Read a single v2_settings value. Returns default on any error."""
-    try:
-        conn = get_db()
-        rows = conn.run("SELECT value FROM v2_settings WHERE key = :k", k=key)
-        conn.close()
-        if rows and rows[0] and rows[0][0] is not None:
-            return rows[0][0]
-    except Exception:
-        pass
-    return default
-
-
-def _settings_set(key, value):
-    """Upsert a v2_settings value."""
-    try:
-        conn = get_db()
-        conn.run(
-            "INSERT INTO v2_settings (key, value, updated_at) VALUES (:k, :v, NOW()) "
-            "ON CONFLICT (key) DO UPDATE SET value = :v, updated_at = NOW()",
-            k=key, v=str(value))
-        conn.close()
-        return True
-    except Exception as e:
-        print("[SETTINGS] write error {}={}: {}".format(key, value, e))
-        return False
-
-
-def _lmts_live_enabled():
-    """True if Limitless live trading is currently switched ON. DB-backed and
-    cached for ~3s so the per-signal hot path doesn't hit DB every check.
-    Falls back to LIMITLESS_LIVE_BOOTSTRAP only when no DB row exists yet (first
-    boot migration); after first read DB becomes the single source of truth."""
-    now = time.time()
-    if _lmts_live_cache["value"] is not None and (now - _lmts_live_cache["ts"]) < 3.0:
-        return _lmts_live_cache["value"]
-    v = _settings_get("limitless_live")
-    if v is None:
-        v = "1" if LIMITLESS_LIVE_BOOTSTRAP else "0"
-        _settings_set("limitless_live", v)
-    enabled = str(v).strip().lower() in ("1", "true", "yes", "on")
-    _lmts_live_cache["value"] = enabled
-    _lmts_live_cache["ts"] = now
-    return enabled
-
-
-def _lmts_live_set(enabled):
-    """Flip the live switch and bust the in-process cache so the next scanner
-    pass picks up the change immediately."""
-    ok = _settings_set("limitless_live", "1" if enabled else "0")
-    _lmts_live_cache["value"] = bool(enabled) if ok else _lmts_live_cache["value"]
-    _lmts_live_cache["ts"] = time.time() if ok else _lmts_live_cache["ts"]
-    return ok
-
-
-def _lmts_get_client():
-    """Lazily import py-limitless and authenticate. Returns None on any
-    failure — caller treats None as 'live not available, keep going on paper'.
-    Cached after the first successful auth."""
-    global _lmts_client_singleton, _lmts_client_error_logged
-    if _lmts_client_singleton is not None:
-        return _lmts_client_singleton
-    if not LIMITLESS_PRIV_KEY:
-        if not _lmts_client_error_logged:
-            print("[LMTS-LIVE] no LIMITLESS_PRIVATE_KEY — live disabled")
-            _lmts_client_error_logged = True
-        return None
-    try:
-        from limitless_sdk import Limitless
-    except Exception as e:
-        if not _lmts_client_error_logged:
-            print("[LMTS-LIVE] py-limitless not installed ({}). Add `py-limitless` to requirements to enable live.".format(e))
-            _lmts_client_error_logged = True
-        return None
-    try:
-        client = Limitless(private_key=LIMITLESS_PRIV_KEY, wallet_type="eoa")
-        client.authenticate()
-        print("[LMTS-LIVE] client authenticated as {}".format(client.address))
-        _lmts_client_singleton = client
-        return client
-    except Exception as e:
-        if not _lmts_client_error_logged:
-            print("[LMTS-LIVE] authenticate error: {}".format(e))
-            _lmts_client_error_logged = True
-        return None
-
-
-def _lmts_today_spend_usdc():
-    """Sum of stake_usdc on v2_live_trades from the last 24h. Informational
-    only (shown on the dashboard) — NOT a gate. The gate is the balance floor
-    in _lmts_get_balance_usdc(). Defensive: any DB error returns 0."""
-    try:
-        conn = get_db()
-        rows = conn.run(
-            "SELECT COALESCE(SUM(stake_usdc), 0) FROM v2_live_trades "
-            "WHERE fired_at > NOW() - INTERVAL '24 hours' "
-            "AND fill_status IN ('FILLED', 'CANCELLED')")
-        conn.close()
-        if rows and rows[0] and rows[0][0] is not None:
-            return float(rows[0][0])
-    except Exception as e:
-        print("[LMTS-LIVE] daily spend lookup error: {}".format(e))
-    return 0.0
-
-
-# Wallet balance cache — RPC reads are ~500ms so we cache for 30s. Winning
-# redemptions invalidate freshness naturally on the next read after the cache
-# expires (worst case 30s lag before a topped-up wallet starts trading again).
-_lmts_balance_cache = {"value": None, "ts": 0.0}
-
-
-def _lmts_get_balance_usdc(force=False):
-    """Read the wallet's USDC balance on Base. Returns float USDC or None if
-    the RPC fails (the placer treats None as 'pause for safety')."""
-    import time as _t
-    now = _t.time()
-    if (not force and _lmts_balance_cache["value"] is not None
-            and (now - _lmts_balance_cache["ts"]) < 30.0):
-        return _lmts_balance_cache["value"]
-    if not LIMITLESS_PRIV_KEY:
-        return None
-    try:
-        from limitless_sdk import get_usdc_balance, USDC_DECIMALS
-        from web3 import Web3
-        from eth_account import Account
-        w3 = Web3(Web3.HTTPProvider(LIMITLESS_BASE_RPC))
-        addr = Account.from_key(LIMITLESS_PRIV_KEY).address
-        balance_raw = get_usdc_balance(w3, addr)
-        value = float(balance_raw) / (10 ** USDC_DECIMALS)
-        _lmts_balance_cache["value"] = value
-        _lmts_balance_cache["ts"] = now
-        return value
-    except Exception as e:
-        print("[LMTS-LIVE] balance read error: {}".format(str(e)[:120]))
-        return None
-
-
-def _lmts_extract_tokens(market):
-    """Extract (up_token, down_token) from a Limitless /markets/{slug} response.
-    The Limitless API doesn't publish a stable field name for token IDs and the
-    SDK doesn't reference one directly, so we try the conventions used by
-    CTF-fork markets in order of likelihood. Returns ("", "") if none match.
-
-    YES (UP) is outcome index 0; NO (DOWN) is index 1 — same convention as
-    Polymarket (confirmed by limitless_sdk.redemption.get_redeemable_positions
-    which uses winningOutcomeIndex 0=YES, 1=NO)."""
-    if not isinstance(market, dict):
-        return "", ""
-
-    # 1) Polymarket-style: clobTokenIds = ["yes_tok", "no_tok"] OR a JSON string.
-    clob = market.get("clobTokenIds")
-    if isinstance(clob, str):
-        try:
-            clob = json.loads(clob)
-        except Exception:
-            clob = None
-    if isinstance(clob, list) and len(clob) >= 2:
-        return str(clob[0]), str(clob[1])
-
-    # 2) tokens: [{"token_id": "...", "outcome": "YES"}, ...] — Limitless-style
-    toks = market.get("tokens")
-    if isinstance(toks, list) and len(toks) >= 2:
-        up = dn = ""
-        for t in toks:
-            if not isinstance(t, dict):
-                continue
-            tid = str(t.get("token_id") or t.get("tokenId") or t.get("id") or "")
-            label = str(t.get("outcome") or t.get("label") or t.get("name") or "").upper()
-            if not tid:
-                continue
-            if label in ("YES", "UP", "ABOVE") and not up:
-                up = tid
-            elif label in ("NO", "DOWN", "BELOW") and not dn:
-                dn = tid
-        if up or dn:
-            # Fallback: if only one labelled, assume the other is the remaining
-            if not up and len(toks) >= 2:
-                for t in toks:
-                    tid = str((t or {}).get("token_id") or (t or {}).get("tokenId") or "")
-                    if tid and tid != dn:
-                        up = tid; break
-            if not dn and len(toks) >= 2:
-                for t in toks:
-                    tid = str((t or {}).get("token_id") or (t or {}).get("tokenId") or "")
-                    if tid and tid != up:
-                        dn = tid; break
-            return up, dn
-
-    # 3) positionIds: [yes_id, no_id]
-    pids = market.get("positionIds") or market.get("position_ids")
-    if isinstance(pids, list) and len(pids) >= 2:
-        return str(pids[0]), str(pids[1])
-
-    # 4) Nested venue/clob/outcomes containers
-    for container_key in ("clob", "outcomes", "venue"):
-        sub = market.get(container_key)
-        if isinstance(sub, dict):
-            up, dn = _lmts_extract_tokens(sub)   # one-level recurse
-            if up or dn:
-                return up, dn
-        if isinstance(sub, list) and len(sub) >= 2:
-            up = str(((sub[0] or {}).get("tokenId") or (sub[0] or {}).get("token_id") or "")
-                     if isinstance(sub[0], dict) else sub[0])
-            dn = str(((sub[1] or {}).get("tokenId") or (sub[1] or {}).get("token_id") or "")
-                     if isinstance(sub[1], dict) else sub[1])
-            if up or dn:
-                return up, dn
-
-    return "", ""
-
-
-def _lmts_record_live_trade(paper_trade_id, asset, tf_label, direction,
-                            market_slug, token_id, limit_cents, stake,
-                            shares, fill_status, order_id=None,
-                            fill_price=None, filled_size=None,
-                            raw_response=None, error_message=None,
-                            condition_id=None):
-    """Single audit row per live attempt — FILLED / CANCELLED / ERROR / CAPPED.
-    condition_id is captured so the resolver/redeemer can find the on-chain
-    market without re-fetching from the API later."""
-    try:
-        conn = get_db()
-        conn.run("""
-            INSERT INTO v2_live_trades (
-                paper_trade_id, platform, timeframe, asset, direction,
-                market_slug, token_id, condition_id, limit_price_cents,
-                stake_usdc, size_shares, fill_status, order_id,
-                fill_price_cents, filled_size, raw_response, error_message
-            ) VALUES (
-                :ptid, 'limitless', :tf, :asset, :dir,
-                :slug, :tok, :cid, :lim,
-                :stake, :shares, :st, :oid,
-                :fp, :fs, :raw, :err
-            )
-        """,
-            ptid=paper_trade_id, tf=tf_label, asset=asset, dir=direction,
-            slug=market_slug, tok=token_id, cid=(condition_id or None),
-            lim=limit_cents, stake=stake, shares=shares, st=fill_status,
-            oid=order_id, fp=fill_price, fs=filled_size,
-            raw=(json.dumps(raw_response)[:4000] if raw_response else None),
-            err=(error_message[:1000] if error_message else None))
-        conn.close()
-    except Exception as e:
-        print("[LMTS-LIVE] record error: {}".format(e))
-
-
-def _lmts_place_live(paper_trade_id, market_data, asset, tf_label, direction,
-                     limit_price_cents, stake_usdc):
-    """Place an FOK BUY mirroring a just-recorded paper trade. All paths record
-    to v2_live_trades for audit (CAPPED for cap rejections, ERROR for failures).
-    Returns the fill_status string. NEVER raises — paper recording upstream
-    must be unaffected by any live failure."""
-    market_slug = (market_data or {}).get("slug") or ""
-    token_id = ((market_data or {}).get("up_token") if direction == "UP"
-                else (market_data or {}).get("down_token")) or ""
-    condition_id = (market_data or {}).get("condition_id") or ""
-
-    # The lightweight /markets/active/slugs feed used by the V2 scanner does
-    # NOT include conditionId OR the per-outcome token IDs. The SDK's
-    # client.buy() needs token_id; the redeemer needs condition_id. So we
-    # lazily fetch the full market once at order time and extract both.
-    # ~1 extra HTTP call per live trade — negligible at <20/day. Best-effort
-    # only; if it fails the trade still attempts to place with whatever
-    # market_data already had.
-    if (not condition_id or not token_id) and market_slug:
-        try:
-            import requests as _req
-            _r = _req.get("{}/markets/{}".format(LIMITLESS_API, market_slug), timeout=6)
-            if _r.status_code == 200:
-                _m = _r.json() or {}
-                if not condition_id:
-                    condition_id = (_m.get("conditionId")
-                                    or _m.get("condition_id") or "")
-                if not token_id:
-                    up_tok, dn_tok = _lmts_extract_tokens(_m)
-                    token_id = up_tok if direction == "UP" else dn_tok
-        except Exception as _e:
-            print("[LMTS-LIVE] market fetch failed for {}: {}".format(
-                market_slug[:40], str(_e)[:80]))
-
-    # Clamp stake to per-trade cap; reject if essential data missing.
-    if not market_slug or not token_id:
-        _lmts_record_live_trade(paper_trade_id, asset, tf_label, direction,
-                                market_slug, token_id, limit_price_cents,
-                                stake_usdc, 0.0, "ERROR",
-                                error_message="missing slug or token_id",
-                                condition_id=condition_id)
-        return "ERROR"
-
-    capped_stake = min(float(stake_usdc), LIMITLESS_MAX_TRADE_USDC)
-    if capped_stake <= 0 or limit_price_cents <= 0:
-        _lmts_record_live_trade(paper_trade_id, asset, tf_label, direction,
-                                market_slug, token_id, limit_price_cents,
-                                stake_usdc, 0.0, "CAPPED",
-                                error_message="stake or price non-positive",
-                                condition_id=condition_id)
-        return "CAPPED"
-
-    # Balance floor gate — read live USDC balance on Base and pause if below
-    # the floor. Replaces the old daily-cap model. Failing closed: if the RPC
-    # read returns None (transient failure), we PAUSE rather than guess.
-    # The cache (30s) ensures successful redemptions resume trading promptly.
-    balance = _lmts_get_balance_usdc()
-    if balance is None:
-        _lmts_record_live_trade(paper_trade_id, asset, tf_label, direction,
-                                market_slug, token_id, limit_price_cents,
-                                stake_usdc, 0.0, "CAPPED",
-                                error_message="balance read failed (RPC) — pausing for safety",
-                                condition_id=condition_id)
-        print("[LMTS-LIVE] balance read failed — pausing this signal")
-        return "CAPPED"
-    if balance < LIMITLESS_MIN_BALANCE_USDC:
-        _lmts_record_live_trade(paper_trade_id, asset, tf_label, direction,
-                                market_slug, token_id, limit_price_cents,
-                                stake_usdc, 0.0, "CAPPED",
-                                error_message="balance ${:.2f} below floor ${:.2f} — paused".format(
-                                    balance, LIMITLESS_MIN_BALANCE_USDC),
-                                condition_id=condition_id)
-        print("[LMTS-LIVE] balance ${:.2f} < floor ${:.2f} — paused, waiting for top-up".format(
-            balance, LIMITLESS_MIN_BALANCE_USDC))
-        return "CAPPED"
-    # Also guard against trying to spend more than we have (in case stake > balance)
-    if balance < capped_stake:
-        _lmts_record_live_trade(paper_trade_id, asset, tf_label, direction,
-                                market_slug, token_id, limit_price_cents,
-                                stake_usdc, 0.0, "CAPPED",
-                                error_message="balance ${:.2f} insufficient for ${:.2f} stake".format(
-                                    balance, capped_stake),
-                                condition_id=condition_id)
-        return "CAPPED"
-
-    client = _lmts_get_client()
-    if client is None:
-        _lmts_record_live_trade(paper_trade_id, asset, tf_label, direction,
-                                market_slug, token_id, limit_price_cents,
-                                capped_stake, 0.0, "ERROR",
-                                error_message="client unavailable",
-                                condition_id=condition_id)
-        return "ERROR"
-
-    # shares = USDC budget / (price in dollars). e.g. $2 @ 70c -> ~2.857 shares.
-    shares = round(capped_stake / max(limit_price_cents / 100.0, 0.01), 4)
-
-    try:
-        from limitless_sdk import ORDER_TYPE_FOK
-    except Exception:
-        ORDER_TYPE_FOK = "FOK"
-
-    try:
-        resp = client.buy(
-            market_slug=market_slug,
-            token_id=str(token_id),
-            price_cents=float(limit_price_cents),
-            amount=float(shares),
-            token_type=("YES" if direction == "UP" else "NO"),
-            order_type=ORDER_TYPE_FOK,
-        )
-    except Exception as e:
-        _lmts_record_live_trade(paper_trade_id, asset, tf_label, direction,
-                                market_slug, token_id, limit_price_cents,
-                                capped_stake, shares, "ERROR",
-                                error_message=str(e)[:1000],
-                                condition_id=condition_id)
-        print("[LMTS-LIVE] order error {} {} {}: {}".format(
-            asset, tf_label, direction, str(e)[:200]))
-        return "ERROR"
-
-    # Parse common response shapes defensively — exact response is API-shaped
-    # and we record the raw JSON for any field we don't pull out.
-    resp_d = resp if isinstance(resp, dict) else {}
-    order_id = (resp_d.get("orderId") or resp_d.get("order_id")
-                or resp_d.get("id") or "")
-    matches = (resp_d.get("makerMatches") or resp_d.get("maker_matches")
-               or resp_d.get("matches") or [])
-    filled_size = sum(float(m.get("size", m.get("amount", 0)) or 0)
-                      for m in matches) if isinstance(matches, list) else 0.0
-    fill_price = None
-    if matches and isinstance(matches, list):
-        prices = [float(m.get("price", 0) or 0) for m in matches if m.get("price")]
-        if prices:
-            fill_price = sum(prices) / len(prices)
-    status = (resp_d.get("status") or "").upper()
-    fill_status = "FILLED" if (filled_size > 0 or status in ("FILLED", "MATCHED")) else "CANCELLED"
-
-    _lmts_record_live_trade(paper_trade_id, asset, tf_label, direction,
-                            market_slug, token_id, limit_price_cents,
-                            capped_stake, shares, fill_status,
-                            order_id=str(order_id) if order_id else None,
-                            fill_price=fill_price, filled_size=filled_size,
-                            raw_response=resp_d, condition_id=condition_id)
-    print("[LMTS-LIVE] {} {} {} {} @ {:.0f}c x {:.4f} shares -> {}".format(
-        fill_status, asset, tf_label, direction, limit_price_cents, shares, order_id or "(no id)"))
-    return fill_status
-
-
-# ═══════════════════════════════════════════════════════════
 # V2 ORDER BOOK READING (for paper odds accuracy)
 # ═══════════════════════════════════════════════════════════
 
@@ -2457,289 +1961,6 @@ def _v2_resolve_trades():
 
 
 # ═══════════════════════════════════════════════════════════
-# LIMITLESS LIVE — RESOLUTION + ON-CHAIN REDEMPTION
-# ═══════════════════════════════════════════════════════════
-# Mirrors the paper resolver but reads v2_live_trades. When a FILLED row's
-# market resolves, we mark WIN/LOSS/PUSH, compute realized P&L from the
-# actual fill (not the limit), then queue a WIN row for on-chain redemption
-# of the YES/NO conditional tokens into USDC via the CTF contract.
-#
-# The redeemer runs as its own pass so a flaky RPC, a not-yet-settled-on-chain
-# condition, or a single failure can't block resolution of new rows.
-
-_LMTS_LIVE_RESOLVE_DIAG = [0]   # at-most-N diagnostic prints per process
-_LMTS_REDEEM_MAX_ATTEMPTS = 10  # docs warn API can mark resolved before CTF on-chain;
-                                # we retry with cooldown so the pass-through is forgiving
-
-
-def _v2_resolve_live_trades():
-    """Resolve FILLED rows in v2_live_trades by polling Limitless for market
-    outcome (same logic as the paper resolver's limitless branch). Updates
-    outcome / pnl / actual_result / resolved_at, and queues WIN rows for
-    on-chain redemption by setting redeem_status='PENDING'."""
-    import requests as req
-    try:
-        conn = get_db()
-        rows = conn.run("""
-            SELECT id, timeframe, asset, direction, market_slug, condition_id,
-                   limit_price_cents, fill_price_cents, filled_size, stake_usdc,
-                   fired_at
-            FROM v2_live_trades
-            WHERE fill_status = 'FILLED' AND outcome IS NULL
-            ORDER BY id ASC
-        """)
-        cols = ["id", "timeframe", "asset", "direction", "market_slug",
-                "condition_id", "limit_price_cents", "fill_price_cents",
-                "filled_size", "stake_usdc", "fired_at"]
-        trades = [dict(zip(cols, r)) for r in rows]
-        conn.close()
-
-        if not trades:
-            return 0
-
-        resolved = 0
-        for t in trades:
-            slug = t.get("market_slug") or ""
-            asset = t.get("asset") or ""
-            direction = t.get("direction") or ""
-            if not slug or not direction:
-                continue
-
-            # Skip if too young — give the market time to actually resolve.
-            fired = t.get("fired_at")
-            if fired:
-                if isinstance(fired, str):
-                    try:
-                        fired = datetime.fromisoformat(fired.replace("Z", "+00:00"))
-                    except Exception:
-                        fired = None
-                if fired:
-                    if not fired.tzinfo:
-                        fired = fired.replace(tzinfo=timezone.utc)
-                    tf = t.get("timeframe") or "1H"
-                    min_age = {"5M": 1, "15M": 2, "1H": 61, "DAILY": 1441}.get(tf, 61)
-                    if (datetime.now(timezone.utc) - fired).total_seconds() / 60 < min_age:
-                        continue
-
-            # Poll Limitless for the resolved outcome — exact same logic as
-            # the paper resolver's limitless branch (lines ~2111 of paper path).
-            actual = None
-            captured_cid = None
-            try:
-                r = req.get("{}/markets/{}".format(LIMITLESS_API, slug), timeout=8)
-                if r.status_code == 200:
-                    market = r.json()
-                    # Defensive: if this row was placed before the order-time
-                    # condition_id fetch landed, grab it here so the redeemer
-                    # can still claim winnings.
-                    if not t.get("condition_id"):
-                        captured_cid = (market.get("conditionId")
-                                        or market.get("condition_id") or None)
-                    status = str(market.get("status", "")).lower()
-                    is_done = (status in ("resolved", "closed", "settled", "expired", "ended")
-                               or market.get("closed") is True
-                               or market.get("resolved") is True
-                               or market.get("expired") is True
-                               or market.get("winningOutcomeIndex") is not None
-                               or market.get("winningOutcome") not in (None, ""))
-                    if is_done:
-                        winner = (market.get("winningOutcome") or market.get("winner") or "")
-                        widx = market.get("winningOutcomeIndex")
-                        if str(winner).lower() in ("yes", "up", "above"):
-                            actual = "UP"
-                        elif str(winner).lower() in ("no", "down", "below"):
-                            actual = "DOWN"
-                        elif widx is not None:
-                            actual = "UP" if int(widx) == 0 else "DOWN"
-                        else:
-                            op = market.get("outcomePrices") or market.get("prices")
-                            if isinstance(op, list) and len(op) >= 2:
-                                if float(op[0]) > 0.9: actual = "UP"
-                                elif float(op[0]) < 0.1: actual = "DOWN"
-                    if not actual and _LMTS_LIVE_RESOLVE_DIAG[0] < 6:
-                        _LMTS_LIVE_RESOLVE_DIAG[0] += 1
-                        print("[LMTS-LIVE-RESOLVE-DIAG] {} status={} keys={} winner={} widx={}".format(
-                            slug[:40], status, list(market.keys())[:14],
-                            market.get("winningOutcome"), market.get("winningOutcomeIndex")))
-            except Exception as e:
-                print("[LMTS-LIVE] resolve check error {}: {}".format(slug[:30], e))
-
-            if not actual:
-                continue  # try again next cycle
-
-            # Realized P&L from the actual fill (not the limit). Each share is
-            # worth $1 USDC if direction wins, $0 otherwise.
-            filled_size = float(t.get("filled_size") or 0)
-            fill_px = float(t.get("fill_price_cents") or t.get("limit_price_cents") or 0)
-            cost = filled_size * (fill_px / 100.0)
-            if actual == direction:
-                outcome = "WIN"
-                pnl = filled_size - cost            # receive $1/share, paid `cost`
-                redeem_status = "PENDING"           # queue for on-chain claim
-            elif actual == "FLAT":
-                outcome = "PUSH"
-                pnl = 0.0
-                redeem_status = "SKIPPED"
-            else:
-                outcome = "LOSS"
-                pnl = -cost
-                redeem_status = "SKIPPED"
-
-            try:
-                conn2 = get_db()
-                # If we captured a condition_id this pass, persist it too so
-                # the redeemer can pick this row up next cycle.
-                if captured_cid:
-                    conn2.run("""
-                        UPDATE v2_live_trades SET
-                            actual_result = :ar,
-                            outcome       = :oc,
-                            pnl           = :pnl,
-                            resolved_at   = NOW(),
-                            redeem_status = :rs,
-                            condition_id  = :cid
-                        WHERE id = :tid
-                    """, ar=actual, oc=outcome, pnl=round(pnl, 4),
-                        rs=redeem_status, cid=captured_cid, tid=t["id"])
-                else:
-                    conn2.run("""
-                        UPDATE v2_live_trades SET
-                            actual_result = :ar,
-                            outcome       = :oc,
-                            pnl           = :pnl,
-                            resolved_at   = NOW(),
-                            redeem_status = :rs
-                        WHERE id = :tid
-                    """, ar=actual, oc=outcome, pnl=round(pnl, 4),
-                        rs=redeem_status, tid=t["id"])
-                conn2.close()
-                resolved += 1
-            except Exception as e:
-                print("[LMTS-LIVE] resolve update error: {}".format(e))
-                continue
-
-            emoji = "✅" if outcome == "WIN" else ("❌" if outcome == "LOSS" else "➖")
-            send_telegram("{} LIVE {} {} {} @ {:.0f}c → {} | P&L ${:+.2f}".format(
-                emoji, t.get("timeframe") or "?", asset, direction,
-                fill_px, outcome, pnl))
-
-        return resolved
-    except Exception as e:
-        print("[LMTS-LIVE] resolve error: {}".format(e))
-        return 0
-
-
-def _lmts_redeem_winnings(condition_id):
-    """Submit an on-chain redeemPositions() call for a resolved condition.
-    Returns {ok, tx_hash, error}. Caller persists tx_hash + status. The CTF
-    accepts redemption from any holder; calling it for a non-winning condition
-    just zeroes the dust positions (no harm, but a small gas cost), so we
-    only call this for WIN rows."""
-    if not LIMITLESS_PRIV_KEY:
-        return {"ok": False, "error": "LIMITLESS_PRIVATE_KEY not set"}
-    if not condition_id:
-        return {"ok": False, "error": "missing condition_id"}
-    try:
-        from limitless_sdk import (BASE_CTF_ADDRESS, BASE_CHAIN_ID,
-                                   USDC_ADDRESS)
-        from limitless_sdk.redemption import EOAPositionRedeemer
-        redeemer = EOAPositionRedeemer(
-            private_key=LIMITLESS_PRIV_KEY,
-            rpc_url=LIMITLESS_BASE_RPC,
-            ctf_address=BASE_CTF_ADDRESS,
-            collateral_token=USDC_ADDRESS,
-            chain_id=BASE_CHAIN_ID,
-        )
-        tx_hash = redeemer.redeem_position(condition_id)
-        return {"ok": True, "tx_hash": tx_hash}
-    except ImportError as e:
-        return {"ok": False, "error": "py-limitless missing: {}".format(e)}
-    except Exception as e:
-        # Common: "execution reverted" before CTF is settled on-chain (docs
-        # warn this can lag the API). We propagate the message; the caller
-        # decides whether to retry on a future pass.
-        return {"ok": False, "error": str(e)[:500]}
-
-
-def _v2_redeem_pending_live():
-    """Pick up PENDING rows from v2_live_trades and try on-chain redemption.
-    Re-tries with a per-row attempts counter. After _LMTS_REDEEM_MAX_ATTEMPTS
-    the row is marked FAILED so we stop spamming the RPC; the operator can
-    re-queue it manually from the dashboard later."""
-    try:
-        conn = get_db()
-        rows = conn.run("""
-            SELECT id, condition_id, asset, timeframe, direction, pnl,
-                   COALESCE(redeem_attempts, 0) AS attempts
-            FROM v2_live_trades
-            WHERE redeem_status = 'PENDING'
-              AND condition_id IS NOT NULL AND condition_id <> ''
-            ORDER BY id ASC
-            LIMIT 8
-        """)
-        cols = ["id", "condition_id", "asset", "timeframe", "direction",
-                "pnl", "attempts"]
-        pending = [dict(zip(cols, r)) for r in rows]
-        conn.close()
-    except Exception as e:
-        print("[LMTS-LIVE] redeem fetch error: {}".format(e))
-        return 0
-
-    if not pending:
-        return 0
-
-    done = 0
-    for p in pending:
-        attempts = int(p.get("attempts") or 0)
-        cid = p.get("condition_id") or ""
-        res = _lmts_redeem_winnings(cid)
-        if res.get("ok"):
-            tx_hash = res.get("tx_hash") or ""
-            try:
-                conn2 = get_db()
-                conn2.run("""
-                    UPDATE v2_live_trades SET
-                        redeem_status       = 'DONE',
-                        redeem_tx_hash      = :tx,
-                        redeem_attempts     = :a,
-                        redeem_last_attempt = NOW()
-                    WHERE id = :tid
-                """, tx=tx_hash, a=attempts + 1, tid=p["id"])
-                conn2.close()
-                done += 1
-                print("[LMTS-LIVE] redeemed {} {} {} -> {}".format(
-                    p.get("timeframe"), p.get("asset"), p.get("direction"),
-                    tx_hash[:14] + "…" if len(tx_hash) > 14 else tx_hash))
-                send_telegram("💰 LIVE redeemed {} {} {} → tx {}".format(
-                    p.get("timeframe"), p.get("asset"), p.get("direction"),
-                    tx_hash[:10] + "…"))
-            except Exception as e:
-                print("[LMTS-LIVE] redeem update error: {}".format(e))
-        else:
-            err = res.get("error") or "unknown"
-            new_status = "FAILED" if attempts + 1 >= _LMTS_REDEEM_MAX_ATTEMPTS else "PENDING"
-            try:
-                conn2 = get_db()
-                conn2.run("""
-                    UPDATE v2_live_trades SET
-                        redeem_status       = :rs,
-                        redeem_attempts     = :a,
-                        redeem_last_attempt = NOW(),
-                        error_message       = COALESCE(error_message, '') || :err_suffix
-                    WHERE id = :tid
-                """, rs=new_status, a=attempts + 1,
-                    err_suffix=(" [redeem {}: {}]".format(attempts + 1, err))[:300],
-                    tid=p["id"])
-                conn2.close()
-                print("[LMTS-LIVE] redeem attempt {} for id={} -> {} ({})".format(
-                    attempts + 1, p["id"], new_status, err[:120]))
-            except Exception as e:
-                print("[LMTS-LIVE] redeem fail-update error: {}".format(e))
-
-    return done
-
-
-# ═══════════════════════════════════════════════════════════
 # V2 WATCHER THREADS
 # ═══════════════════════════════════════════════════════════
 
@@ -3004,84 +2225,59 @@ def _v2_scan_timeframe(timeframe):
 
                     # Record paper trade as PENDING
                     market_url = _v2_market_url(platform, market_data, asset, tf_label)
-
-                    # ── Either-or mode (toggled from the paper bot page) ──
-                    # When live trading is ON for a Limitless market, the scanner
-                    # SKIPS the paper insert entirely and places a real FOK on
-                    # Limitless — paper does not record. When OFF (or non-Limitless
-                    # platform), the original paper path runs unchanged.
-                    go_live = (platform == "limitless" and _lmts_live_enabled())
-
-                    if go_live:
-                        try:
-                            live_status = _lmts_place_live(
-                                None, market_data, asset, tf_label, direction,
-                                float(limit_price), float(FLAT_STAKE))
-                        except Exception as _lmts_e:
-                            print("[LMTS-LIVE] place exception (signal not recorded): {}".format(_lmts_e))
-                            continue
-                    else:
-                        try:
-                            conn = get_db()
-                            conn.run("""
-                                INSERT INTO v2_paper_trades (
-                                    platform, timeframe, asset, direction, ptb, entry_odds,
-                                    entry_price, stake, entry_note, hh_count, hl_count, ll_count, lh_count,
-                                    grind_rate, ptb_distance, session_label, volatility,
-                                    prev_candle, market_id, slug, condition_id,
-                                    up_token, down_token, confidence, market_url,
-                                    limit_price, book_ask, order_status, status
-                                ) VALUES (
-                                    :plat, :tf, :asset, :dir, :ptb, :odds,
-                                    :price, :stake, :note, :hh, :hl, :ll, :lh,
-                                    :grind, :ptb_dist, :sess, :vol,
-                                    :prev, :mid, :slug, :cid,
-                                    :up_tok, :dn_tok, :conf, :murl,
-                                    :lim, :bask, 'PENDING', 'OPEN'
-                                )
-                            """,
-                                plat=platform, tf=tf_label, asset=asset, dir=direction,
-                                ptb=ptb, odds=entry_odds, price=price,
-                                stake=FLAT_STAKE, note=note,
-                                hh=structure.get("hh_count", 0) if structure else 0,
-                                hl=structure.get("hl_count", 0) if structure else 0,
-                                ll=structure.get("ll_count", 0) if structure else 0,
-                                lh=structure.get("lh_count", 0) if structure else 0,
-                                grind=structure.get("grind_type", "") if structure else "",
-                                ptb_dist=0, sess=session_label, vol=vol_label,
-                                prev=prev_str or "",
-                                mid=market_data.get("market_id", "") if market_data else "",
-                                slug=market_data.get("slug", "") if market_data else "",
-                                cid=market_data.get("condition_id", "") if market_data else "",
-                                up_tok=market_data.get("up_token", "") if market_data else "",
-                                dn_tok=market_data.get("down_token", "") if market_data else "",
-                                conf=str(confidence) if confidence else "",
-                                murl=market_url,
-                                lim=limit_price, bask=book_ask,
+                    try:
+                        conn = get_db()
+                        conn.run("""
+                            INSERT INTO v2_paper_trades (
+                                platform, timeframe, asset, direction, ptb, entry_odds,
+                                entry_price, stake, entry_note, hh_count, hl_count, ll_count, lh_count,
+                                grind_rate, ptb_distance, session_label, volatility,
+                                prev_candle, market_id, slug, condition_id,
+                                up_token, down_token, confidence, market_url,
+                                limit_price, book_ask, order_status, status
+                            ) VALUES (
+                                :plat, :tf, :asset, :dir, :ptb, :odds,
+                                :price, :stake, :note, :hh, :hl, :ll, :lh,
+                                :grind, :ptb_dist, :sess, :vol,
+                                :prev, :mid, :slug, :cid,
+                                :up_tok, :dn_tok, :conf, :murl,
+                                :lim, :bask, 'PENDING', 'OPEN'
                             )
-                            conn.close()
-                        except Exception as e:
-                            print("[V2] Record PENDING error: {}".format(e))
-                            continue
+                        """,
+                            plat=platform, tf=tf_label, asset=asset, dir=direction,
+                            ptb=ptb, odds=entry_odds, price=price,
+                            stake=FLAT_STAKE, note=note,
+                            hh=structure.get("hh_count", 0) if structure else 0,
+                            hl=structure.get("hl_count", 0) if structure else 0,
+                            ll=structure.get("ll_count", 0) if structure else 0,
+                            lh=structure.get("lh_count", 0) if structure else 0,
+                            grind=structure.get("grind_type", "") if structure else "",
+                            ptb_dist=0, sess=session_label, vol=vol_label,
+                            prev=prev_str or "",
+                            mid=market_data.get("market_id", "") if market_data else "",
+                            slug=market_data.get("slug", "") if market_data else "",
+                            cid=market_data.get("condition_id", "") if market_data else "",
+                            up_tok=market_data.get("up_token", "") if market_data else "",
+                            dn_tok=market_data.get("down_token", "") if market_data else "",
+                            conf=str(confidence) if confidence else "",
+                            murl=market_url,
+                            lim=limit_price, bask=book_ask,
+                        )
+                        conn.close()
+                    except Exception as e:
+                        print("[V2] Record PENDING error: {}".format(e))
+                        continue
 
                     _v2_active_boundaries[boundary_key] = True
                     entered += 1
 
                     url_str = "\n🔗 {}".format(market_url) if market_url else ""
-                    if go_live:
-                        send_telegram(
-                            "🟢 LIVE FOK {} {} {} {} @ {:.0f}c → {}\n"
-                            "Conf {} | ${:.2f} | {}/{}{}".format(
-                                platform[:4].upper(), tf_label, asset, direction,
-                                limit_price, live_status,
-                                confidence, FLAT_STAKE, entered, len(_scan_candidates), url_str))
-                    else:
-                        send_telegram(
-                            "📋 V2 LIMIT {} {} {} {} @ {:.0f}c (book {:.0f}c)\n"
-                            "Conf {} | ${:.2f} | BEST {}/{}{}".format(
-                                platform[:4].upper(), tf_label, asset, direction,
-                                limit_price, book_ask or 0, confidence,
-                                FLAT_STAKE, entered, len(_scan_candidates), url_str))
+                    send_telegram(
+                        "📋 V2 LIMIT {} {} {} {} @ {:.0f}c (book {:.0f}c)\n"
+                        "Conf {} | ${:.2f} | BEST {}/{}{}".format(
+                            platform[:4].upper(), tf_label, asset, direction,
+                            limit_price, book_ask or 0, confidence,
+                            FLAT_STAKE, entered, len(_scan_candidates), url_str))
 
                 if _scan_candidates:
                     print("[V2] {} scan: {} candidates, entered {}".format(
@@ -3206,9 +2402,7 @@ def _v2_monitor_thread():
 
 
 def _v2_resolve_loop():
-    """Background thread to resolve paper + live trades, then attempt on-chain
-    redemption of pending live wins. All three pieces run on the same 60s
-    cadence; each is wrapped so one failing path can't stall the others."""
+    """Background thread to resolve paper trades periodically."""
     print("[V2] Resolve loop started")
     while True:
         try:
@@ -3217,18 +2411,6 @@ def _v2_resolve_loop():
                 print("[V2] Resolved {} trades".format(resolved))
         except Exception as e:
             print("[V2] Resolve loop error: {}".format(e))
-        try:
-            live_resolved = _v2_resolve_live_trades()
-            if live_resolved:
-                print("[LMTS-LIVE] Resolved {} live trades".format(live_resolved))
-        except Exception as e:
-            print("[LMTS-LIVE] resolve loop error: {}".format(e))
-        try:
-            redeemed = _v2_redeem_pending_live()
-            if redeemed:
-                print("[LMTS-LIVE] Redeemed {} positions on-chain".format(redeemed))
-        except Exception as e:
-            print("[LMTS-LIVE] redeem loop error: {}".format(e))
         time.sleep(60)
 
 
@@ -3375,141 +2557,95 @@ def _v2_cleanup_loop():
 
 DASHBOARD_CSS = """
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Sora:wght@500;600;700;800&family=DM+Sans:wght@400;500;700;900&family=JetBrains+Mono:wght@400;500;700&display=swap');
-:root{
-  --brand:#2f6bd6; --brand2:#4f86ee; --brand-deep:#1f54b0; --brand-soft:#e8f0fd;
-  --bg1:#eef3fa; --bg2:#e3eaf5;
-  --ink:#0c1320; --ink2:#3a465c; --muted:#73819b;
-  --surface:#ffffff; --surface2:#f6f9fd;
-  --line:rgba(12,19,32,0.09); --line2:rgba(12,19,32,0.06);
-  --glass:rgba(255,255,255,0.72); --glass-line:rgba(12,19,32,0.07);
-  --shadow:0 16px 44px rgba(20,40,90,0.10);
-  --good:#1f9d6b; --good-soft:rgba(31,157,107,0.13);
-  --red:#e1556a; --red-soft:rgba(225,85,106,0.13);
-  --orange:#e08a3c; --grid:rgba(47,107,214,0.05);
+@import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;700;900&family=JetBrains+Mono:wght@400;500;700&display=swap');
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+  font-family: 'DM Sans', sans-serif; color: #0f2417; min-height: 100vh;
+  background:
+    radial-gradient(1200px 600px at 10% -10%, rgba(74,222,128,0.12), transparent 60%),
+    radial-gradient(1000px 500px at 90% 0%, rgba(34,197,94,0.10), transparent 55%),
+    linear-gradient(160deg, #eafaf0 0%, #dff5e8 35%, #d2f0de 100%);
 }
-[data-theme="dark"]{
-  --brand:#5a8cf0; --brand2:#7aa2f5; --brand-deep:#3f78e6; --brand-soft:rgba(90,140,240,0.16);
-  --bg1:#0a0e16; --bg2:#06090f;
-  --ink:#eaf0fb; --ink2:#c3cde0; --muted:#8696b4;
-  --surface:#121826; --surface2:#0f1420;
-  --line:rgba(255,255,255,0.09); --line2:rgba(255,255,255,0.06);
-  --glass:rgba(255,255,255,0.055); --glass-line:rgba(255,255,255,0.10);
-  --shadow:0 20px 54px rgba(0,0,0,0.55);
-  --good:#56d3a0; --good-soft:rgba(86,211,160,0.16);
-  --red:#fca5a5; --red-soft:rgba(248,113,113,0.16);
-  --orange:#fb923c; --grid:rgba(120,160,255,0.05);
+.container { max-width: 1100px; margin: 0 auto; padding: 22px 18px 60px; }
+.header { display: flex; justify-content: space-between; align-items: center; padding: 10px 0 18px; margin-bottom: 18px; }
+.header h1 { font-size: 1.6rem; color: #15803d; font-weight: 900; letter-spacing: -0.5px; }
+.header .subtitle { font-size: 0.85rem; color: #42795a; font-weight: 500; }
+.nav { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 22px; }
+.nav a { color: #356148; text-decoration: none; font-size: 0.8rem; font-weight: 700; padding: 8px 14px; border-radius: 999px; transition: all 0.15s; }
+.nav a:hover { background: rgba(74,222,128,0.18); }
+.nav a.active { background: #15803d; color: #fff; }
+.stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin-bottom: 22px; }
+.stat-card {
+  background: rgba(255,255,255,0.62); backdrop-filter: blur(20px); -webkit-backdrop-filter: blur(20px);
+  border: 1px solid rgba(255,255,255,0.8); border-radius: 18px; padding: 16px;
+  box-shadow: 0 8px 32px rgba(21,128,61,0.08), inset 0 1px 0 rgba(255,255,255,0.6);
 }
-* { margin:0; padding:0; box-sizing:border-box; }
-body { font-family:'DM Sans',sans-serif; color:var(--ink); min-height:100vh; transition:background .35s ease,color .35s ease;
-  background:radial-gradient(1200px 600px at 10% -10%, var(--brand-soft), transparent 60%),
-    radial-gradient(1000px 500px at 90% 0%, var(--brand-soft), transparent 55%),
-    radial-gradient(130% 90% at 50% -10%, var(--bg1), var(--bg2)); }
-.container { max-width:1100px; margin:0 auto; padding:22px 18px 60px; }
-.header { display:flex; justify-content:space-between; align-items:center; padding:10px 0 18px; margin-bottom:18px; }
-.header h1 { font-family:'Sora',sans-serif; font-size:1.6rem; color:var(--brand-deep); font-weight:800; letter-spacing:-0.5px; }
-.header .subtitle { font-size:0.85rem; color:var(--muted); font-weight:500; }
-.hd-right { display:flex; align-items:center; gap:12px; font-family:'JetBrains Mono',monospace; font-size:0.72rem; color:var(--muted); }
-.nav { display:flex; gap:6px; flex-wrap:wrap; margin-bottom:22px; }
-.nav a { color:var(--ink2); text-decoration:none; font-size:0.8rem; font-weight:700; padding:8px 14px; border-radius:999px; transition:all 0.15s; }
-.nav a:hover { background:var(--brand-soft); }
-.nav a.active { background:var(--brand); color:#fff; }
-.stats-grid { display:grid; grid-template-columns:repeat(auto-fit, minmax(150px, 1fr)); gap:12px; margin-bottom:22px; }
-.stat-card { background:var(--glass); backdrop-filter:blur(20px); -webkit-backdrop-filter:blur(20px);
-  border:1px solid var(--glass-line); border-radius:18px; padding:16px; box-shadow:var(--shadow); }
-.stat-card .label { font-size:0.7rem; color:var(--muted); text-transform:uppercase; letter-spacing:0.5px; font-weight:700; }
-.stat-card .value { font-size:1.5rem; font-weight:700; font-family:'JetBrains Mono', monospace; margin-top:4px; color:var(--ink); }
-.stat-card .value.green { color:var(--good); }
-.stat-card .value.red { color:var(--red); }
-.stat-card .value.blue { color:var(--brand); }
-.table-wrap { background:var(--glass); backdrop-filter:blur(20px); -webkit-backdrop-filter:blur(20px); border:1px solid var(--glass-line); border-radius:18px; padding:8px; overflow-x:auto; box-shadow:var(--shadow); }
-table { width:100%; border-collapse:collapse; font-size:0.82rem; }
-thead th { color:var(--muted); text-transform:uppercase; font-size:0.66rem; letter-spacing:0.5px; padding:10px 8px; text-align:left; border-bottom:1px solid var(--line); }
-tbody td { padding:10px 8px; border-bottom:1px solid var(--line2); font-family:'JetBrains Mono', monospace; font-size:0.76rem; color:var(--ink2); }
-tbody tr:hover { background:var(--brand-soft); }
-.up { color:var(--good); }
-.down { color:var(--red); }
-.win { color:var(--good); font-weight:700; }
-.loss { color:var(--red); font-weight:700; }
-.pend { color:var(--orange); }
-.hedge-badge { background:var(--brand-soft); color:var(--brand-deep); padding:2px 6px; border-radius:6px; font-size:0.7rem; }
-.conf-high { color:var(--good); }
-.conf-med { color:var(--orange); }
-.conf-low { color:var(--red); }
-.note-cell { max-width:300px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; cursor:pointer; color:var(--muted); font-size:0.72rem; }
-.note-cell:hover { white-space:normal; color:var(--ink); }
-.filter-bar { display:flex; gap:8px; margin-bottom:16px; flex-wrap:wrap; }
-.filter-btn { background:var(--surface); border:1px solid var(--line); color:var(--ink2); padding:7px 14px; border-radius:999px; cursor:pointer; font-size:0.8rem; font-weight:600; }
-.filter-btn.active { background:var(--brand); color:#fff; border-color:var(--brand); }
-.rtds-dot { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:6px; }
-.rtds-dot.on { background:var(--good); box-shadow:0 0 6px var(--good); }
-.rtds-dot.off { background:var(--red); }
-.empty { text-align:center; padding:40px; color:var(--muted); }
+.stat-card .label { font-size: 0.7rem; color: #5b8a6e; text-transform: uppercase; letter-spacing: 0.5px; font-weight: 700; }
+.stat-card .value { font-size: 1.5rem; font-weight: 700; font-family: 'JetBrains Mono', monospace; margin-top: 4px; color:#0f2417; }
+.stat-card .value.green { color: #15803d; }
+.stat-card .value.red { color: #dc2626; }
+.stat-card .value.blue { color: #0ea5e9; }
+.table-wrap { background: rgba(255,255,255,0.62); backdrop-filter: blur(20px); -webkit-backdrop-filter: blur(20px); border: 1px solid rgba(255,255,255,0.8); border-radius: 18px; padding: 8px; overflow-x: auto; box-shadow: 0 8px 32px rgba(21,128,61,0.08); }
+table { width: 100%; border-collapse: collapse; font-size: 0.82rem; }
+thead th { color: #5b8a6e; text-transform: uppercase; font-size: 0.66rem; letter-spacing: 0.5px; padding: 10px 8px; text-align: left; border-bottom: 1px solid rgba(21,128,61,0.15); }
+tbody td { padding: 10px 8px; border-bottom: 1px solid rgba(21,128,61,0.08); font-family: 'JetBrains Mono', monospace; font-size: 0.76rem; color:#1a3d2a; }
+tbody tr:hover { background: rgba(74,222,128,0.10); }
+.up { color: #15803d; }
+.down { color: #dc2626; }
+.win { color: #15803d; font-weight: 700; }
+.loss { color: #dc2626; font-weight: 700; }
+.pend { color: #ca8a04; }
+.hedge-badge { background: rgba(14,165,233,0.15); color: #0ea5e9; padding: 2px 6px; border-radius: 6px; font-size: 0.7rem; }
+.conf-high { color: #15803d; }
+.conf-med { color: #ca8a04; }
+.conf-low { color: #dc2626; }
+.note-cell { max-width: 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: pointer; color: #6b9580; font-size: 0.72rem; }
+.note-cell:hover { white-space: normal; color: #0f2417; }
+.filter-bar { display: flex; gap: 8px; margin-bottom: 16px; flex-wrap: wrap; }
+.filter-btn { background: rgba(255,255,255,0.5); border: 1px solid rgba(21,128,61,0.2); color: #42795a; padding: 7px 14px; border-radius: 999px; cursor: pointer; font-size: 0.8rem; font-weight: 600; }
+.filter-btn.active { background: #15803d; color: #fff; border-color: #15803d; }
+.rtds-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
+.rtds-dot.on { background: #15803d; box-shadow: 0 0 6px #15803d; }
+.rtds-dot.off { background: #dc2626; }
+.empty { text-align: center; padding: 40px; color: #5b8a6e; }
 @media (max-width:600px){
-  .header h1 { font-size:1.25rem; }
-  .nav { gap:4px; overflow-x:auto; flex-wrap:nowrap; }
-  .nav a { padding:7px 11px; font-size:0.72rem; white-space:nowrap; }
-  .stats-grid { grid-template-columns:repeat(2, 1fr); }
-  .container { padding:18px 12px 50px; }
+  .header h1 { font-size: 1.25rem; }
+  .nav { gap: 4px; overflow-x: auto; flex-wrap: nowrap; }
+  .nav a { padding: 7px 11px; font-size: 0.72rem; white-space: nowrap; }
+  .stats-grid { grid-template-columns: repeat(2, 1fr); }
+  .container { padding: 18px 12px 50px; }
 }
 </style>
 """
 
 
-_ICONS = {
-    'home': '<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:block"><path d="M3 10.4 12 3l9 7.4"/><path d="M5.5 9.2V20a1 1 0 0 0 1 1h11a1 1 0 0 0 1-1V9.2"/><path d="M9.5 21v-5.5a1 1 0 0 1 1-1h3a1 1 0 0 1 1 1V21"/></svg>',
-    'picks': '<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:block"><circle cx="12" cy="12" r="9"/><path d="m12 7.1 3.3 2.4-1.26 3.9H9.96L8.7 9.5z"/><path d="M12 3v4.1M5.1 9l2.85 2.25M18.9 9l-2.85 2.25M8.45 20.1 9.96 13.4M15.55 20.1 14.04 13.4"/></svg>',
-    'codes': '<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:block"><path d="M3.5 8.6A1.6 1.6 0 0 0 5 7V6.2A1.2 1.2 0 0 1 6.2 5h11.6A1.2 1.2 0 0 1 19 6.2V7a1.6 1.6 0 0 0 1.5 1.6v2A1.6 1.6 0 0 0 19 12.2v5.6a1.2 1.2 0 0 1-1.2 1.2H6.2A1.2 1.2 0 0 1 5 17.8v-5.6A1.6 1.6 0 0 0 3.5 10.6z"/><path d="M12 7.5v1.6M12 11.2v1.6M12 14.9v1.6"/></svg>',
-    'builder': '<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:block"><line x1="21" y1="5.5" x2="14" y2="5.5"/><line x1="10" y1="5.5" x2="3" y2="5.5"/><line x1="21" y1="12" x2="12.5" y2="12"/><line x1="8.5" y1="12" x2="3" y2="12"/><line x1="21" y1="18.5" x2="16" y2="18.5"/><line x1="12" y1="18.5" x2="3" y2="18.5"/><line x1="14" y1="3.5" x2="14" y2="7.5"/><line x1="8.5" y1="10" x2="8.5" y2="14"/><line x1="16" y1="16.5" x2="16" y2="20.5"/></svg>',
-    'cards': '<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:block"><rect x="3" y="4.5" width="18" height="15" rx="2.5"/><circle cx="8.5" cy="9.5" r="1.6"/><path d="m3.8 17.5 4.4-4.3a2 2 0 0 1 2.8 0l5.2 5.1"/><path d="m13.5 14 2-2a2 2 0 0 1 2.8 0l2 2"/></svg>',
-    'crypto': '<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:block"><circle cx="12" cy="12" r="9"/><path d="M12 6.4v11.2"/><path d="M14.9 9c-.5-.9-1.6-1.45-2.9-1.45-1.75 0-3.05.95-3.05 2.35 0 1.3 1 1.95 3.05 2.35s3.05.95 3.05 2.35c0 1.4-1.3 2.35-3.05 2.35-1.35 0-2.45-.55-2.95-1.45"/></svg>',
-    'results': '<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:block"><path d="M3 3v16.5A1.5 1.5 0 0 0 4.5 21H21"/><path d="m7 14.5 3.4-3.4 3 3 4.6-5.1"/><path d="M18 5h2v2"/></svg>',
-}
-
-
 def _tabbar_dark(active):
-    """Self-contained bottom tab bar + theme toggle for the landing + crypto pages."""
+    """Self-contained bottom tab bar (own styles) for the dark-themed landing +
+    crypto pages, so navigation is consistent app-wide."""
     tabs = [("home", "/", "🏠", "Home"), ("picks", "/app/picks", "⚽", "Picks"),
             ("codes", "/app/codes", "🎫", "Codes"),
-            ("cards", "/app/cards", "🖼️", "Cards"),
             ("crypto", "/app/paper-poly", "💰", "Crypto"),
             ("results", "/app/results", "📈", "Results")]
     items = "".join(
         '<a href="{}" class="{}"><span class="ic">{}</span>'
         '<span class="tl">{}</span></a>'.format(
-            u, "active" if k == active else "", _ICONS.get(k, ""), l)
+            u, "active" if k == active else "", ic, l)
         for k, u, ic, l in tabs)
     css = (
         '<style>'
         '.cb-tabbar{position:fixed;bottom:0;left:0;right:0;z-index:9999;display:flex;'
-        'justify-content:space-around;background:color-mix(in srgb,var(--surface) 90%, transparent);'
+        'justify-content:space-around;background:rgba(10,15,13,0.93);'
         'backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px);'
-        'border-top:1px solid var(--line);padding:6px 4px calc(6px + env(safe-area-inset-bottom));'
-        'box-shadow:0 -6px 26px rgba(20,40,90,0.10);}'
+        'border-top:1px solid #1f3a28;padding:6px 4px calc(6px + env(safe-area-inset-bottom));}'
         '.cb-tabbar a{flex:1;display:flex;flex-direction:column;align-items:center;gap:3px;'
-        'text-decoration:none;color:var(--muted);padding:6px 2px;border-radius:12px;}'
+        'text-decoration:none;color:#6b8f74;padding:6px 2px;border-radius:12px;}'
         '.cb-tabbar a .ic{font-size:1.3rem;line-height:1;}'
         '.cb-tabbar a .tl{font-size:0.62rem;font-weight:700;letter-spacing:0.2px;}'
-        '.cb-tabbar a.active{color:var(--brand);}'
+        '.cb-tabbar a.active{color:#4ade80;}'
         '.cb-tabbar a.active .tl{font-weight:900;}'
-        '.theme-toggle{width:34px;height:34px;border-radius:10px;border:1px solid var(--line);'
-        'background:var(--surface2);color:var(--ink);font-size:15px;cursor:pointer;line-height:1;'
-        'display:flex;align-items:center;justify-content:center;transition:.18s;}'
-        '.theme-toggle:hover{border-color:var(--brand);}'
         'body{padding-bottom:88px !important;}'
         '</style>')
-    script = (
-        '<script>(function(){var t=localStorage.getItem("cmvng-theme")||"light";'
-        'document.documentElement.setAttribute("data-theme",t);})();'
-        'function cmvngToggleTheme(){var d=document.documentElement,'
-        'n=d.getAttribute("data-theme")==="dark"?"light":"dark";'
-        'd.setAttribute("data-theme",n);localStorage.setItem("cmvng-theme",n);'
-        'var b=document.getElementById("cmvngThemeBtn");if(b)b.textContent=n==="dark"?"☀️":"🌙";}'
-        'document.addEventListener("DOMContentLoaded",function(){'
-        'var t=localStorage.getItem("cmvng-theme")||"light";'
-        'var b=document.getElementById("cmvngThemeBtn");if(b)b.textContent=t==="dark"?"☀️":"🌙";});'
-        '</script>')
-    return css + '<div class="cb-tabbar">' + items + '</div>' + script
+    return css + '<div class="cb-tabbar">' + items + '</div>'
 
 
 def _v2_dashboard_html(platform, trades, bal):
@@ -3536,90 +2672,20 @@ def _v2_dashboard_html(platform, trades, bal):
     h += '<div class="header">'
     h += '<div><h1>CMVNG BOT v2</h1>'
     h += '<div class="subtitle">Confirmation Trading — {} Paper</div></div>'.format(platform.title())
-    h += '<div class="hd-right"><span class="rtds-dot {}"></span><span>{}</span>'.format(
+    h += '<div><span class="rtds-dot {}"></span>{}</div>'.format(
         "on" if _chainlink_connected else "off",
         "RTDS Live" if _chainlink_connected else "RTDS Off")
-    h += '<button class="theme-toggle" id="cmvngThemeBtn" onclick="cmvngToggleTheme()" aria-label="Toggle theme">🌙</button></div>'
     h += '</div>'
 
     # Nav
     h += '<div class="nav">'
     h += '<a href="/app/paper-poly" class="{}">Polymarket</a>'.format("active" if platform == "polymarket" else "")
     h += '<a href="/app/paper-limitless" class="{}">Limitless</a>'.format("active" if platform == "limitless" else "")
-    if platform == "limitless":
-        h += '<a href="/app/live-limitless">Limitless Live</a>'
     h += '<a href="/app/picks">⚽ Picks</a>'
     h += '<a href="/app/codes">🎫 Codes</a>'
     h += '<a href="/app/results">📈 Results</a>'
     h += '<a href="/v2/status">Engine Status</a>'
     h += '</div>'
-
-    # ── Limitless mode banner (toggle + approve + status, in-page) ──
-    if platform == "limitless":
-        live = _lmts_live_enabled()
-        appr = _lmts_get_approval_state()
-        addr = appr.get("wallet", "—")
-        err = appr.get("error")
-        flow_msg = request.args.get("msg", "") if request else ""
-        flow_ok = request.args.get("approved") == "1" if request else False
-        mode_bg = "#16a34a" if live else "#475569"
-        mode_txt = "LIVE TRADING" if live else "PAPER MODE"
-        flip_to = "0" if live else "1"
-        flip_label = "Switch to Paper" if live else "Go Live →"
-        flip_bg = "#475569" if live else "#16a34a"
-        flip_confirm = ("'Switch to PAPER mode? Live trading will stop until you turn it back on.'"
-                        if live else
-                        "'Activate LIVE trading? Real USDC on Base will be used. $%.2f per trade, pauses below $%.2f balance.'" % (
-                            LIMITLESS_MAX_TRADE_USDC, LIMITLESS_MIN_BALANCE_USDC))
-        # Approval state line
-        if err:
-            appr_html = ("<span style='color:#b91c1c;font:12px ui-monospace,monospace'>"
-                         "Approval check failed: {}</span>").format(_html.escape(err)[:160])
-            approve_btn = ""
-        else:
-            allow = appr.get("allowance_usdc", 0)
-            bal_u = appr.get("balance_usdc", 0)
-            eth = appr.get("eth_balance", 0)
-            needs = appr.get("needs_approval", True)
-            allow_color = "#16a34a" if not needs else "#a16207"
-            appr_html = ("<span style='color:#475569;font:12px ui-monospace,monospace'>"
-                         "USDC <b style='color:{ac}'>${al:.2f}</b> approved | "
-                         "Balance <b>${bu:.2f}</b> | ETH gas <b>{eth:.5f}</b>"
-                         "</span>").format(ac=allow_color, al=allow, bu=bal_u, eth=eth)
-            if needs:
-                approve_btn = ('<form action="/app/limitless-approve" method="post" style="margin:0">'
-                               '<button type="submit" onclick="return confirm(\'Approve USDC for the Limitless exchange contract on Base? This is a one-time on-chain transaction and costs a tiny amount of ETH for gas.\')"'
-                               ' style="background:#2563eb;color:#fff;border:0;padding:8px 14px;border-radius:8px;'
-                               'font:600 13px system-ui;cursor:pointer">Approve USDC</button></form>')
-            else:
-                approve_btn = ('<span style="color:#16a34a;font:600 12px system-ui">✓ Approved</span>')
-
-        flash_html = ""
-        if flow_msg:
-            flash_bg = "#dcfce7" if flow_ok else "#fee2e2"
-            flash_color = "#166534" if flow_ok else "#7f1d1d"
-            flash_html = ('<div style="background:{bg};color:{c};padding:8px 14px;border-radius:8px;'
-                          'margin:8px 0;font:13px system-ui">{m}</div>').format(
-                              bg=flash_bg, c=flash_color, m=_html.escape(flow_msg.replace("+", " "))[:200])
-
-        h += ('<div style="background:var(--card-bg,#f8fafc);border:1px solid var(--border,#e5e7eb);'
-              'border-radius:12px;padding:14px 16px;margin:12px 0 16px">{flash}'
-              '<div style="display:flex;flex-wrap:wrap;align-items:center;gap:14px">'
-              '<span style="background:{bg};color:#fff;padding:6px 14px;border-radius:8px;'
-              'font:700 13px system-ui">{txt}</span>'
-              '<span style="color:var(--muted,#64748b);font:12px ui-monospace,monospace">{addr}</span>'
-              '{appr}'
-              '<div style="margin-left:auto;display:flex;gap:8px;align-items:center">'
-              '{approve}'
-              '<form action="/app/limitless-toggle" method="post" style="margin:0">'
-              '<input type="hidden" name="to" value="{to}">'
-              '<button type="submit" onclick="return confirm({conf})" '
-              'style="background:{bbg};color:#fff;border:0;padding:8px 16px;border-radius:8px;'
-              'font:600 13px system-ui;cursor:pointer">{lbl}</button></form>'
-              '</div></div></div>').format(
-                  flash=flash_html, bg=mode_bg, txt=mode_txt, addr=addr,
-                  appr=appr_html, approve=approve_btn, to=flip_to, conf=flip_confirm,
-                  bbg=flip_bg, lbl=flip_label)
 
     # Stats
     h += '<div class="stats-grid">'
@@ -3689,7 +2755,7 @@ def _v2_dashboard_html(platform, trades, bal):
             hedge_str = '<span class="hedge-badge">HEDGED</span>' if hedged else ""
             market_url = t.get("market_url", "")
             if market_url:
-                link_str = '<a href="{}" target="_blank" style="color:var(--brand);text-decoration:none;font-size:0.72rem;">View ↗</a>'.format(
+                link_str = '<a href="{}" target="_blank" style="color:#60a5fa;text-decoration:none;font-size:0.72rem;">View ↗</a>'.format(
                     _html.escape(market_url))
             else:
                 link_str = "-"
@@ -3721,111 +2787,130 @@ LANDING_HTML = """<!DOCTYPE html><html lang="en"><head>
 <link href="https://fonts.googleapis.com/css2?family=Sora:wght@400;600;700;800&family=DM+Sans:wght@400;500;600&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet">
 <style>
 :root{
-  --brand:#2f6bd6; --brand2:#4f86ee; --brand-deep:#1f54b0; --brand-soft:#e8f0fd;
-  --bg1:#eef3fa; --bg2:#e3eaf5;
-  --ink:#0c1320; --ink2:#3a465c; --muted:#73819b;
-  --surface:#ffffff; --surface2:#f6f9fd;
-  --line:rgba(12,19,32,0.09); --line2:rgba(12,19,32,0.06);
-  --glass:rgba(255,255,255,0.72); --glass-line:rgba(12,19,32,0.07);
-  --shadow:0 16px 44px rgba(20,40,90,0.10);
-  --good:#1f9d6b; --good-soft:rgba(31,157,107,0.13);
-  --red:#e1556a; --red-soft:rgba(225,85,106,0.13);
-  --orange:#e08a3c; --grid:rgba(47,107,214,0.05);
-}
-[data-theme="dark"]{
-  --brand:#5a8cf0; --brand2:#7aa2f5; --brand-deep:#3f78e6; --brand-soft:rgba(90,140,240,0.16);
-  --bg1:#0a0e16; --bg2:#06090f;
-  --ink:#eaf0fb; --ink2:#c3cde0; --muted:#8696b4;
-  --surface:#121826; --surface2:#0f1420;
-  --line:rgba(255,255,255,0.09); --line2:rgba(255,255,255,0.06);
-  --glass:rgba(255,255,255,0.055); --glass-line:rgba(255,255,255,0.10);
-  --shadow:0 20px 54px rgba(0,0,0,0.55);
-  --good:#56d3a0; --good-soft:rgba(86,211,160,0.16);
-  --red:#fca5a5; --red-soft:rgba(248,113,113,0.16);
-  --orange:#fb923c; --grid:rgba(120,160,255,0.05);
+  --bg:#05080a; --green:#4ade80; --green2:#22c55e; --green-deep:#15803d;
+  --ink:#eaf3ee; --muted:#7d9788; --line:rgba(74,222,128,0.14);
+  --panel:rgba(255,255,255,0.035);
 }
 *{margin:0;padding:0;box-sizing:border-box;}
 html{scroll-behavior:smooth;}
-body{ font-family:'DM Sans',sans-serif; color:var(--ink); min-height:100vh; overflow-x:hidden; position:relative;
-  background:radial-gradient(130% 90% at 50% -10%, var(--bg1), var(--bg2)); transition:background .35s ease,color .35s ease; }
-body::before{ content:""; position:fixed; inset:0; z-index:0; pointer-events:none;
-  background:radial-gradient(900px 520px at 18% -8%, var(--brand-soft), transparent 60%),
-    radial-gradient(760px 520px at 88% 4%, var(--brand-soft), transparent 58%),
-    radial-gradient(700px 700px at 50% 120%, var(--brand-soft), transparent 60%);
-  animation:drift 16s ease-in-out infinite alternate; }
-body::after{ content:""; position:fixed; inset:0; z-index:0; pointer-events:none; opacity:.6;
-  background-image:linear-gradient(var(--grid) 1px, transparent 1px), linear-gradient(90deg, var(--grid) 1px, transparent 1px);
-  background-size:46px 46px; mask-image:radial-gradient(circle at 50% 30%, black, transparent 78%);
-  -webkit-mask-image:radial-gradient(circle at 50% 30%, black, transparent 78%); }
+body{
+  font-family:'DM Sans',sans-serif; color:var(--ink); background:var(--bg);
+  min-height:100vh; overflow-x:hidden; position:relative;
+}
+/* layered atmosphere */
+body::before{
+  content:""; position:fixed; inset:0; z-index:0; pointer-events:none;
+  background:
+    radial-gradient(900px 520px at 18% -8%, rgba(74,222,128,0.16), transparent 60%),
+    radial-gradient(760px 520px at 88% 4%, rgba(34,197,94,0.12), transparent 58%),
+    radial-gradient(700px 700px at 50% 120%, rgba(21,128,61,0.10), transparent 60%);
+  animation:drift 16s ease-in-out infinite alternate;
+}
+body::after{
+  content:""; position:fixed; inset:0; z-index:0; pointer-events:none; opacity:.5;
+  background-image:
+    linear-gradient(rgba(74,222,128,0.05) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(74,222,128,0.05) 1px, transparent 1px);
+  background-size:46px 46px;
+  mask-image:radial-gradient(circle at 50% 30%, black, transparent 78%);
+  -webkit-mask-image:radial-gradient(circle at 50% 30%, black, transparent 78%);
+}
 @keyframes drift{ from{transform:translate3d(0,0,0);} to{transform:translate3d(0,-18px,0);} }
 .shell{position:relative; z-index:1; max-width:1080px; margin:0 auto; padding:30px 22px 40px;}
+
+/* top bar */
 .bar{display:flex; align-items:center; justify-content:space-between;}
-.bar-right{display:flex; align-items:center; gap:12px;}
 .brand{font-family:'Sora',sans-serif; font-weight:800; font-size:1.05rem; letter-spacing:-.5px; color:var(--ink);}
-.brand b{color:var(--brand);}
-.bar .live{ display:inline-flex; align-items:center; gap:7px; font-family:'JetBrains Mono',monospace;
-  font-size:.66rem; letter-spacing:1.5px; color:var(--brand-deep); text-transform:uppercase;
-  border:1px solid var(--line); border-radius:999px; padding:6px 12px; background:var(--surface); }
-.dot{width:7px; height:7px; border-radius:50%; background:var(--brand); box-shadow:0 0 0 0 rgba(47,107,214,.6); animation:pulse 1.8s infinite;}
-@keyframes pulse{0%{box-shadow:0 0 0 0 rgba(47,107,214,.5);}70%{box-shadow:0 0 0 9px rgba(47,107,214,0);}100%{box-shadow:0 0 0 0 rgba(47,107,214,0);}}
-.theme-toggle{width:34px;height:34px;border-radius:10px;border:1px solid var(--line);background:var(--surface);color:var(--ink);font-size:15px;cursor:pointer;line-height:1;display:flex;align-items:center;justify-content:center;transition:.18s;}
-.theme-toggle:hover{border-color:var(--brand);}
+.brand b{color:var(--green);}
+.bar .live{
+  display:inline-flex; align-items:center; gap:7px; font-family:'JetBrains Mono',monospace;
+  font-size:.66rem; letter-spacing:1.5px; color:var(--green); text-transform:uppercase;
+  border:1px solid var(--line); border-radius:999px; padding:6px 12px; background:var(--panel);
+}
+.dot{width:7px; height:7px; border-radius:50%; background:var(--green); box-shadow:0 0 0 0 rgba(74,222,128,.6); animation:pulse 1.8s infinite;}
+@keyframes pulse{0%{box-shadow:0 0 0 0 rgba(74,222,128,.55);}70%{box-shadow:0 0 0 9px rgba(74,222,128,0);}100%{box-shadow:0 0 0 0 rgba(74,222,128,0);}}
+
+/* hero */
 .hero{padding:64px 0 26px; text-align:center;}
-.hero .kicker{ font-family:'JetBrains Mono',monospace; font-size:.72rem; letter-spacing:3px;
-  color:var(--muted); text-transform:uppercase; opacity:0; animation:rise .7s .05s forwards; }
-.hero h1{ font-family:'Sora',sans-serif; font-weight:800; letter-spacing:-2.5px; line-height:.96;
+.hero .kicker{
+  font-family:'JetBrains Mono',monospace; font-size:.72rem; letter-spacing:3px;
+  color:var(--muted); text-transform:uppercase; opacity:0;
+  animation:rise .7s .05s forwards;
+}
+.hero h1{
+  font-family:'Sora',sans-serif; font-weight:800; letter-spacing:-2.5px; line-height:.96;
   font-size:clamp(3.2rem,11vw,6.4rem); margin:14px 0 6px; opacity:0;
-  background:linear-gradient(180deg,var(--ink) 0%, var(--brand-deep) 70%, var(--brand) 100%);
+  background:linear-gradient(180deg,#ffffff 0%, #b9f3cf 55%, var(--green2) 100%);
   -webkit-background-clip:text; background-clip:text; -webkit-text-fill-color:transparent;
-  filter:drop-shadow(0 12px 36px rgba(47,107,214,.18)); animation:rise .8s .12s forwards; }
-.hero h1 sup{font-size:.26em; color:var(--brand); -webkit-text-fill-color:var(--brand); vertical-align:super; letter-spacing:0;}
-.hero .lede{ max-width:560px; margin:18px auto 0; color:var(--ink2); font-size:1.05rem; line-height:1.6; opacity:0; animation:rise .8s .2s forwards; }
+  filter:drop-shadow(0 10px 40px rgba(74,222,128,.22));
+  animation:rise .8s .12s forwards;
+}
+.hero h1 sup{font-size:.26em; color:var(--green); -webkit-text-fill-color:var(--green); vertical-align:super; letter-spacing:0;}
+.hero .lede{
+  max-width:560px; margin:18px auto 0; color:#9fbdac; font-size:1.05rem; line-height:1.6; opacity:0;
+  animation:rise .8s .2s forwards;
+}
 @keyframes rise{from{opacity:0; transform:translateY(16px);} to{opacity:1; transform:translateY(0);}}
+
+/* equity curve */
 .curve{margin:34px auto 0; max-width:620px; opacity:0; animation:rise .9s .3s forwards;}
 .curve svg{width:100%; height:90px; display:block;}
-.curve path.line{fill:none; stroke:var(--brand); stroke-width:2.4; stroke-linecap:round;
-  stroke-dasharray:1400; stroke-dashoffset:1400; animation:draw 2.2s .5s ease-out forwards;
-  filter:drop-shadow(0 4px 14px rgba(47,107,214,.35));}
+.curve path.line{fill:none; stroke:url(--g); stroke:var(--green); stroke-width:2.4;
+  stroke-linecap:round; stroke-dasharray:1400; stroke-dashoffset:1400; animation:draw 2.2s .5s ease-out forwards;
+  filter:drop-shadow(0 4px 14px rgba(74,222,128,.4));}
 .curve path.fill{fill:url(#grad); opacity:0; animation:fade 1.4s 1.6s forwards;}
 @keyframes draw{to{stroke-dashoffset:0;}}
 @keyframes fade{to{opacity:1;}}
+
+/* stats */
 .stats{display:flex; justify-content:center; gap:14px; flex-wrap:wrap; margin:38px 0 4px;}
-.stat{ flex:1; min-width:150px; max-width:230px; padding:20px 18px; border-radius:18px;
-  background:var(--glass); border:1px solid var(--glass-line); backdrop-filter:blur(10px); -webkit-backdrop-filter:blur(10px);
-  box-shadow:var(--shadow); opacity:0; animation:rise .7s forwards; }
+.stat{
+  flex:1; min-width:150px; max-width:230px; padding:20px 18px; border-radius:18px;
+  background:linear-gradient(180deg, rgba(74,222,128,0.07), rgba(255,255,255,0.02));
+  border:1px solid var(--line); backdrop-filter:blur(8px);
+  opacity:0; animation:rise .7s forwards;
+}
 .stats .stat:nth-child(1){animation-delay:.34s;}
 .stats .stat:nth-child(2){animation-delay:.42s;}
 .stats .stat:nth-child(3){animation-delay:.5s;}
-.stat .num{font-family:'JetBrains Mono',monospace; font-weight:700; font-size:2.05rem; color:var(--ink); letter-spacing:-1px;}
+.stat .num{font-family:'JetBrains Mono',monospace; font-weight:700; font-size:2.05rem; color:#fff; letter-spacing:-1px;}
 .stat .lab{font-size:.7rem; color:var(--muted); text-transform:uppercase; letter-spacing:1.5px; margin-top:6px;}
+
+/* feature cards */
 .grid{display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:16px; margin:46px 0 0;}
-.feat{ position:relative; padding:24px 22px; border-radius:20px; overflow:hidden;
-  background:var(--glass); border:1px solid var(--glass-line); backdrop-filter:blur(10px); -webkit-backdrop-filter:blur(10px);
-  box-shadow:var(--shadow); transition:transform .25s cubic-bezier(.2,.8,.2,1), border-color .25s, box-shadow .25s;
-  opacity:0; animation:rise .7s forwards; }
+.feat{
+  position:relative; padding:24px 22px; border-radius:20px; overflow:hidden;
+  background:var(--panel); border:1px solid rgba(255,255,255,0.06);
+  transition:transform .25s cubic-bezier(.2,.8,.2,1), border-color .25s, box-shadow .25s;
+  opacity:0; animation:rise .7s forwards;
+}
 .grid .feat:nth-child(1){animation-delay:.56s;}
 .grid .feat:nth-child(2){animation-delay:.63s;}
 .grid .feat:nth-child(3){animation-delay:.7s;}
 .feat::before{content:""; position:absolute; inset:0 0 auto 0; height:2px;
-  background:linear-gradient(90deg, transparent, var(--brand), transparent); opacity:.6;}
-.feat:hover{transform:translateY(-5px); border-color:var(--brand-soft); box-shadow:0 24px 60px rgba(20,40,90,.16);}
+  background:linear-gradient(90deg, transparent, var(--green), transparent); opacity:.5;}
+.feat:hover{transform:translateY(-5px); border-color:var(--line); box-shadow:0 18px 50px rgba(0,0,0,.45), 0 0 0 1px var(--line);}
 .feat .ico{font-size:1.5rem; display:inline-block; margin-bottom:12px;}
-.feat h3{font-family:'Sora',sans-serif; font-weight:700; font-size:1.02rem; color:var(--brand-deep); margin-bottom:8px;}
-.feat p{color:var(--ink2); font-size:.85rem; line-height:1.55;}
+.feat h3{font-family:'Sora',sans-serif; font-weight:700; font-size:1.02rem; color:var(--green); margin-bottom:8px;}
+.feat p{color:#8fae9c; font-size:.85rem; line-height:1.55;}
+
+/* CTA */
 .cta{display:flex; flex-wrap:wrap; gap:12px; justify-content:center; margin:44px 0 0; opacity:0; animation:rise .7s .8s forwards;}
-.btn{ display:inline-flex; align-items:center; gap:8px; text-decoration:none; font-weight:700;
-  font-size:.92rem; padding:15px 28px; border-radius:14px; transition:transform .2s, box-shadow .2s, background .2s; }
-.btn.primary{color:#fff; background:linear-gradient(135deg, var(--brand), var(--brand2)); box-shadow:0 10px 30px rgba(47,107,214,.32);}
-.btn.primary:hover{transform:translateY(-2px); box-shadow:0 16px 40px rgba(47,107,214,.45);}
-.btn.ghost{color:var(--brand-deep); background:var(--surface); border:1px solid var(--line);}
-.btn.ghost:hover{transform:translateY(-2px); background:var(--brand-soft);}
-.foot{text-align:center; margin:54px 0 10px; color:var(--muted); font-size:.74rem; font-family:'JetBrains Mono',monospace; letter-spacing:.5px;}
+.btn{
+  display:inline-flex; align-items:center; gap:8px; text-decoration:none; font-weight:700;
+  font-size:.92rem; padding:15px 28px; border-radius:14px; transition:transform .2s, box-shadow .2s, background .2s;
+}
+.btn.primary{color:#04140a; background:linear-gradient(135deg, var(--green), var(--green2));
+  box-shadow:0 10px 30px rgba(74,222,128,.32);}
+.btn.primary:hover{transform:translateY(-2px); box-shadow:0 16px 40px rgba(74,222,128,.45);}
+.btn.ghost{color:var(--green); background:var(--panel); border:1px solid var(--line);}
+.btn.ghost:hover{transform:translateY(-2px); background:rgba(74,222,128,.1);}
+.foot{text-align:center; margin:54px 0 10px; color:#52685b; font-size:.74rem; font-family:'JetBrains Mono',monospace; letter-spacing:.5px;}
 </style></head><body>
 <div class="shell">
   <div class="bar">
     <div class="brand">CMVNG<b>BOT</b></div>
-    <div class="bar-right"><div class="live"><span class="dot"></span>Engine Live</div>
-    <button class="theme-toggle" id="cmvngThemeBtn" onclick="cmvngToggleTheme()" aria-label="Toggle theme">🌙</button></div>
+    <div class="live"><span class="dot"></span>Engine Live</div>
   </div>
 
   <div class="hero">
@@ -3836,8 +2921,8 @@ body::after{ content:""; position:fixed; inset:0; z-index:0; pointer-events:none
     <div class="curve">
       <svg viewBox="0 0 620 90" preserveAspectRatio="none">
         <defs><linearGradient id="grad" x1="0" y1="0" x2="0" y2="1">
-          <stop offset="0%" stop-color="rgba(47,107,214,0.26)"/>
-          <stop offset="100%" stop-color="rgba(47,107,214,0)"/>
+          <stop offset="0%" stop-color="rgba(74,222,128,0.28)"/>
+          <stop offset="100%" stop-color="rgba(74,222,128,0)"/>
         </linearGradient></defs>
         <path class="fill" d="M0,74 L40,70 L90,72 L140,58 L190,62 L240,46 L300,50 L350,34 L410,40 L470,22 L530,26 L580,12 L620,16 L620,90 L0,90 Z"/>
         <path class="line" d="M0,74 L40,70 L90,72 L140,58 L190,62 L240,46 L300,50 L350,34 L410,40 L470,22 L530,26 L580,12 L620,16"/>
@@ -3932,314 +3017,6 @@ def paper_limitless():
         trades = []
     bal = _v2_balances.get("limitless", {"balance": 100, "peak_balance": 100})
     return _v2_dashboard_html("limitless", trades, bal)
-
-
-# ═══════════════════════════════════════════════════════════
-# LIMITLESS LIVE — in-app controls (toggle + approve + records)
-# ═══════════════════════════════════════════════════════════
-
-def _lmts_get_approval_state():
-    """Read-only on-chain state for the wallet: USDC allowance + balance + ETH
-    for gas. Returns dict with 'error' on any failure so the UI can show it."""
-    if not LIMITLESS_PRIV_KEY:
-        return {"error": "LIMITLESS_PRIVATE_KEY not set"}
-    try:
-        from limitless_sdk import (check_usdc_allowance, get_usdc_balance,
-                                   CLOB_ADDRESS, USDC_DECIMALS)
-        from web3 import Web3
-        from eth_account import Account
-        w3 = Web3(Web3.HTTPProvider(LIMITLESS_BASE_RPC))
-        addr = Account.from_key(LIMITLESS_PRIV_KEY).address
-        allowance_raw = check_usdc_allowance(w3, addr, CLOB_ADDRESS)
-        balance_raw = get_usdc_balance(w3, addr)
-        eth_wei = w3.eth.get_balance(Web3.to_checksum_address(addr))
-        return {
-            "wallet": addr,
-            "allowance_usdc": allowance_raw / (10 ** USDC_DECIMALS),
-            "balance_usdc": balance_raw / (10 ** USDC_DECIMALS),
-            "eth_balance": float(eth_wei) / 1e18,
-            "needs_approval": allowance_raw < (10 ** USDC_DECIMALS),  # < $1 allowance
-        }
-    except ImportError:
-        return {"error": "py-limitless not installed — add to requirements.txt"}
-    except Exception as e:
-        return {"error": str(e)[:200]}
-
-
-def _lmts_run_approval():
-    """Sends the USDC approval transaction to Base. One-time on-chain step
-    that lets the Limitless exchange contract spend the wallet's USDC. Needs
-    a small amount of ETH on Base for gas."""
-    if not LIMITLESS_PRIV_KEY:
-        return {"ok": False, "error": "LIMITLESS_PRIVATE_KEY not set"}
-    try:
-        from limitless_sdk import ensure_usdc_approved, CLOB_ADDRESS
-        from web3 import Web3
-        w3 = Web3(Web3.HTTPProvider(LIMITLESS_BASE_RPC))
-        result = ensure_usdc_approved(w3, LIMITLESS_PRIV_KEY, CLOB_ADDRESS, min_amount=0)
-        return {"ok": True,
-                "already_approved": result.get("already_approved", False),
-                "tx_hash": result.get("tx_hash"),
-                "allowance": result.get("allowance", 0)}
-    except ImportError:
-        return {"ok": False, "error": "py-limitless not installed"}
-    except Exception as e:
-        return {"ok": False, "error": str(e)[:500]}
-
-
-@app.route("/app/limitless-toggle", methods=["POST", "GET"])
-def limitless_toggle():
-    """Flip the live trading switch (DB-backed). POST changes state; GET is
-    treated the same so a simple link works on mobile. The toggle takes
-    effect on the next signal — no redeploy needed."""
-    cur = _lmts_live_enabled()
-    target = request.values.get("to", "").strip().lower()
-    if target in ("1", "live", "on", "yes", "true"):
-        new = True
-    elif target in ("0", "paper", "off", "no", "false"):
-        new = False
-    else:
-        new = not cur
-    ok = _lmts_live_set(new)
-    print("[LMTS-LIVE] toggled {} -> {} (ok={})".format(
-        "live" if cur else "paper", "live" if new else "paper", ok))
-    return redirect("/app/paper-limitless")
-
-
-@app.route("/app/limitless-approve", methods=["POST", "GET"])
-def limitless_approve():
-    """Trigger the one-time on-chain USDC approval. Result is shown back on
-    the paper bot page via a flash query param so the UX is one click + one
-    confirmation message."""
-    if _FB_CACHE.get("running"):
-        pass  # not relevant; placeholder to keep style consistent
-    res = _lmts_run_approval()
-    if res.get("ok"):
-        if res.get("already_approved"):
-            msg = "Already approved (allowance OK)"
-        else:
-            tx = res.get("tx_hash") or ""
-            msg = "Approval submitted: {}{}".format(tx[:14], "…" if len(tx) > 14 else "")
-        print("[LMTS-LIVE] approve: {}".format(msg))
-        return redirect("/app/paper-limitless?approved=1&msg=" + msg.replace(" ", "+"))
-    err = res.get("error") or "unknown error"
-    print("[LMTS-LIVE] approve error: {}".format(err))
-    return redirect("/app/paper-limitless?approved=0&msg=" + err.replace(" ", "+")[:120])
-
-
-@app.route("/app/live-limitless")
-def live_limitless():
-    """Live trades records page — mirrors the paper dashboard's UI/UX but
-    reads from v2_live_trades. Live status badge + toggle live."""
-    try:
-        conn = get_db()
-        rows = conn.run("SELECT * FROM v2_live_trades ORDER BY id DESC LIMIT 200")
-        cols = [c['name'] for c in conn.columns]
-        trades = [dict(zip(cols, r)) for r in rows]
-        conn.close()
-    except Exception:
-        trades = []
-    return _v2_live_dashboard_html(trades)
-
-
-def _v2_live_dashboard_html(trades):
-    """Live trades dashboard. Same theme/structure as _v2_dashboard_html — uses
-    the shared DASHBOARD_CSS, header, and nav so paper and live feel like two
-    tabs of one product. Stats and table columns are adapted to live data."""
-    import html as _html
-
-    total = len(trades)
-    filled = sum(1 for t in trades if t.get("fill_status") == "FILLED")
-    cancelled = sum(1 for t in trades if t.get("fill_status") == "CANCELLED")
-    errored = sum(1 for t in trades if t.get("fill_status") == "ERROR")
-    capped = sum(1 for t in trades if t.get("fill_status") == "CAPPED")
-    fill_rate = round(filled / max(filled + cancelled, 1) * 100, 1)
-    spend = sum(float(t.get("stake_usdc") or 0) for t in trades if t.get("fill_status") == "FILLED")
-    today_spend = _lmts_today_spend_usdc()
-    balance_usdc = _lmts_get_balance_usdc()      # None if RPC failed
-    paused_low = (balance_usdc is not None and balance_usdc < LIMITLESS_MIN_BALANCE_USDC)
-
-    # Resolution + redemption tallies (FILLED rows only count toward W/L stats).
-    wins = sum(1 for t in trades if t.get("outcome") == "WIN")
-    losses = sum(1 for t in trades if t.get("outcome") == "LOSS")
-    pushes = sum(1 for t in trades if t.get("outcome") == "PUSH")
-    total_pnl = sum(float(t.get("pnl") or 0) for t in trades if t.get("outcome"))
-    open_filled = sum(1 for t in trades
-                      if t.get("fill_status") == "FILLED" and not t.get("outcome"))
-    redeem_done = sum(1 for t in trades if t.get("redeem_status") == "DONE")
-    redeem_pending = sum(1 for t in trades if t.get("redeem_status") == "PENDING")
-    redeem_failed = sum(1 for t in trades if t.get("redeem_status") == "FAILED")
-    win_rate = round(wins / max(wins + losses, 1) * 100, 1) if (wins + losses) else 0.0
-
-    appr = _lmts_get_approval_state()
-    addr = appr.get("wallet", "—")
-    live = _lmts_live_enabled()
-
-    h = '<!DOCTYPE html><html><head><meta charset="utf-8">'
-    h += '<meta name="viewport" content="width=device-width, initial-scale=1">'
-    h += '<title>Cmvng Bot v2 — Limitless Live</title>'
-    h += DASHBOARD_CSS
-    h += '</head><body><div class="container">'
-
-    # Header
-    h += '<div class="header"><div><h1>CMVNG BOT v2</h1>'
-    h += '<div class="subtitle">Confirmation Trading — Limitless <b>LIVE</b></div></div>'
-    h += '<div class="hd-right"><span class="rtds-dot {}"></span><span>{}</span>'.format(
-        "on" if _chainlink_connected else "off",
-        "RTDS Live" if _chainlink_connected else "RTDS Off")
-    h += '<button class="theme-toggle" id="cmvngThemeBtn" onclick="cmvngToggleTheme()" aria-label="Toggle theme">🌙</button></div></div>'
-
-    # Nav (same as paper, with active state on Limitless live)
-    h += '<div class="nav">'
-    h += '<a href="/app/paper-poly">Polymarket</a>'
-    h += '<a href="/app/paper-limitless">Limitless Paper</a>'
-    h += '<a href="/app/live-limitless" class="active">Limitless Live</a>'
-    h += '<a href="/app/picks">⚽ Picks</a>'
-    h += '<a href="/app/codes">🎫 Codes</a>'
-    h += '<a href="/app/results">📈 Results</a>'
-    h += '</div>'
-
-    # Mode banner: shows current state + lets you flip back to paper from here too
-    mode_bg = "#16a34a" if live else "#475569"
-    mode_txt = "LIVE TRADING" if live else "PAPER MODE"
-    flip_to = "0" if live else "1"
-    flip_label = "Switch to Paper" if live else "Go Live →"
-    h += ('<div style="display:flex;flex-wrap:wrap;align-items:center;gap:12px;'
-          'background:var(--card-bg,#f8fafc);border:1px solid var(--border,#e5e7eb);'
-          'border-radius:12px;padding:14px 16px;margin:12px 0 16px">'
-          '<span style="background:{bg};color:#fff;padding:6px 14px;border-radius:8px;'
-          'font:700 13px system-ui">{txt}</span>'
-          '<span style="color:var(--muted,#64748b);font:13px ui-monospace,monospace">{addr}</span>'
-          '<form action="/app/limitless-toggle" method="post" style="margin-left:auto">'
-          '<input type="hidden" name="to" value="{to}">'
-          '<button type="submit" onclick="return confirm({conf})" '
-          'style="background:{bbg};color:#fff;border:0;padding:8px 16px;border-radius:8px;'
-          'font:600 13px system-ui;cursor:pointer">{lbl}</button>'
-          '</form></div>'.format(
-              bg=mode_bg, txt=mode_txt, addr=addr, to=flip_to,
-              conf=("'Switch to PAPER mode? Live trading will stop until you turn it back on.'"
-                    if live else
-                    "'Activate LIVE trading? Real USDC on Base will be used. ${:.2f} per trade, pauses below ${:.2f} balance.'".format(
-                        LIMITLESS_MAX_TRADE_USDC, LIMITLESS_MIN_BALANCE_USDC)),
-              bbg="#475569" if live else "#16a34a", lbl=flip_label))
-
-    # Stats — entry side
-    h += '<div class="stats-grid">'
-    h += '<div class="stat-card"><div class="label">Total attempts</div><div class="value">{}</div></div>'.format(total)
-    h += '<div class="stat-card"><div class="label">Filled</div><div class="value green">{}</div></div>'.format(filled)
-    h += '<div class="stat-card"><div class="label">Cancelled</div><div class="value">{}</div></div>'.format(cancelled)
-    h += '<div class="stat-card"><div class="label">Errors</div><div class="value {}">{}</div></div>'.format("red" if errored else "", errored)
-    h += '<div class="stat-card"><div class="label">Fill rate</div><div class="value {}">{:.1f}%</div></div>'.format(
-        "green" if fill_rate >= 60 else "red" if fill_rate < 30 else "", fill_rate)
-    # Wallet balance vs floor — the live circuit breaker. RED if paused, GREEN
-    # if trading, GREY if balance read failed.
-    if balance_usdc is None:
-        bal_val_html = '<div class="value">RPC ✕</div>'
-    elif paused_low:
-        bal_val_html = '<div class="value red">${:.2f} ⏸</div>'.format(balance_usdc)
-    else:
-        bal_val_html = '<div class="value green">${:.2f}</div>'.format(balance_usdc)
-    h += '<div class="stat-card"><div class="label">Wallet / Floor ${:.2f}</div>{}</div>'.format(
-        LIMITLESS_MIN_BALANCE_USDC, bal_val_html)
-    h += '<div class="stat-card"><div class="label">24h volume</div><div class="value blue">${:.2f}</div></div>'.format(today_spend)
-    h += '</div>'
-
-    # Stats — resolution + redemption (only shown once any trade has resolved
-    # so an empty dashboard isn't cluttered with zeros)
-    if (wins + losses + pushes + open_filled) > 0:
-        h += '<div class="stats-grid" style="margin-top:8px">'
-        h += '<div class="stat-card"><div class="label">Open (awaiting resolve)</div><div class="value">{}</div></div>'.format(open_filled)
-        h += '<div class="stat-card"><div class="label">Wins</div><div class="value green">{}</div></div>'.format(wins)
-        h += '<div class="stat-card"><div class="label">Losses</div><div class="value red">{}</div></div>'.format(losses)
-        h += '<div class="stat-card"><div class="label">Win rate</div><div class="value {}">{:.1f}%</div></div>'.format(
-            "green" if win_rate >= 55 else "red" if win_rate < 45 else "", win_rate)
-        h += '<div class="stat-card"><div class="label">Realized P&L</div><div class="value {}">${:+.2f}</div></div>'.format(
-            "green" if total_pnl > 0 else "red" if total_pnl < 0 else "", total_pnl)
-        h += '<div class="stat-card"><div class="label">Redeemed on-chain</div><div class="value {}">{} done · {} pending{}</div></div>'.format(
-            "green" if redeem_done and not redeem_failed else "red" if redeem_failed else "",
-            redeem_done, redeem_pending,
-            " · {} failed".format(redeem_failed) if redeem_failed else "")
-        h += '</div>'
-
-    # Trade table
-    h += '<div class="table-wrap"><table><thead><tr>'
-    h += '<th>#</th><th>Time</th><th>TF</th><th>Asset</th><th>Dir</th>'
-    h += '<th>Limit</th><th>Fill px</th><th>Stake</th><th>Shares</th>'
-    h += '<th>Status</th><th>Outcome</th><th>P&L</th><th>Redeem</th><th>Order id</th>'
-    h += '</tr></thead><tbody>'
-
-    for i, t in enumerate(trades):
-        st = t.get("fill_status") or "—"
-        cls = {"FILLED": "green", "CANCELLED": "", "CAPPED": "",
-               "ERROR": "red"}.get(st, "")
-        ts_val = t.get("fired_at")
-        ts_txt = ts_val.strftime("%m-%d %H:%M:%S") if ts_val else "—"
-        lim = t.get("limit_price_cents") or 0
-        stake = t.get("stake_usdc") or 0
-        shares = t.get("size_shares") or 0
-        fp = t.get("fill_price_cents")
-        fs = t.get("filled_size")
-        oid = (t.get("order_id") or "")[:14]
-        err_msg = t.get("error_message") or ""
-
-        outcome = t.get("outcome") or ""
-        if outcome == "WIN":
-            oc_html = '<span class="badge green">WIN</span>'
-        elif outcome == "LOSS":
-            oc_html = '<span class="badge red">LOSS</span>'
-        elif outcome == "PUSH":
-            oc_html = '<span class="badge">PUSH</span>'
-        elif st == "FILLED":
-            oc_html = '<span class="badge" style="background:#fef3c7;color:#92400e">OPEN</span>'
-        else:
-            oc_html = '—'
-
-        pnl_val = t.get("pnl")
-        if pnl_val is None or outcome == "":
-            pnl_html = '—'
-        else:
-            pnl_html = '<span style="color:{}">${:+.2f}</span>'.format(
-                "#16a34a" if pnl_val > 0 else ("#dc2626" if pnl_val < 0 else "#475569"),
-                float(pnl_val))
-
-        rs = t.get("redeem_status") or ""
-        rtx = t.get("redeem_tx_hash") or ""
-        if rs == "DONE" and rtx:
-            short_tx = rtx[:10] + "…"
-            redeem_html = ('<a href="https://basescan.org/tx/{tx}" target="_blank" '
-                          'style="color:#16a34a;text-decoration:none;font:600 11px ui-monospace">'
-                          '✓ {short}</a>').format(tx=_html.escape(rtx), short=_html.escape(short_tx))
-        elif rs == "PENDING":
-            redeem_html = '<span class="badge" style="background:#fef3c7;color:#92400e">PENDING</span>'
-        elif rs == "FAILED":
-            redeem_html = '<span class="badge red">FAILED</span>'
-        elif rs == "SKIPPED":
-            redeem_html = '<span style="color:#94a3b8;font-size:11px">—</span>'
-        else:
-            redeem_html = '—'
-
-        h += '<tr><td>{}</td><td>{}</td><td>{}</td><td><b>{}</b></td><td><b>{}</b></td>'.format(
-            i + 1, ts_txt, t.get("timeframe") or "—",
-            t.get("asset") or "—", t.get("direction") or "—")
-        h += '<td>{:.0f}c</td><td>{}</td><td>${:.2f}</td><td>{:.4f}</td>'.format(
-            lim, "{:.1f}c".format(fp) if fp else "—", stake, shares)
-        h += '<td><span class="badge {}">{}</span>'.format(cls, st)
-        if err_msg:
-            h += '<div class="errmsg">{}</div>'.format(_html.escape(err_msg[:120]))
-        h += '</td>'
-        h += '<td>{}</td><td>{}</td><td>{}</td>'.format(oc_html, pnl_html, redeem_html)
-        h += '<td class="mono">{}</td></tr>'.format(oid or "—")
-    if not trades:
-        h += '<tr><td colspan="14" class="muted">No live trades yet — flip the toggle when ready.</td></tr>'
-    h += '</tbody></table></div>'
-
-    h += '<style>.badge{padding:3px 9px;border-radius:6px;font:600 11px system-ui;background:#e2e8f0;color:#475569}'
-    h += '.badge.green{background:#16a34a;color:#fff}.badge.red{background:#dc2626;color:#fff}'
-    h += '.errmsg{font:11px ui-monospace,monospace;color:#b91c1c;margin-top:3px;max-width:280px;white-space:normal}'
-    h += '.mono{font:12px ui-monospace,monospace;color:#64748b}.muted{color:#94a3b8;text-align:center;padding:24px}</style>'
-    h += '</div></body></html>'
-    return h
-
 
 
 @app.route("/v2/status")
@@ -6768,8 +5545,8 @@ TIER_CONFIG = {
         "label": "10 ODDS — RISK", "emoji": "🟠",
     },
     "1000_odds": {
-        "target": 1000.0, "min_conf": 58, "min_sel": 4, "max_sel": 20,
-        "odds_lo": 1.28, "odds_hi": 15.0,   # real legs only — no 1.01 padding
+        "target": 1000.0, "min_conf": 58, "min_sel": 4, "max_sel": 16,
+        "odds_lo": 1.40, "odds_hi": 15.0,   # real legs only — no 1.01 padding
         "rank": "odds",                      # build toward big odds, best longshots first
         "prefer": ["correct_score", "home_win_btts", "home_win_over_2.5",
                    "handicap_home_-1.5", "handicap_away_-1.5", "over_3.5",
@@ -6919,7 +5696,7 @@ def build_accumulator(all_picks, tier_key, used_selections=None, match_count=Non
                 if type_count.get(key, 0) >= per_type_cap:
                     continue
                 new_running = running * p["odds"]
-                if rank_mode != "odds" and new_running > target * 1.18 and len(slip) >= cfg["min_sel"]:
+                if new_running > target * 1.18 and len(slip) >= cfg["min_sel"]:
                     continue
                 slip.append(p)
                 used_matches.add(p["match"])
@@ -6974,33 +5751,18 @@ def build_all_accumulators(all_picks, avoid_games=None):
     # pick DIFFERENT expressions of the same games rather than the identical slip.
     rotation_seed = int(time.time() // 3600)
     for tier_key in ["2_odds", "3_odds", "5_odds", "10_odds", "1000_odds"]:
-        tgt = TIER_CONFIG[tier_key]["target"]
-        if tier_key in ("10_odds", "1000_odds"):
-            # The two highest tiers need the scarce high-odds legs, and on a thin
-            # slate the lower tiers eat them first under no-repeat — which is what
-            # stranded the moonshot on 4 legs. Each of these is a STANDALONE slip
-            # the user plays on its own, so build each from the FULL board (highest
-            # available legs, one per match) rather than the leftovers. They may
-            # share a game with another slip — that's fine across separate slips.
-            result[tier_key] = build_accumulator(
-                all_picks, tier_key, set(), {}, {}, rotation_seed,
-                max_reuse=1, avoid_games=avoid_games)
-            continue
-        # 2/3/5: kept distinct from each other (no-repeat). Relax the cap 1->2->3
-        # so a tier can still REACH ITS TARGET on a thin slate by reusing a game
-        # with a DIFFERENT bet family. Keep the best build across caps.
-        best = None
+        acc = None
+        # Default no-repeat (cap 1). Relax to 2 then 3 ONLY if this tier would
+        # otherwise fail to build on a thin slate.
         for cap in (1, 2, 3):
             acc = build_accumulator(all_picks, tier_key, used, match_count,
                                     match_families, rotation_seed,
                                     max_reuse=cap, avoid_games=avoid_games)
-            if acc and (best is None or acc["total_odds"] > best["total_odds"]):
-                best = acc
-            if best and best["total_odds"] >= tgt * 0.92:
+            if acc:
                 break
-        result[tier_key] = best
-        if best:
-            for s in best["selections"]:
+        result[tier_key] = acc
+        if acc:
+            for s in acc["selections"]:
                 used.add((s["match"], s["market_type"]))
                 m = s["match"]
                 match_count[m] = match_count.get(m, 0) + 1
@@ -9108,93 +7870,66 @@ Matches the arcaprotocol aesthetic (frosted cards, bold display type).
 
 # Shared CSS for all v3 football pages
 FB_CSS = """
-@import url('https://fonts.googleapis.com/css2?family=Sora:wght@500;600;700;800&family=DM+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@500;700&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Sora:wght@600;700;800&family=DM+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@500;700&display=swap');
 :root{
-  --brand:#2f6bd6; --brand2:#4f86ee; --brand-deep:#1f54b0; --brand-soft:#e8f0fd;
-  --bg1:#eef3fa; --bg2:#e3eaf5;
-  --ink:#0c1320; --ink2:#3a465c; --muted:#73819b;
-  --surface:#ffffff; --surface2:#f6f9fd;
-  --line:rgba(12,19,32,0.09); --line2:rgba(12,19,32,0.06);
-  --glass:rgba(255,255,255,0.72); --glass-line:rgba(12,19,32,0.07);
-  --shadow:0 16px 44px rgba(20,40,90,0.10);
-  --good:#1f9d6b; --good-soft:rgba(31,157,107,0.13);
-  --red:#e1556a; --red-soft:rgba(225,85,106,0.13);
-  --orange:#e08a3c; --grid:rgba(47,107,214,0.05);
-}
-[data-theme="dark"]{
-  --brand:#5a8cf0; --brand2:#7aa2f5; --brand-deep:#3f78e6; --brand-soft:rgba(90,140,240,0.16);
-  --bg1:#0a0e16; --bg2:#06090f;
-  --ink:#eaf0fb; --ink2:#c3cde0; --muted:#8696b4;
-  --surface:#121826; --surface2:#0f1420;
-  --line:rgba(255,255,255,0.09); --line2:rgba(255,255,255,0.06);
-  --glass:rgba(255,255,255,0.055); --glass-line:rgba(255,255,255,0.10);
-  --shadow:0 20px 54px rgba(0,0,0,0.55);
-  --good:#56d3a0; --good-soft:rgba(86,211,160,0.16);
-  --red:#fca5a5; --red-soft:rgba(248,113,113,0.16);
-  --orange:#fb923c; --grid:rgba(120,160,255,0.05);
+  --bg:#05080a; --green:#4ade80; --green2:#22c55e; --green-deep:#16a34a;
+  --ink:#eaf3ee; --muted:#7d9788; --line:rgba(74,222,128,0.14);
+  --panel:rgba(255,255,255,0.04); --red:#f87171;
 }
 * { margin:0; padding:0; box-sizing:border-box; }
 body {
-  font-family:'DM Sans',sans-serif; color:var(--ink);
-  background:radial-gradient(130% 90% at 50% -10%, var(--bg1), var(--bg2));
+  font-family:'DM Sans',sans-serif; color:var(--ink); background:var(--bg);
   min-height:100vh; padding-bottom:90px; position:relative; overflow-x:hidden;
-  transition:background .35s ease, color .35s ease;
 }
-body::before{ content:""; position:fixed; inset:0; z-index:0; pointer-events:none; opacity:.9;
+body::before{ content:""; position:fixed; inset:0; z-index:0; pointer-events:none;
   background:
-    radial-gradient(900px 520px at 12% -8%, var(--brand-soft), transparent 60%),
-    radial-gradient(760px 520px at 90% 2%, var(--brand-soft), transparent 58%);
+    radial-gradient(900px 520px at 12% -8%, rgba(74,222,128,0.14), transparent 60%),
+    radial-gradient(760px 520px at 90% 2%, rgba(34,197,94,0.10), transparent 58%);
 }
-body::after{ content:""; position:fixed; inset:0; z-index:0; pointer-events:none; opacity:.6;
-  background-image:linear-gradient(var(--grid) 1px,transparent 1px),
-    linear-gradient(90deg,var(--grid) 1px,transparent 1px);
+body::after{ content:""; position:fixed; inset:0; z-index:0; pointer-events:none; opacity:.45;
+  background-image:linear-gradient(rgba(74,222,128,0.045) 1px,transparent 1px),
+    linear-gradient(90deg,rgba(74,222,128,0.045) 1px,transparent 1px);
   background-size:48px 48px;
   mask-image:radial-gradient(circle at 50% 0%,black,transparent 75%);
   -webkit-mask-image:radial-gradient(circle at 50% 0%,black,transparent 75%); }
 .nav {
   position:sticky; top:0; z-index:50;
   display:flex; align-items:center; justify-content:space-between; padding:14px 20px;
-  background:color-mix(in srgb,var(--surface) 80%, transparent);
-  backdrop-filter:blur(18px); -webkit-backdrop-filter:blur(18px);
+  background:rgba(5,8,10,0.72); backdrop-filter:blur(18px); -webkit-backdrop-filter:blur(18px);
   border-bottom:1px solid var(--line);
 }
-.nav .logo { font-family:'Sora',sans-serif; font-weight:800; font-size:1.1rem; color:var(--brand); letter-spacing:-0.5px; text-decoration:none; }
+.nav .logo { font-family:'Sora',sans-serif; font-weight:800; font-size:1.1rem; color:var(--green); letter-spacing:-0.5px; text-decoration:none; }
 .nav .logo span { color:var(--ink); }
-.nav-right { display:flex; align-items:center; gap:12px; }
 .nav .nav-page { font-size:0.8rem; font-weight:700; color:var(--muted); font-family:'JetBrains Mono',monospace; letter-spacing:1px; text-transform:uppercase; }
-.theme-toggle { width:34px; height:34px; border-radius:10px; border:1px solid var(--line); background:var(--surface2);
-  color:var(--ink); font-size:15px; cursor:pointer; line-height:1; display:flex; align-items:center; justify-content:center; transition:.18s; }
-.theme-toggle:hover { border-color:var(--brand); }
-.theme-toggle:active { transform:scale(.94); }
+/* bottom tab bar */
 .tabbar {
   position:fixed; bottom:0; left:0; right:0; z-index:60;
   display:flex; justify-content:space-around; align-items:stretch;
-  background:color-mix(in srgb,var(--surface) 90%, transparent);
-  backdrop-filter:blur(22px); -webkit-backdrop-filter:blur(22px);
+  background:rgba(7,11,13,0.92); backdrop-filter:blur(22px); -webkit-backdrop-filter:blur(22px);
   border-top:1px solid var(--line);
   padding:6px 4px calc(6px + env(safe-area-inset-bottom));
-  box-shadow:0 -6px 26px rgba(20,40,90,0.10);
+  box-shadow:0 -6px 26px rgba(0,0,0,0.4);
 }
 .tabbar a { flex:1; display:flex; flex-direction:column; align-items:center; gap:3px;
   text-decoration:none; color:var(--muted); padding:6px 2px; border-radius:12px; transition:color .15s, background .15s; }
 .tabbar a .ic { font-size:1.3rem; line-height:1; }
 .tabbar a .tl { font-size:0.62rem; font-weight:700; letter-spacing:0.2px; }
-.tabbar a.active { color:var(--brand); }
+.tabbar a.active { color:var(--green); }
 .tabbar a.active .tl { font-weight:900; }
-.tabbar a:active { background:var(--brand-soft); }
+.tabbar a:active { background:rgba(74,222,128,0.12); }
 .wrap { position:relative; z-index:1; max-width:980px; margin:0 auto; padding:26px 18px 0; }
 .page-head { margin:14px 4px 22px; }
 .page-head h1 { font-family:'Sora',sans-serif; font-size:2.2rem; font-weight:800; letter-spacing:-1.5px; color:var(--ink);
-  background:linear-gradient(180deg,var(--ink),var(--brand-deep)); -webkit-background-clip:text; background-clip:text; -webkit-text-fill-color:transparent; }
+  background:linear-gradient(180deg,#fff,#a7e9bf); -webkit-background-clip:text; background-clip:text; -webkit-text-fill-color:transparent; }
 .page-head .sub { color:var(--muted); font-size:0.95rem; margin-top:4px; font-weight:500; }
-.page-head .date { font-family:'JetBrains Mono',monospace; font-size:0.78rem; color:var(--brand); margin-top:6px; letter-spacing:0.5px; }
+.page-head .date { font-family:'JetBrains Mono',monospace; font-size:0.78rem; color:#5b8a6e; margin-top:6px; letter-spacing:0.5px; }
 
 /* Glass card */
 .glass {
-  position:relative; background:var(--glass);
+  position:relative; background:linear-gradient(180deg, rgba(74,222,128,0.06), rgba(255,255,255,0.02));
   backdrop-filter:blur(16px); -webkit-backdrop-filter:blur(16px);
-  border:1px solid var(--glass-line); border-radius:20px;
-  box-shadow:var(--shadow); padding:22px; margin-bottom:18px;
+  border:1px solid rgba(255,255,255,0.07); border-radius:20px;
+  box-shadow:0 14px 44px rgba(0,0,0,0.4); padding:22px; margin-bottom:18px;
   animation:fb-rise .55s ease both;
 }
 @keyframes fb-rise{from{opacity:0; transform:translateY(14px);} to{opacity:1; transform:translateY(0);}}
@@ -9202,88 +7937,89 @@ body::after{ content:""; position:fixed; inset:0; z-index:0; pointer-events:none
 /* Accumulator tier card */
 .tier { position:relative; overflow:hidden; transition:transform .2s, box-shadow .2s, border-color .2s; }
 .tier::before{ content:""; position:absolute; inset:0 0 auto 0; height:2px;
-  background:linear-gradient(90deg,transparent,var(--brand),transparent); opacity:.6; }
-.tier:hover{ transform:translateY(-3px); border-color:var(--brand-soft); box-shadow:0 24px 60px rgba(20,40,90,0.16); }
+  background:linear-gradient(90deg,transparent,var(--green),transparent); opacity:.55; }
+.tier:hover{ transform:translateY(-3px); border-color:var(--line); box-shadow:0 22px 56px rgba(0,0,0,0.5); }
 .tier-head { display:flex; align-items:center; justify-content:space-between; margin-bottom:16px; }
 .tier-title { display:flex; align-items:center; gap:10px; }
 .tier-title .dot { width:11px; height:11px; border-radius:50%; box-shadow:0 0 12px currentColor; }
 .tier-title h2 { font-family:'Sora',sans-serif; font-size:1.12rem; font-weight:800; letter-spacing:-0.3px; color:var(--ink); }
-.tier-odds { font-family:'JetBrains Mono',monospace; font-weight:700; font-size:1.45rem; color:var(--brand); }
+.tier-odds { font-family:'JetBrains Mono',monospace; font-weight:700; font-size:1.45rem; color:var(--green); }
 .tier-odds .lbl { font-size:0.62rem; color:var(--muted); display:block; text-align:right; font-weight:500; letter-spacing:1.5px; }
 .section-head { display:flex; align-items:baseline; gap:10px; margin:6px 2px 14px; font-family:'Sora',sans-serif;
   font-size:1.15rem; font-weight:800; letter-spacing:-0.4px; color:var(--ink); }
-.section-head span { font-family:'DM Sans',sans-serif; font-size:0.72rem; font-weight:500; color:var(--muted);
+.section-head span { font-family:'Inter',sans-serif; font-size:0.72rem; font-weight:500; color:var(--muted);
   letter-spacing:0.3px; }
-.sel { display:flex; align-items:flex-start; gap:12px; padding:12px 0; border-top:1px solid var(--line2); }
+.sel { display:flex; align-items:flex-start; gap:12px; padding:12px 0; border-top:1px solid rgba(255,255,255,0.06); }
 .sel:first-of-type { border-top:none; }
 .sel .ico { font-size:1.05rem; margin-top:1px; opacity:.9; }
 .sel .body { flex:1; min-width:0; }
 .sel .match { font-weight:700; font-size:0.88rem; color:var(--ink); }
-.sel .pick { font-size:0.82rem; color:var(--brand-deep); margin-top:1px; }
+.sel .pick { font-size:0.82rem; color:#9ad3b1; margin-top:1px; }
 .sel .why { font-size:0.68rem; color:var(--muted); margin-top:2px; font-style:italic; line-height:1.3; }
 .sel .reason { font-size:0.72rem; color:var(--muted); margin-top:3px; }
-.sel .odds { font-family:'JetBrains Mono',monospace; font-weight:700; font-size:0.95rem; color:var(--brand); white-space:nowrap; }
+.sel .odds { font-family:'JetBrains Mono',monospace; font-weight:700; font-size:0.95rem; color:var(--green); white-space:nowrap; }
 .sel .conf { font-family:'JetBrains Mono',monospace; font-size:0.66rem; color:var(--muted); text-align:right; }
 .code-box {
   margin-top:16px; padding:15px 16px; border-radius:14px;
-  background:var(--brand-soft); border:1px solid var(--glass-line);
+  background:linear-gradient(135deg, rgba(74,222,128,0.16), rgba(34,197,94,0.06));
+  border:1px solid var(--line);
   display:flex; align-items:center; justify-content:space-between; gap:10px;
 }
 .code-box .label { font-size:0.66rem; color:var(--muted); font-weight:700; text-transform:uppercase; letter-spacing:1.5px; }
-.code-box .code { font-family:'JetBrains Mono',monospace; font-weight:700; font-size:1.4rem; color:var(--brand-deep); letter-spacing:3px; margin-top:2px; }
-.code-box a { font-size:0.75rem; font-weight:700; color:#fff; background:linear-gradient(135deg,var(--brand),var(--brand2)); padding:10px 16px; border-radius:999px; text-decoration:none; white-space:nowrap; box-shadow:0 6px 18px rgba(47,107,214,0.32); transition:transform .15s; }
+.code-box .code { font-family:'JetBrains Mono',monospace; font-weight:700; font-size:1.4rem; color:var(--green); letter-spacing:3px; margin-top:2px; }
+.code-box a { font-size:0.75rem; font-weight:700; color:#04140a; background:linear-gradient(135deg,var(--green),var(--green2)); padding:10px 16px; border-radius:999px; text-decoration:none; white-space:nowrap; box-shadow:0 6px 18px rgba(74,222,128,0.3); transition:transform .15s; }
 .code-box a:active { transform:scale(0.96); }
-.code-box.pending { background:var(--surface2); border-color:var(--line); }
+.code-box.pending { background:rgba(255,255,255,0.03); border-color:rgba(255,255,255,0.08); }
 .code-box.pending .code { color:var(--muted); font-size:0.9rem; letter-spacing:0; }
 
 /* Match pick card */
 .match-card .mhead { display:flex; align-items:center; justify-content:space-between; gap:10px; margin-bottom:6px; }
 .match-card .teams { font-family:'Sora',sans-serif; font-weight:700; font-size:1.05rem; color:var(--ink); letter-spacing:-0.3px; }
-.match-card .league { font-size:0.66rem; color:var(--brand-deep); font-weight:700; text-transform:uppercase; letter-spacing:1px; background:var(--brand-soft); padding:4px 10px; border-radius:999px; white-space:nowrap; }
+.match-card .league { font-size:0.66rem; color:var(--green); font-weight:700; text-transform:uppercase; letter-spacing:1px; background:rgba(74,222,128,0.12); padding:4px 10px; border-radius:999px; white-space:nowrap; }
 .match-card .meta { font-family:'JetBrains Mono',monospace; font-size:0.72rem; color:var(--muted); margin-bottom:12px; }
-.match-card .meta .inj { color:var(--orange); }
+.match-card .meta .inj { color:#fb923c; }
 .match-card .status { display:inline-block; font-family:'JetBrains Mono',monospace; font-size:0.72rem; font-weight:700; padding:4px 10px; border-radius:8px; margin-bottom:10px; letter-spacing:0.3px; }
-.match-card .status.live { background:var(--red-soft); color:var(--red); }
+.match-card .status.live { background:rgba(248,113,113,0.16); color:#fca5a5; }
 .match-card .status.live .det { font-weight:600; opacity:0.85; }
-.match-card .status.ft { background:var(--good-soft); color:var(--good); }
-.match-card .status.pre { background:var(--surface2); color:var(--muted); }
-.pickrow { display:flex; align-items:center; gap:10px; padding:10px 0; border-top:1px solid var(--line2); }
+.match-card .status.ft { background:rgba(74,222,128,0.14); color:var(--green); }
+.match-card .status.pre { background:rgba(255,255,255,0.06); color:var(--muted); }
+.pickrow { display:flex; align-items:center; gap:10px; padding:10px 0; border-top:1px solid rgba(255,255,255,0.06); }
 .pickrow:first-of-type { border-top:none; }
-.pickrow .rank { width:22px; height:22px; border-radius:50%; background:linear-gradient(135deg,var(--brand),var(--brand-deep)); color:#fff; font-size:0.7rem; font-weight:800; display:flex; align-items:center; justify-content:center; }
+.pickrow .rank { width:22px; height:22px; border-radius:50%; background:linear-gradient(135deg,var(--green),var(--green-deep)); color:#04140a; font-size:0.7rem; font-weight:800; display:flex; align-items:center; justify-content:center; }
 .pickrow .ptext { flex:1; font-weight:600; font-size:0.85rem; color:var(--ink); }
-.pickrow .pct { font-family:'JetBrains Mono',monospace; font-weight:700; font-size:0.95rem; color:var(--brand); }
-.bar { height:5px; background:var(--line); border-radius:999px; margin-top:5px; overflow:hidden; }
-.bar > div { height:100%; background:linear-gradient(90deg,var(--brand),var(--brand-deep)); border-radius:999px; }
+.pickrow .pct { font-family:'JetBrains Mono',monospace; font-weight:700; font-size:0.95rem; color:var(--green); }
+.bar { height:5px; background:rgba(255,255,255,0.08); border-radius:999px; margin-top:5px; overflow:hidden; }
+.bar > div { height:100%; background:linear-gradient(90deg,#4ade80,#16a34a); border-radius:999px; }
 .empty { text-align:center; padding:54px 20px; color:var(--muted); }
 .empty .big { font-size:2.4rem; margin-bottom:10px; }
-.disclaimer { text-align:center; font-size:0.72rem; color:var(--muted); margin:24px 18px; line-height:1.5; }
+.disclaimer { text-align:center; font-size:0.72rem; color:#52685b; margin:24px 18px; line-height:1.5; }
 
 /* Calendar */
 .cal-head { display:flex; align-items:center; justify-content:space-between; margin-bottom:14px; }
 .cal-head h2 { font-family:'Sora',sans-serif; font-size:1.2rem; font-weight:800; color:var(--ink); }
-.cal-nav a { text-decoration:none; color:var(--brand-deep); font-weight:700; font-size:1.3rem; padding:4px 12px; border-radius:10px; background:var(--brand-soft); }
+.cal-nav a { text-decoration:none; color:var(--green); font-weight:700; font-size:1.3rem; padding:4px 12px; border-radius:10px; background:rgba(74,222,128,0.12); }
 .cal-grid { display:grid; grid-template-columns:repeat(7,1fr); gap:6px; }
 .cal-dow { text-align:center; font-size:0.65rem; font-weight:700; color:var(--muted); text-transform:uppercase; letter-spacing:0.5px; padding:4px 0; }
-.cal-cell { aspect-ratio:1; border-radius:12px; background:var(--surface2); border:1px solid var(--line2); display:flex; flex-direction:column; align-items:center; justify-content:center; text-decoration:none; color:var(--ink); position:relative; transition:transform .12s; }
-.cal-cell.has-data { background:var(--brand-soft); border-color:var(--brand-soft); font-weight:700; }
+.cal-cell { aspect-ratio:1; border-radius:12px; background:rgba(255,255,255,0.03); border:1px solid rgba(255,255,255,0.06); display:flex; flex-direction:column; align-items:center; justify-content:center; text-decoration:none; color:var(--ink); position:relative; transition:transform .12s; }
+.cal-cell.has-data { background:rgba(74,222,128,0.16); border-color:var(--line); font-weight:700; }
 .cal-cell.has-data:active { transform:scale(0.95); }
 .cal-cell.empty-cell { background:transparent; border:none; }
-.cal-cell.today { outline:2px solid var(--brand); }
+.cal-cell.today { outline:2px solid var(--green); }
 .cal-cell .dnum { font-size:0.85rem; }
-.cal-cell .dcount { font-size:0.6rem; color:var(--brand-deep); font-family:'JetBrains Mono',monospace; margin-top:1px; }
+.cal-cell .dcount { font-size:0.6rem; color:var(--green); font-family:'JetBrains Mono',monospace; margin-top:1px; }
 .cal-cell .ddots { display:flex; gap:2px; margin-top:2px; }
 .cal-cell .ddot { width:5px; height:5px; border-radius:50%; }
 .legend { display:flex; gap:14px; justify-content:center; flex-wrap:wrap; margin-top:14px; font-size:0.72rem; color:var(--muted); }
 .legend span { display:flex; align-items:center; gap:5px; }
 .legend i { width:9px; height:9px; border-radius:50%; display:inline-block; }
-.back-link { display:inline-block; margin-bottom:14px; color:var(--brand-deep); font-weight:700; text-decoration:none; font-size:0.85rem; }
+.back-link { display:inline-block; margin-bottom:14px; color:var(--green); font-weight:700; text-decoration:none; font-size:0.85rem; }
 .badge { font-size:0.62rem; font-weight:700; padding:3px 9px; border-radius:999px; text-transform:uppercase; letter-spacing:0.5px; }
-.badge.won { background:var(--good-soft); color:var(--good); }
-.badge.lost { background:var(--red-soft); color:var(--red); }
-.badge.pending { background:var(--surface2); color:var(--muted); }
-.badge.void { background:var(--surface2); color:var(--muted); }
-.tier .sel.won .pick { color:var(--good); }
-.tier .sel.lost .pick { color:var(--red); text-decoration:line-through; opacity:0.75; }
+.badge.won { background:rgba(74,222,128,0.16); color:var(--green); }
+.badge.lost { background:rgba(248,113,113,0.16); color:#fca5a5; }
+.badge.pending { background:rgba(255,255,255,0.06); color:var(--muted); }
+.badge.void { background:rgba(255,255,255,0.06); color:#8aa394; }
+.tier .sel.won .pick { color:var(--green); }
+.tier .sel.lost .pick { color:#fca5a5; text-decoration:line-through; opacity:0.75; }
 
 @media (max-width:600px){
   .page-head h1 { font-size:1.75rem; }
@@ -9303,25 +8039,19 @@ def _nav(active):
     page_names = {"home": "Home", "picks": "Picks", "codes": "Codes",
                   "crypto": "Crypto", "sports": "Markets", "results": "Results"}
     top = ('<div class="nav"><a href="/" class="logo">CMVNG<span>BOT</span></a>'
-           '<div class="nav-right"><div class="nav-page">{}</div>'
-           '<button class="theme-toggle" id="cmvngThemeBtn" onclick="cmvngToggleTheme()" aria-label="Toggle theme">🌙</button>'
-           '</div></div>').format(page_names.get(active, ""))
-    top += ('<script>(function(){var t=localStorage.getItem("cmvng-theme")||"light";document.documentElement.setAttribute("data-theme",t);})();'
-            'function cmvngToggleTheme(){var d=document.documentElement,n=d.getAttribute("data-theme")==="dark"?"light":"dark";d.setAttribute("data-theme",n);localStorage.setItem("cmvng-theme",n);var b=document.getElementById("cmvngThemeBtn");if(b)b.textContent=n==="dark"?"☀️":"🌙";}'
-            'document.addEventListener("DOMContentLoaded",function(){var t=localStorage.getItem("cmvng-theme")||"light";var b=document.getElementById("cmvngThemeBtn");if(b)b.textContent=t==="dark"?"☀️":"🌙";});</script>')
+           '<div class="nav-page">{}</div></div>').format(page_names.get(active, ""))
     tabs = [
         ("home", "/", "🏠", "Home"),
         ("picks", "/app/picks", "⚽", "Picks"),
         ("codes", "/app/codes", "🎫", "Codes"),
         ("builder", "/app/builder", "⭐", "Builder"),
-        ("cards", "/app/cards", "🖼️", "Cards"),
         ("crypto", "/app/paper-poly", "💰", "Crypto"),
         ("results", "/app/results", "📈", "Results"),
     ]
     items = "".join(
         '<a href="{}" class="{}"><span class="ic">{}</span>'
         '<span class="tl">{}</span></a>'.format(
-            url, "active" if key == active else "", _ICONS.get(key, ""), label)
+            url, "active" if key == active else "", ic, label)
         for key, url, ic, label in tabs)
     bottom = '<div class="tabbar">{}</div>'.format(items)
     return top + bottom
@@ -9334,17 +8064,6 @@ def _fb_fmt_kickoff(ts):
     try:
         dt = _dt.datetime.fromtimestamp(int(ts) / 1000, _dt.timezone.utc) + _dt.timedelta(hours=1)
         return dt.strftime("%a %H:%M")
-    except Exception:
-        return ""
-
-
-def _fb_fmt_when(ts):
-    """Epoch-ms -> 'Sat 14 Jun · 15:00' (UTC+1 Lagos) for share-card sublines."""
-    if not ts:
-        return ""
-    try:
-        dt = _dt.datetime.fromtimestamp(int(ts) / 1000, _dt.timezone.utc) + _dt.timedelta(hours=1)
-        return dt.strftime("%a %d %b · %H:%M")
     except Exception:
         return ""
 
@@ -9441,7 +8160,7 @@ def render_codes_page(accumulators, date_str, builders=None):
             elif _st == "post":
                 started += 1
                 _hs, _as = _live.get("hs"), _live.get("aw")
-                status_html = ('<div class="reason" style="color:var(--good);font-weight:600">'
+                status_html = ('<div class="reason" style="color:#16a34a;font-weight:600">'
                                '✅ FT {}–{}</div>').format(
                     _hs if _hs is not None else 0, _as if _as is not None else 0)
             else:
@@ -9490,8 +8209,7 @@ def render_codes_page(accumulators, date_str, builders=None):
 <div class="wrap">
 <div class="page-head"><h1>Today's Codes</h1>
 <div class="sub">Accumulator booking codes for SportyBet</div>
-<div class="date">{date}</div>
-<a href="/app/fb-rescan" style="display:inline-block;margin-top:8px;font:600 13px system-ui;color:var(--brand,#2563eb);text-decoration:none;border:1px solid var(--line,#e5e7eb);border-radius:8px;padding:6px 12px">↻ Rescan now</a></div>
+<div class="date">{date}</div></div>
 {body}
 <div class="disclaimer">Codes are auto-generated from data analysis. Odds may shift before kickoff.
 Always review selections in your SportyBet app before staking. No bet is guaranteed.</div>
@@ -9587,7 +8305,7 @@ def render_results_page(stats, date_str):
             '<div class="glass"><div class="tier-head">'
             '<div class="tier-title"><h2>{}</h2></div>'
             '<div class="tier-odds">{:.0f}%<span class="lbl">WIN RATE</span></div></div>'
-            '<div class="meta" style="font-family:JetBrains Mono,monospace;color:var(--muted);font-size:0.8rem">'
+            '<div class="meta" style="font-family:JetBrains Mono,monospace;color:#5b8a6e;font-size:0.8rem">'
             '{} won / {} settled · {} pending</div></div>'.format(
                 st["tier_label"], wr, st["wins"], st["settled"], st.get("pending", 0))
         )
@@ -9752,10 +8470,10 @@ def render_results_day(date_iso, date_human, sets):
         ".run-set{margin-bottom:30px}"
         ".run-head{display:flex;align-items:center;justify-content:space-between;"
         "font-weight:700;font-size:13px;letter-spacing:.05em;margin:20px 0 12px;"
-        "padding:10px 14px;border-radius:12px;background:var(--surface2);"
-        "border:1px solid var(--line)}"
-        ".run-set.latest .run-head{color:var(--brand-deep);border-color:var(--brand-soft);"
-        "background:var(--brand-soft)}"
+        "padding:10px 14px;border-radius:12px;background:rgba(255,255,255,.04);"
+        "border:1px solid rgba(255,255,255,.08)}"
+        ".run-set.latest .run-head{color:#16a34a;border-color:rgba(22,163,74,.3);"
+        "background:rgba(22,163,74,.07)}"
         ".run-set.earlier .run-head{opacity:.75}"
         ".run-count{font-weight:600;font-size:11px;opacity:.8}")
 
@@ -10016,7 +8734,6 @@ _FB_CACHE = {
     "match_picks": {},      # {match: [top picks]}
     "accumulators": [],     # [acca dict with code]
     "last_run": None,
-    "last_run_ts": 0,       # epoch of last scan; anchors the scheduler + survives restarts via DB restore
     "running": False,
 }
 
@@ -10037,7 +8754,6 @@ def fb_init_db(get_db):
                 market_type TEXT, pick TEXT,
                 confidence REAL, odds REAL,
                 reasoning TEXT,
-                kickoff_ts BIGINT,
                 result TEXT DEFAULT 'pending',
                 created_at TIMESTAMPTZ DEFAULT NOW()
             )
@@ -10071,7 +8787,6 @@ def fb_init_db(get_db):
             ("match_date", "DATE"), ("home", "TEXT"), ("away", "TEXT"),
             ("league", "TEXT"), ("market_type", "TEXT"), ("pick", "TEXT"),
             ("confidence", "REAL"), ("odds", "REAL"), ("reasoning", "TEXT"),
-            ("kickoff_ts", "BIGINT"),
             ("result", "TEXT DEFAULT 'pending'"), ("created_at", "TIMESTAMPTZ DEFAULT NOW()"),
         ]
         for col, typ in _fp_cols:
@@ -10131,11 +8846,11 @@ def fb_save_run(get_db, date_str, all_picks, accumulators):
         # Save top picks (limit to keep DB lean)
         for p in all_picks[:200]:
             conn.run("""INSERT INTO football_picks
-                (match_date, home, away, league, market_type, pick, confidence, odds, reasoning, kickoff_ts)
-                VALUES (:d,:h,:a,:l,:mt,:pk,:cf,:od,:rs,:kt)""",
+                (match_date, home, away, league, market_type, pick, confidence, odds, reasoning)
+                VALUES (:d,:h,:a,:l,:mt,:pk,:cf,:od,:rs)""",
                 d=today, h=p["home"], a=p["away"], l=p["league"],
                 mt=p["market_type"], pk=p["pick"], cf=p["confidence"],
-                od=p["odds"], rs=p["reasoning"], kt=int(p.get("kickoff_ts") or 0))
+                od=p["odds"], rs=p["reasoning"])
         # Save accumulators — tag every slip in this run with one shared run_id
         # so the history view can group them as a single "set".
         run_id = _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -10161,94 +8876,6 @@ def fb_save_run(get_db, date_str, all_picks, accumulators):
         conn.close()
     except Exception as e:
         print("[FB] save error: {}".format(e))
-
-
-def fb_load_latest(get_db):
-    """Repopulate the in-memory cache from the most recent run already saved in
-    the DB, so a redeploy shows the last scan immediately WITHOUT re-scraping.
-    Returns True if a run was restored, else False (caller then scans). Fully
-    defensive: any failure -> False -> normal boot scan, so it can't make a
-    deploy worse than today's behaviour."""
-    try:
-        conn = get_db()
-        # Accumulators from the latest run_id (ascending odds so the page lists
-        # banker -> moonshot, matching a live run).
-        accs = conn.run(
-            "SELECT tier, label, target_odds, total_odds, num_selections, "
-            "selections_json, sportybet_code, match_date, created_at "
-            "FROM sportybet_accumulators "
-            "WHERE run_id = (SELECT run_id FROM sportybet_accumulators "
-            "ORDER BY created_at DESC LIMIT 1) ORDER BY total_odds ASC")
-        accumulators = []
-        latest_date = None
-        latest_ts = None
-        for r in (accs or []):
-            tier, label, tgt, tot, ns, sj, code, mdate, created = r
-            try:
-                sels = json.loads(sj or "[]")
-            except Exception:
-                sels = []
-            if not sels:
-                continue
-            accumulators.append({
-                "tier": tier, "label": label,
-                "emoji": TIER_CONFIG.get(tier, {}).get("emoji", "🟢"),
-                "target_odds": tgt, "total_odds": tot,
-                "num_selections": ns or len(sels),
-                "selections": sels, "code": code or None,
-            })
-            if mdate is not None and latest_date is None:
-                latest_date = mdate
-            if created is not None and latest_ts is None:
-                latest_ts = created
-
-        # Per-match picks from the latest match_date (drives /app/picks + /app/cards).
-        prows = conn.run(
-            "SELECT home, away, league, market_type, pick, confidence, odds, "
-            "reasoning, kickoff_ts FROM football_picks "
-            "WHERE match_date = (SELECT MAX(match_date) FROM football_picks)")
-        conn.close()
-        by_match = {}
-        for r in (prows or []):
-            home, away, league, mt, pick, conf, odds, reason, kts = r
-            label = "{} vs {}".format(home, away)
-            by_match.setdefault(label, []).append({
-                "match": label, "home": home, "away": away, "league": league or "",
-                "market_type": mt or "", "pick": pick or "",
-                "confidence": float(conf or 0), "odds": float(odds or 0),
-                "reasoning": reason or "", "kickoff_ts": int(kts or 0),
-                "result": "pending",
-            })
-        match_picks = {}
-        for m, ps in by_match.items():
-            ps.sort(key=lambda x: x["confidence"], reverse=True)
-            match_picks[m] = ps[:3]
-
-        if not accumulators and not match_picks:
-            return False
-
-        date_human = ""
-        if latest_date is not None:
-            try:
-                date_human = latest_date.strftime("%A, %B %d, %Y")
-            except Exception:
-                date_human = str(latest_date)
-        _FB_CACHE["date"] = date_human or _fb_today_human()
-        _FB_CACHE["match_picks"] = match_picks
-        _FB_CACHE["accumulators"] = accumulators
-        if latest_ts is not None:
-            try:
-                _FB_CACHE["last_run_ts"] = latest_ts.timestamp()
-                _FB_CACHE["last_run"] = (latest_ts.replace(tzinfo=None)
-                                         if hasattr(latest_ts, "tzinfo") else latest_ts)
-            except Exception:
-                pass
-        print("[FB] restored last run from DB: {} codes, {} matches, date={}".format(
-            len(accumulators), len(match_picks), _FB_CACHE["date"]))
-        return True
-    except Exception as e:
-        print("[FB] restore error: {}".format(e))
-        return False
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -11421,7 +10048,6 @@ def run_football_engine(get_db, tg_token, tg_chat, send_telegram,
         _FB_CACHE["accumulators"] = accumulators
         _FB_CACHE["bet_builders"] = bet_builders
         _FB_CACHE["last_run"] = _dt.datetime.now()
-        _FB_CACHE["last_run_ts"] = time.time()
 
         try:
             fb_save_run(get_db, date_human, all_picks, accumulators)
@@ -11457,45 +10083,23 @@ def run_football_engine(get_db, tg_token, tg_chat, send_telegram,
 
 
 def fb_scanner_thread(get_db, tg_token, tg_chat, send_telegram, interval_hours=12):
-    """Keep the engine on a schedule, but DON'T re-scrape on every deploy. On boot
-    we restore the last run from the DB and only scan if that run is missing or
-    older than the interval. The schedule is anchored to the real last-scan time
-    (last_run_ts), so a redeploy no longer resets the clock, and a manual rescan
-    re-anchors it automatically."""
-    interval = interval_hours * 3600
+    """Background thread: run the engine on a schedule."""
     def loop():
         time.sleep(30)  # let app boot first
-        # Restore the last scan so the pages aren't blank after a redeploy.
-        restored = False
+        # Initial run
         try:
-            restored = fb_load_latest(get_db)
+            run_football_engine(get_db, tg_token, tg_chat, send_telegram)
         except Exception as e:
-            print("[FB] boot restore error: {}".format(e))
-        # Scan on boot ONLY if there's no usable run, or the restored one is stale.
-        age = time.time() - (_FB_CACHE.get("last_run_ts") or 0)
-        if not restored or age >= interval:
-            print("[FB] boot scan ({})".format(
-                "no saved run" if not restored else "last run {:.1f}h old".format(age / 3600)))
+            print("[FB] initial run error: {}".format(e))
+        # Periodic
+        while True:
+            time.sleep(interval_hours * 3600)
             try:
                 run_football_engine(get_db, tg_token, tg_chat, send_telegram)
             except Exception as e:
-                print("[FB] initial run error: {}".format(e))
-        else:
-            print("[FB] boot: restored run {:.1f}h old — skipping re-scrape, "
-                  "next scan in {:.1f}h".format(age / 3600, (interval - age) / 3600))
-        # Schedule anchored to last_run_ts: wake every few minutes and run only
-        # when due, so deploys and manual rescans re-anchor instead of resetting.
-        while True:
-            time.sleep(300)  # 5-min tick
-            if _FB_CACHE.get("running"):
-                continue
-            if time.time() - (_FB_CACHE.get("last_run_ts") or 0) >= interval:
-                try:
-                    run_football_engine(get_db, tg_token, tg_chat, send_telegram)
-                except Exception as e:
-                    print("[FB] scheduled run error: {}".format(e))
+                print("[FB] scheduled run error: {}".format(e))
     threading.Thread(target=loop, daemon=True).start()
-    print("[FB] scanner thread started (every {}h, anchored, no re-scrape on deploy)".format(interval_hours))
+    print("[FB] scanner thread started (every {}h)".format(interval_hours))
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -12021,118 +10625,6 @@ def _fb_get_results():
 
 # ── Flask routes ──
 
-import base64
-
-SHARE_STUDIO_HTML = base64.b64decode(
-    "PCFkb2N0eXBlIGh0bWw+CjxodG1sIGxhbmc9ImVuIiBkYXRhLXRoZW1lPSJsaWdodCI+CjxoZWFkPgo8bWV0YSBjaGFyc2V0PSJ1dGYtOCI+CjxtZXRhIG5hbWU9InZpZXdwb3J0IiBjb250ZW50PSJ3aWR0aD1kZXZpY2Utd2lkdGgsIGluaXRpYWwtc2NhbGU9MSI+Cjx0aXRsZT5jbXZuZyDCtyBTaGFyZSBDYXJkIFN0dWRpbzwvdGl0bGU+CjxsaW5rIHJlbD0icHJlY29ubmVjdCIgaHJlZj0iaHR0cHM6Ly9mb250cy5nb29nbGVhcGlzLmNvbSI+CjxsaW5rIHJlbD0icHJlY29ubmVjdCIgaHJlZj0iaHR0cHM6Ly9mb250cy5nc3RhdGljLmNvbSIgY3Jvc3NvcmlnaW4+CjxsaW5rIGhyZWY9Imh0dHBzOi8vZm9udHMuZ29vZ2xlYXBpcy5jb20vY3NzMj9mYW1pbHk9U29yYTp3Z2h0QDUwMDs2MDA7NzAwOzgwMCZmYW1pbHk9RE0rU2Fuczp3Z2h0QDQwMDs1MDA7NjAwOzcwMCZkaXNwbGF5PXN3YXAiIHJlbD0ic3R5bGVzaGVldCI+CjxzdHlsZT4KOnJvb3R7CiAgLyogYnJhbmQgKi8KICAtLWJyYW5kOiMyZjZiZDY7IC0tYnJhbmQtZGVlcDojMWY1NGIwOyAtLWJyYW5kLXNvZnQ6I2U4ZjBmZDsKICAvKiBwYWdlIChidWlsZGVyIGNocm9tZSkg4oCUIExJR0hUICovCiAgLS1wYWdlMTojZWVmM2ZhOyAtLXBhZ2UyOiNlNGViZjY7CiAgLS1zdXJmYWNlOiNmZmZmZmY7IC0tc3VyZmFjZTI6I2Y1ZjhmZDsgLS1maWVsZDojZjFmNWZjOyAtLWZpZWxkLWxpbmU6cmdiYSgxMiwxOSwzMiwuMTApOwogIC0taW5rOiMwYzEzMjA7IC0taW5rLXNvZnQ6IzNhNDY1YzsgLS1tdXRlZDojNzM4MTliOyAtLWxpbmU6cmdiYSgxMiwxOSwzMiwuMDkpOwogIC8qIGNhcmQgKi8KICAtLWMxOiNmZmZmZmY7IC0tYzI6I2VhZjBmOTsgLS1jLWluazojMGMxMzIwOyAtLWMtaW5rLXNvZnQ6IzNhNDY1YzsgLS1jLW11dGVkOiM3YzhhYTQ7CiAgLS1jLWxpbmU6cmdiYSgxMiwxOSwzMiwuMDkpOyAtLWdsYXNzOnJnYmEoMjU1LDI1NSwyNTUsLjcyKTsgLS1nbGFzcy1saW5lOnJnYmEoMTIsMTksMzIsLjA3KTsKICAtLWdsb3cxOnJnYmEoNDcsMTA3LDIxNCwuMTYpOyAtLWdsb3cyOnJnYmEoMTIwLDE3MCwyNTUsLjEzKTsgLS12aWc6cmdiYSgyMCw0MCw5MCwuMDYpOwogIC0tcmluZy1hOiNmZmZmZmY7IC0tcmluZy1iOiNjZmRhZWU7IC0tYy1zaGFkb3c6MCAzMHB4IDcwcHggcmdiYSgyMCw0MCw5MCwuMTYpLDAgNnB4IDE4cHggcmdiYSgyMCw0MCw5MCwuMTApOwogIC0tYy1zb2Z0OiNlOGYwZmQ7Cn0KW2RhdGEtdGhlbWU9ImRhcmsiXXsKICAtLWJyYW5kOiM1YThjZjA7IC0tYnJhbmQtZGVlcDojMmY2YmQ2OyAtLWJyYW5kLXNvZnQ6cmdiYSg5MCwxNDAsMjQwLC4xNik7CiAgLS1wYWdlMTojMGEwZTE2OyAtLXBhZ2UyOiMwNzBhMTE7CiAgLS1zdXJmYWNlOiMxMjE4MjY7IC0tc3VyZmFjZTI6IzBmMTQyMDsgLS1maWVsZDojMGUxMzFlOyAtLWZpZWxkLWxpbmU6cmdiYSgyNTUsMjU1LDI1NSwuMTApOwogIC0taW5rOiNlYWYwZmI7IC0taW5rLXNvZnQ6I2M1Y2ZlMjsgLS1tdXRlZDojODY5NmI0OyAtLWxpbmU6cmdiYSgyNTUsMjU1LDI1NSwuMDkpOwogIC0tYzE6IzE0MWIyYTsgLS1jMjojMGIxMDFhOyAtLWMtaW5rOiNlZWYyZmI7IC0tYy1pbmstc29mdDojYzVjZmUyOyAtLWMtbXV0ZWQ6IzhiOWFiODsKICAtLWMtbGluZTpyZ2JhKDI1NSwyNTUsMjU1LC4wOSk7IC0tZ2xhc3M6cmdiYSgyNTUsMjU1LDI1NSwuMDU1KTsgLS1nbGFzcy1saW5lOnJnYmEoMjU1LDI1NSwyNTUsLjEwKTsKICAtLWdsb3cxOnJnYmEoOTAsMTQwLDI0MCwuMjgpOyAtLWdsb3cyOnJnYmEoMzQsMTIwLDIyMCwuMTgpOyAtLXZpZzpyZ2JhKDAsMCwwLC41KTsKICAtLXJpbmctYTojNDY1MzZlOyAtLXJpbmctYjojMTYxZTJkOyAtLWMtc2hhZG93OjAgNDBweCA5MHB4IHJnYmEoMCwwLDAsLjYpLDAgOHB4IDI0cHggcmdiYSgwLDAsMCwuNSk7CiAgLS1jLXNvZnQ6cmdiYSg5MCwxNDAsMjQwLC4xNSk7Cn0KKntib3gtc2l6aW5nOmJvcmRlci1ib3g7bWFyZ2luOjA7cGFkZGluZzowfQpodG1sLGJvZHl7aGVpZ2h0OjEwMCV9CmJvZHl7Zm9udC1mYW1pbHk6J0RNIFNhbnMnLHN5c3RlbS11aSxzYW5zLXNlcmlmO2NvbG9yOnZhcigtLWluayk7CiAgYmFja2dyb3VuZDpyYWRpYWwtZ3JhZGllbnQoMTIwJSA4MCUgYXQgNTAlIC0xMCUsIHZhcigtLXBhZ2UxKSwgdmFyKC0tcGFnZTIpKTsKICBtaW4taGVpZ2h0OjEwMHZoO3RyYW5zaXRpb246YmFja2dyb3VuZCAuMzVzIGVhc2UsY29sb3IgLjM1cyBlYXNlfQoKLyogLS0tLS0tLS0tLSB0b3AgYmFyIC0tLS0tLS0tLS0gKi8KLmJhcntwb3NpdGlvbjpzdGlja3k7dG9wOjA7ei1pbmRleDo0MDtkaXNwbGF5OmZsZXg7YWxpZ24taXRlbXM6Y2VudGVyO2dhcDoxOHB4O2ZsZXgtd3JhcDp3cmFwOwogIHBhZGRpbmc6MTZweCAyNnB4O2JhY2tncm91bmQ6Y29sb3ItbWl4KGluIHNyZ2IsdmFyKC0tc3VyZmFjZSkgNzglLCB0cmFuc3BhcmVudCk7CiAgLXdlYmtpdC1iYWNrZHJvcC1maWx0ZXI6Ymx1cigxNHB4KTtiYWNrZHJvcC1maWx0ZXI6Ymx1cigxNHB4KTtib3JkZXItYm90dG9tOjFweCBzb2xpZCB2YXIoLS1saW5lKX0KLmJhciAuYnJhbmR7ZGlzcGxheTpmbGV4O2FsaWduLWl0ZW1zOmNlbnRlcjtnYXA6MTJweDttYXJnaW4tcmlnaHQ6YXV0b30KLmJhciAuYnJhbmQgaW1ne2hlaWdodDoyNHB4O2Rpc3BsYXk6YmxvY2t9Ci5iYXIgLmJyYW5kIC50YWd7Zm9udDo2MDAgMTJweCAnRE0gU2Fucyc7bGV0dGVyLXNwYWNpbmc6LjIyZW07dGV4dC10cmFuc2Zvcm06dXBwZXJjYXNlO2NvbG9yOnZhcigtLW11dGVkKX0KLnNlZ3tkaXNwbGF5OmZsZXg7YmFja2dyb3VuZDp2YXIoLS1maWVsZCk7Ym9yZGVyOjFweCBzb2xpZCB2YXIoLS1maWVsZC1saW5lKTtib3JkZXItcmFkaXVzOjEycHg7cGFkZGluZzo0cHh9Ci5zZWcgYnV0dG9ue2JvcmRlcjowO2JhY2tncm91bmQ6dHJhbnNwYXJlbnQ7Y29sb3I6dmFyKC0tbXV0ZWQpO2ZvbnQ6NjAwIDEzcHggJ0RNIFNhbnMnO2xldHRlci1zcGFjaW5nOi4wNGVtOwogIHBhZGRpbmc6OHB4IDE2cHg7Ym9yZGVyLXJhZGl1czo5cHg7Y3Vyc29yOnBvaW50ZXI7dHJhbnNpdGlvbjouMThzfQouc2VnIGJ1dHRvbi5vbntiYWNrZ3JvdW5kOnZhcigtLWJyYW5kKTtjb2xvcjojZmZmO2JveC1zaGFkb3c6MCA0cHggMTJweCByZ2JhKDQ3LDEwNywyMTQsLjMpfQouaWNvbi1idG57d2lkdGg6NDJweDtoZWlnaHQ6NDJweDtib3JkZXItcmFkaXVzOjEycHg7Ym9yZGVyOjFweCBzb2xpZCB2YXIoLS1maWVsZC1saW5lKTtiYWNrZ3JvdW5kOnZhcigtLWZpZWxkKTsKICBjb2xvcjp2YXIoLS1pbmspO2N1cnNvcjpwb2ludGVyO2ZvbnQtc2l6ZToxOHB4O2Rpc3BsYXk6ZmxleDthbGlnbi1pdGVtczpjZW50ZXI7anVzdGlmeS1jb250ZW50OmNlbnRlcjt0cmFuc2l0aW9uOi4xOHN9Ci5pY29uLWJ0bjpob3Zlcntib3JkZXItY29sb3I6dmFyKC0tYnJhbmQpfQouZGx7Ym9yZGVyOjA7YmFja2dyb3VuZDp2YXIoLS1icmFuZCk7Y29sb3I6I2ZmZjtmb250OjcwMCAxNHB4ICdETSBTYW5zJztsZXR0ZXItc3BhY2luZzouMDNlbTsKICBwYWRkaW5nOjExcHggMjJweDtib3JkZXItcmFkaXVzOjEycHg7Y3Vyc29yOnBvaW50ZXI7ZGlzcGxheTpmbGV4O2FsaWduLWl0ZW1zOmNlbnRlcjtnYXA6OXB4OwogIGJveC1zaGFkb3c6MCA4cHggMjBweCByZ2JhKDQ3LDEwNywyMTQsLjMyKTt0cmFuc2l0aW9uOi4xOHN9Ci5kbDpob3ZlcntiYWNrZ3JvdW5kOnZhcigtLWJyYW5kLWRlZXApfQouZGw6YWN0aXZle3RyYW5zZm9ybTp0cmFuc2xhdGVZKDFweCl9CgovKiAtLS0tLS0tLS0tIGxheW91dCAtLS0tLS0tLS0tICovCi5hcHB7ZGlzcGxheTpncmlkO2dyaWQtdGVtcGxhdGUtY29sdW1uczozODBweCAxZnI7Z2FwOjI2cHg7cGFkZGluZzoyNnB4O21heC13aWR0aDoxMzIwcHg7bWFyZ2luOjAgYXV0bzthbGlnbi1pdGVtczpzdGFydH0KQG1lZGlhKG1heC13aWR0aDo5MjBweCl7LmFwcHtncmlkLXRlbXBsYXRlLWNvbHVtbnM6MWZyO2dhcDoyMHB4O3BhZGRpbmc6MThweH0uY29udHJvbHN7b3JkZXI6Mn0uc3RhZ2V3cmFwe29yZGVyOjF9fQoKLyogLS0tLS0tLS0tLSBjb250cm9scyAtLS0tLS0tLS0tICovCi5jb250cm9sc3tiYWNrZ3JvdW5kOnZhcigtLXN1cmZhY2UpO2JvcmRlcjoxcHggc29saWQgdmFyKC0tbGluZSk7Ym9yZGVyLXJhZGl1czoyMHB4O3BhZGRpbmc6MjJweDsKICBib3gtc2hhZG93OjAgMThweCA0MHB4IHJnYmEoMjAsNDAsOTAsLjA2KX0KLmNvbnRyb2xzIGgye2ZvbnQ6NzAwIDE0cHggJ1NvcmEnO2xldHRlci1zcGFjaW5nOi4wNGVtO2NvbG9yOnZhcigtLWluayk7bWFyZ2luLWJvdHRvbTo0cHh9Ci5jb250cm9scyAuaGludHtmb250LXNpemU6MTJweDtjb2xvcjp2YXIoLS1tdXRlZCk7bWFyZ2luLWJvdHRvbToxOHB4O2xpbmUtaGVpZ2h0OjEuNX0KLmZsZHttYXJnaW4tYm90dG9tOjE0cHh9Ci5mbGQgbGFiZWx7ZGlzcGxheTpibG9jaztmb250OjYwMCAxMXB4ICdETSBTYW5zJztsZXR0ZXItc3BhY2luZzouMTJlbTt0ZXh0LXRyYW5zZm9ybTp1cHBlcmNhc2U7Y29sb3I6dmFyKC0tbXV0ZWQpO21hcmdpbi1ib3R0b206NnB4fQouZmxkIGlucHV0W3R5cGU9dGV4dF0sLmZsZCBpbnB1dFt0eXBlPW51bWJlcl17d2lkdGg6MTAwJTtwYWRkaW5nOjExcHggMTNweDtib3JkZXItcmFkaXVzOjExcHg7Ym9yZGVyOjFweCBzb2xpZCB2YXIoLS1maWVsZC1saW5lKTsKICBiYWNrZ3JvdW5kOnZhcigtLWZpZWxkKTtjb2xvcjp2YXIoLS1pbmspO2ZvbnQ6NTAwIDE0cHggJ0RNIFNhbnMnO3RyYW5zaXRpb246LjE2c30KLmZsZCBpbnB1dDpmb2N1c3tvdXRsaW5lOjA7Ym9yZGVyLWNvbG9yOnZhcigtLWJyYW5kKTtib3gtc2hhZG93OjAgMCAwIDNweCB2YXIoLS1icmFuZC1zb2Z0KX0KLnJvdzJ7ZGlzcGxheTpncmlkO2dyaWQtdGVtcGxhdGUtY29sdW1uczoxZnIgMWZyO2dhcDoxMnB4fQoucm93LXNie2Rpc3BsYXk6Z3JpZDtncmlkLXRlbXBsYXRlLWNvbHVtbnM6MWZyIDY0cHggNjRweDtnYXA6MTBweDthbGlnbi1pdGVtczplbmR9Ci5zdWJoZWFke2ZvbnQ6NzAwIDEycHggJ1NvcmEnO2xldHRlci1zcGFjaW5nOi4wNmVtO2NvbG9yOnZhcigtLWJyYW5kLWRlZXApO3RleHQtdHJhbnNmb3JtOnVwcGVyY2FzZTttYXJnaW46MThweCAwIDEwcHg7CiAgZGlzcGxheTpmbGV4O2FsaWduLWl0ZW1zOmNlbnRlcjtnYXA6OHB4fQouc3ViaGVhZDo6YmVmb3Jle2NvbnRlbnQ6IiI7d2lkdGg6MTRweDtoZWlnaHQ6MnB4O2JvcmRlci1yYWRpdXM6MnB4O2JhY2tncm91bmQ6dmFyKC0tYnJhbmQpfQoudXBsb2Fke2Rpc3BsYXk6ZmxleDthbGlnbi1pdGVtczpjZW50ZXI7Z2FwOjEwcHh9Ci51cGxvYWQgLmZha2VidG57ZmxleDoxO3BhZGRpbmc6MTBweCAxMnB4O2JvcmRlci1yYWRpdXM6MTFweDtib3JkZXI6MXB4IGRhc2hlZCB2YXIoLS1maWVsZC1saW5lKTtiYWNrZ3JvdW5kOnZhcigtLWZpZWxkKTsKICBjb2xvcjp2YXIoLS1tdXRlZCk7Zm9udDo1MDAgMTNweCAnRE0gU2Fucyc7Y3Vyc29yOnBvaW50ZXI7dGV4dC1hbGlnbjpjZW50ZXI7dHJhbnNpdGlvbjouMTZzfQoudXBsb2FkIC5mYWtlYnRuOmhvdmVye2JvcmRlci1jb2xvcjp2YXIoLS1icmFuZCk7Y29sb3I6dmFyKC0tYnJhbmQpfQoudXBsb2FkIGlucHV0W3R5cGU9ZmlsZV17ZGlzcGxheTpub25lfQoudXBsb2FkIC50aHVtYnt3aWR0aDozOHB4O2hlaWdodDozOHB4O2JvcmRlci1yYWRpdXM6OXB4O29iamVjdC1maXQ6Y292ZXI7Ym9yZGVyOjFweCBzb2xpZCB2YXIoLS1maWVsZC1saW5lKTtiYWNrZ3JvdW5kOnZhcigtLWZpZWxkKX0KLnVwbG9hZCAuY2xlYXJ7d2lkdGg6MzJweDtoZWlnaHQ6MzJweDtib3JkZXItcmFkaXVzOjlweDtib3JkZXI6MXB4IHNvbGlkIHZhcigtLWZpZWxkLWxpbmUpO2JhY2tncm91bmQ6dmFyKC0tZmllbGQpO2NvbG9yOnZhcigtLW11dGVkKTtjdXJzb3I6cG9pbnRlcn0KLmxlZ2NhcmR7Ym9yZGVyOjFweCBzb2xpZCB2YXIoLS1maWVsZC1saW5lKTtib3JkZXItcmFkaXVzOjE0cHg7cGFkZGluZzoxM3B4O21hcmdpbi1ib3R0b206MTJweDtiYWNrZ3JvdW5kOnZhcigtLXN1cmZhY2UyKX0KLmxlZ2NhcmQgLmxoZWFke2Rpc3BsYXk6ZmxleDthbGlnbi1pdGVtczpjZW50ZXI7anVzdGlmeS1jb250ZW50OnNwYWNlLWJldHdlZW47bWFyZ2luLWJvdHRvbToxMHB4fQoubGVnY2FyZCAubGhlYWQgYntmb250OjcwMCAxMnB4ICdTb3JhJztjb2xvcjp2YXIoLS1pbmspO2xldHRlci1zcGFjaW5nOi4wNGVtfQoubGVnY2FyZCAucm17Ym9yZGVyOjA7YmFja2dyb3VuZDp0cmFuc3BhcmVudDtjb2xvcjp2YXIoLS1tdXRlZCk7Y3Vyc29yOnBvaW50ZXI7Zm9udC1zaXplOjEzcHg7cGFkZGluZzoycHggNnB4O2JvcmRlci1yYWRpdXM6NnB4fQoubGVnY2FyZCAucm06aG92ZXJ7Y29sb3I6I2UxNTU2YTtiYWNrZ3JvdW5kOmNvbG9yLW1peChpbiBzcmdiLCNlMTU1NmEgMTIlLHRyYW5zcGFyZW50KX0KLmFkZGxlZ3t3aWR0aDoxMDAlO3BhZGRpbmc6MTJweDtib3JkZXItcmFkaXVzOjEycHg7Ym9yZGVyOjFweCBkYXNoZWQgdmFyKC0tYnJhbmQpO2JhY2tncm91bmQ6dmFyKC0tYnJhbmQtc29mdCk7CiAgY29sb3I6dmFyKC0tYnJhbmQtZGVlcCk7Zm9udDo3MDAgMTNweCAnRE0gU2Fucyc7Y3Vyc29yOnBvaW50ZXI7dHJhbnNpdGlvbjouMTZzfQouYWRkbGVnOmhvdmVye2JhY2tncm91bmQ6dmFyKC0tYnJhbmQpO2NvbG9yOiNmZmZ9Ci5hZGRsZWc6ZGlzYWJsZWR7b3BhY2l0eTouNDU7Y3Vyc29yOm5vdC1hbGxvd2VkfQoucm5ne2Rpc3BsYXk6ZmxleDthbGlnbi1pdGVtczpjZW50ZXI7Z2FwOjEycHh9Ci5ybmcgaW5wdXRbdHlwZT1yYW5nZV17ZmxleDoxO2FjY2VudC1jb2xvcjp2YXIoLS1icmFuZCl9Ci5ybmcgLnZhbHtmb250OjcwMCAxNHB4ICdTb3JhJztjb2xvcjp2YXIoLS1icmFuZC1kZWVwKTttaW4td2lkdGg6NDJweDt0ZXh0LWFsaWduOnJpZ2h0fQoKLyogLS0tLS0tLS0tLSBwcmV2aWV3IHN0YWdlIC0tLS0tLS0tLS0gKi8KLnN0YWdld3JhcHtwb3NpdGlvbjpyZWxhdGl2ZX0KLnN0YWdlLWxhYmVse2ZvbnQ6NjAwIDExcHggJ0RNIFNhbnMnO2xldHRlci1zcGFjaW5nOi4xOGVtO3RleHQtdHJhbnNmb3JtOnVwcGVyY2FzZTtjb2xvcjp2YXIoLS1tdXRlZCk7bWFyZ2luLWJvdHRvbToxNHB4O3RleHQtYWxpZ246Y2VudGVyfQouc3RhZ2V7ZGlzcGxheTpmbGV4O2p1c3RpZnktY29udGVudDpjZW50ZXI7YWxpZ24taXRlbXM6ZmxleC1zdGFydDttaW4taGVpZ2h0OjIwMHB4fQouc2NhbGVye3RyYW5zZm9ybS1vcmlnaW46dG9wIGNlbnRlcn0KCi8qID09PT09PT09PT09PT09PT09PT09PT0gVEhFIENBUkQgPT09PT09PT09PT09PT09PT09PT09PSAqLwouY2FyZHtwb3NpdGlvbjpyZWxhdGl2ZTt3aWR0aDo1NDBweDtib3JkZXItcmFkaXVzOjI4cHg7b3ZlcmZsb3c6aGlkZGVuO2JveC1zaGFkb3c6dmFyKC0tYy1zaGFkb3cpOwogIGlzb2xhdGlvbjppc29sYXRlO2NvbG9yOnZhcigtLWMtaW5rKX0KLmNhcmQuc2luZ2xle2hlaWdodDo2NzVweH0KLmNhcmQuc2xpcHttaW4taGVpZ2h0OjU2MHB4fQouYXRtb3N7cG9zaXRpb246YWJzb2x1dGU7aW5zZXQ6MDt6LWluZGV4OjA7CiAgYmFja2dyb3VuZDoKICAgIHJhZGlhbC1ncmFkaWVudCgxMjAlIDg2JSBhdCA1MCUgLTEyJSwgdmFyKC0tZ2xvdzIpLCB0cmFuc3BhcmVudCA1OCUpLAogICAgcmFkaWFsLWdyYWRpZW50KDc0JSA1NiUgYXQgMTAlIDI2JSwgdmFyKC0tZ2xvdzEpLCB0cmFuc3BhcmVudCA2MCUpLAogICAgcmFkaWFsLWdyYWRpZW50KDc4JSA1OCUgYXQgOTIlIDc0JSwgdmFyKC0tZ2xvdzEpLCB0cmFuc3BhcmVudCA2MiUpLAogICAgbGluZWFyLWdyYWRpZW50KDE2NmRlZywgdHJhbnNwYXJlbnQgMzglLCByZ2JhKDI1NSwyNTUsMjU1LC4wNSkgNTAlLCB0cmFuc3BhcmVudCA2MiUpLAogICAgcmFkaWFsLWdyYWRpZW50KDEyMCUgMTAwJSBhdCA1MCUgNDYlLCB0cmFuc3BhcmVudCA1NiUsIHZhcigtLXZpZykgMTAwJSksCiAgICBsaW5lYXItZ3JhZGllbnQoMTYyZGVnLCB2YXIoLS1jMSksIHZhcigtLWMyKSl9Ci5ncmFpbntwb3NpdGlvbjphYnNvbHV0ZTtpbnNldDowO3otaW5kZXg6Mztwb2ludGVyLWV2ZW50czpub25lO29wYWNpdHk6LjA1OwogIGJhY2tncm91bmQtaW1hZ2U6dXJsKCJkYXRhOmltYWdlL3BuZztiYXNlNjQsaVZCT1J3MEtHZ29BQUFBTlNVaEVVZ0FBQUVBQUFBQkFDQVlBQUFDcWFYSGVBQUEzTTBsRVFWUjRuRDJiWjBDT2Y5aitqNVoyb1ZMYVE2V2tORWhwSzVKSVNVUTdXU0dFUEQ4clpFWWEya0tVSkJVdFNkS21SYW1rUkV2THJhM2JyZFQ1Zi9IOG4xNWRMNi9yeGZmOFh1ZnhPWTREd2NIQlpHTmpRNzI5dlRRMk5rYXBxYWxrYm01TzgrYk5vd2NQSGxCa1pDUWRPSENBVkZSVUtETXprd29MQzZtdXJvNHlNek9wdDdlWHZMeTg2Ty9mdjhUSHgwZDM3dHdoZDNkM2NuSnlvb2lJQ0txc3JDUUxDd3RTVlZXbEF3Y09VSE56TTZXbHBkSHk1Y3NwSlNXRkRBd015TXJLaXV6dDdVbGZYNStFaElRb05qYVdzckt5cUtXbGhXeHRiVWxQVDQ5VVZWVnBhbXFLcksydHFhV2xoWFIwZENneE1aRTZPanJveUpFajlPelpNMHBNVEtUQndVRlNVVkdoQlFzV2tMT3pNN0d4c2RHM2I5OW8zcng1TkQ0K1R1ZlBuNmZidDIvVHZIbnp5TWpJaUQ1OStrUnNibTV1OVByMWE5eTZkUXVuVDUvR2x5OWZVRjVlRGpzN094UVhGMlBidG0yUWtKREEyclZyOGZEaFE2U21wdUxEaHc5WXVYSWwwdFBUMGREUWdEdDM3a0JWVlJVZlBueEFhbW9xaElTRXdNL1BqNEtDQXF4ZXZScDFkWFZRVUZEQWp4OC9zSEhqUmxoYVdzTER3d05zYkd4SVRVM0Y1czJiTVRZMmh1dlhyMlB2M3IzZzRPQ0FqSXdNMk5uWllXOXZEMTFkWFZSVlZjSFB6dytPam83UTA5T0RyNjh2TGx5NGdQVDBkTFMydHVMSWtTTVFFUkZCY25JeWZ2LytEWEZ4Y1d6ZnZoMENBZ0tZbnA1R2JHd3NqaDgvRGdFQkFiaTd1eU1yS3d0ZnYzNEZ1NkNnSVBqNCtGQlJVUUZQVDAvWTJkbkJ6YzBOZFhWMTBOSFJnWVdGQlpxYW1yQisvWG84Zi80Y3g0OGZoNTJkSFJRVUZMQjE2MWI0K2ZsaDY5YXRzTEN3UUhkM043NTgrWUw0K0hqazVPVEF3Y0VCZzRPRFVGVlZSVnRiR3dEQTA5TVRNVEV4Nk92clExNWVIdjcrL1l0SGp4NWgyYkpsZVB2MkxRNGNPQUFuSnlkMGRIU0F5V1RpOXUzYjZPenNSRlZWRmI1Ky9ZbzdkKzVBVVZFUklpSWl5TS9QaDUyZEhacWFtaUFwS1FsUFQwL0l5OHZEd2NFQnljbkprSktTUWtoSUNCd2RIV0ZrWklScjE2NWhlSGdZNzkrL3g2MWJ0M0R1M0RtdzhmUHpVMnBxS2xSVlZSRVZGWVZObXpZaE5qWVdOVFUxNk8vdng1a3paeEFURXdONWVYbjA5L2VqdnI0ZXRiVzFFQllXUms1T0RrNmZQZzByS3l2SXk4c2pNaklTK3ZyNmtKQ1F3TUtGQ3lFcks0dUZDeGVpdHJZV2lZbUorUExsQzNoNGVKQ1dsZ1liR3h2SXljbmg2dFdyNE9IaHdiWnQyOERKeVFrbWs0a1ZLMVpBV2xvYXQyN2RRa1JFQkV4TVRIRHIxaTBjUFhvVWJtNXUyTGR2SC9idTNZdSt2ajZ3czdPanVMZ1l2YjI5a0pTVVJHWm1KcFNWbFNFbEpRVmJXMXRjdjM0ZEZSVVZzTGUzeDlxMWF6RThQSXltcGlZWUdocWl1N3NidUhUcEVoVVdGcEtWbFJYTnpzN1M0T0FnRFE4UEV5Y25KM0Z3Y0ZCS1NnckZ4OGRUVjFjWFNVaElrS09qSTFsYVdwSzV1VGxwYTJ2VG1UTm5LQ0lpZ2hZc1dFQXNGb3ZjM055SWs1T1QxTlRVNk1XTEYzVC8vbjA2ZCs0Y0ZSY1hVMWRYRnprNU9SR1R5YVNkTzNlU3JxNHVLU29xVW45L1A0V0ZoVkYrZmo0RkJnYlM4UEF3eGNiR2twdWJHNW1hbXBLZ29DQ3RXTEdDenA0OVMxcGFXbFJRVUVDL2YvOG1BTFIvLzM0eU5EUWtjWEZ4dW5mdkhna0tDaEk3T3p1ZE8zZU9tcHFhcUxlM2w0S0RnNm0vdjU5U1UxT0p3V0JRYVdrcDNiaHhnMVJWVllsTlJrYUdWRlJVc0h2M2JuUjFkYUd1cmc1Q1FrS1FsWlZGV1ZrWlVsSlNjUHIwYVNRa0pPRDM3OTk0L2ZvMWlvdUx3V0F3RUJRVUJCTVRFN3g3OXc2VmxaVzRkT2tTbkoyZElTc3JpNjlmdjRLTmpRMmNuSnhZc0dBQi92MzdCMWRYVnhRVUZFQkRRd004UER5WW1wcUNnWUVCWEYxZFVWdGJpOU9uVDhQVDB4Tyt2cjVZdTNZdE9qbzYwTkRRZ0JzM2JxQ3FxZ3ByMTY2Rm01c2JObTdjQ0cxdGJiUzJ0a0pBUUFCZVhsNFFGQlNFdWJrNWhJU0VVRkJRZ0dYTGxpRXRMUTNOemMxSVNrckN2SG56OE9USkUxeS9maDMzNzkrSG9xSWkyTm5ad1phVGswT2NuSnh3Y25MQ3MyZlBVRnBhaXM3T1RpUW1KaUlvS0FoaFlXSGc1ZVhGeDQ4ZmtaV1ZCUWNIQjZpcnE0UEZZdUhqeDQ5Z01wa3dOemZIOWV2WE1YLytmQVFFQkNBbEpRVVpHUm5vNnVwQ1UxTVRZbUppME5QVGc3OS8veUkxTlJVMk5qWUlEZzVHUUVBQTdPenMwTkhSZ2FHaEllemR1eGZuejUvSHBVdVhJQ1FraEI4L2ZvQ1hseGZEdzhPWW1wcENhbW9xYW1wcTRPWGxCUjhmSHl4ZHVoUWZQMzdFOFBBd0JBUUVjT2pRSVV4T1R1TDM3OTlZc1dJRkhqeDRnTGEyTnNqSXlPRDA2ZE00Y2VJRVJFUkVvSzJ0RFNhVGllenNiSENtcEtSQVdGZ1lpWW1KU0VsSmdiMjlQUVFFQkRBN093czdPenNzWDc0Y0Nnb0tlUFBtRGFxcnExRlJVUUViR3h1VWxKVGc0c1dMZVBQbURUdzhQSkNlbm83MTY5Y2pLQ2dJdnI2KzJMNTlPODZmUDQreXNqSllXRmpBdzhNRFUxTlRxS2lvZ0krUEQvcjcrekU3TzR0VnExWkJXRmdZMjdadHc3WnQyOURlM282MnRqWU1EUTBoTHk4UHNyS3lzTEN3Z0p5Y0hLcXFxa0JFR0JnWWdJU0VCTXpNek5EVjFZVy9mLytpcjY4UEV4TVQyTHg1TTJabVp1RG82SWlMRnkvQ3k4c0xibTV1VUZkWHgrdlhyN0ZxMVNxOGZmc1d0Mi9mUm5aMk50RFMwa0oyZG5iMDd0MDd1bjM3Tmlrcks1T1hseGZsNStmVGtTTkhhUDc4K1JRZEhVM0p5Y20wYTljdTJyWnRHODJmUDU4Y0hSM0oyTmlZVkZWVmFXaG9pRHc4UEVoUVVKQjZlbnBJWGw2ZStQajRhTy9ldmJSaHd3WmFzV0lGblQ5L25ob2JHK25VcVZNVUd4dExKU1VsSkNFaFFSY3VYS0M0dURoaU1wbTBkKzllV3J0MkxkMjVjNGZLeXNyb3o1OC85UFRwVTNKM2Q2ZUlpQWlhbUpnZ0RRME51bkRoQXZIeDhaRyt2ajVWVjFmVDZkT25hV3hzak5qWTJNakl5SWpxNnVxSXhXSlJXbG9hM2JoeGczSnljdWp4NDhmRXdjRkJzYkd4NU9qb1NBTURBMlJyYTB1Yy9mMzkrUFhyRjA2ZE9nVXpNelA4K3ZVTENnb0s0T2ZuaDUrZkgwUkVSUEQ5KzNkczJiSUZoWVdGU0VoSVFIaDRPTzdmdnc4bEpTV3dzYkZoZkh3Y29xS2lPSDM2Tk1URXhIRHMyREhJeWNuaHlKRWpPSExrQ0ZKU1VqQTlQUTB1TGk2TWo0OURXMXNiTjIvZVJIRnhNVTZmUG8zNCtIaXdXQ3lJaW9wQ1EwTUR3Y0hCcUtxcXd0VFVGTXJMeXlFcEtZbjM3OStEaDRjSDNOemNpSXFLZ3F1ckt3SURBN0ZzMlRKVVZWWGh6NTgvK1AzN04weE1UT2ErdGErdkQ1T1RrOWkwYVJONmUzdGhhV21KZ0lBQTFOWFZ3ZEhSRVlPRGcrQmN0V29Wb3FPallXbHBDWHQ3ZTl5K2ZSdXBxYWtvTFMzRnIxKy93TW5KQ1hsNWVXellzQUZaV1Zsd2RuYUdnb0lDN08zdFlXbHBDWFYxZFJ3OGVCQ2VucDdZdjM4L3pNM05rWldWQlFVRkJSdzhlQkEzYjk0RVB6OC9wS1dsb2Flbmg5V3JWNk92cncvZDNkMXdjbktDajQ4UFJrZEg4ZS9mUC9UMjltSm1aZ2FIRHgvRy92MzdFUllXQm41K2ZpeGR1aFQ1K2ZsSVNFakFxVk9ud0dLeDBOTFNnamR2M2lBdExRMk9qbzdRMU5URTZ0V3JrWldWaGFpb0tNek96Z0lBeXN2TGNmRGdRZHk3ZHcvdjM3K0hxYWtwcmwrL0Rna0pDU3hac2dUc3QyN2RncmUzTjVLVGsrSHI2NHVCZ1FHSWlvcGlaR1FFcTFldnhwSWxTMkJuWjRkYnQyN2g1TW1UVUZWVnhlam9LTXJMeTdGbHl4Yms1dWFpb3FJQzFkWFZPSFhxRks1ZHU0YXZYNy9DMmRrWlo4NmN3ZnYzNzVHWm1Zbkl5RWo4K3ZVTG82T2pXTEZpQmNURnhaR1ZsWVhJeUVoY3ZYb1ZyMSsvaHJhMk52YnQyNGVFaEFRY1BIZ1FrWkdSeU1qSXdPenNMQW9MQzFGZFhZMkppUW04ZS9jT0V4TVRHQmdZQUlQQndQWHIxMUZUVTRQZTNsN2N1SEVEOWZYMWVQandJVXBLU2xCWldZbWZQMytpdGJVVjN0N2VVRk5UdytIRGg4SE96ZzRQRHcrd256aHhBdG5aMlhCM2Q0ZUlpQWpxNitzeE9qb0tVMU5USkNRa2dKdWJHL2IyOXFpdnI4ZkZpeGR4NHNRSnVMbTVnY1ZpUVZGUkVVbEpTWkNWbFlXaW9pTEV4Y1VoTHkrUG56OS9ncHViRzdPenM4ak56VVZoWVNGRVJFUXdPam9LSlNVbFRFOVBRMFZGQmFhbXBxaXVyb2F6c3pQVTFOVFEydHFLdjMvL3psMkVnWUdCVUZSVXhJNGRPOURhMmdwbloyZDgrdlFKV2xwYTBOSFJnYlMwTkJRVUZNQmdNS0NwcVFrek16TW9LaXJpNXMyYlVGRlJnWlNVRktTa3BCQWRIWTF2Mzc3aDRjT0hPSDc4T0FEZ3paczNxS3lzQkh0M2R6Y1dMbHlJNXVabWVIaDRZTjI2ZFpDVGs4UE16QXhhVzF2UjFkV0Z2cjQrbUppWWdNbGtBZ0NlUEhtQ2xwWVcvUDM3RnprNU9iQzN0NGVrcENUTXpjM1IwZEdCZGV2V1ljZU9IUWdORGNYQmd3Y3hNVEdCYmR1MndkM2RIUXNXTElDWW1CaENRME1SR2hvS0tTa3A2T3ZyNDhXTEYvRDM5OGZYcjEvaDd1NE9IeDhmZUh0N2c0aVFsSlNFczJmUG9yYTJGbEZSVVhqNDhDRUNBd1BSM3Q2T3VybzZzRmdzaElTRW9LNnVEaUlpSXRpL2Z6K3NyYTNoNU9TRXlzcEs3TjY5RzlYVjFjakx5ME45ZlQyVWxaWHg3Tmt6ZUhsNUFYMTlmV1J0YlUzVjFkVkVSQlFRRUVDY25KejA3Tmt6VWxGUm9VK2ZQcEdxcWlvOWVQQ0E5dS9mVDJWbFpSUWVIazYvZi8rbTRlRmh5czdPSms5UFR5b3RMYVhObXpmVHhNUUU3ZG16aDdadTNVcHNiR3gwNnRRcHlzbkpvZi81bi8raGlJZ0lXcjE2TlNrcUtsSlpXUmtWRnhmVHg0OGZ5ZGZYbDR5TWpLaW9xSWh5Y25Jb016T1R6cDA3Ung4L2ZxVHg4WEdTbHBhbXhzWkdTa3BLSWg0ZUhtS3hXTVRPems1S1NrclUwOU5ERVJFUjlPM2JOL3J5NVF2eDhQQ1FsWlVWR1JzYms2K3ZMNlducDFOb2FDaU5qSXpRbHk5ZktDMHRqUjQrZkVnNU9UbFVYMTlQaUlxS0lrVkZSVHAwNkJDeFdDeHFhbXFpZGV2V1VVcEtDbkZ3Y05DL2YvOG9LeXVMM3J4NU0vZVNycTR1NnU3dXBnY1BIbEJjWEJ4NWUzdVRxYWtwblRsemh2VDA5Q2cyTnBZNE9EaW9wcWFHMXExYlI4Ykd4bFJlWGs0VEV4UDA4K2RQMHRYVkpVZEhSN3AwNlJMMTl2YVNuNThmN2Q2OW14WXRXa1NYTGwwaVMwdExhbWhvb0ZldlhwR3ZyeStabTV1VGdJQUFyVm16aHRMVDA2bW5wNGVZVENZWkdCaVFzTEF3MmRqWWtKZVhGMmxyYTVPbXBpWlpXMXZUcDArZlNFZEhoNzU5KzBabFpXVTBNVEZCQXdNRFpHMXRUVDA5UFRRNU9Va3VMaTdFcWFDZ2dPTGlZbXpjdUJGS1Nrb0lEdy9IK3ZYcnNXN2RPcWlycStQcjE2L1lzR0VEeE1URXNHM2JOc2pLeW9MRllrRmFXaG9sSlNYZzVPU0VnNE1EWHI1OGljYkdSckJZTEtTbXBpSTNOeGVxcXFyUTBOREF4TVFFUkVSRThQUG5UMHhOVGVIMTY5ZG9hV2xCWFYwZG5KMmRjZkxrU1h6NjlBbDlmWDN3OC9PRG41OGZqSTJOc1dIREJwU1ZsZUhNbVROZ01wa1lHQmpBNWN1WGNmVG9VWFIwZEVCQVFBQXRMUzBvS1NuQnlwVXJZV2hvQ0hGeGNkeTVjd2Z0N2Uwb0tTbEJkM2Mzcmw2OWlvcUtDcWlwcVNFdkx3KzdkKzlHUUVBQXhNVEV3QlliRzB1dlhyM0MwYU5IY2VUSUVXemF0QW1QSHo5R2MzTXppQWp6NTg5SGMzTXpvcU9qa1pXVkJVNU9Uc2pKeVNFakl3TTNidHdBTHk4dlltTmpvYU9qZzd0Mzc2Szh2QnlIRGgzQyt2WHJJU2twaWNlUEh5TXdNQkFuVHB4QVpXVWxaR1ZsOGZUcFV6UTNOOFBMeXd0YnQyNkZzckl5MXF4WkF3ME5EU1FuSnlNbUpnYkt5c3FJaVlsQlcxc2JkdXpZZ1dmUG51SFBuejhZR3h1RGlvb0twcWVuTVRJeWdwcWFHdXpldlJ2ejU4OEhHeHNiQkFVRndjWEZCUWNIQjZ4Y3VSTDI5dlpJU0VoQWFXa3BtcHViY2VMRUNRUUZCYUczdHhmejU4OEg1L2J0MjhISHh3Y3hNVEZvYUdpZ282TUQ1ODZkdzU0OWU4RER3NFBMbHkvRHlja0o2ZW5wTURNekF3Y0hCMHhOVFdGbVpvYnM3R3lNakl6Z3o1OC8wTkhSZ2JLeU1sYXRXb1VWSzFaQVEwTUQvLzMzSDM3OCtBRXhNVEdjUG4wYXpzN08wTmZYUjB4TURENTgrQUFHZzRHcHFTa2tKU1hCMXRZV1BqNCtXTEZpQlJnTUJoWXVYSWdyVjY2QWs1TVQvLzMzSDVZdVhRb1dpNFhaMlZsd2NYSE5pUzhpZ3JtNU9mcjcrOUhZMklpM2I5OWljSEFRdkx5OGFHeHNoSmlZR01yTHkyRm9hSWlXbGhiOHovLzhEMUpUVTFGZVhvNlRKMDhDTWpJeUZCOGZUN3k4dkpTUmtVRkhqaHdoZlgxOVdyNThPYVducDVPa3BDUjkvUGlSWEZ4Y3lNN09qcVNrcEdoc2JJekN3OFBwNWN1WHhNYkdSbmw1ZVhUeDRrVlNWRlFrRnhjWFlqQVlwS21wU1ltSmlmVDgrWFBLeXNxaW1wb2FZakFZMU43ZVRycTZ1cFNmbjA4c0Zvc0VCQVRvN2R1MzVPVGtSTGEydHBTZG5VMTM3OTRsZFhWMTJyWnRHd1VIQjlQV3JWdnA1TW1UZE8vZVBSSVhGeWR2YjIrYW5Kd2tIeDhmK3ZUcEUvWDA5SkNhbWhxOWZ2MmFObTdjT0lmQWRIVjFxYkN3a0xTMHRNakN3b0tXTFZ0R1BUMDlORG82U2xOVFV5UWdJRURzeGNYRnFLdXJnNHFLQ3FxcnErSGs1SVNSa1JFNE9qcmkrdlhyU0V0THc3eDU4K0RnNElDWm1SazBOalppZUhnWVZWVlYwTlhWeGZIangrSHI2NHVKaVFsa1pHVEF4Y1VGWGw1ZTZPL3Z4NnBWcStEbzZBaE9UazZJaW9yaTJiTm5DQTRPeHNHREJ5RWtKSVFsUzVaQVZsWVdWNjVjUVVOREEvejkvWEh3NEVHa3BLUmc3OTY5c0xLeUFqOC9QejUrL0FndExTM1kyTmlBblowZFJrWkdlUG55SmNURXhORGQzWTM2K25xb3E2dmo2TkdqV0xObURVeE1UTEJ4NDBiNCtQakF6YzBOZ1lHQnVIRGhBalpzMklCTm16YkJ6czRPdGJXMXVIdjNMdGhEUWtKdzlPalJPWlZWVkZTRVJZc1dBY0RjdXRqZTNvNXQyN2FocWFrSlg3NThnYjYrUG9xTGl5RWdJSURpNG1Kb2FXbWhxYWtKWTJOaldMWnNHV1ptWnFDaG9ZRUhEeDVBVFUwTklpSWlVRkpTUW5KeU11enM3QkFURXdNdUxpNEVCUVZoZW5vYVBqNCsyTFZyRjU0K2ZZckt5a293R0F3SUNncUNoNGNIRXhNVHFLcXF3cWxUcDZDbHBRVnVibTZVbEpSZzc5Njl5TTNOeGNtVEo1R2JtNHZtNW1hRWhvWmljbklTeXNyS2lJMk5SVUJBQU1MQ3dqQStQbzZjbkJ3WUdCamcyTEZqWURBWWlJaUlRRWxKQ2RpY25aMUpWRlFVUGo0KzBOVFVSR05qSXg0L2ZneFpXVmxvYUdpQW01c2JiR3hzMkxsejV4eGZjM1oyaG9PREEyUmxaZkhvMFNNSUNRbWhzTEFRVDU0OHdmNzkrMkZsWllWTm16YWhyYTBOYjk2OFFVSkNBb3lNakhEMTZsVXNYcndZd3NMQ21KNmVocUtpSWs2Y09JRmZ2MzdoNGNPSHFLMnRSV2RuSjVxYW1xQ2pvd01KQ1Fsb2FHamcvdjM3bUo2ZUJqczdPL1QxOWVIaTRnSWhJU0djUG4wYStmbjVxSzZ1eHNtVEo4RmlzZERYMTRlaW9pTFkyZGxoeFlvVm1KMmR4ZXZYcnlFcUtvcFZxMWFCd1dEZytQSGp5TTNOUlVoSUNCQVVGRVNDZ29JME96dEw5ZlgxZE9yVUtSSVRFNk85ZS9mU3o1OC9LU29xaXJ5OHZHamh3b1ZrYTJ0THo1NDlvejE3OXREWTJCang4L1BUdG0zYktENCtuc0xEdzJuWnNtVmtaMmRIN096c1ZGSlNRdHpjM0tTaG9VRWNIQnhrWW1KQ2ZuNSt4TWZIUjYydHJhU2hvVUZjWEZ5a3A2ZEhMQmFMYkd4c3lNTENnbkp6YytuWXNXT1VtNXRMWm1abXRHblRKZ29LQ2lJR2cwRTVPVGxVV1ZsSmxwYVc5UERoUXpJMU5hVTllL1lRRHc4UExWMjZsQ1ltSm1oMGRKVDA5ZlVKQUsxWXNZSVdMVnBFSmlZbTlPN2RPMkt4V0RRK1BrNWhZV0drcnE1T1lXRmh4SzZvcUlqQ3drSUVCQVRnOE9IRDJMZHZIMzc4K0lHSWlBakl5Y2xCUmtZRzd1N3VNRFEwQkRzN082U2xwV0ZoWVFFZEhSM2N2SGtUaVltSitQUG5EM2JzMklIUjBWRThmZm9VV1ZsWktDb3FncEtTRXA0OWV3WS9QeitvcXFvaUl5TUQwZEhSc0xhMmhxdXJLNTQ4ZVlLaG9TRklTVW5CeXNvS1RVMU5XTEJnQWQ2K2ZZdm56NStqb3FJQ1RDWVRIaDRlS0M0dVJuRnhNUzVjdURDSHkrYlBudzhwS1Nsb2FtcmkvZnYzdUhmdkhpNWR1Z1FHZ3pFM3BtMXRiY2pMeTBOSlNRbDZlbnF3Zi85K3ZIdjNEaytmUGdXTHhRSmJSa1lHVlZkWFEwcEtDZ3NXTEVCUVVCQjRlWGtSRVJFQmZuNSsxTmJXUWwxZEhicTZ1Z2dJQ0lDVmxSVmV2SGdCWVdGaDZPbnBZV3hzREdGaFlUQXlNa0pEUXdNZVBYb0VPenM3YUd0cnc4TENBdWJtNXREUTBNRERodzhSRmhZR0d4c2I3TisvSC9QbXpjT2FOV3V3ZHUxYVBIcjBDQzB0TFdodWJnYUF1Vi9jdFd2WE1EbzZpcTZ1THN5ZlB4Ky9mdjJDc2JFeDFxMWJCeXNySzNSM2QrUHQyN2RZdG13Wm5qOS9qcGlZR0R4Ky9CaXpzN053ZG5iR25UdDNvS3lzREVWRlJWUlVWT0Rldlh2SXpNeUVzTEF3d3NQRG9hbXBDYzdKeVVsNGVYbmgrZlBuMkxwMUt6ZzRPSkNabVluMjluWVlHaHJDMmRrWlpXVmxrSldWeGZEd01Nek16REE0T0lpb3FDZ3NXTEFBalkyTk1ERXhnYTJ0TFk0ZVBZcWdvQ0JZV2xyQ3lzb0tTVWxKNk9qb0FCSGgyN2R2aUkrUHgvbno1L0hxMVNzVUZ4ZERRVUVCRFEwTitQdjNMelp0Mm9TaG9TR29xNnNqSnljSG56OS9ocm01T1VSRVJIRHUzRGtFQkFSQVRVME5ob2FHS0NvcWdybTVPZlQxOWNITHl3c21rNGxuejU3aHg0OGZXTDU4T2RUVTFEQThQQXdpQWg4Zkg4ek56WEgvL24xOC92d1p4Y1hGVUZGUndmWHIxd0VBYk8zdDdUUXhNVEZuWEJnYkcwTmRYUjBORFEyWW5wN0c2dFdyc1dmUEhuQnpjMk40ZUJoTUpoTXlNaklJQ1FsQllXRWhvcU9qWVc1dURqOC9QNnhac3diTnpjMFFFQkJBWjJjbkZpNWNpS3RYcjJKd2NCRFhybDNENjlldjBkM2RqV1hMbHNIUHp3L0hqeCtIcmEwdG1wcWFZR05qZy9Ed2NPVGw1WUhGWXVIeTVjc1lIaDVHVEV3TWlvdUxzV1hMRmpDWlRGUlhWNk94c1JFK1BqNTQ4ZUlGOHZQem9hU2toSmN2WDZLaG9RRzdkKytHaG9ZR2NuTnprWitmRHdhREFRc0xDNGlLaXVMMjdkc29MeThIaThYQzNyMTdJU3NyQzg0OWUvWkFUVTBORXhNVDZPM3RSVTFORFN3dExTRXRMWTE3OSs3aDVjdVhFQklTZ3F1ckt5SWpJMUZRVURBM0lyYTJ0cmh5NVFwcWEyc3hmLzU4cUtpb0lDVWxCZDNkM1RoNDhDRDI3Tm1EbUpnWVdGdGJnNE9EQXdZR0J2aisvVHUrZmZ1R2dJQUF0TFcxZ1pPVEUwRkJRZkQzOTRlYW1ocUVoSVN3YytkT25EbHpCbU5qWS9EMDlJU1FrQkJHUjBleGF0VXFKQ1Frb0srdkR6bzZPckMxdFlXRGd3T3NyYTNSMk5pSWQrL2VRVnBhR2lvcUt1anY3MGRKU1FsNGVIaHc4K1pOdUxpNElEczdHLy8rL1FNM056ZTJidDJLenM1T3NETVlEQmdhR2tKV1ZoYUNnb0lJREF5RXJhMHRlSGg0c0hidFdzVEh4ME5CUVFFTEZ5N0VzMmZQME52Ymk3UzBORXhPVHFLMnRoYjI5dmJnNStlSHFha3BNak16WVd4c0RCNGVIb2lKaVNFd01CQU9EZzR3TURCQVRrNE9ObTdjaU9YTGwwTkxTd3RDUWtMdzhmSEJtVE5ud0dLeFlHMXRqVHQzN3NEVTFCUnFhbXA0OGVMRm5PV1ZuWjJOZ1lFQlRFMU5ZZEdpUmVEazVJU0ZoUVgyNzkrUDNOeGNiTm15QmNlUEg4ZUhEeDhnSXlPRGYvLytJU1FrQk1iR3hsaStmRGsrZnZ5STFOUlUzTHAxQy9IeDhVaElTTUM4ZWZOZ1lHQUFOZ2FEUWJ0Mzd3WUhCd2NpSWlMZzd1Nk94c1pHY0hKeVl0MjZkY2pNeklTcHFTa1dMVnFFOHZKeUxGeTRFSEZ4Y2VqczdFUndjREFpSWlKUVhWMk4rZlBuUTA5UEQ4M056VkJRVU1DOGVmTVFIUjBOTFMwdDNMaHhBMFNFVDU4K1FWSlNFdno4L0pDVmxjWGV2WHR4OGVKRnJGdTNEb09EZ3pBMU5jV0RCdyt3ZCs5ZVdGaFlZUFhxMVFnUEQ0ZWlvaUlPSGp3SU56YzNhR3RyWS9YcTFUaDgrUEFjRmxOUVVFQjRlRGkrZnYyS1E0Y09ZY09HRGNqSXlFQi9meitFaElRd1BUMk42ZW5wT2I1WVVGQ0FTNWN1UVVSRUJKeXZYcjFDUlVVRkpDUWs1dWdxQUFRRkJXSGx5cFZZdUhBaHpNek1jUGZ1WGJpNnVxSzh2QnhQbmp6QnYzLy9JQzh2RHc0T0RwU1hsMk5pWWdLSmlZbHpGMVI3ZXp0V3JWcUY1Y3VYNDlTcFV4QVNFa0phV2hxMmJObUN6TXhNZlB2MkRkM2QzWGozN2gzYTI5dkJZckZ3NWNvVnhNWEZRVTlQRHp3OFBGQlRVNE9EZ3dPQ2dvSlFVRkNBMHRKU2VIaDR3TWpJQ0FNREF4Z2NITVRzN0N3YUdocHc3dHc1dkg3OUdyVzF0UmdaR1lHSmlRbDZlbnBRWFYyTmxTdFhRbGRYRjQ2T2p1anA2VUZnWUNETXpNemc0dUlDbEphVzBzT0hEOG5JeUloaVltS0l3V0NRaVlrSmRYUjBrS2lvS05YVjFaR0ZoUVZwYTJ2VGpoMDdLQ2twaVFRRkJTazdPNXVLaTR2cDJiTm5wS1dsUmEydHJWUlJVVUZwYVduRVlEREl5TWlJN3R5NVE5Ky9meWNsSlNWeWRIU2t6czVPK3Z6NU14VVdGbEorZmo3WjJ0clNreWRQS0Q4L254WXZYa3pxNnVvVUV4TkQ0dUxpMU5iV1JpSWlJdlRmZi8rUmtaRVJpWXFLa3E2dUxxV2xwVkZqWXlPNXU3dFRXVmtaNmVqb1VIdDdPL242K2xKL2Z6K2RQMytlZHUvZVRTRWhJYVNnb0VCeWNuTGs2ZWxKcDA2ZG9zREFRTHA3OXk0MU5UWFI0c1dMU1ZGUmthQ29xRWh0Ylcxa1pHUkVYNzU4b1lhR0JycDgrVElkUDM2Y0ZCUVV5TkhSa1FJREEybDZlcG9lUFhwRU8zYnNvUGo0ZUtxcnF5TlJVVkZxYUdpZzR1SmkrdnYzTHhVV0Z0SzVjK2ZJMGRHUmVIbDVhV0JnZ0E0ZVBFam56cDBqVzF0YmV2MzZOVlZVVkpDMnRqWU5EUTJScGFVbHRiVzFVV3hzTEYyK2ZKbGFXbHJvMUtsVDlPdlhMenB5NUFodDNyeVpwS1NrcUttcGlaaE1KaFVYRnhNWEZ4ZXhzN09Uam80T05UYzMwNkpGaXlnK1BwN016TXpvekprelZGVlZSWnMyYmFMczdHeTZkKzhlTlRRMDBKSWxTNml2cjQvYTJ0cUlrNU9URWhNVGFXQmdnTFMwdEFqRHc4TzBaczBhNHVMaUlpNHVMcnB4NHdZTkR3K1RuWjBkK2ZuNVVXNXVMdlgwOUpDdnJ5OXBhbXFTckt3c0ZSVVZrYlcxTlhWM2Q5T1BIejlvYkd5TXVydTc2ZHUzYjhSa011bml4WXNrSVNGQkhoNGVsSnViU3hzMmJDQkJRVUd5czdNak56YzMyclp0Ry8zNzk0OXljM09wc2JHUm1wcWFTRUJBZ0k0ZlAwNHRMUzNrN2UxTjc5Ky9Kd2tKQ1hyMDZCSGw1K2ZUM2J0M0tUVTFsYnE2dXVqMzc5K2tyYTFOQlFVRlZGOWZUK3ZYcjZmeDhYRmFzR0RCSERPc3JLeWt5c3BLY25aMkprVkZSVXBOVGFWcjE2NVJhbW9xK2Z2N2s0K1BEelUyTmhLYmxwWVdTVWxKd2NIQkFjYkd4cWlwcVVGTlRRM1UxTlFnS2lvS1MwdExqSXlNNE15Wk01aWFtc0tYTDErd2JOa3loSWFHNHVUSmszajY5Q21Ta3BLUWw1ZUg3ZHUzbzZPakEzRnhjVEF4TWNHREJ3OHdPVG1KblR0M29yeThIQklTRXNqSnlVRmtaQ1JzYkd5UWw1ZUgvdjUreE1mSHc5SFJFZEhSMFFnS0NvS2ZueDg0T1RuUjJ0b0tOalkyaElXRjRjU0pFK0RoNGNINCtEZzRPRGdnSmlZR0p5Y25SRVpHUWtkSEI3VzF0UWdLQ29LbXBpYWVQbjBLWGw1ZVNFdExvNmFtQmsrZVBJRzZ1anErZi84T05qWTI3TisvSDRzV0xZS05qUTNZN096c2FQdjI3ZGl6WncvVTFkVWhMQ3dNYjI5di9QejVFOHVYTDhlZlAzOXc4K1pOS0Nnb3dNek1EUEh4OFFnSUNFQkRRd1BjM2QyeGZ2MTZKQ2NuUTFkWEY4SEJ3ZURqNHdNUklTWW1CcU9qbzJodmIwZDVlVG55OC9QaDYrdUxkZXZXUVVOREF5MHRMZURnNElDeHNUR0NnNE1oS1NtSm1aa1pIRGh3QVAvKy9adjdOVXRLU3FLam93T3hzYkVRRXhNREx5OHZ1cnU3a1ppWWlPVGtaQmdhR2tKYld4dEtTa29ZR1JtQmdvSUNEaHc0Z043ZVhxaXFxcUt4c1JGRFEwT3dzYkZCY25JeUNnc0xZV0ZoZ1hmdjNxR3hzUkhJek15a2h3OGYwb2NQSCtqaHc0ZkV6YzFOaXhjdnBzT0hEOVBvNkNodDNicVZzckt5aU1sa1VuVjFOVDE2OUlqT25qMUw5ZlgxMU5MU1FsTlRVOFRKeVVsWHIxNmxSWXNXVVZWVkZRa0xDOVBZMkJoVlZsYVNxS2dvSFRseWhBNGRPa1J4Y1hHVWxaVkZVMU5USkNjblJ6NCtQaFFlSGs2N2QrK20zNzkvazUyZEhXM2N1SkdpbzZOSlZWV1ZrcEtTaUkrUGorcnE2dWpCZ3dla282TkRYbDVlMU5UVVJQcjYrcVNscFVVakl5UDA5KzlmS2kwdHBZNk9EbnJ4NGdVWkdoclM0Y09IcWJTMGxGUlVWR2gwZEpSc2JHd29PanFhUmtkSGlZT0RnMWdzRnBXVWxCQW5IeDhmcmw2OU9tY2loSWVIUTA5UEQ2MnRyWGovL2owNk96dHg3Tmd4WExseUJUZHUzSUNVbEJUNCtQZ2dKQ1NFaUlnSTdOdTNEOUhSMFJBVUZJU3dzRERXcjE4UE56ZTN1VkU0ZGVvVWhJV0ZFUlFVaEo4L2YyTHQyclZRVUZEQXJsMjc1b3pMbEpRVWNIRnhRVjFkSFNJaUluQjBkTVRZMkJoMjc5Nk4wdEpTaElXRndkemNITXJLeW9pTWpJU1BqdytHaDRlUm5aMk40T0JnTEYyNkZOYlcxZ2dLQ3NMU3BVdHg1Y29WU0VoSUlDc3JDME5EUTdoNDhTTDQrZmx4NmRJbE9EZzRZTisrZlRBeU1vS1dsaGF3ZE9sU3FxcXFJa3RMUzJLeFdNVEp5VWtKQ1FtMGNlTkd1bm56SmgwOWVwU1NrNU5KVTFPVHVMaTQ2Tk9uVDdSLy8zNTY4K1lONWVmbms0dUxDL0h6ODVPb3FDaFZWRlRRbmoxN3lOZlhsMUpTVXNqVDA1TjhmSHlJaDRlSE5EUTBpSWVIaDRpSXZuMzdSa2xKU2RUVTFFVG01dWFVbVpsSmNYRnhaR1ptUnVycTZqUXhNVUdlbnA3RVlERG95NWN2RkI4ZlQxeGNYT1RxNmtwT1RrNVVWbFpHbXBxYTVPM3RUWFYxZGNUUHowOXljbkpVVTFORDN0N2V4R0F3YVAzNjlhU2twRVFlSGg1a2EydExZV0ZoeE0zTlRkemMzTlRZMkVncEtTbFVXbHI2djhiSXJsMjdDQUFORFEzUmYvLzlSNzI5dmFTdHJVMnpzN08wYytkT1dydDJMWTJNakpDOHZEd3BLU25SclZ1M3FMdTdtNVNWbGNuZTNwNWFXMXNwT3p1Ym5KeWNxS1NraEFZSEIrbm8wYU9VbDVkSEowK2VKRE16TTdwOCtUSU5EZzdTNzkrL2FmZnUzV1J0YlUyTmpZMXpJL1A5KzNkeWQzY25WMWRYaW91TG82ZFBueEtEd1NCQlFVRVNFaEtpcEtRa01qYzNwMGVQSHRHdlg3OG9NaktTNU9Ua0tDTWpnMUpTVXNqVzFwYjgvUHlvcUtpSTJ0cmFLREF3a01URnhTa3FLb3FZVENhOWZ2MmEwdFBUYVdCZ2dGUlVWS2kzdDVmKy9mdEgrTDhnbEwrL1AwbEpTVkZGUlFVVkZ4ZFRUMDhQeWNqSTBQSGp4Nm04dkp4eWMzTnArZkxsZFBmdVhiS3dzS0MxYTlmUzh1WExTVTlQajg2ZlAwL0R3OE4wN2RvMXVuMzdOc25JeU5DS0ZTc29JaUtDT0RnNDZObXpaN1J6NTA2YW1KZ2dPVGs1bXBpWUlCTVRFenAyN0JndFdMQ0FHQXdHclYyN2xvYUdocWl6czVPeXM3TnA4ZUxGVkZ4Y1RDOWV2S0QwOUhScWFXbWh0clkya3BhV0poY1hGM3IvL2oydFdMR0NUcHc0UVVsSlNXUm5aMGZIangrbmhRc1gwdWpvS0ltTGk5UFBuejlwYkd5TW5qOS9UaTR1TGxSY1hFeXRyYTBrS2lwS2NYRnhwSyt2VCt3UkVSRndjM09EaUlnSTNyeDVneU5IamlBM054ZHNiR3hJU1VsQmFHZ29YcjkrallxS0NyQllMRGc1T1VGUFR3LzgvUHh6K3Z2bno1OXdjSEJBUVVFQkJnY0hVVnRiQ3dEbzYrdURuWjBkbUV3bS92ejVBejA5UFV4T1RxS21wZ2JpNHVLSWlvckNwMCtmb0tHaGdkKy9mME5MU3dzS0NnclExZFdGa1pFUlFrTkRvYWlvaUlVTEY4NEZLWGZ1M0ltWm1SbW9xS2hBVGs0T0Nnb0tHQjhmaDZhbUptWm5aekU1T1luejU4OURYVjBkSHo1OHdObXpaK0hwNlFrUkVSR2NQMzhleGNYRkdCOGZSM2QzTjR5TmpZR09qZzY2ZCs4ZTNibHpod29LQ3VqTm16ZFVWbFpHMTY1ZEl5RWhJYnA2OVNyVjE5ZFRURXdNalk2T1VraElDSEZ4Y1ZGOWZUM056czdTOSsvZlNWcGFtcXl0cmNuR3hvWU1EUTJwdHJhV0xseTRRRDA5UFhUbnpoMnl0YldsbHk5ZmtwbVpHVVZHUnBLZW5oN2R1WE9IZnY3OFNVVkZSYlJreVJJaUlucnk1QWtORFExUmVIZzR5Y25Ka2FtcEtlM2F0WXZFeGNYcDI3ZHZKQ3dzVEIwZEhiUnYzejc2OGVNSDdkNjltOFRGeFNraElZSHUzTGxEUlVWRkZCSVNRbjUrZnJSMDZWSXlORFFrSHg4ZmV2ZnVIVlZXVnRLbFM1ZG81ODZkOU8zYk4vcjc5eS9KeWNrUjU3eDU4MUJUVXdOWFYxYzhmdndZRWhJU2VQUG1EWFIxZFRFMU5UV1gyTEMydHA3RDRJOGVQUUlmSHg4dVhyeUk2ZWxwZEhkM3ozbUtrcEtTS0NvcUFpY25KNHlNalBEbXpSdTB0N2RqL2ZyMThQZjN4K2pvS0VSRlJSRVNFb0xZMkZnSUN3c2pPam9hOSsvZng4VEVCQTRkT29UMzc5OURUVTBOZCs3Y3diWnQyK0RvNklpb3FDamN2SGtUS1NrcEdCb2Fnb2lJQ01URnhhR2lvb0tZbUpnNWZENHdNSUJIang2aG82TUQzTnpjS0Nnb3dQNzkrK0hwNllucDZXbVltcHJDMDlNVEppWW11SG56NXYrbXhCd2NIUERyMXk4Y1Bud1lEeDQ4UUVCQUFMWnYzdzRqSXlOa1ptWmliR3dNSmlZbVdMZHVIZjc4K1lQczdHd1lHeHRqM3J4NUtDOHZSMkZoSVI0L2ZneDlmWDNjdUhFRHExZXZ4cytmUDZHbXBvYloyVmtJQ2dwaWNuSVNUNTQ4d2VEZ0lPN2R1d2MyTmpaczM3NGREQVlENWVYbElDS3NXclVLcHFhbUtDc3JnNk9qSTE2OWVvWGUzbDRFQndkajhlTEZPSGp3SUd4c2JMQnYzejVzMnJRSlZsWldxSzJ0eGRUVUZOTFQweUVvS0lpQmdRSEl5c3BDVEV3TWNuSnlrSmFXeHBZdFcxQmRYUTFlWGw3OC9mc1hYNzkrUlhwNk91VGs1SUFYTDE2UWc0TURQWC8rbkRRMU5lbnQyN2NVRXhORHNiR3gxTkhSUVh2MjdLRlBuejZSa0pBUWVYbDVrWitmSDYxYnQ0NFlEQVl0WDc2Y2hJV0Z5Y1hGaFlxS2lzak16SXdZREFiSnk4dFRiMjh2S1NvcVVucDZPdm42K2xKZlh4ODVPVGxSZkh3OHljdkwwOVRVRkVsTFN4TTNOemY5K1BHRDFxMWJSOEhCd1RRNk9rcXRyYTFVV1ZsSlUxTlRSRVQwOHVWTGFtNXVKaWFUU1dscGFTUXZMMDhDQWdJME5qWkdFUkVSZE9MRUNmTDI5aVlURXhOYXNtUUpzYkd4a2FDZ0lLMVpzNFlzTFMzcDVzMmJGQmNYUitucDZkVGUzazd0N2UyMGNlTkdZckZZeEdaa1pFVGw1ZVVJQ0FpQWk0c0w1cytmajhlUEgrUHAwNmRnWjJkSFNVa0pabVptRUJvYUNnTURBMVJWVmVISGp4OHdOVFZGYTJzclpHUmtzR0RCQXR5NmRRc3JWNjVFVjFjWE5tL2VqSnljSEN4YnRnelYxZFZnc1Zqdzl2WkdmMzgvTEMwdDhlYk5HMlJrWk9ENTgrZHpYT0QvSE4vazVHUThmZm9VNjlldm4zdkd4c2JDM3Q0ZTE2NWR3NTgvZnlBcEtZbSt2ajVFUlVVaEtTa0pOMi9leEo4L2Y5RFIwWUhLeWtvME56Zmo4ZVBIWUdkbng4R0RCM0hod2dVY1BYb1VuSnljc0xLeWdvR0JBYTVjdVlJRkN4YUFUVmxabVJZdFdvVE5temRqYW1vS2NYRnhDQWdJd05UVUZESXlNbUJ2YjQrZlAzL0MzOThmUkFScGFXbDRlbnJPdVVBdExTMndzcktDazVNVHhzYkdVRnhjREJNVEU2U2twTURMeXd2ZnYzOEhPenM3dm56NWdzREFRS2lycTJONmVocWhvYUg0L2ZzMyt2cjZzSExsU3Z6MzMzL3c5L2RIZkh3ODB0TFNzSFRwVXR5OWV4ZkJ3Y0dRazVPRGc0TURORFEwTURVMWhRc1hMc0ROelExRFEwUDQrdlVyamg4L2pxMWJ0K0xvMGFNNGQrNGN2bjM3aHBtWkdWeTdkZzE1ZVhtNGYvOCtvcUtpa0phV0JuOS9mNVNXbG9LTGkrdC9mY3Y4L0h3RUJ3ZWpyS3dNZS9mdXhaVXJWM0R2M2ozbzZlbmgyTEZqYzBvdk5UVVZyYTJ0YzRocVpHUUVWbFpXcUsrdng4NmRPOUhTMG9MdzhIQWtKU1VoSmlZR3IxNjl3b2NQSDZDbHBRVVhGeGRvYVdtaG9LQUFHemR1UkhkM042U2xwV0ZtWm9haW9pS29xYWtoUHo4Zk5qWTJHQmdZZ0lHQkFRUUZCVEUwTklUaDRXRVVGQlJBVkZRVUxCWUx6czdPME5MU3d2Mzc5NUdYbHdkT1RrNDhlUEFBT2pvNnVIRGhBaFl2WGd4RlJVWDgrdlVMcTFhdFFtZG5KOGJHeHVEazVJVGc0R0F3R0F5SWlZbGg2ZEtsZVB2MkxkaW5wcWF3WnMwYTdOaXhBMVpXVmtoTVRNU05HemZRMmRtSng0OGZ3OERBWUE1NS9WK0dYMDVPRHNlT0hZT3VyaTQrZi82TXJLd3NqSStQdzl6Y0hKS1NraEFRRU1DNWMrZlExdFlHSFIwZEtDb3F3dDdlSGl3V0MrYm01Z2dORFoxTGg1MC9meDdaMmRuSXo4K0hycTR1L3Z2dlA1dzZkUW9WRlJWd2NuSkNSRVFFcksydE1YLytmSGg3ZTBOVVZCU1RrNVBJeXNwQ1hWMGR0TFMwRUJJU0FpYVRpWm1aR1FnSUNNeXAyU2RQbnVESWtTUHc5dllHRnhjWDR1TGk0T3pzakV1WExnRUFWcTVjQ1FRR0JoS0x4YUt1cmk1YXZIZ3hiZG15aFJZc1dFQWFHaHBrYlcxTmFtcHFkUGJzV1VwTVRLVEl5RWpTMXRhbTRPQmdzckN3b0xxNk9nb0xDeU1CQVFGU1ZWV2xreWRQMHFsVHA4amYzNStHaG9Zb096dWJEaDA2Uk1QRHd3U0E2dXJxNXNESSsvZnZLU2twaVlxS2l1akVpUk5VWGw1T0RRME45UFRwVXhJVEU2TWRPM2JReE1RRUZSWVdVbkp5TXZYMjlwSyt2ajdWMTlmVGhnMGI2Ty9mdjNUNDhHSHE3KytuWjgrZTBmZnYzOG5Bd0lEczdPekl5TWlJMXE1ZFN3Y09IS0FsUzVaUVNFZ0lSVVJFRUFCS1QwK24xdFpXMHRUVXBCY3ZYaEM3djc4L2FtcHFjT1RJRVNncEtXRjRlQml5c3JLSWk0dkRyVnUzRUI0ZURqRXhNUncrZkhndVEwUkV1SHo1TXE1ZHV3WU9EZzQ4ZWZJRWZIeDhtSjJkblFNVUZ5NWNBSXZGd3BZdFc3QjU4K1k1bC9qRml4ZHp3ZVd3c0RBY09uUUlPM2JzZ0kyTkRRd05EY0ZrTWlFdkw0OGZQMzRnTGk1dUxvcm43dTQrZDRwVVZGUXdNaklDSnljbjlQWDFnWitmSDY2dXJoZ1lHRUJoWVNGTVRVMXg0c1FKUEg3OEdKOC9mOGFOR3pmUTM5K1B3c0xDdVR0SldWa1p2THk4NER4ejVnd01EUTJockt5TTA2ZFBRMWRYRjE1ZVhsaStmRG5tejUrUDl2WjIyTnZibzZpb0NOKytmVU4rZmo1bVptWncrL1p0UEhqd0FGcGFXaGdaR2NHK2ZmdGdiVzBOTGk0dUxGNjhHRGR2M3NUWnMyY1JIUjBORFEwTi9QcjFDOExDd25CM2QwZEpTUW5hMnRyUTI5dUxmZnYyZ1plWEYxeGNYSFByYzF0Ykd6dzhQTEJzMlRMdzgvUGoxNjlmT0hmdUhONjllNGZkdTNlanFLZ0lBZ0lDS0NrcFFYbDVPYnE2dWhBY0hBd0RBd01zWDc0Y2h3OGZocGFXRnRMUzB2RGl4UXU0dTd0RFVGQVFCZ1lHcUtpb3dPZlBuK0h1N281ZHUzWUJOVFUxZFBmdVhYcjQ4Q0ZOVEV4UVpXVWx5Y3ZMazRpSUNJV0docEs0dURpNXVMalF2My8vYU0rZVBTUXVMazZyVnEyaXpzNU9DZ2tKb1M5ZnZwQ1ltQmg1ZTNzVEx5OHZMVjY4bURnNU9lbisvZnMwUER4TVY2OWVwVGR2M3BDeHNURWxKaWFTazVNVFJVZEhrNUtTRXZIeDhaR0VoQVFORFExUmIyOHZEUTRPMHVUa0pQMzc5NDhZREFiNSsvdlRxbFdyU0VSRWhIeDlmVWxXVnBadTM3NU5zN096ZE92V0xVcE1UQ1FQRHc4YUdocWkrL2Z2MDRJRkN5ZzBOSlNLaTR0cFptYUdidDY4U2I2K3ZtUnZiMDhkSFIxVVdscEtKU1VsdEhyMWF2cjM3eDh0WExpUTJMaTR1T2o0OGVQZzVPVEVwazJic0hqeFlnd05EVUZRVUJBRkJRV29xcXFDbXBvYS9QMzk0ZVRraElhR0JwU1dsdUxmdjMvWXZuMDdIang0QUZkWFYrVGw1VUZjWEJ6MTlmVjQvdnc1YnQyNkJTVWxKYmk0dU9EUG56L1l2SGt6VHB3NGdiTm56MEpHUmdiQ3dzSVlHUmxCUWtJQ3ZuMzdCbVZsWlhCeWNtTHQyclZnWTJQRDkrL2ZjZXZXTFdSbVprSkRRd1BMbGkzRGxTdFg0T2pvQ0VkSFIvVDE5V0hwMHFYZzUrZWZzK2U1dWJsaFptYUcvUHg4V0ZsWklTTWpBOGVPSFlPQ2dnS2lvcUxBeGNVRlVWRlJKQ1Frd04vZkg0OGVQUUo3WTJNajJ0cmFzSFhyVnRqYjIyUHYzcjFJVDAvSHAwK2Z3R1F5c1huelpxeGN1Ukp2Mzc2RnBLUWtNakl5a0pLU2dsZXZYaUVxS2dvbUppYXdzYkhCaFFzWG9LeXNqT0xpWXF4ZXZSb3JWcXlBbFpVVkppY25JU01qZyt2WHJ5TTRPQmdwS1NuSXlzcENaMmNuaW9xS01EWTJocTlmdjhMSXlBaFhybHhCVEV3TWlvcUtRRVM0Zi84K3JLMnQ0ZVBqZzh6TVROeS9meCtWbFpYZzRPREF4bzBiWVdCZ0FIRnhjYXhac3daK2ZuNzQ5T2tUaElXRk1YLytmQmdaR2VISGp4OTQ5KzRkdXJ1NzBkblppVE5uem1ETGxpMDRmUGd3K3ZyNmtKV1ZCZmJ6NTgvajlldlhHQjhmeCt6c0xQNzgrWVBhMmxxWW1wcUNqWTBOWjg2Y2dhdXJLOTYrZll2djM3OGpPam9hOHZMeXFLbXBRWFIwTkthbXBxQ3NySXdEQnc2QWc0TURycTZ1V0xseUpXeHNiTEIrL1hvVUZoWkNWMWNYdmIyOVdMeDRNZjc3Nzc4NUo3aXNyQXg4Zkh3WUhoNUdhV2twdkwyOWNmWHFWVENaVE5UWDErUHg0OGZJenM1R1kyTWpRa0pDa0p1Ymk1R1JFUmdZR09ERGh3OFFGUldGZ0lBQVZGVlZZVzF0RFVORFEweE5UZUhWcTFkSVRFeEVlM3M3RGgwNmhOZXZYNE9mbngvSnljbFFWRlNFbVprWndzTENNREl5QWdRRUJOQ2FOV3RveDQ0ZHRIVHBVaG9lSHFhOWUvZlMwNmRQcWJHeGtlVGw1V2xvYUlpYW01dXB0cmFXQ2dvS3FLeXNqSzVjdVVLZW5wN1UwdEpDd3NMQzVPcnFTaDRlSGhRWkdVbnE2dXBrWm1aR1g3NThvYmEyTnBLVWxLU2lvaUphdEdnUnRiYTIwcVZMbDRpTGk0dXFxcW9vSXlPRC92ejVRMjV1YnNSa01tbmx5cFYwK2ZKbHVuRGhBaDA3ZG13T2FraEtTbEpKU1FtdFg3K2V1TGk0S0RBd2tQTHk4b2lOalkyV0xWdEdWNjllcGQ3ZVhqcDA2QkNWbFpWUlhWMGQ4ZkR3MEtKRmkyamV2SGtVSHg5UC83OGZSVTFOVFZSVlZVWGUzdDdFMmRIUmdiTm56OExNekF3OVBUMVFWVldkS3pEZXUzY1B4Y1hGYUdwcXdxVkxsOERGeFlXc3JDems1dWJpOCtmUFdMMTZOZWJObTRjdFc3YUFuWjBkTWpJeXFLbXB3Y1dMRjZHZ29JQzh2RHhzM3J3WmNuSnlNREV4bVpQSjlmWDFVRlZWUlZkWEY2eXNyREErUG82MWE5ZWlwcVlHU2twS2NITnpRMHhNRE5hc1dRTkZSVVY4Ly80ZDQrUGpPSC8rUEo0K2ZZcDM3OTRoTnpkM3JsWFcyOXVMblR0M29xMnREYjYrdmdnTkRZV0Rnd084dmIyeGFOR2lPVFc0Yjk4K0hEOStISk9UazlEUzBrSk5UYzMvUm1WMzdkb0ZKcE9KUTRjT1llUEdqZmo5K3pjY0hSM2g0ZUdCcTFldllzV0tGZmoxNnhkeWMzTUJBRnUyYkFFZkh4ODJiOTQ4NTlVTENBaWdvYUVCUGo0K2VQTGtDZjcrL1FzMU5UV1VsWldCeVdSaTY5YXRFQmNYQjR2RndydDM3M0RzMkRFWUd4dlA1WWI1K1BqUTM5K1A4UEJ3bEplWFk5KytmWkNVbE1TaFE0ZncvZnQzdkh6NUVrd21jODVBRlJNVEE0UEJnSW1KQ1NZbUpwQ1FrSUQwOUhSTVQwOURSRVFFcXFxcU1EWTJSbFJVRks1ZnY0NTc5KzVCU1VrSlY2OWV4Yk5uejdCbnp4NFVGaGFDL2RpeFk3Q3pzNE9FaEFUOC9QeHc1ODRkOVBiMjR1M2J0M2p5NUFsbVptYVFtWmtKUGo0K0pDY25ZOGVPSGRpMmJSdnUzYnMzbDhWalkyUEQ3ZHUzRVI4Zmo1Q1FFSHovL2gzcjE2L0grUGc0cEtTazRPUGpBd2NIQjVTWGx5TWlJZ0lPRGc0SUN3dURsWlVWZHV6WU1SZGgrZmp4STV5Y25DQXBLUWxWVmRVNTlWZFNVZ0k5UFQzTXpNeWd1TGdZQnc0Y3dJOGZQeUFnSUFCcGFlbTVIWU9kblIyenM3TklTa3FDcTZzcnRtelpncjkvLzJKa1pBVGJ0MjlIZDNjM0xDd3M4UDc5ZXpBWWpQK3R6ckt6czVPWGx4ZWFtcHJBeHNZR1B6OC9MRml3QURJeU11RG01Z1lmSHg5Ky92d0pXMXRieU1qSVlHQmdBRHQzN3NURGh3K2hvNk1EQm9PQndzSkMyTmpZWU1PR0RlRGo0OE9iTjI5Z2JXMDlkelJOVFUyaHI2K1Bpb29LZUh0N1EwQkFBRnBhV3JodzRRTEN3OFBoNU9RRWYzOS9IRDE2RkJZV0ZxaW9xRUJvYUNnK2YvNk0zNzkvUTBwS0NtbHBhVkJVVklTbHBlVmNiK2pMbHkvSXpNd0VQejgvc3JLeXNIcjFhbXpidGcxK2ZuNXo2Ylc2dXJxNUlzZStmZnR3K2ZKbC9QanhBeTlldklDK3ZqN1llM3A2a0pxYUNrMU5UVVJGUllHZm54OExGeTdFMjdkdjBkL2ZQeGVFK0w5ZElDRWhBVjVlWGxCV1ZvYXlzaklLQ2dvUUdCaUk5UFIwV0Z0Ync4dkxDMHdtRTlQVDAranE2a0pzYkN6Ky9QbUQ1T1JrUkVaRzR1UEhqK2pvNklDUWtCQ2NuWjNSM3Q2T3lNaElQSDc4R0haMmRyQ3hzWUdBZ0FDWVRDYmV2MzhQWjJmbk9SRDZmd1hOLzdQd3pwMDdCMkZoWWRUWDEyUHg0c1VRRkJRRU96czdQbi8rREE0T0RuUjFkV0ZtWmdaTGxpeEJRa0lDa3BPVDhlblRKM3orL0JtenM3T3d0YlhGL3dNeVMrSGsrSkMvZEFBQUFBQkpSVTVFcmtKZ2dnPT0iKTtiYWNrZ3JvdW5kLXNpemU6MTUwcHggMTUwcHh9Ci5wYWR7cG9zaXRpb246cmVsYXRpdmU7ei1pbmRleDoyO2hlaWdodDoxMDAlO2Rpc3BsYXk6ZmxleDtmbGV4LWRpcmVjdGlvbjpjb2x1bW59Ci5jYXJkLnNpbmdsZSAucGFke3BhZGRpbmc6MzRweCAzMnB4IDI4cHh9Ci5jYXJkLnNsaXAgLnBhZHtwYWRkaW5nOjMwcHggMjZweCAyNHB4fQoKLmNoZWFke2Rpc3BsYXk6ZmxleDthbGlnbi1pdGVtczpjZW50ZXI7anVzdGlmeS1jb250ZW50OnNwYWNlLWJldHdlZW59Ci5jaGVhZCBpbWd7aGVpZ2h0OjI0cHg7ZGlzcGxheTpibG9ja30KLmNraWNre3RleHQtYWxpZ246cmlnaHR9Ci5ja2ljayAuY29tcHtmb250OjcwMCAxM3B4ICdTb3JhJztsZXR0ZXItc3BhY2luZzouMjZlbTt0ZXh0LXRyYW5zZm9ybTp1cHBlcmNhc2U7Y29sb3I6dmFyKC0tYnJhbmQtZGVlcCl9Ci5ja2ljayAuc3Vie2Rpc3BsYXk6YmxvY2s7Zm9udDo1MDAgMTFweCAnRE0gU2Fucyc7bGV0dGVyLXNwYWNpbmc6LjJlbTtjb2xvcjp2YXIoLS1jLW11dGVkKTttYXJnaW4tdG9wOjNweDt0ZXh0LXRyYW5zZm9ybTp1cHBlcmNhc2V9CgovKiBtZWRhbGxpb24gKi8KLm1lZGFse3Bvc2l0aW9uOnJlbGF0aXZlO2JvcmRlci1yYWRpdXM6NTAlO292ZXJmbG93OmhpZGRlbjtwYWRkaW5nOjNweDtmbGV4Om5vbmU7CiAgYmFja2dyb3VuZDpsaW5lYXItZ3JhZGllbnQoMTU1ZGVnLHZhcigtLXJpbmctYSksdmFyKC0tcmluZy1iKSk7CiAgYm94LXNoYWRvdzowIDEycHggMjZweCByZ2JhKDIwLDQwLDkwLC4yMCksIGluc2V0IDAgMXB4IDAgcmdiYSgyNTUsMjU1LDI1NSwuNjUpfQoubWVkYWwgLmlubmVye3dpZHRoOjEwMCU7aGVpZ2h0OjEwMCU7Ym9yZGVyLXJhZGl1czo1MCU7b3ZlcmZsb3c6aGlkZGVuO2Rpc3BsYXk6ZmxleDthbGlnbi1pdGVtczpjZW50ZXI7anVzdGlmeS1jb250ZW50OmNlbnRlcjsKICBiYWNrZ3JvdW5kOnZhcigtLWMtc29mdCk7Ym94LXNoYWRvdzppbnNldCAwIDJweCA3cHggcmdiYSgyMCw0MCw5MCwuMTQpfQoubWVkYWwgaW1ne3dpZHRoOjEwMCU7aGVpZ2h0OjEwMCU7b2JqZWN0LWZpdDpjb3ZlcjtkaXNwbGF5OmJsb2NrfQoubWVkYWwgLm1vbm97Zm9udC1mYW1pbHk6J1NvcmEnO2ZvbnQtd2VpZ2h0OjgwMDtjb2xvcjp2YXIoLS1icmFuZCk7bGV0dGVyLXNwYWNpbmc6LjAxZW19Ci5tZWRhbDo6YWZ0ZXJ7Y29udGVudDoiIjtwb3NpdGlvbjphYnNvbHV0ZTtpbnNldDowO2JvcmRlci1yYWRpdXM6NTAlO3BvaW50ZXItZXZlbnRzOm5vbmU7CiAgYmFja2dyb3VuZDpyYWRpYWwtZ3JhZGllbnQoMTIwJSA5MCUgYXQgMzIlIDE4JSwgcmdiYSgyNTUsMjU1LDI1NSwuNiksIHJnYmEoMjU1LDI1NSwyNTUsMCkgNDYlKX0KCi8qIHNpbmdsZSBzdGFnZSAqLwouY3N0YWdle2ZsZXg6MTtkaXNwbGF5OmZsZXg7ZmxleC1kaXJlY3Rpb246Y29sdW1uO2FsaWduLWl0ZW1zOmNlbnRlcjtqdXN0aWZ5LWNvbnRlbnQ6Y2VudGVyfQoubWljcm97Zm9udDo2MDAgMTFweCAnRE0gU2Fucyc7bGV0dGVyLXNwYWNpbmc6LjQyZW07dGV4dC10cmFuc2Zvcm06dXBwZXJjYXNlO2NvbG9yOnZhcigtLWJyYW5kKTtvcGFjaXR5Oi45O21hcmdpbi1ib3R0b206MTJweH0KLm1hdGNodXB7d2lkdGg6MTAwJTtkaXNwbGF5OmZsZXg7YWxpZ24taXRlbXM6Y2VudGVyO2p1c3RpZnktY29udGVudDpzcGFjZS1iZXR3ZWVufQoudGVhbXtkaXNwbGF5OmZsZXg7ZmxleC1kaXJlY3Rpb246Y29sdW1uO2FsaWduLWl0ZW1zOmNlbnRlcjtnYXA6MTRweDt3aWR0aDoxMjJweH0KLnNpbmdsZSAubWVkYWx7d2lkdGg6MTA0cHg7aGVpZ2h0OjEwNHB4fQouc2luZ2xlIC5tZWRhbCAubW9ub3tmb250LXNpemU6MzNweH0KLnRuYW1le2ZvbnQ6NjAwIDIwcHggJ0RNIFNhbnMnO2xldHRlci1zcGFjaW5nOi4wN2VtO3RleHQtdHJhbnNmb3JtOnVwcGVyY2FzZTtjb2xvcjp2YXIoLS1jLWluay1zb2Z0KTt0ZXh0LWFsaWduOmNlbnRlcjsKICB3aGl0ZS1zcGFjZTpub3JtYWw7bGluZS1oZWlnaHQ6MS4xMjttYXgtd2lkdGg6MTcwcHg7d29yZC1icmVhazpicmVhay13b3JkfQouc2NvcmV7ZGlzcGxheTpmbGV4O2FsaWduLWl0ZW1zOmNlbnRlcjt0cmFuc2Zvcm06dHJhbnNsYXRlWSgtNnB4KX0KLnNjb3JlIC5zbntmb250OjgwMCAxMzBweC8uODIgJ1NvcmEnO2NvbG9yOnZhcigtLWMtaW5rKTtsZXR0ZXItc3BhY2luZzotLjAzZW07Zm9udC12YXJpYW50LW51bWVyaWM6dGFidWxhci1udW1zfQouc2NvcmUgLnNlcHt3aWR0aDo5cHg7aGVpZ2h0OjlweDtib3JkZXItcmFkaXVzOjJweDt0cmFuc2Zvcm06cm90YXRlKDQ1ZGVnKTttYXJnaW46MCAyMnB4O2ZsZXg6bm9uZTsKICBiYWNrZ3JvdW5kOnZhcigtLWJyYW5kKTtib3gtc2hhZG93OjAgMCAwIDVweCB2YXIoLS1jLXNvZnQpfQouY3BpY2t7ZGlzcGxheTpmbGV4O2p1c3RpZnktY29udGVudDpjZW50ZXI7bWFyZ2luLWJvdHRvbTozMHB4fQoucGlsbHtkaXNwbGF5OmlubGluZS1mbGV4O2FsaWduLWl0ZW1zOmNlbnRlcjtnYXA6MTZweDtwYWRkaW5nOjE1cHggMzBweDtib3JkZXItcmFkaXVzOjk5OXB4OwogIGJhY2tncm91bmQ6dmFyKC0tZ2xhc3MpO2JvcmRlcjoxcHggc29saWQgdmFyKC0tZ2xhc3MtbGluZSk7CiAgYm94LXNoYWRvdzowIDEycHggMjhweCByZ2JhKDIwLDQwLDkwLC4xMyksIGluc2V0IDAgMXB4IDAgcmdiYSgyNTUsMjU1LDI1NSwuOCl9Ci5waWxsIC5wZG90e3dpZHRoOjEwcHg7aGVpZ2h0OjEwcHg7Ym9yZGVyLXJhZGl1czo1MCU7ZmxleDpub25lO2JhY2tncm91bmQ6dmFyKC0tYnJhbmQpO2JveC1zaGFkb3c6MCAwIDAgNXB4IHZhcigtLWMtc29mdCl9Ci5waWxsIC5wbGFiZWx7Zm9udDo3MDAgMTlweCAnRE0gU2Fucyc7bGV0dGVyLXNwYWNpbmc6LjA1ZW07dGV4dC10cmFuc2Zvcm06dXBwZXJjYXNlO2NvbG9yOnZhcigtLWMtaW5rKX0KLnBpbGwgLnBiYXJ7d2lkdGg6MXB4O2hlaWdodDoyMXB4O2JhY2tncm91bmQ6dmFyKC0tYy1saW5lKX0KLnBpbGwgLnBwY3R7Zm9udDo3MDAgMTlweCAnU29yYSc7Y29sb3I6dmFyKC0tYnJhbmQtZGVlcCl9CgovKiBzbGlwICovCi5zbGlwdGl0bGV7ZGlzcGxheTpmbGV4O2FsaWduLWl0ZW1zOmJhc2VsaW5lO2p1c3RpZnktY29udGVudDpzcGFjZS1iZXR3ZWVuO21hcmdpbi10b3A6MTRweH0KLnNsaXB0aXRsZSAubWFpbntmb250OjgwMCAyNnB4ICdTb3JhJztsZXR0ZXItc3BhY2luZzotLjAxZW07Y29sb3I6dmFyKC0tYy1pbmspfQouc2xpcHRpdGxlIC5sZWdze2ZvbnQ6NzAwIDExcHggJ0RNIFNhbnMnO2xldHRlci1zcGFjaW5nOi4xOGVtO3RleHQtdHJhbnNmb3JtOnVwcGVyY2FzZTtjb2xvcjp2YXIoLS1jLW11dGVkKX0KLmxlZ2xpc3R7ZGlzcGxheTpmbGV4O2ZsZXgtZGlyZWN0aW9uOmNvbHVtbjtnYXA6OXB4O21hcmdpbjoxNHB4IDB9Ci5sZWd7ZGlzcGxheTpmbGV4O2FsaWduLWl0ZW1zOmNlbnRlcjtnYXA6MTNweDtwYWRkaW5nOjEycHggMTNweDtib3JkZXItcmFkaXVzOjE0cHg7CiAgYmFja2dyb3VuZDp2YXIoLS1nbGFzcyk7Ym9yZGVyOjFweCBzb2xpZCB2YXIoLS1nbGFzcy1saW5lKTsKICBib3gtc2hhZG93OjAgNnB4IDE2cHggcmdiYSgyMCw0MCw5MCwuMDcpLCBpbnNldCAwIDFweCAwIHJnYmEoMjU1LDI1NSwyNTUsLjcpfQouc2xpcCAubGVnIC5tZWRhbHt3aWR0aDo0MHB4O2hlaWdodDo0MHB4fQouc2xpcCAubGVnIC5tZWRhbCAubW9ub3tmb250LXNpemU6MTNweH0KLmxlZyAubWlke2ZsZXg6MTttaW4td2lkdGg6MH0KLmxlZyAubWF0Y2h7Zm9udDo3MDAgMTVweCAnU29yYSc7Y29sb3I6dmFyKC0tYy1pbmspO3doaXRlLXNwYWNlOm5vd3JhcDtvdmVyZmxvdzpoaWRkZW47dGV4dC1vdmVyZmxvdzplbGxpcHNpc30KLmxlZyAubHBpY2t7Zm9udDo1MDAgMTNweCAnRE0gU2Fucyc7Y29sb3I6dmFyKC0tYnJhbmQtZGVlcCk7bWFyZ2luLXRvcDoycHg7d2hpdGUtc3BhY2U6bm93cmFwO292ZXJmbG93OmhpZGRlbjt0ZXh0LW92ZXJmbG93OmVsbGlwc2lzfQoubGVnIC5yaWdodHtkaXNwbGF5OmZsZXg7YWxpZ24taXRlbXM6Y2VudGVyO2dhcDoxMXB4O2ZsZXg6bm9uZX0KLmxlZyAubHNje2ZvbnQ6ODAwIDE2cHggJ1NvcmEnO2NvbG9yOnZhcigtLWMtaW5rKTtmb250LXZhcmlhbnQtbnVtZXJpYzp0YWJ1bGFyLW51bXN9Ci5sZWcgLmxwY3R7Zm9udDo3MDAgMTJweCAnRE0gU2Fucyc7Y29sb3I6I2ZmZjtiYWNrZ3JvdW5kOnZhcigtLWJyYW5kKTtwYWRkaW5nOjRweCA5cHg7Ym9yZGVyLXJhZGl1czo4cHg7bWluLXdpZHRoOjQwcHg7dGV4dC1hbGlnbjpjZW50ZXJ9Ci5zbGlwdG90e2Rpc3BsYXk6ZmxleDthbGlnbi1pdGVtczpjZW50ZXI7anVzdGlmeS1jb250ZW50OnNwYWNlLWJldHdlZW47cGFkZGluZzoxM3B4IDE2cHg7Ym9yZGVyLXJhZGl1czoxM3B4OwogIGJhY2tncm91bmQ6dmFyKC0tYy1zb2Z0KTtib3JkZXI6MXB4IHNvbGlkIHZhcigtLWdsYXNzLWxpbmUpO21hcmdpbi1ib3R0b206NHB4fQouc2xpcHRvdCAubHtmb250OjcwMCAxMXB4ICdETSBTYW5zJztsZXR0ZXItc3BhY2luZzouMTZlbTt0ZXh0LXRyYW5zZm9ybTp1cHBlcmNhc2U7Y29sb3I6dmFyKC0tYnJhbmQtZGVlcCl9Ci5zbGlwdG90IC5ye2ZvbnQ6ODAwIDIxcHggJ1NvcmEnO2NvbG9yOnZhcigtLWJyYW5kLWRlZXApfQoKLyogZm9vdGVyICovCi5jZm9vdHttYXJnaW4tdG9wOmF1dG87cGFkZGluZy10b3A6MTZweH0KLmNhcmQuc2xpcCAuY2Zvb3R7bWFyZ2luLXRvcDoxNHB4fQouaHJ7aGVpZ2h0OjFweDtiYWNrZ3JvdW5kOmxpbmVhci1ncmFkaWVudCg5MGRlZyx0cmFuc3BhcmVudCx2YXIoLS1jLWxpbmUpLHRyYW5zcGFyZW50KTttYXJnaW4tYm90dG9tOjE0cHh9Ci5kaXNje2ZvbnQ6NTAwIDEwLjVweCAnRE0gU2Fucyc7bGV0dGVyLXNwYWNpbmc6LjIyZW07dGV4dC10cmFuc2Zvcm06dXBwZXJjYXNlO2NvbG9yOnZhcigtLWMtbXV0ZWQpO3RleHQtYWxpZ246Y2VudGVyfQouY2ItdGFiYmFye3Bvc2l0aW9uOmZpeGVkO2JvdHRvbTowO2xlZnQ6MDtyaWdodDowO3otaW5kZXg6OTk5OTtkaXNwbGF5OmZsZXg7anVzdGlmeS1jb250ZW50OnNwYWNlLWFyb3VuZDtiYWNrZ3JvdW5kOmNvbG9yLW1peChpbiBzcmdiLHZhcigtLXN1cmZhY2UpIDkwJSwgdHJhbnNwYXJlbnQpOy13ZWJraXQtYmFja2Ryb3AtZmlsdGVyOmJsdXIoMjBweCk7YmFja2Ryb3AtZmlsdGVyOmJsdXIoMjBweCk7Ym9yZGVyLXRvcDoxcHggc29saWQgdmFyKC0tbGluZSk7cGFkZGluZzo2cHggNHB4IGNhbGMoNnB4ICsgZW52KHNhZmUtYXJlYS1pbnNldC1ib3R0b20pKTtib3gtc2hhZG93OjAgLTZweCAyNnB4IHJnYmEoMjAsNDAsOTAsMC4xMCk7fS5jYi10YWJiYXIgYXtmbGV4OjE7ZGlzcGxheTpmbGV4O2ZsZXgtZGlyZWN0aW9uOmNvbHVtbjthbGlnbi1pdGVtczpjZW50ZXI7Z2FwOjNweDt0ZXh0LWRlY29yYXRpb246bm9uZTtjb2xvcjp2YXIoLS1tdXRlZCk7cGFkZGluZzo2cHggMnB4O2JvcmRlci1yYWRpdXM6MTJweDt9LmNiLXRhYmJhciBhLmFjdGl2ZXtjb2xvcjp2YXIoLS1icmFuZCk7fS5jYi10YWJiYXIgYSAudGx7Zm9udC1zaXplOjAuNjJyZW07Zm9udC13ZWlnaHQ6NzAwO2xldHRlci1zcGFjaW5nOjAuMnB4O30uY2ItdGFiYmFyIGEuYWN0aXZlIC50bHtmb250LXdlaWdodDo5MDA7fS5nYW1lbGlzdHtkaXNwbGF5OmZsZXg7ZmxleC1kaXJlY3Rpb246Y29sdW1uO2dhcDo4cHg7bWF4LWhlaWdodDoyNzBweDtvdmVyZmxvdy15OmF1dG87bWFyZ2luLWJvdHRvbTo2cHg7cGFkZGluZy1yaWdodDoycHg7fS5nYW1lcm93e3Bvc2l0aW9uOnJlbGF0aXZlO3RleHQtYWxpZ246bGVmdDtib3JkZXI6MXB4IHNvbGlkIHZhcigtLWZpZWxkLWxpbmUpO2JhY2tncm91bmQ6dmFyKC0tZmllbGQpO2JvcmRlci1yYWRpdXM6MTJweDtwYWRkaW5nOjExcHggMTNweDtjdXJzb3I6cG9pbnRlcjt0cmFuc2l0aW9uOi4xNXM7fS5nYW1lcm93OmhvdmVye2JvcmRlci1jb2xvcjp2YXIoLS1icmFuZCk7YmFja2dyb3VuZDp2YXIoLS1icmFuZC1zb2Z0KTt9LmdhbWVyb3cuYWRkZWR7Ym9yZGVyLWNvbG9yOnZhcigtLWJyYW5kKTtiYWNrZ3JvdW5kOnZhcigtLWJyYW5kLXNvZnQpO30uZ2FtZXJvdy5hZGRlZCAuZ3ItY29uZntiYWNrZ3JvdW5kOnZhcigtLWJyYW5kKTtjb2xvcjojZmZmO30uZ3ItbWFpbntmb250OjcwMCAxNHB4ICdTb3JhJztjb2xvcjp2YXIoLS1pbmspO30uZ3Itdntjb2xvcjp2YXIoLS1tdXRlZCk7Zm9udC13ZWlnaHQ6NTAwO2ZvbnQtc2l6ZToxMnB4O30uZ3Itc3Vie2ZvbnQ6NTAwIDExcHggJ0RNIFNhbnMnO2NvbG9yOnZhcigtLW11dGVkKTttYXJnaW4tdG9wOjNweDt9LmdyLWNvbmZ7cG9zaXRpb246YWJzb2x1dGU7dG9wOjEwcHg7cmlnaHQ6MTJweDtmb250OjcwMCAxMnB4ICdTb3JhJztjb2xvcjp2YXIoLS1icmFuZC1kZWVwKTtiYWNrZ3JvdW5kOnZhcigtLWJyYW5kLXNvZnQpO3BhZGRpbmc6M3B4IDhweDtib3JkZXItcmFkaXVzOjhweDt9LnBpY2tjaGlwc3tkaXNwbGF5OmZsZXg7ZmxleC13cmFwOndyYXA7Z2FwOjdweDttYXJnaW4tYm90dG9tOjRweDt9LnBjaGlwe2JvcmRlcjoxcHggc29saWQgdmFyKC0tZmllbGQtbGluZSk7YmFja2dyb3VuZDp2YXIoLS1maWVsZCk7Y29sb3I6dmFyKC0taW5rKTtmb250OjYwMCAxMnB4ICdETSBTYW5zJztwYWRkaW5nOjdweCAxMXB4O2JvcmRlci1yYWRpdXM6OTk5cHg7Y3Vyc29yOnBvaW50ZXI7dHJhbnNpdGlvbjouMTVzO30ucGNoaXAgYntjb2xvcjp2YXIoLS1icmFuZC1kZWVwKTt9LnBjaGlwOmhvdmVye2JvcmRlci1jb2xvcjp2YXIoLS1icmFuZCk7fS5wY2hpcC5vbntiYWNrZ3JvdW5kOnZhcigtLWJyYW5kKTtib3JkZXItY29sb3I6dmFyKC0tYnJhbmQpO2NvbG9yOiNmZmY7fS5wY2hpcC5vbiBie2NvbG9yOiNmZmY7fS5zZWxub3Rle2ZvbnQ6NTAwIDEyLjVweCAnRE0gU2Fucyc7Y29sb3I6dmFyKC0taW5rLXNvZnQpO2JhY2tncm91bmQ6dmFyKC0tYnJhbmQtc29mdCk7Ym9yZGVyLXJhZGl1czoxMHB4O3BhZGRpbmc6OXB4IDEycHg7bWFyZ2luOjJweCAwIDRweDt9LnNlbG5vdGUgYntjb2xvcjp2YXIoLS1pbmspO30ubGVnbWluaXtkaXNwbGF5OmZsZXg7YWxpZ24taXRlbXM6Y2VudGVyO2dhcDo4cHg7Ym9yZGVyOjFweCBzb2xpZCB2YXIoLS1maWVsZC1saW5lKTtiYWNrZ3JvdW5kOnZhcigtLWZpZWxkKTtib3JkZXItcmFkaXVzOjExcHg7cGFkZGluZzo5cHggMTJweDttYXJnaW4tYm90dG9tOjZweDt9LmxtLW1haW57ZmxleDoxO2Rpc3BsYXk6ZmxleDtmbGV4LWRpcmVjdGlvbjpjb2x1bW47Z2FwOjFweDt9LmxtLW1haW4gYntmb250OjcwMCAxM3B4ICdTb3JhJztjb2xvcjp2YXIoLS1pbmspO30ubG0tbWFpbiBzcGFue2ZvbnQ6NTAwIDExLjVweCAnRE0gU2Fucyc7Y29sb3I6dmFyKC0tbXV0ZWQpO30ubG0tcm17d2lkdGg6MjZweDtoZWlnaHQ6MjZweDtib3JkZXItcmFkaXVzOjhweDtib3JkZXI6MXB4IHNvbGlkIHZhcigtLWZpZWxkLWxpbmUpO2JhY2tncm91bmQ6dmFyKC0tc3VyZmFjZSk7Y29sb3I6dmFyKC0tbXV0ZWQpO2N1cnNvcjpwb2ludGVyO2ZvbnQtc2l6ZToxMnB4O30ubG0tcm06aG92ZXJ7Y29sb3I6dmFyKC0tcmVkKTtib3JkZXItY29sb3I6dmFyKC0tcmVkKTt9LmVkaXRidG57d2lkdGg6MTAwJTt0ZXh0LWFsaWduOmxlZnQ7YmFja2dyb3VuZDpub25lO2JvcmRlcjpub25lO2JvcmRlci10b3A6MXB4IHNvbGlkIHZhcigtLWxpbmUyKTttYXJnaW4tdG9wOjhweDtwYWRkaW5nOjEzcHggMnB4IDRweDtjb2xvcjp2YXIoLS1tdXRlZCk7Zm9udDo3MDAgMTIuNXB4ICdETSBTYW5zJztsZXR0ZXItc3BhY2luZzouMDJlbTtjdXJzb3I6cG9pbnRlcjt9LmVkaXRidG46aG92ZXJ7Y29sb3I6dmFyKC0tYnJhbmQpO30uZWRpdHdyYXB7bWFyZ2luLXRvcDo0cHg7fS5zbGlwZW1wdHl7dGV4dC1hbGlnbjpjZW50ZXI7Y29sb3I6dmFyKC0tbXV0ZWQpO2ZvbnQ6NTAwIDEzcHggJ0RNIFNhbnMnO3BhZGRpbmc6MjZweCAxNHB4O30udnN7Zm9udDo4MDAgNThweCAnU29yYSc7Y29sb3I6dmFyKC0tbXV0ZWQpO29wYWNpdHk6LjU7bGV0dGVyLXNwYWNpbmc6LjAyZW07fS5mbGQgc2VsZWN0e3dpZHRoOjEwMCU7cGFkZGluZzoxMXB4IDM2cHggMTFweCAxM3B4O2JvcmRlci1yYWRpdXM6MTFweDtib3JkZXI6MXB4IHNvbGlkIHZhcigtLWZpZWxkLWxpbmUpO2JhY2tncm91bmQ6dmFyKC0tZmllbGQpO2NvbG9yOnZhcigtLWluayk7Zm9udDo2MDAgMTRweCAnRE0gU2Fucyc7LXdlYmtpdC1hcHBlYXJhbmNlOm5vbmU7YXBwZWFyYW5jZTpub25lO2N1cnNvcjpwb2ludGVyO30uZmxkIHNlbGVjdDpmb2N1c3tvdXRsaW5lOjA7Ym9yZGVyLWNvbG9yOnZhcigtLWJyYW5kKTtib3gtc2hhZG93OjAgMCAwIDNweCB2YXIoLS1icmFuZC1zb2Z0KTt9LmNvbXBzZWwtaGludHtmb250OjUwMCAxMS41cHggJ0RNIFNhbnMnO2NvbG9yOnZhcigtLW11dGVkKTttYXJnaW46LThweCAwIDEycHg7fWJvZHl7cGFkZGluZy1ib3R0b206ODRweDt9Cjwvc3R5bGU+CjwvaGVhZD4KPGJvZHk+CiAgPGRpdiBjbGFzcz0iYmFyIj4KICAgIDxkaXYgY2xhc3M9ImJyYW5kIj48aW1nIGlkPSJiYXJsb2dvIiBhbHQ9ImNtdm5nIj48c3BhbiBjbGFzcz0idGFnIj5TaGFyZSBDYXJkIFN0dWRpbzwvc3Bhbj48L2Rpdj4KICAgIDxkaXYgY2xhc3M9InNlZyIgaWQ9Im1vZGVzZWciPgogICAgICA8YnV0dG9uIGRhdGEtbW9kZT0ic2luZ2xlIiBjbGFzcz0ib24iPlNpbmdsZTwvYnV0dG9uPgogICAgICA8YnV0dG9uIGRhdGEtbW9kZT0ic2xpcCI+U2xpcDwvYnV0dG9uPgogICAgPC9kaXY+CiAgICA8YnV0dG9uIGNsYXNzPSJpY29uLWJ0biIgaWQ9InRoZW1lYnRuIiB0aXRsZT0iVG9nZ2xlIGxpZ2h0IC8gZGFyayI+8J+MmTwvYnV0dG9uPgogICAgPGJ1dHRvbiBjbGFzcz0iZGwiIGlkPSJkbGJ0biI+4qSTIERvd25sb2FkIFBORzwvYnV0dG9uPgogIDwvZGl2PgoKICA8ZGl2IGNsYXNzPSJhcHAiPgogICAgPGRpdiBjbGFzcz0iY29udHJvbHMiIGlkPSJjb250cm9scyI+PC9kaXY+CiAgICA8ZGl2IGNsYXNzPSJzdGFnZXdyYXAiPgogICAgICA8ZGl2IGNsYXNzPSJzdGFnZS1sYWJlbCIgaWQ9InN0YWdlbGFiZWwiPkxpdmUgcHJldmlldzwvZGl2PgogICAgICA8ZGl2IGNsYXNzPSJzdGFnZSI+PGRpdiBjbGFzcz0ic2NhbGVyIiBpZD0ic2NhbGVyIj48ZGl2IGlkPSJjYXJkIj48L2Rpdj48L2Rpdj48L2Rpdj4KICAgIDwvZGl2PgogIDwvZGl2PgoKPHNjcmlwdCBzcmM9Imh0dHBzOi8vY2RuanMuY2xvdWRmbGFyZS5jb20vYWpheC9saWJzL2h0bWwyY2FudmFzLzEuNC4xL2h0bWwyY2FudmFzLm1pbi5qcyI+PC9zY3JpcHQ+CjxzY3JpcHQ+CmNvbnN0IExPR09fTElHSFQ9ImRhdGE6aW1hZ2UvcG5nO2Jhc2U2NCxpVkJPUncwS0dnb0FBQUFOU1VoRVVnQUFBZGtBQUFCOENBWUFBQUFsNGNyckFBQTFTa2xFUVZSNDJ1MTllWmdzVlpIdkwydnY5WGJmaFh1QkJpOENEcmdqS0NveWJ1RGdycThaQm14RWNVZG5jSnp2VThjTmhTZlBjY1oxeGhWSGNIaTArSUNlOFRrZ1B2WDVWTndWSFhkQUZzVytYQzUzYTdwdkw5VzE1UHZqUkpoUnB6T3JzcXBPVmxkVngrLzc2cXM5OCtUSmMrSVhFU2RPaERlOFpTY1VDb1ZDb1ZDNFIwcTdRS0ZRS0JRS0pWbUZRcUZRS0pSa0ZRcUZRcUZRS01rcUZBcUZRcUVrcTFBb0ZBcUZrcXhDb1ZBb0ZBb2xXWVZDb1ZBb2xHUVZDb1ZDb1ZDU1ZTZ1VDb1ZDb1NTclVDZ1VDb1dTckVLaFVDZ1VTcklLaFVLaFVDaVVaQlVLaFVLaFVKSlZLQlFLaFVKSnRndmcwZlhJaDBjUCtadDYvK2RIRmtDbXp1L3Rmc3RFOUtWc0UwTGEweTM5MXV6dk0yMGV4M1BRam1iSDlpQTlqOFQ0YjdiQjhkYjdIbVlTT2xiVzBUR0hyT041QVBLTyt5QWIwbjZ2aWY4MnV0YThPR2EyaWJFais3VWczbStPMmNkZWhBeHB0bDhhWFZlU0dLcnpYU0ZDN2piaUpWc2U1OWVCdjFycXUzUnVjS3pmRlFtL0JSS3BBS2hhTjVpSk53T2diUDJuYXAwbkF5QkhqeFFkeisrQnZpb0FHQWF3MmtBaHFDYllocTBBbGh3ZWJ6T0FaWHBlcEd0cmhLb1FxaGtBcFRyM0x3VWczVUtmakJIeHI3UkEybFVoek95eE5VN0hiUFpZcmM2WE1KUkNqbDBSYlM0NU9BZjNlU3Rqc2RIL1V0WTg1OSt1Tm5rT1QvVG5zbldzVVJwZlM1YnM4ZXZJc0F5QWdRYnlwQnBCZXB2cGY4VU95SkY2OTdjY1F6bXBDSVVoRlhHL0tsYS95SHZYN2hqMnJMNWpHVjVwNldCYXRCMGVUVmcwUVlZRmE4RGtySWxZRlRjOFpRMnNWTUlreGNSeUlFVERMZFAxWmNYMXhtbExpdjZURmhPNUdORlhoU2FGUEpONTFmRTk5YTMyWkFGc0EzQWZFVkdaU0xjYVFwaGhmWk9pWTNsRWpvc1J5a0NyOTFjS2RhL0JPTFRQd1lKZ29jWHoxZnVzRmJEWFlJbTAvMktDYzljWGZiQk1KTFRZNEgvajFMWlZ1dC8xNWowcjFpdDBYWEVVd0RFQWMyTGVsWVExWHhTS20veDlpdHBkSkFMMnFYMnJkZHJHRm1PUnJpRXRGUHl5WTJVVmJZNXBPU1pHTEVJdVcrTXVHMExVUStMellRQjdPbXg4ck1TY214dU9aTU5jeGRVUWNrMWIzMG5OeFE4UmNBTmljSmNqQmxkYWFOdE12S2tPV0lKaExvN1ZCZ01qVDIzbEFUUksvMWxwTUZHek5LR1gydFFlMlgyM2xNQ2tZS3RodnNFNHlZaEpQMVRuM3NZbHJFWWtsS00yVldNU3MxUjBsdXBjOTZhWUFpZ1Zva1M0SEplMm9NeFMreFljSEx0ZFphQ2VvUFNRak5lSmxiUWxxNitITEtVZ2FxeEtXVGJjUkQrTzBIMVlFWE85RTlac3MrTkplczZrblBUcmVGaUdhQjQ5aUdCNXNKVFE5V1JiUGZaR0pGbWZIbUVreXplMllya3BXQXN0a0lDc0NJSE1XcVMwYXNmRStaWnBZcTEwOExxM0F0aFhoMUNMQ1J5L0VLS1JOaHEwdnZYN1FvUkM0RVc0ejZLK3IxcVRRbG9XSTNTL1U5UVBpMDBJalMwMHNlOFg3V3pYQ3M4TGhRMU5XRXRNTnEyNlRDV1paQzNMdmRHYWJ5TVhzeSs4T0ZKUmRVbGdLYXM5MGtxTWN1djVFZU93akZyWFl6MWhQUUxnVUlPMitUU1dmU0VURmlMR3JDK091MHJYd0o2eWxaanpLR1hOYVp1NFU4Smk3NlNDSHpiUGgraDlLNjdyRVpyTGYyeEM3b2NoSFRLT2ZldDFoaFNlQXkzTXk3NGdXYS9CeEtuM0h6L2tzM1RJYjFrNDVHZ0M4M3BJVmhBdFR3cGVzMHVIRVBlcUlOcnlPdlRWSUxWZGFzYzdhY0FlQm1BSFBXK2l5WjJsOXJLQVhBU3dGOEFzakt2MUFJQmRkSnpOMUNlN0VyU0lYRm16T3dIOFBxUnZkZ0E0R3NDeDlIcUErcXNJNEFFQTl3RDRBMTNqWEF5eUdJbGhaZGlLempZRUx0L0RBRHlTZmpNZ1hIL3o5RmdDOEZzQWQxdEVNQ3JjY1hIR21ieFB6YnI0RzhFVzh2SzlLNkxsWXc0MW9TaTFNb1o4NjE2MWEwVkg5YlZ0S1JWb3pPNGdwWFlyM1dNZW03dUpiSGJSYzZsTnBUZEpUMW9VbVI1RjEzZ2tqZnNCb2NUUDAzeTlpK2JobktYWWo5STg4MUc3NU5TeXhSbUM3WFJ1ZnlPU2JGWm9abEhyS2MxTVpEdklaMENRNWhoMTloWmhkWlJwNExCTHRXaHB6eklZaG4relRJOVYxQzZpKytoTVVOUWdnQXNBbkF2Z3FXMGU2NmNBUGdmZ2loYXQ0bFNJMVZTbXlmWVlZU2swR3ozSXg1d0g4Rjhrb0JaSUNNdkovZzRBVHdSd0J0WkdPOWJEVndIY0NPQmoxajJMNDVJUEU3WkhBSGdDZ0FzQlBLdUZmdndTZ0tzQi9IdWJZMGdLL2tlVHd0V01wV0NmZXdlQWJ3SjRISUQvWTFrenJraVcyL3g4Y2hmeWtzVWlnTU90ZHRtQmlTVlNYcFpwVEd3bTVlZ09BTGRiYzJhSnpuVWFqYXRGSW9SNjJFS0s2VUVpREI3UHd3RCtuMFVVUlRFdWp3RndKb0MzME90bXh2L1BBWHdRd1ArMFBoK2w0eHpxSU9IeStuZzFoTFNPQVBCaFVtb25XcEE3L3duZ1BWaTdIcytLMXArSEdFMzF2Qm84TnFyaTh5S0FXeTBsZ2NtN2FVOWdyNUpzd1NKWlNiU3lneXNSTGpJL2hHRFRGZ2xVYUZJY1B6RTE4d1FBanlEQ1pTeUx4NklnVHhtd3NEdzdQVGtQWUwvUXhoWUUrVUw4eHlYUlNoSzdFTUE3QVR3MG9YdnhPd0NYQXBodTBWVXBOY1MzQTdqY1FadHVBM0FpWGZQZDlObVJKSUNlN3VpNnZ3RGd2UUIrM2NTMU1sNEE0REpTS0Z5Z0F1QXFFbDYvYVZFQjQzdHdBWUIvY3pnK25nTGdKM0MvRHNodDNvOWdlMHk3ZUtjWWY5SmlQUVBBMXh5ZDQ1Z1FqOHJaZE84bUhKM2ord0F1cG42M3ZTdEpXdjVST0JuQTZ3Rzh3dUV4N3dMd1JnQTNpYytlQ2VEckRvNDlEZUQ4a0xuUkVucVZaSG5ROElEeFNQdWVJeUk4WkZrMktVR2tLUVRCQjJuaFdwQnJHeHlJTXdSZ1ltSnE1cTlJODlwQ21tRkZFR2xaRUQxYlpUazZ6Z0tDNEtGOXM5T1R2d0R3QzVqQWxFUEN2VkYxNU9KZ0xldmhKQ3pmUkczcEJPWUJ2QS9BcDBtRDMwSHVuVGdSckt3VWZBTEFSUTdhTWt1dUtNQkVrdDRBNEJrSlhmZFZBUDQ2WkNMeWRjcnJmVDJBdndWd2ZFSnRXU1pGNHAxa1NkbnpKSzVIcCtLd1RmOEs0TFZJWmduaFRQSXV1TUtSTUVzaU5rNGlLOG9GVGlRbGtLMnVEd0I0ZkVMajRaOUlFWnl2by9EeC9CdEE4K1FyeHpiTEhubU9SMU1ibnBXZzNMa1d3RFVBdmt6OStDTUh4N3dad0hNYUtNcE5XVHk5aUVQQ3hjZ21QbisyaUNCU05tVzVCM3pVdW1uTFlyRGtoSkFwb1RZQUtrZURjSWcwbXlFUzNsdkU4MWJTcUxjaFdPczhtclRUaHdBNGRtSnE1akVUVXpNbklWZ241YjIzcVpEN2tvcTRYNWtJOXd4b2tMK1ZyS3UzZHBCZzJTMzFQaEx1TDRjSkRpcFQvekMyZGNobHhWNkNTMkRXa0orUjRMa3VKRGZqNlVMWXlPQ2JNb0RIQXJnT3dNY1RKRmpRR0gwTmVVMmVUd1M3bmVaRUJ0RkpVK1FjcWRKOWRJVno2Wmc4M2wyQTU4QWJITGJ6NmdpQ2RZM2YweGk1QXNDM0VpUllBSGd6ekhydENmUmVMZ1BzUUcwVTc2SVl2M0V0Y2lrLzVkYWpFWmdsbFo4blRMQUFjQjVaczIrSGlXWG9PdlFxeWNxb1BRWmJxY01oV2pNVEprY0RaMURyb3VVOWt5dldaeHk1bVJLRGlRTlNob2tzTnlHSWVodEhrR1JnbEVoM25MN2ZTbVI3QW4wM0lJUmVXSFJzdFk0UVRGblc2eUtBdjZEdi8yR2Q3MDJhckxzZkFUaU9yRnBXZVBZaUNOQkpFbHNBZkJIR2pkMEpIQW5nMjJTeDhmbzhSOWkrR01BdEFQNnl3L2ZoUzJRMTd5R1M1eUNZT1AxL2hjTjJETU80Vzh0d0Y1REN3djJGRHR2NWxnN2RsL05oWFBxdjdxRHkrMXZ5b3N5UlFqNUtTbkNWNUJLRU55K3VXLzhlQkh0ZnBUZnJZaGhYN2hzNlBONHZCM0Nsa3F4YlpDd2lTdE9FemhEUmJhWUJkQmhaVU52cGVTdVJYa0dRM3pnTk1Kbit6WFkxODE3U05JS296d0hVYnUwWnBHTU8wUE9RK0UyZUJ2Y1crbjBlUVFCWDNKUjk3TFlZRUFUckViRitwY3Z1eitNQi9CREFpNFJ5a0VYOS9hcXVzTW14QUk2TFR3RjRsMURVM2dzVGxEUzhUdmZnd3dDK0FSTUVCaHFUY3pHdHJUc2N0dU1mRTVBNVQzUFl2Z2RJR2NsR2VJcGN5c25QSUxuNGlIcjRPTXh5ektJMUJ3K0k2MnQybVdBSndSWW8wTmovS01sWmhlVjI2VVY0Q0RMS2pOQXpwd1RNV3dPSDk3SHlXdW9Ta1JzbkJWaEJFRXlWcDBtWFE3QTJ5K2tST2FPSzNQckRBVmd5MjRwSHozWUVzU1JYZGdsWEk2NHRMYzVUUVcxbW1rVTZ4dUV3MFhhUDdOSjd0Qm5BZjhBRStWeUs1RGFLZHhNdWcxbTZ5QU40V3hlMDUra3dnVXd2ZzNFZmo4VWsybGNBK0k2ak5wd0U5NGxZTG5IWVJ5K2g1MzRmbnhmUnZYODdnRk5KQ2E0aVdMdVBteDVVUnFQemZmMG9XYkdLUGlKWkpyaEhUa3pOSEVla3N4VzFpU0dZVkpkbnB5ZDVHODBxYVhLOEozU1ZCdGd5ekZhQUJVRytBOElhSFJUa2JSTTRFMk1HdFJITVBtcmR3WGFpQzE5OEZtYkorb0pZN2NGL0xFd1FWYllIN3RVbE1QdmhYZ2IzZXpLN0VSL3FzdlpjUU1yWWpURUp0Z0RndTQ3YjhEd1lGN1lMak1CZGxQaCtBUDhYOVlQRHZENGFtMitEMlZ2N2NTR3pGaEJrbW9xenoxVEtxeUtBZjRFSi9sUDBDY21tYUVJVUFLUW1wbVpPZ1FrUkIweVFFU2VOWUNKY0FiQTBNVFhEQ1NFNEtJWUgwMEZCeEhjUWNSMmk3OW5seXdUTDVNdVJ4Wkw0WkhvOEQwR2lpaVh4MjBySS84S3lzTmlaa0d3OEI3V2g2NzJBQzJDMkZueEtwOTI2NEhvaXBtL0crTzJxc0U3ZTZPajhyeUdTYlh0TEJNeWVWVmU0VkpDRnZlT2dYL0V4SWxtZlBCdDdTV2JPSTE1Z1lnbEIxcmNQS3NFMkppd1g2S1NtVnhYa04wTEVlaVNNcTNoQVdLaThWcm9KWmwzMmNQcnQwUUFlQmhOS2Z5TE1Yc1duQURoclltcm04ZlFiWGtPVmdVNjVFS3RVQmlqeDN0b1MxcFlQWTJzNGpXQ3pjeG0xZTJzbHdlWWkrblNVQnZkTlBUaldib1pKWUtGWVAzd2VKcW8wemh4THdRUk91Y0p6WVFLd1hPU25QdDlodTc1SXp4em9XTm9nWTRFanFUa1ljUS9KeGpoYlZaaGczd0hnNzNSYUpVdXluaUMwYkJPa20ycnhYSHllT1pvTWh4T0JGbUNDQ2JZVDhYSVpxVEVFS2NsMndPeWRQSktJbDhzL0hRc1QrSlNHeVVhU0Z4T085OVFPa1VVczExL3ROVnQyRlZmSUJWVW1OMHlXamw4UnBIb0lRUlNmYmNuNnFDMnRKak1TTGRPazZEVk1rL1c5RXVFOThYdllzOUpMT055eU91eWxoa3pJL0wzZTRmbFB0WTR2eng4bjg5WTR6ZkVwUisyNUNVRWUzSHJuci9UcFdMaVFYbk1nMUwwaGN6QVRJclAza2J4OWI1L09rNnBMSTlLRkpTdno5ZHBDTTBVVFkxQllsank1Q3ZRZDd5OGR3dHFFL29QMHU1U3dBRXZDK3VQZ0piWnFCeEhrRjg0SXk1WkpseCs4eGlvSldTb0thU0xKek1UVXpHWUVKYzVLd3FXVXR2cEFydE95bGNvQlRCbngrMlU2RGw5SHZRazhSc1RFeC81SkR3N1k2NFhsa2NmNjUxTGQ2SGdGekI1SElMd3VNbWgrOFBZT2x3RkdMN0xrUTBuTU9Wc1dGVUxlSHdSd2pzUDJYQ284UkN0SXByaDhOK005MXZ1UmtERWhhK3FPaTN0MWcwNmx6cENzSDBFVVBISFloVHNpck1udGduQ0hpVWkyME9mYkJlRnlnZ2RPN3JBVndWb3NXNDY4d1YxR3hjWEpXeW5US0hKUWtReEN5b25CZFJpQ3JUSVYxSlpqU21QdEZoeDVURTV1VVJiL2llTXU0MnRaRk84L0JwTkJwZGNzV0NrVWk2aE5UYWxZSHd2bTFSYloyZU9PQzR3L0NKT2Q2RFpINXo0TEpnQk95aDdlL3JZU0lkd2hpQjhBL3NaUlcrNEc4R09oL0FGcml3SDBPNDZHMlYrUG1KNGtscGwvRHhNeHJ1aVFKVnNKSWRwTlJINERSSTdIQVRoNVltcm1kSmpNT0ErRmNkTWVoV0JOZFFjSmdCMUVyRnVJaEpsVTgrSW1aN0IyUzQwc3VOM01kWG1vM2VaVFJsQ0V2WUxhemRxVk9nTXhMZHJBeDVSRjI1blltNm1uV1JZS3lodDZiR3hkRFJQczVDSElTQVhFaTI1VkpJdlhoaWpFdHBJNGlHQjkwbVZneXptV3BjcHBSOE1LUmtnY3BMbmdLbU1XdTV5M3dTekJERzdRc2ZCQk1RNE9Sb3dIbnIvN1NENWZybE1vUHRwZEEyTnk0NjBxVlVFcVdRQ0hVVERSbnhHaERrOU16U3lJQ2NWMUxKZGgxaW5uRVZUR1lJdHhBY0NoMmVuSmd3aEtPN0U3bUlPVDBzSWE5V0phdENuVXBsN2tOZE1TZ2dBbGRsa3YwM01LNFlFQjZUckV5NUhHYkNuRUlSbU9mQjZIMlN6K3YzdHNYSDBmWnJzT1lGeVQ5OURyUnNYVEZaM0JaaUtyM3lFNjBFVjZYTDRGRTJld3hjRzVYd21UbklLUFh3cFJlSG1ibDB4UDZjTnRWcVlmQ0lLVjJBaGJ6Q1M0OEFsN3pYSllHL3pGeGtVWndQdDErblNXWk9Ya2tKTjFsYlRPUHdQd1pIcmVURGZyQVVHTUhMSExXMks0dUhrT1FZVHRDb0RsaWFtWjNRQnVuWjJlOUdqQzgvK2w5WnBHL0EzVlFHMHlDSHVMRFZ1bUJXclhDT29YaEphYjdUbEFpck5JY1NCVGFuWjZNbzRsV3lMdDhRQk1TYmFuZDNoY1ZCRFA3UjZHMjJCSzZiR2ljSS80THU0K3ZDUnhrQjVMQ0FwS3JIY3lqL3RKbVp3bm9mOXc4Z0lsbVRubjJVU3k1VHB6Z3BYS01reWlkeGNwT3g4R0UyQjRYNGpjNEZpSVZJUTEreHBIMS81bUdvZDdoVks3Sk1oOHZmQUFqWU9ma3ZkcUM0SjZ6MG5pQmVSNXlndXlsZU5BSnA2NG9BUDl3UGtLOXBPQk00QWd5TFhuNEdKTlZoSXRoRGEwZFdKcVppZU0zMThtcHVidE1ISk5kanQxNHRFd3J1UUJRY1JEOVA4eCtyeU0ybUNpckxBWUc1RnJwYzduY2tzTkUyUk9UTUFCSVFRZ0NEMGQwWTlWWVNrWFJSODFXK25pbW9USHdDek1Hc3Z4TUc3N0p3STRCU2JIOHFOaGN1NWVTWVRmQ0wrbS81UXNxMmNveGoxSUdqZVJNSGtZekZMRm8yQ1dMaDVGOS9BaDFBK2R3aUlSMTFOSkNYMFk5ZnV6eWZvL0FxWkt5NDBKblYrdWxlZERsR1VXc2lQMC9scUg1MzZyZFY0SUQ1aHRSVXVMeTRXUXJjSlV2cEVFTHVWVHA5ZGs1MGw1NGUyRHg5RzllUWJNOXNMdE1EV0hQNU5nRzg2ajV6RkxodHQ0WTRKdHFBSjROL1hCR0l6bjg3RUFua1RQSEs5eklzeis3ZFdOUXJKUlFwUGRyR01JSW5QVEpIaVBvdzdjZ1NDUGNGNVkxVlg2elFTQ0lDamVaOHBXY2hwQWRtSnFob09mUEVGNG1SaFdXTm9TS3JJbXJReCs0a2RGSEhjbFpuOVdyWE93TzdzWWsyZ1dZZkt6SHB2UXZmOHFFZUpSNUFLNms2eUxIOExrdXIwZHdDOWhvZ2hmQ1JPd1VxL1c2TmVwdlNXeXdPNFhncFRMRVJhUVRNbXplbGlHQ2ZSNUhreldvMzMwdWR3dk9ncXpmZUg5TUlYRzcwcTRUVCtHMmRMMEZwakNBbVZMSWFuU1o3ZkFWTk41VXdKdE9DMUVvTXFpR1ZWQkFwdXBmKzUyZE82TDY4d1hoQWg4d0FSTnVjRE5sb0hBZXo0OWRENlgreDJrVkwwTlp1ZEFPZVRhc3pSZVhnTlQydS91Qk5weHFwZ3JzTHdJc2w5ZW1sQS8vRFBKMThzQTdMYSs0MjJTN0lXNkRXYi85aW5va1dVMEYvdGt3NnhhcmkyNENVRkF3UWlDTlJlMlFEazZXQ2JZSDBXUVczZ01RVUYwVHYvRmVZRVBrZlhCd1VxRGdvQ0Iya0NrbEVXOGJQWG15VUtyVUZ0M0lRaXc4a1hiUitrYzg0aVh4dEFuSzUzM3ZBN1IvdzlRUC9DMkhLNGxLd2xaOXVtN0VycnZaOEJFRmY2UzNoY3NJUjlXR1dnQnBsYnB5OG5kSnZFRElnMG1zTDBobG9GZlIwSHhFblRWL1FWTVRWTjdyTjh2WHMrSjF6OGpLejZwZ2dzL0lNdmsyK0t6SlV1NWdwZ3pBUEFSc25oZFk2ZTR0L2FXR1ZtdDV3Q05peWM2UFBmakl5eFdUNUM3bENldThrQi96SHEvVDR5OVRpcUFONUtpOHoxNnZ6bGlQSllzUmZaWXVJdjJadkQrNDNtTFpObmJXS1Y3bjBSRThlRmtJWWZsQmVEckQxdGUraVZNenVsWG9NdlJEc2w2bG5Dc1dDUVRsa3kvVXNlcXRJbVIxMXg1MzZzL096MVpGRGVEeVZiK1hqN2lnaWRYQ1VFU0NqNTNIb0hMT0JWQ2dtRXVEMm5oVnl3cnVZejYrMFNsSlhFQzNOZEJ2WU9VaVIrSG5GY0srV29Ed3ZzQVRRNG0xQ2NoMkVQY1RYZ3FXWVA1SmdWb0dXYXJpT3NncmJzQnZLb0o1WlhYN3dlSmxNOTMzSjU4SFkvVW9SRFB5bDRBdjNKMDdoZGJNaWhUUjlFNkVXNkNycjZPN3FoVzlRQ0ExeEhCSHlrVUdSL3hFaDg4RFdacHhqWFp3Ym9YSzJJTW5wZEFQN0RIYTFDY044NFd4MUVFc1RKWHdkUXM3anVTdGNuR1RnM29JU2p4NW92ZmxCRzRTNnVDM094dFFMekdtaGF2aTNUVE9UQkpXc0poeEZxUGFMTVdNVll0TWdTQU5MbWpPUUNMYTlDbVFralVGdUFWb1lYeGRaY1FCSGo1RVM0eUNkZjFSMmNCbkUzRU1XLzFReEh4czVwNE1PNzgrNmx2amhZYTZPRmROTFpYaGJVb3lhUVE4LzkzWXUxbS9YWnhYVXpoYUJNTkM1NXB4KzBaRG5FUDJncGoxaUwranpvNjkrc3NpN2xzalVGWk4vbHNSK2U4cWt2RzV0bmtOUU05eXdEVWdSai8zd09UbE44bGpyVEdnaTBQWEpmbnU0aVVETTVsUFlMNGlXcm1MYS9ZdjVNSHF1OHMyU2lod05Zb0o0N3dyRWthWnVYWlpKTkI3VFlkamtCZXNjNGpvNHNsQVRZYkdlc0pBcFJFTCt1OTJtVGM2SGhNMkNWaDZaZHBRTVVodE5NZDMrdVhrb3ZsVVNIM3crNi9SdmY2VGlMYUV0MFR6cGl6QzdYN2l0Y1R2QTl5eExKSTR3UzJNQ2wvMm5HYmJtbEIwNGRGUnYvbXNEM1pPc1J1SzZ0TUJLNENzY1poQWxybTZ2eUdDMzI0Q3JqNU10WS9kV2VWeHNFMjFPNEpIclFVcW5ySXdLeEh1cXo1V3dnNWgvejhLSWZuK2lsTW9aRGpRdVRRU014alpNUTR5Z0Y0WnIrUnJHODk3RW1aZ1hGTGpncWk0dlZIV2RjMUxMMGdrNmNVQkdueGV6NC91M016d3JLT1M2NHlJamlGMm5xemR2azZDRVhBdHlaTEdObFdMRktGK0M5YjRtRmVBVHVsNUtrTzcvTU5DS3F2L0JMQjFveFNpQUNJV3pydlRpSDREeUZZMzl2WEpXUDdCcnBPZG5kdEpVRVdaOTIzU0VyaUV0eXQwKzBsSVI4SGcrSS9QQjVZVWZoYWgrZi9pdkRLZ0R3WTczWjAvaGVKNjh1SENOeEZtSUFuRjBYdkx5RkNYKyswbnRjUWNlMmx0bXdXNUJyWHkxS20rL0F0eDU0ZmlaSzQvenRoSXAxZGdYTW0vNEh1OFU0eFQrTW02MkZGK0NBZDR5RFdMb1AxdkNYclJ3aXNMSXlyZFppRUJaTm1CbXNMTjFlc1oybEI1Z1NSUXBDV3pQU1V0YXhadnFZNEZxMGtUYjZXS21ycndNb0FJRm1pTG16dHRXcVJzMjladmpLalZNcXlIbXlTUFJhMWdTZnQ0bTh0bDQ5ZHpDRVZNcm5pakJ1WlpPUDN3bnV4M3RodDNhZFVDK1RQRnNVZkhiWHByaWJtbkMxd2Q0clhMdk5YdDZwQXpEZzYvOFZpSGtpUGxwd0xybHpGWCtnU21mdEZpOUFXVUxzRzJneCs1YkJkcFFaZUIxZllqNkFPdGxUY3dyeHI5YkNJV2k5cEZzbEU0YThyeVlaQkpzVG5yVGNaOFVnM09HZGFrQUFUbkN5RVhrSVFHY3drS3dPcjBrMElGMmxwZWhZWjhuWGtoWVp0cDI2c3QrZldEbmlTMXZCcUNLbW1ySDV4dWVuNmJnVHJQNXcrcmxpSFpPUDIzeGdKaFR6TW5rNGUrTjJ3ZiswQWtWVEdHbGRMTVMzMUVYSGZsaHkxaWNkTFhLdHNXQ2lZY2x2RDd4ejJrMTlIRm1UcnlJczdIRm5VNHpBbDhDRG00cWpWTGhjRkFiNExreFNsR3dMejdxRDVzMDJRV3g2MWU4a2JnUlh3MngyMksreCs4OUxQZ01QemZGUmNOOWZxWHFINUduZDN3WmcxZm4zNi8zYzNBc25LWTlycnBmTDdiQjJ5a211Z1hKK1ZFMFdrQkZtbkJSbnpjYVJMT1JWQ3FsTGdWaTJMMXJhbTVTTW5DTjBMYVRNSGNMSHJXN2JOcmhWYmpiRGdiV1hGRlY1aWFjMUxJVzF2eFlVMlIyUlVoTmxmdTcxTjY4Z2xobW5pbHEwSkhkZFNseTRyVjJ0NDNKWTRFY3NGc3J5TFdKczhQNm4rVFVjb0JWSUFWMFVmZnNUUmVjK2s2eTJFOU05a2srUVRoWXNRN0J4WWJ5d0xoVmRhWll1SVh3R0krMmpXWWJ0eUlUS2M1OEV4RHM5ekhUMFAwalZ6S2RGY2s3Sm4xSktUQytoU3VDQlp1YWJJS1ExNWorc3lFVjllQ0hmZUZwTkRkRVF3VzMzM2s0QlpGaTZGZ3JBb2kwTFRZbUh2aXpaSVYwakpJanRlSStieWVRL09Uay91RmNKbGpvaUQxMzhyd2txdkNJc3RMZDZ6UzVuMzJnNVN2eXpRNnp2RitjdUM0TXVXVUhNWnBYdEE5THRyQXBjRGUwOFhqV3N2d3IzVTdqSGFRVFBXZ0NUVnBRUVZZOCthSTRnZzgxS0lFdkJsUjZUMVJycmVGUVI3NlJrWE9qaitkOGo2NzVaYXhmV3N0V2F6VGFVVEdndDhYMW5HN1VoZ0hxUXR4YVBaN1hMekNIYWVTQnpxVjB0V3VqOVRJUlpjSmVTOHFZanZwV1Zhb29GWHRLd3RKdkhOQ0hJRGx4QzRZK1d4d3FvRXlVeFA5aGFqS21yVEpjcjEzMHlJMVF1c2paS1cyYWN5bHBYdFcrY01HK1F1SStVV3JBbmpRNkZ3WTVWZjZ1aDRad25sUW1aaWVxNkRZMy9COG1vb21pZHhsMHRBaTVaRkQ3UVd4NUdsZTJyTHM5OTFXeWNtdFVaaGsyNWNUYzdXcEd4WE1FK1V5c1RVekNZaVdiWm8yYTBiRmZVYmRnN2ZPbjRGdGNrdFpENWtkbkdYVytoZkdmZ2thOUpXSTM3dk1ydlBuSktySWlHU3ZjelI4ZjVIaU1YOEpFY0MvU3E5WFMwakNldC96aHBEUUd2NXpNZXNkcWE2VmM2NUpsa1p1SlJ0NDF3YzNldFpWaVlUMUNxTUgzK0VQaXZTNzNNUlZxTGR4cFN3U0QweHdYa1ROdWN1em9qak5WUGhSMFlOLzZtaXlPejBKRnZPWHNTOTROOGU3ZWgrVkpSYyt3N2RkajlkUk8yZVpDbm9nSnVLTzU5RnJidmQwK0hURklvSldMS2xrSHZSU2xHR3hRaUQ2VEhkMW9tdTFtUlRJVVJXejVxTkkwaXFxQzJBTGdNWEtoYVJyRm9rSDZmTmZBNSt6ZXRDN0dKT2t4dUQxMXd6RWRjWjUxeXl5ZzhIR29XdGdkbWxwVndvUFVNZDhGd29OaDY0Q01qRmpvNTN0cGo3MjJBS09yU0xUd3FsdnhuNW9LaFY2UFk3UE9aeGxpSFZLcFlReEpsVUxXT29ieTFadVk3SjY1Y3lRamZLUllvSXNwR1duZHdPWXlldjkxRzc5bW9mQ3lIZnBjU05zUU9YdURqQUFGbktPY3ZxVFVWY2Q5UUE1VFhZR25kM2hFWEM3ZjJPdy91eXJZdXRJRVh2WWdCbVhXMHZUQWFmZHZGNjhmcGtCOGU3RlVFaWZSNzN1aTRiWDRHU2NKbGc1bVdXUFBMYThEVFlYSkx2eHM1MFRiSWNZWnlMSUI1N1QyczZaa2V5RmNqVzN5YWhuZWJFZFpUUU9PMWh4U0kvdG1oWGhHWHJFY0dPSVZpVTl4dVFWQnJoQVYxMlFncDJqL2dScEF3QTF6dThMOXVWWlB2U3VsaHZMSXUydk4zQjhaNE9Vek1XY0pOVTROMUM1cFNocnVKV1NKWmwyYjBPai8zWENMWUUrUll4TmpPMk0xaTdYZlA4YnV6TWxLTmoySlYwbW5YUDJMOHJDOEtUMWkzZmhCRUU3bHZlRHNSa0xKUHYyNW1ZWkVhbXFuVnNqbERtN1QxNU9rOEIwVG1XNDRJelBjbVVpL1dFNXk4YzN1UE5Lak1VanNHRlB6ajk0L2ZnWnV2RTQyaHVQc3ZCc1c2aWVld0x5MXZSbklYSWZYZVA0K00vemdFSGhlVlNudXBYa3BYdVhiWm1WMkN5RnNsTVQwVTB6dmdrSjNFUmdRdDNZSFo2Y2c3QjN0dEZJbzlsSXNaaDFPNUxqWU1SK2orVDM0SzRua01UVXpPYzlXY3ZYY3NxVGRTNCt5MjU5TnNDbmVzQkJMVnJmZEgvU1d2WS80djZMUk9pclhvUldtdytRbk8wWFRzalZuOTJDeW9PanBGeGVDeGJ3V3ZHbXJCZlo3dWdmemxRaFl0ZExBQjRoNFBqUGd2QTN6azR6bXZGSEJ3U2JlMFhUNFRYZ2JFZ00yOWxBUHlIdzJOL0JrRTJLU2xyQm1QK2YwZ1Evd2pKN09lU042UXZTVGJNS3MzVkdWVE5XSU1WOFI4Wk5ad1g1QzJ6UjZXYUZJcHNvWlpRV3lEQUU1WnlPb1pWbnE0ekdWS29yVmRyMTkxTjJ2MlhnM0hEbGJHMjZvb2ZJUVNLWWdKa2hUWE92eCtuMXpJWnhiS1luSXIreGhnOUg0RWdKdUkvSFJ6M0pYQlRuUDM2RUlWQTBab2l4Y3JLZlE2UFBRN2djaG8zQjRWQ3U0VGFRRTBQeHBOb0t4T0xRall0MEhFdTZ0YU9UR29Manl4MDd1SWNYSXRWcGthVU9ZV3JnaHpqa0piY1l1T0xZNWVGaGlnSlBCM1JaN2FiUEcxcG1tSEZBYXFvWDZBYUFINExFN2poQ3A4US9jaDVwZXZ0Z1pOMVprdlc1Nk0wTVFCVGcvSjRRY0tBKzBMbml1N0RnNVlTWENETDRtb0g4cWpkNHV4WGlQR1pRWGVrVXV4MWtnWGNGaU1BekJhdE53dlpjWlFnVUNtblZ5d1p4TjQvbGswZWdHdmhKbkZKVjVLc0YwSkNhUVIxSUNzV29jV3hXbTEzcWgwNHhNUnFsOFB6TGVLb3Q0WXExeHprOXBxd1dySjJkSFNjUGt4YkEwSWVQNDRTVUFid0RZZjMrZEVJaW1TWGFTQ1g2eEJzeWJySFdVSFM4d2hjeXJzUVpGalpybkpwdzRESDhCNWhnUURBKzd1Z2JaK2k1eUVhbzBxeTdjdDRBUGhLQXNmK0IvS0FqQ09vZHJXakFWZklkZlpCbVBTZTUzUnpCN3JPZzVvR2dJbXBtWUxvREJtbTNZeDcxQk9rVUJLV0lKT1l6Q2ZNeDg2aWZxTHpNRXZXM3NNS2kxeFRFUVFkdDErWnlJdUMrT09zeTkzdCtGNS9FaVlaZTFoYjYrV3dsWjk1Q0FLcGlxUTluaTBFN2hBMGluT2pnTmZQTmd2aDk1c0VMSjVtY0EyQW53bUxLQ3grSXErM0xoYnlRbjRWWUVwWmZpQ0I4endQeHROMkVzbU8rOUU0di9NNGdGZlJlRHVyMnpzeWlUVlpqNFJ0R3ExSDVNcklZR25KVmkyU3RiTkNlVTBlLzA5RVBEczl5ZnRZS3dqMitjcm9acitGYS9Bc29sMXRvczkva0lBV2ZpVnFxL0xJQ1NYN2JpUkVJZUhYOC9SOEdvQWJZZGEvM2lNRW0yNFQyaGpnTmZnRFJMZ1Z5NUpjRDN5dWdjTE9RbG9SVDM0eE9ETDdtd21kNjF5WXZkWTNBSGd5Z0lmRExFV04wdGdhcGZjbkU2bCtGaVo0NmlHOTBKR3VTTloycVVxU2FzVVNETE04SzVhYllCREIyaThYQnBEWm4reHpWa09JUXlhNzhMRTI2bGNXQ2FqWFp5blVEMzRDYXJOV3hTR2kvd0x3TDQ3djl3U0FhYkpBanhCOXc0blpPWkhJZ3RWK0dYaFFobG4za2drejNnMFR4UXgwUjlGMlJiS3dsMnRLWW41ZGdkcms3NTNDajhTWUhCTHpVdFlHVmk5TGZFaVAxZ0lwNGo5RFVBMHRDZnczbUpxd3Y0WXA0N2NQd2E2TVdRQS9BWEF6Z0JmM1VrZTJTN0pjcGsydVorWVFCTmFFUmViS3BBMDJPY2xFRVRKYkUxZmk0VVZ3cnUyNlNEZmdJTXhXbXprYUVGdzNkVkg4aHgrckNMYnVsRkM3QjVjdDVBekN3K09yRVlxQ0pPTzBzS3Fadk5uZEhWZlJZQ0Z4UzBMMy9VWVNTRk9valFhdVlxMjdtTnQvSklBUDBYMTRkY2d4ejRHcHlyS2k4cW52NGRjUnlDVzRLeHpRREs0VlZ1cWlHTTlTWVJ6WFc5Y1VSb1JpUFFBVFlmdzNIVHgvRm9GWHRHZmhvc3FDSkJNT2V1SklzVTBJQ251bkVLUXRMRmlDM2M1RlhCREVsQ1hOcGtva21vWForRjRoSXQyRElBUFVmaEx5cTRJc1pTWXF1NGozWFRCcEI0dEUwanRKY3lyRDdJMmRvMmUyUU9jUlhXUmVYc3NLZ2dnNHZuYXVLWHNnUnAreWtKaUJpZG84Sm9GN2Z3ek1HbGFGenZNdDZvOEY2b3NUeWZMZENsTVY2Qmt4am5rSjllSExFQjNwblkwZ2NyVTBlZ3YxM0s1WEFYaGZoOXR6WFl6ZkhORGIxaFFYU0FWbGpwNXZJUG13VGJzc1daS1ZBalFsaUpacnFMSXJsNk9EK1ZsdXR3bXpZUGx6ZTE4czE0TXMwbmV6Wk9WbEVWVGsyUXdUNGNvcDFEajRhc0N5VHFWTG16TkZGWVdMaTRzQjVMQTJSM0lVQ2RpV3VyeWVTb2kyM3doRGdtaWZBN09sSnlta3lRcDFGYUYzQWZYZGVmUitoK1ZpMHZ5eC9ZODlNR3YxZjlsQksvWUI3ZmFPNGRrd3JsdEZnaVFycmNJS2F0Y3ZjNEtVWklLSHRIak4xaDJURzd0c014YWh5WW8xblBKd0JjQmRzOU9UK3dXUmw4aGlQcEsrWjJMTmlVaG5XWGc5RCtCdzBzN0dBTndKNC8vbmtIL3AvdlZRVzdnOURrbXc0bEVTQk5zTXVTeUwrM01iVFBqOFdUMDByczRsNWVmbFJMQUZCRzVrRFl6YUdMaWtneVI3bVNwdkhjV3RNR2tybjZ0ZGtSekoya0ZFdmlDbExHcURvTml5NUJxdVZTRndWN0UyS0Ftb3JjSlRtWjJlbE5tR3lrU01lNGdVaDhrTnRJZUlrdE1ZcGdGa1pxY25tU0JsVHVVRkdEZG9HV2J6KzRNdzY3cWpDTlpscytLUlFmaldtM3JKTnFUMTdzOU9UeTRoS0FyZlRQOE93YXlkN3UreHNTVXQyaFhxUXhXRUd3ZTNBZGhOeW15UytENkNhanVLemlBTHMzWHZkcmlyZmEwa0cwRWc5bnRwTFRJaHlxMDJMR2hYeGZmeUdIYmdVQnExZ1VyOEg2NEFVaVFycVNvc3dLS3d0c05Ja2EzdkF3aGN6UnhFeGIvaG5Nc3kyVVpXdkk4YkljMEJZVlUwVi9nNGk5cTl3WXN3MlZIK3FjZkcxN25VaitmUWRTalJiZ3p3Y3NkN0FIdzY0WE85Vjd1NzQyRFA0b3ZncHN4aFg4UEZGaDYyRXBsSWM2aGRqNjFhRm00cXhGcExXU1NiRWlRbnQ3NHdhUzRKSzNwT0hJK0pzb2dndWxnK09QSTRneUJuOFJ4OUpwTmJ5SlNRc3Z5ZGJIZFV4SnQwajB2cnU0aTExWVRxRFdLcEFBM0NiQVQvV2crT3NiTUJmSldVSVNYWWpRR2VoMWNrZko3ZndXVDh5V2lYZHh3N1lMYjBuSzlka1F6SmhsbHlkaTFaenlMZnJDQmdTYVI1RXNBRENJS1ZKTkh4M2xkSlREbnh2emp3QkdsNnd0cVZGamVmZHdCQjhtbWJjT3Z0aDQyeVpKbDRWOUJjVWd2ZVdqTWlsSXFYdzAxSnNVN2pESmlvUk1YR3c4Y1NQUFlIclhtczZCeFdxZCtuQWJ4Q3V5TjVrcFhrSTZPTks5YjNNcUJJRW03V2V0aVpudGpsS2tteUtpeWpGSUkwWUdIN1czM0xpdVRNUzhQV05WVUFZR0pxaHR1V0VWWnNTaHdMV0x1VnAycFpzN0w5Yk1rMmt3R0x0eHNzQ00zeFBnRFA3OUd4OWx5MU9qWU1wUEtiWkFhb0dhRWtvODc4VjdpRlIvS3BETE1tZTVVU3JYdVNsZitYNjQxTVRCd0Z2Q2cwSGxsTTNhN1NreGJDbDk4ek1lMUhyZXRWRXA2ZHZKNlQ4WHVJcnBmS21pKzdpcVVtUEVTV0k5ZFNIRWFRVW96WFNmbGFtUER0b3ZBVkdQZnVmVEQ3ZHdkZzhuNm1FZFNZYlNYQ2xyZkJmQlBBQ1QwNjNtNUZzRFpySzBHQXU4aGpGNXZYeTQ3YmxPOUNxeXVWMEhGbFFwSTdFeUxhRDhBRU9nNVpKRnRLNEZ5NUxpUTUxL2V2bVdQNVF1N2VTL0x1S3BnOHhQMkFkc3F6SmpMSi9oUkJTNFI2Q0xWMVlNdGtqUzJUOE51RXRibUlaU200UXdpU09DelQrME13THRQVkppODRTa0NXeEdUTWtnQ1VhOGtGQlB0azJmcmxObGF3TnMyam5WOVpGaDFZb1BiTEF2SHQ0bllBVDBoSW9DU0Yxd0o0RjB3NngwcUhoTDNMaWFab1hxNWthUjdQSkhDT1Q5QTg1ZlhmVWV2WkpWem1FTytYaEN1bEVLWHFKcGhvOHIwNkJXb3R1bFlIaXAzcmx6dDdIMHlXb2lJQ3R6RzdQbm05OHlDQ3pFOEYwb1RZbXEyUWhia3NpRW4rdGtqZmx4MEl3cFFnVnc3Z2tobXBwS3VYOTczYUU2NWlFUzByRmxWeERhd2dWQnlSTEFEOG1LenVieFBoZGlzZUJQQW9tRkpXQllRWGYwNUJTNUt0QjVMcWMxOTRGRW93WlJ1WGhWZW9YZHhOTW1aTUNQaVVOUjhWblJzTFhLbG5CY2JqZGhqTUh1bnJPdGorRTJEVy84L29WbzJ6V2FRanRQMWwwbUorUzBMMVFVRXV5L1NlazBpd0MzaUZQdHNONDFhOWs0N3hBTXplMXdlSXVPZUluQi9FMnBKNVhzU2pucElRbGplWkh6S2hobHovTFlyZitDSFdlRlZjSzd1VVYrbC9QbXJMOWJVRHptMWNCSEFxdW5jYncwMHdLVFlmSUlWZ0JSdDN6Y3kxUzN3OTUzK2NhOTB1Q0xBS3R6bHYzMExQY3dnQ0tPZElnVi9za1hIUWpmZXRtZk5uRVpRN1pEaytKbjV6UFV4cTFxUmwwNGNBUEFMR3U5ZVZlZFBiU1VZaFV5dHlVRkVSSm5uRUxRQm1KNlptZHNGa1laSlJ3N3dQTmsyQ2x5T0xtWGpaUGJzc0NFcTZZUDBZNUI5WG02MVlwTWZ1WENiSEpXcmZxaUJKWU8xK1hwdGtWMFA2eUtXYmFCRzFlNVBmUllUMi9TNXlKVjBNNFBNSUFyZEtJVzRtMnh2UWphNjBxdVBqZEpQRm5tUi9MMWp2UHd2Z1h4MGM5MTRZOTdOTTErblZHVnY5alBWYWs2MEt3MFB1ZlorbjU2MWtHTjFHc3Vrek1Ec2pMblhZM2lzQnZCSm1lWUFMR1l6MEU4bjZFWUtTSzdZc0FUZzBPejM1QjdLNmVNMHpUK1MwUk8vSEpxWm14bUN5TG5IdHdEU0M5ZGpGMmVsSlR0Zy9RTjg5R0NLbzVIN1VacTVCV3FwTXJIYTFIZ2czRnhjZWtGWnZ4bm92aVp2WHFWZEUzN2pBSVBVaFIyTlhZT3JQZWdDK0NPQ0Y2emltOWdKNExOYTZoYXM5WnVVbEtSajczVFdlcGZFNVlwSHRsV2cvQ3ZWejlKeXpCRDdQQ1g3dU51dlRwV0tUaE1MV2FnblNFUmdQbzBjeWZKRUlkZ2ZKMW9Pa0dGMUdqMUdoSkIyRHdDdlhDTE13ZVFLK1RzcDdYaEQ3dkpBOWZVV3lNcnBXQmdKVllTbzBWS2pENXhCa1MrTHRPY1AwL2U3WjZjbXFzQXdoM0QrOERqb1A0MHJtcU9ScW13UGNSM1NwTGxrNWg0bGVhbW9WckMwT1g0bm9HeEM1enMxT1Q4Nmp1WXhQamJCRUhvSmQxUFp4R3N5QXljSUNBRzhDOE4rYkdNVHQ0cnNBTG9SSkVNQjl5Vkhpbk9aeXJnSHhkTk42bXVkWXVLYkVuT3VXcEJ4SjlUZXZ4YVl0eGZCeUJ5UjdqUkM2VW1FcGRhR25JQ25DcnJaZ1ZMaHNsOHhGZmxEOFg4NXY5akpJMlRST1J0S1o5SDRVcHZENllXVDlqaE0zY016T0FRQjNFRW5ic29OekhlUnBiQjBrNHU0Ymt1VWI3VmxXSVUvYSs0U2c0c1FPVEp5KzBEeDRiYlNBMm4yeWl3aUtDUEMyR1Y1RGJjWHY3c1VjWkh3TlMzU0QwNlNKODJBK2hDRHFtSU80VXFpTnJ1YWdKNjVseTRXSEQ5RzF1Vm8zMkNXRXpNRVFVdmd3dWVkT0lzSDJzZ1RHei8wQVBnSlRFZWw3OU5rWTNWKzVqM2tocG5YWHp4YWVKd2lvVzVBVXlhN1FQYlVGNDkxa2liUWFuSElsS1hGWlN6SGVTbFpNeXRIOHN1ZVNTMlhMcFV2Ylg2ZXhzQkl5ZjNQVzUyTUk0bWlZREE5YUN1YzhnRisyMGViTkpLZUxYVGkzZ3NFMHZHVm5Kd1JMbUtZcnlacUZMQWREWlZDNzk5Ukg4cTVFSGlnRm1KcW9Jd2pjMlVNUWxYMW9BT1hwSVQvbjZ5a1FDZDQrT3ozNUc1ZzZyYnVKYkRyaEVwV2w4aVNlRCtBbEFFNkhDYlZ2WlUxbmxvVGRkOUIrbWtmYmRUb2l0TmwyWEZ0M3dVMzB1ZDBtM29mZGFES3pKY2Zid3haZ0FnRmR1VEhiM1NmTk1ROXpRdUh0SkJxMWY1ajZhc1VTNEh0aktHeEpZQlJtNjJFaHBpRFBDWVU3STk3dko2SnhaWUdPb1hhWmpZMkVkSXo1STZPeGw4akNiRVUrMlo0Wkxyd3loN1cxb3d0dEdFbmNMajRtRXl4L04wS3l5Y1VXTGs2dWtVZjl1c2xkUWJLOUJKN01hZFNtVmJUTDc2VmgxcEI1alRsbldlczhnQjhrb2JDWEJweE1EVm5zNEhWdEpZRzZHUEhkRVVTNFI4QkVBbThoeFdFUFRMVDNIOGd6OGNjNkFpNkQybnpRclZvTWdKczFOZDBTNU02SzY2YjVXZTNEYy9VeWprQnQ3TVZSSkNkczhOSVdLeXlORkx0c0F6a1NSbjR2Z1VueDZBSi9EK0Q5Y0xTMG95bnVhclg3aXVXR2tRWG1PUjl6aFFpSUJ3TmJLNXdxc2lKSWRVazhHbG4zTGlFSDRUN3JYbk5CKzFYNmJoK0FYelF4WG5MaWVtVHU1M0tMZlc3RGhiVlhkVEF2eXRaN3J3a0ZvaDVSUlhrWnVta2VkQ09xZlhBdXpuQlhkakErS3duY0s2K0pNVEJFQkR1R1lGbmdqd0NlQnJNYzhFNGhpNWhnZDVMaTNnaU41bGxGekZFbTVMTWQ5c1AzUXNaQnk0cVhXcksxQTB3RzYrUUVxUXlnTmxuR2ZnUnViYnNvQWc4Q3p2aFU3TERseWdNaXJvdmRFeGE1blNZVEVkWnBIbXUzUC9HeEJ1QSt1ck1ickNqZXNoVm5vbVd4OGJhVDlLdFZMZHZBSHB1Vk50cWQ1RFd4UENyR0dKL041RkZ2aE8xa2VKd000Q2YwMldOSWVaY1I1aTRVVEpaUkhGRGwwZmwzTyt6SElaSmhrbGhidG1xVlpNT0pWaFkwc0xXOGNzZ2c5aXhMTjZxQWdwK1FCdHFzc0crR2hGMXJ3UFg2WFYxMGlsNGdYb1dCM0t0OEJ0YkdhTHdPcHA3d1ZwakF6eFdzZFRIYlNrSmNqMUVCd1JiTTd3QTR6ZEUxL1FvbVF4MWNrYXk2aTJzaE5WWTdHRXRXOHNrS3dyVHJ6SWE1RmZqL1hvZUZoQjEwTUVqdDJ4ZHpYRlFhYU9TWm1PNmRPUDNlVFlMVGkxQWdXbW1qckV1Y2ltbHBLUHBMYVhjOXhubE1RY2llYXB0dFRLRzVwQjU1UWJDUFFIZ1E1S2NBUEJKQnRxL05STEJSN3U2NEpNYkpMa1poY3FLZjV2Q2VmVFNDVkZzMkFOU1NUVWFUWm5kcUo2MVdWMVptTzR2OUhIRTlyOE9rcTVHMWxNWnViRjhGNnRub1ZraEQ0aFNZUE9yMThIT1lVcGU3eFA5YlZUcWsvSDBQZ0hjN3ZyYUh3T3pMNWZPMEhZaXBKRnZma3JOVFJ6THNuTWR5OElWcFpMSmdmQ2VFUjcxRmVobEczK3BnNzJXWFhkeTJwN3JVeXQ2b2lpMTY2RDRrblhDa1crYmY2VEQ3bnVPV0F2d0NnUE1pcmlkaktWbXJXQnVJeW5nMFRCclppUVN1YWNnaTFURUVnVjB0OVhzNk56aW1VM2d0cWlFUDMvbytGVElBYkxjd0IwNXhFRlVXbmNuNFUyOGdsR1ArYnFORHlWWFJqdnpvWll3TFJUeHZHUkpETkMrT0IvQVZOTGN2OVpGa2ZYS1d1Z09DMEtTc0RhdDJ0aFhBQ3dDOENpYTFaaElsRFY4TGs1NVdvdTNrSm1ySnRxNUp4dEd1T1NDS0g1ekJxcWdDWEtGUTlJQ2NDNU5UandYd013ZkhYNFp4TmQ4T3MvMkhNK054V2RNdEFCNUtsdXRKSGJqZXpRaXlVcm5yUkNYWlJNalhqL2l1WHpSZGhVTFJ2K0NFRVhrWWQra2U4YmtQazFGdFc1OWQ4eWNCdkQ2SkE2ZDBQRGtsMkhxV3JZeFFWaWdVaW03RlBGbDFSU0xZY2ZyOEtQcHVXeDllOCtWSkhWaEoxaDE4Ujc5UktCU0s5VVFCWnIwVUNCTDdud3JnRzMxNnZZK0JpWHhPcEI2dDdwUHRQTkVxRkFwRk4yTVZRZUJtRWNaTi9JOHdKZW42RFZjalNDdWJTUEdKald6SmVvNlBKVGQwcDlDWkhNVUtoVUxoR3JKR2VBckdSZnlUUHJ6T3ZUQWxRTWNSRklIUHVqN0pSdDdDNHprOGpvdzI5aElnY1lWQ29laWtiTndPRStuTDNybXZ3dXlNZUdZZlhlZHhkSTFBa0lYTmVjeU03cE4xQXovaW9WQW9GTDBJV1FDRWpZaGJBRHdGWmx0TnIrTUVtREtldksweU1hTklBNThVQ29WQ0laRkZlSklkQURnVHdKZDYvUHBPZ2RtYm0wR1ExQ0l4bzBoSlZxRlFLQlFTSlFSRkFvYm9PUU5UZkIwQVhnamduM3Z3dW5iUk5kd3FMUFE1b1Zna3dvZEtzZ3FGUXFHd3dmblp1ZjVyR1NZRklydFYzMGhrMnl1NEJpWlQxWDB3U2Y4THFLMDIxSEpSZGlWWmhVS2hVTFJpelRLaEZvZ3JEaUp3cXo0WnhtM3NZVzIrMzI3REZJQ1hDcXQxaVpRRzNnbkNXNVVTNFVRbFdZVkNvVkNFZ2ZNb2pBRVlvTmRId0NUci94NjlId1h3SkFCL0RtQzJ5OXIvR1pqc1ZKOG5RcFhGVWJnTWFSVUpwN3hWa2xVb0ZBcEZQZHlQd0cyOEcwSEI5QXpNSHRvc1RPVHhjUURPQjNEUE9yZjNTekNGNUY5RGJRV0M2bWhabUhYbUFjdHFCeExLK0tRRkFoUUtoVUlSaFN5TXUzaUJpT3ZYekIyb2pjaTEzNTlGaFBzOEFKczYwTTVaQUo4RmNET0FIemJ4UDFtVXZlMEM3VXF5Q29WQ29VZ2FlZFN1Y1o0R1U2ejlyMkFLRDdnazFtdUpYRy92MXM1UWtsVW9GQXBGSi9Gd0dOZnlFd0NjREpQY1ludUV4WHMvZ0hzQi9KNnM2THRnMW9OM3cwRkJkU1ZaaFVLaFVQUWkyTTBNSWtPNVhTYXE1dmJSTU9YMER0Si85aUplMHY2VU9GZkpPcGVTckVLaFVDZzJERElJb253NUFLbU1ZSHNOSXNnNFErOHJDQ0tBRTl2YjZ2cUNGUXFGUXFGd0JhNW93d1FvaVZGdW8xbEVFTFVNbU1BampsaUdaZTJXTGN1MUtvNlpoVW1lc2RxTnBLc2txMUFvRkFxWEtMYjRQeG5sdTJJUlprYVFzRzMxZHAyTFdFbFdvVkFvRkVraFM1Wm5xMG4zbVd3OXNvcDlJdTc1RVA0cVc1OE5XZGF4a3F4Q29WQW8rZ3B4cmNxd0FLaXMrTCtQdFJIRXpGbmxFSUpGdHhHc2txeENvVkFvMWd0K0N3UmQ3cldMMUxTS0NvVkNvVkFveVNvVUNvVkNvU1NyVUNnVUNvVkNTVmFoVUNnVUNpVlpoVUtoVUNpVVpCVUtoVUtoVUNqSktoUUtoVUtoSkt0UUtCUUtoWktzUXFGUUtCUUtKVm1GUXFGUUtKUmtGUXFGUXFGUWtsVW9GQXFGUWlIeC93RnRoQXZGSTRicTJnQUFBQUJKUlU1RXJrSmdnZz09IjsgICAvKiBkYXJrIHdvcmRtYXJrIGZvciBsaWdodCBiZyAqLwpjb25zdCBMT0dPX0RBUksgPSJkYXRhOmltYWdlL3BuZztiYXNlNjQsaVZCT1J3MEtHZ29BQUFBTlNVaEVVZ0FBQWRrQUFBQjhDQVlBQUFBbDRjcnJBQUEwcTBsRVFWUjQydTE5ZVpoc1ZYWHZyK2JxOGZhZHVKY1pCQTB0Q3RLZ3FBU25nRUhScUhtRUFDSUlSaEZONkpqM3FYRkNJUEtNaVZNbk9FRUV3d014Z01ablFQTFU1MU5CUVlVMml0cU1GOFY3Z2N1ZCtuYmZIcXByT1BsanIrVlp0ZnVjcWxOVisxUlhWYS9mOS9WWDNkVlY1K3l6aC9WYmErMjExMHA0bmdlRlFxRlFLQlR1a2RRdVVDZ1VDb1ZDU1ZhaFVDZ1VDaVZaaFVLaFVDZ1VTcklLaFVLaFVDakpLaFFLaFVLaEpLdFFLQlFLaFVKSlZxRlFLQlFLSlZtRlFxRlFLSlJrRlFxRlFxRlFLTWtxRkFxRlFxRWtxMUFvRkFxRmtxeENvVkFvRkFvbFdZVkNvVkFvbEdRVkNvVkNvVkNTN1FBazZIbmtUNEorNUdkcWZaOS9NZ0RTTlQ1djkxczZwQzlsbXhEUW5rN3B0MFkvbjI3eE9na0g3V2gwYnZmVDYxQ0U3MmJxWEcrbHh6QWQwN1V5anE0NVlGMHZBU0RudUE4eUFlMVBOUERkZXMrYUU5Zk1OREIzWkwvbXhkL3JJdlp4SWtTR05Ob3Y5WjRyVGd6VStGOCtSTzdXNHlWYkh1ZFdnTCthNnJ0RWo5V1REVnBrWGhQWDhBSUdPQ1grTGtSWVlFeThGUUJMOU5ycHlOUFBqTlYvN1p3a0d3RHNkRFFYUEJKdXV3RnNBckM5d1dzTUFTZ0RtSzlENWtrQXBRYXZQVUxmMjlQa1BHVmh0bUROcmJYaW1zMG9KbkhQMHdFQWM0NUl0aGlqOFpFRnNPaWdqYVdRc1IybWUreXNJM3RzdVpJTEdQTW9mVDRJWUsrRFoycUhBbGtTL2VkRldGdHA2ZytQK3JEaVNIWnczNVVpeVB4VlE3TE5kaWdUYURtaXNHTnRqQWMvS3daV0VtcVFBRzZISUdOaUNWdndHZkc4bFloQ0p5UDZxVUtUemd2cG04VUcrei9odUUva0l1SDJaQUJzQlBBRUVWR0poSDNGZXM1VVNOOGs2Vm9Kc29yblFzaTMyZkdWd3FXZXNMWHZNVUR2elRaNXYxcnZOUVAyR3N3VEtSUmlYTHVlcFhEMFJTRHh0ZFMySlJydld1dWVGZVpGZXE3NWlBclV0S1VNSkVSZnBDMEZnUld1T2ZyL01MVm5pWDY4T2haamdaNGhSZGZPMGpqT3I3QnNsZk5KemducEVTalNaMHAxRktnQjhmNWdFd3B6cThiSFlzUzF1ZXBJTnNoVlhBa2cxNVQxdnlSTjJxREZsNlNGekpPN0ZESzVVdlFqTGRta2RaOTJ1VGlXNmt5TUhMV1ZKOUF3ZldleHprTE4wSUtlYjlIYVpmZmRmQXlMZ3EyR21UcnpKQzBXL1VDTnNZMUtXUFZJS0V0dHFrUWtacW5vek5kNDdqVVJCVkF5UUlsd09TOXRRWm1oOXMwNnVIYXJ5a0F0UVpsQVBKNGJWdExtcmI2MkxmdXd1U3BsMldBRC9UaEU0N0FvMW5xaERYS24wZmtrM2NaU1RubzFQRDBEdEk3Mnd0OGVqTXU3MGJUblpEV1NyQ2ZjQ2piSjhzQ1d4U1NwQ0MwMFR3S3lMQVF5YTVIU3FoMFI5MXVnaGRWT04wMHRsNnVMUlJaMC9YeUFSbHB2MHRxdW9IeUlRbUJ2QTlUN2Y4VmFGTkt5R0tMeFRsSS96RFVnTk5iVHduNUt0TE5WS3p3bkZEWTBZQzFKTjFtbHliWGhpYkdRbG51OVBkOUtuZkh3aEJkSEtxb3VDU3hwdFVkYWllV1E3M2doODFDNmROTjFoUFVRZ0gxMTJ1YlJYUGFFVEpnTm1iT2V1TzRTUFFON3loWWpycU9rdGFadDRrNEtpNzNkMjFiMk9oK2d2OHROeUtFaFdzdS9hMER1QnlFVk1JODk2L2MwS1R5N20xaVhQVUd5aVRvTHA5WjN2SUQzVWdHZlplR1FwUVdjSmdzMkk0aVdGMFdSUHBzS0lPNGxRYlNsRmVpcmZtcTcxSTRQb3dtN0g0RE45THFHRm5lRzJzc0NjZzdBRGdCYllWeXR1d0Zzbyt1c296N1pGcU5GNU1xYVBRekFid0w2WmpPQVF3QWNRYi8zVVg4VkFEd040REVBdjZWbm5JNUFGa01SckF4YjBka0kzK1c3SDREbjBHZjZoT3R2aG43bUFVd0IyR0lSd2JCd3gwV1paM0tjR25YeDE0TXQ1T1hmcm9pV3IrbHFqemRzRG5uV1dMVnFSWWYxdFcwcDVXbk9iaWFsZGdPTk1jL05KNGxzdHRGcnNVV2xOMDVQV2hpWkhrelBlQ0ROK3o2aHhNL1FlbjJVMXVHMHBkZ1AwenJ6VUwzbDVIS3ZmaFBkMjF1TkpKc1JtbG5ZZmtvakQyWkh1UFVKMGh5aHpsNHZyQTdlQ0dlWGFzSFNubGx6cklqUExORFBrbWkzdEt6YlFiYm5BVGdMd0V0YnZOWWtnQzhCdUxwSnF6Z1pZRFdWYUxFZEt5eUZScU1IK1pvekFQNkxCTlFzQ1dHNTJEOEE0SVVBVHNIeWFNZGErQmFBMndCY1pZMVpGSmQ4a0xBOUFNQUxBRndBNEpWTjlPTTNBRndQNEdzdHppRXArSThoaGFzUlM4Rys5MllBM3dNd0J1RC9XdGFNSzVMbE5yK1czSVc4WlRFSFlIK3JYUlhybmtWU1hoWm9UcXdqNWVnaEFBOWFhMmFlN25VU3phczVJb1JhV0UrSzZSNGlESjdQZ3dEK3YwVVVCVEV2RHdkd0tvRDMwTytOelArZkEvZ0VnUDl0dlQ5TTE5blhSc0lOQ3NoajBqb0F3S2RJcVQyb0NibnpId0F1dy9MOWVGYTBYaEpnTk5YeWF2RGNxSWozQ3dEdXM1UUVKdStHUFlIZFNySjVpMlFsMGNvT0xvZTR5THdBZ2sxWkpGQ21SZkhNMGZISkZ3QTRtZ2lYc1NCKzVnUjV5b0NGaGFtSnNSa0F1NFEyTml2SUYrSTdMZ2RDa3RnRkFENEk0Qmt4amNYREFDNEhjR09UcmtxcEliNGZ3SlVPMnZRQWdGRjY1aTMwM29Fa2dGN3U2TG0vQXVBakFIN1Z3TE15L2dUQUZhUlF1RUFad0hVa3ZIN2RwQUxHWTNBZWdIOTFPRC8rRU1DOWNMOFB5RzNlQmY5NFRLdjRvSmgvMG1JOUJjQzNIZDNqOEFDUHloazBkZ2M1dXNmZEFDNmhmcmU5SzNGYS9tRTRIc0E3QUZ6bzhKcVBBaGdIY0x0NDc0OEFmTWZCdFc4RWNHN0EybWdLM1VxeVBHbDR3aVJJKzU0bUl0eG5XVFpKUWFSSitNRUhLZUZha0hzYkhJZ3pBT0NnMGZISlB5Zk5hejFwaG1WQnBDVkI5R3lWWmVrNnMvQ0RoM1pPVFl6OUFzQXZZQUpUOWduM1JzV1JpNE8xckdlVHNId1h0YVVkbUFId1VRQmZJQTErTTdsM29rU3dzbEx3V1FBWE8yakxWbkpGQVNhUzlGWUFyNGpwdWE4RDhKY0JDNUdmVXo3dk93RDhOWUJueHRTV0JWSWtQa2lXbEwxT29ucDB5ZzdiOUM4QUxrSThXd2lua25mQkZRNkUyUkt4Y1J4WlVTNHdTa29nVzEwZkIvRDhtT2JEUDVJaU9GTkQ0ZVAxMTRmR3lWZk9iWlk5OGg3SFVCdGVHYVBjdVFuQURRQytTZjM0RXdmWHZBUEFxK3NveWcxWlBOMklmY0xGeUNZK3Z6Y0hQMUkyYWJrSFBGUzdhVXRpc21TRmtDbWlPZ0FxUzVOd2dEU2JBUkxlNjhYckJ0S29OOExmNnp5RXROTkRBUnd4T2o1NTdPajQ1SEh3OTBrNTZVVXlZRnlTSWVPVkRuSFBnQ2I1ZThtNmVtOGJDWmJkVWg4bDRmNW1tT0NnRXZVUFkyT2JYRmJzSmJnVVpnLzVGVEhlNndKeU01NHNoSTBNdmlrQmVCNkFtd0Y4SmthQ0JjM1J0NUhYNUxWRXNKdG9UYVFSbmpSRnJwRUtqYU1ybkVYWDVQbnVBcndHM3Vtd25kZUhFS3hyL0libXlOVUF2aDhqd1FMQXUySDJhNCtpditVMndHWlVSL0hPaWZrYjFTS1g4bE1lUFJxQzJWTDVlY3dFQ3dCbmt6WDdmcGhZaG81RHQ1S3NqTnBqc0pVNkdLQTFNMkZ5TkhBYTFTNWFQak81YUwzSGtadEpNWms0SUdXUXlISU4vS2kzdGZUYVR4TnVIYjAzUkNSOEtFMzRZZmdCTm14bDIrMnQxQkNDU2N0Nm5RUHd4L1QvdjEvaHNVbVJkZmNUQUVlU1Zjc0t6dzc0QVRweFlqMkFyOE80c2R1QkF3SDhnQ3cyM3AvbkNOczNBTGdUd0orMWVSeStRVmJ6ZGlKNURvS0owdjlYTzJ6SElJeTd0UVIzQVNrczNGL25zSjN2YWRPNG5BdmowbjlyRzVYZktmS2lUSk5DUGt4S2NJWGtFb1EzTDZwYi96SDRaMStsTitzU0dGZnVPOXM4MzY4RWNLMlNyRnVrTFNKSzBZSk9FOUd0b3dtMEgxbFFtK2gxQTVGZVhwRGZXcHBnTXYyYjdXcm1zNlFwK0ZHZmZhZysydE5QMSt5ajF3SHhtUnhON3ZYMCtSejhBSzZvS2Z2WWJkRW5DRFpCeFBxZkhUWSt6d2Z3WXdDdkY4cEJCclhQcTdyQ0dzY0NPQ28rRCtCRFFsSDdDRXhRMHVBS2pjR25BSHdYSmdnTU5DZW5JMXBiRHpsc3h6L0VJSE5lNXJCOVQ1TXlrZ254RkxtVWs5Y2d2dmlJV3ZnTXpIYk1uTFVHZDR2bmEzU2JZQjcrRVNqUTNKOGdPYXV3M0M3ZGlBVDhqREpEOURvSTR5ck1XUk9IejdIeVh1bzhrUnNuQlZpRUgweVZvMFdYaGI4M200Vy9oeXR6YURMcDJ0bFdFdlJxUnhCTGNtV1hjQ1hrMlZMaVBtVlVaNmFabzJ2c0R4TnQ5NXdPSGFOMUFQNGRKc2puY3NSM1VMeVRjQVhNMWtVT3dQczZvRDB2aHdsa09oL0dmVHdTa1dndkJIQ1hvelljQi9lSldDNTEyRWZuMEd1dno4K0xhZXpmRCtCRVVvSXI4UGZ1VXhISFIwYWo4N2hPa0JXcjZDR1NaWUo3enVqNDVKRkVPaHRRblJpQ1NYVmhhbUtNajlFc2tTYkhaMEtYYUlJdHdCd0ZtQlhrMnllczBYNUIzamFCTXpHbVVSM0I3S0hhSFd3bnV2REVlMEdXckNlSTFaNzhSOEFFVVdXNllLd3VoVGtQZHo3Y244bnNSSHl5dzlwekhpbGp0MFVrMkR5QUh6cHV3MnRnWE5ndU1BUjNVZUs3QVB3LzFBNE9TL1RRM0h3ZnpObmF6d2laTlFzLzAxU1VjNlpTWGhVQS9ETk04SitpUjBnMlNRc2lEeUE1T2o1NUFreUlPR0NDakRocEJCUGhJb0Q1MGZGSlRnakJRVEU4bWZZSUluNklpR3NmL1o5ZHZreXdUTDRjV1N5SlQ2YkhTOEJQVkRFdlBsc08rRjVRRnBaNlNiRmZqZXJROVc3QWVUQkhDejZ2eTI1RmNBc1IwL2NpZkhaSldDZmpqdTcvTmlMWmxvOUV3SnhaZFlYTEJWbllKdzU2RlZjUnlYcmsyZGhCTW5NRzBRSVRpL0N6dm4xQ0NiWStZYmxBT3pXOWlpQy9JU0xXQTJGY3hYM0NRdVc5MGpVdys3TDcwMmNQQWZBc21GRDZVWml6aW44STRMVFI4Y25uMDJkNEQxVUdPbVVEckZJWm9NUm5hNHRZWGo2TXJlRVUvTVBPSlZTZnJaVUVtdzNwMDJHYTNMZDM0Vnk3QXlhQmhXTGw4R1dZcU5Jb2F5d0pFempsQ3FmREJHQzV5RTk5cnNOMmZaMWVPZEN4dUVybUFrZFNjekRpZHBLTlVZNnFNTUYrQU1EZjZMS0tsMlFUZ3RBeURaQnVzc2w3OFgybWFUSHNUd1NhaHdrbTJFVEVPd3cvNHBkVGttMkdPVHQ1SUJIdkFNeWU0UkV3Z1U4cG1Hd2tPYkhnK0V6dEFGbkVjdi9WM3JObFYzR1pYRkFsY3NOazZQcGxRYXI3NEVmeDJaYXNCejlOSTFDZGtXaUJGa1czNFVheXZoZER2Q2RlRjN0V3VnbjdXMWFIdmRXUURsaS90emk4LzRuVzllWDlvMlRlV2t0ci9JMk8ybk03L0R5NHRlNWY3dEc1Y0FIOXpvRlFqd2Vzd1hTQXpONUo4dllqUGJwT0tpNk5TQmVXck16WGF3dk5KQzJNZm1GWjh1TEswLy80Zk9rQWxpZjA3NmZQSllVRldCVFdId2N2c1ZYYkR6Ky9jRnBZdGt5Ni9NTjdySktRcGFLUUlwSk1qNDVQcm9OZjRxd29YRW9wcXcva1BpMWJxUnpBSk92Ukx0QjErRGxxTGVBUklpYSs5cjFkT0dGdkVaWkhEaXVmUzNXMTQwS1lNNDRJR0FzV0xuM3dqM2U0RERCNnZTVWZpbUxOMmJJb0gvRDNIZ0JuT216UDVjSkR0SWg0aXN0M01pNnovaDRLbUJNbE1UZldpckc2VlpkU2UwaldDeUVLWGpqc3doMFMxdVFtUWJpRFJDVHI2ZjFOZ25BNXdRTW5kOWdBZnkrV0xVYys0QzZqNHFMa3JaUnBGRG1vU0FZaFpjWGsyZy8rVVpreXFzc3hwYkQ4Q0k2OEppZTNLSW52UkhHWDhiUE1pYit2Z3NtZzBtMFdyQlNLQlZTbnBsU3NqQVh6Vm92czdIbTNRSzk3WWJJVFBlRG8zcWZCQk1CSjJjUEgzeFpEaERzRThRUEFYemxxeXhZQVB4WEtIN0M4R0VDdjR4Q1k4L1dJNkVsaW1mbTNNQkhqaWpaWnN1VUFvbDFENU5kSDVIZ2tnT05IeHlkUGhzbU04d3dZTiszQjhQZFVONU1BMkV6RXVwNUltRWsxSndZNWplVkhhbVRCN1VhZUs0SHFZejRsK0VYWXk2ZytyRjJ1TVJGVG9nMThUVm0wblltOWtYcWFKYUdndkxQTDV0YjFNTUZPQ2ZnWnFZQm8wYTJLZUhGUmdFSnNLNG45OFBjblhRYTJuR2xacXB4Mk5LaGdoTVFlV2d1dU1tYXh5M2tqekJaTS95cWRDNThRODJCUHlIemc5YnVUNVBPVnVvU2lvOVU5TUNZM1BxcFNFYVNTQWJBZkJSUDlBUkhxNE9qNDVLeFlVRnpIY2dGbW4zSUdmbVVNdGhobkFleWJtaGpiQTcrMEU3dURPVGdwSmF6UlJFU0xOb25xMUl1OFoxcUVINkRFTHVzRmVrMGlPREFnVllONE9kS1lMWVVvSk1PUnoydGhEb3Yvbnk2YlYzZkRITmNCakd2eU1mcTlYdkYwUlh1d2pzanFZWVFIdWtpUHkvZGg0Z3pXTzdqM1cyQ1NVL0QxaXdFS0x4L3prdWtwUGJqTnluU1BJRmlKMVhERVRJSUxuN0RYTEl2bHdWOXNYSlFBZkV5WFQzdEpWaTRPdVZpWFNPdjhBd0F2cHRkMU5GaFBDMkxraUYwK0VzUEZ6YlB3STJ3WEFTeU1qazgrQ2VDK3FZbXhCQzE0L3I2MFhsT0lmcUFhcUU0R1lSK3hZY3MwVCswYVF1MkMwUEt3UFFkSWNSWXBEbVJLVGsyTVJiRmtpNlE5N29ZcHlmYnlOcytMTXFLNTNZUHdBRXdwUFZZVUhoUC9pM29PTDA3c29aOTUrQVVsVmpxWngxT2tUTTZRMEg4MmVZSGl6Snp6S2lMWlVvMDF3VXBsQ1NiUnU0dVVuYytDQ1RCOElrQnVjQ3hFTXNTYWZadWpaMzgzemNNZFFxbWRGMlMrVW5pYTVzRWtlYS9XdzYvM0hDZitoRHhQT1VHMmNoN0l4QlBudGFFZk9GL0JMakp3K3VBSHVYWWRYT3pKU3FLRjBJWTJqSTVQSGdiajk1ZUpxZms0ak55VDNVU2RlQWlNSzdsUEVQRUFmWCtFM2kraE9wZ29JeXpHZXVSYXJ2RytQRkxEQkprVkM3QlBDQUVJUWsrRjlHTkZXTW9GMFVlTlZycTRJZVk1c0JWbWorV1pNRzc3RndJNEFTYkg4akV3T1hldkpjS3ZoMS9SZDRxVzFUTVFZUXppeHUwa1RKNEZzMVh4WEppdGkrZlNHQjVLL2RBdXpCRnh2WlNVMEdkUnY3K0tyUDhEWUtxMDNCYlQvZVZlZVM1QVdXWWhPMFIvMytUdzN1KzE3Z3ZoQWJPdGFHbHh1UkN5RlpqS041TEFwWHhxOTU3c0RDa3ZmSHp3U0JxYlY4QWNMOXdFVTNQNG1oamJjRGE5amxneTNNWjRqRzJvQVBndzljRUlqT2Z6ZVFCZVJLOGNyek1LYzM1N2FiV1FiSmpRWkRmckNQekkzQlFKM2lPcEF6ZkR6eU9jRTFaMWhUNXpFUHdnS0Q1bnlsWnlDa0JtZEh5U2c1OFNndkRTRWF5d2xDVlVaRTFhR2Z6RVAyVngzY1dJL1ZteDdzSHU3RUpFb3BtRHljOTZSRXhqL3kwaXhJUEpCZlFJV1JjL2hzbDEreUNBKzJHaUNOOENFN0JTcTlib2Q2aTlSYkxBbmhLQ2xNc1I1aEZQeWJOYVdJQUo5SGtOVE5ham5mUytQQzg2REhOODRXTXdoY1lmamJsTlA0VTUwdlFlbU1JQ0pVc2hxZEI3ZDhKVTAzbFhERzA0S1VDZ3lxSVpGVUVDNjZoL3RqaTY5eVUxMWdzQ0JENWdncVpjNEE3TFFPQXpud20wUDVmN1E2UlV2US9tNUVBcDROa3pORi9lQmxQYWIwc003VGhSckJWWVhnVFpMMitLcVIvK2llVHJGUUNldFA3SHh5VFpDL1VBelBudEU5QWwyMmd1enNrR1diVmNXM0FOL0lDQ0lmaDdMbXlCY25Td1RMQS9ERCszOEFqOGd1aWMvb3Z6QXU4ajY0T0RsZm9GQVFQVmdVaEppM2paNnMyUmhWYW10bTZESDJEbGliWVAwejFtRUMyTm9VZFdPcDk1SGFEdjc2Wis0R001WEV0V0VyTHMwdy9GTk82bndFUVYzazkvNXkwaEgxUVphQmFtVnVtYnlkMG1jUStSQmhQWWpnREx3S3Vob0NSaWROWDlNVXhOVTN1dVB5VitueGEvLzR5cytMZ0tMdHhEbHNrUHhIdnpsbklGc1dZQTROTms4YnJHWVdKczdTTXpzbHJQYnBvWEwzUjQ3K2VIV0t3SlFlNVNucmpLQTMyVjlmZE9NZmZhcVFEZVJvck9qK2p2ZFNIenNXZ3Bza2ZBWGJRM2c4OGZ6MWdreTk3R0NvMTlIQkhGKzVPRkhKUVhnSjgvYUh2cGZwaWMweGVpdzlFS3lTWXM0VmkyU0NZb21YNjVobFZwRXlQdnVmSzVWMjlxWXF3Z0JvUEpWbjVlL2tRRkw2NGkvQ1FVZk84Y2ZKZHhNb0FFZzF3ZTBzSXZXMVp5Q2JYUGlVcEw0aWk0cjRQNkVDa1RQdzI0cnhUeWxUcUU5M0ZhSEV5b0w0Si9ocmlUOEZLeUJuTU5DdEFTekZFUjEwRmFXd0Q4UlFQS0srL2Y5eE1wbit1NFBia2FIcWw5QVo2VkhRQis2ZWplYjdCa1VMcUdvalVLTjBGWDMwRm5WS3Q2R3NEYmllQVBGSXFNaDJpSkQxNEdzelhqbXV4Z2pjV2ltSU5ueDlBUDdQSHFGL2VOY3NSeEdINnN6SFV3Tll0N2ptUnRzckZUQXliZ2wzanp4R2RLOE4ybEZVRnU5akVnM21OTmlkOExOT2djbUNRdDRTQmlyVVcwR1lzWUt4WVpBa0NLM05FY2dNVTFhSk1CSkdvTDhMTFF3dmk1aS9BRHZMd1FGNW1FNi9xald3R2NRY1F4WS9WREFkR3ptaVJnM1BsUFVkOGNJalRRL1R0b2JpOEphMUdTU1Q3aTl4L0I4c1A2cmVMbWlNTFJKaG9XUERjNmJzOWdnSHZRVmhnekZ2RlBPTHIzMnkyTHVXVE5RVmszK1F4SDk3eXVRK2JtR2VRMUE3M0tBTlMrQ04vZkRwT1UzeVVPdE9hQ0xROWNsK2U3bUpRTXptVTloT2lKYW1Zc3I5alh5QVBWYzVac21GQmdhNVFUUnlTc1JScGs1ZGxrazBiMU1SMk9RRjYwN2lPaml5VUJOaG9abXhBRUtJbGUxbnUxeWJqZTlaaXdpOExTTDlHRWlrSm9KenNlNnplUmkrVzVBZU5oOTErOXNYNkVpTFpJWThJWmM3YWgrbHp4U29MUFFRNVpGbW1Vd0JZbTVTODRidE9kVFdqNnNNam9YeDIySjFPRDJHMWxsWW5BVlNEV1dwaUFsdWthbitGQ0g2NENicjZKbFUvZFdhRjVzQkhWWjRMN0xZV3FGdEl3KzVFdWEvN21BKzRoM3ovWTRiMG1ZUXFGSEJrZ2g0WWlYaU10NWxFV3dCLzFHc2w2MW8rOUtOTXdic2xoUVZTOC95anJ1Z2FsRjJUeWxJSWdKVDdQOTJkM2JscFkxbEhKVlVZRUoxRmRiOVl1WHdlaENIaldZZ2tpMjdKRnFoRGZaVXM4eUN0Z3A1UTgwZUU0M3dxLytzcjk4STltRkFNRVFOVFNlWThJd2I4UC92N2V6ZzZaMjdmU2M3Szdhd01Kc2lqN3ZnVlNFdWZoYnA5dUJ3bjVLT2dYMytINXdJckN0OXU4L2hlRlZ3Ymt3Zml3by91L1hqeGZMa0RnenNFRVBMa29lbjhwRWZwS3AvVzhnWWhyQjdWbG5TRFhxRjZXRW8zRDl4MTdmaVNLWXZ3UGc0bDBkZ1hPbWZ4Ykd1UER4RHFObXF5SEZlRTlkSTA5V0w0TjF2V1dyQmNpc0RJd3J0WkJFaFpNbW1rc0w5eGN0bDZsQlprVlJBcEJXakxUVThheVp2bVpvbGkwa2pUNVdTcW9yZ01yQTRCa2licWd2ZGVLUmM2ZVpmbktqRkpKeTNxd1NmWUlWQWVldElxL3RsdytkakdIWk1EaWlqSnZaSktOM3dqdnhVcmpTV3Vja2syUVAxc1V2M1BVcGtjYldITzJ3RDFNL080eWYzV3pDc1JYSGQzL0VyRU9wRWRMcmdWWHJ1S3ZkSWpNL2JwRmFMT28zZ050Qkw5MDJLNWlIYStESyt5Q1h3ZGJLbTVCM3JWYW1FTzFselNEZUtMd1Y1UmtneUFUNHZQUm03VDRTZFc1WjBxUUFCT2NMSVJlaEI4WnpDUXJBNnRTRFFnWGFXa21MRExrNThnSkRkdE8zVmpyekswZDhDU3Q0YVVBVWsxYS9lTHkwUFVXK1BzL25ENnVVSU5rby9iZkNBbUZITXlaVHA3NG5YQitiVGVSVk5xYVYvTVJMZlVoTVc3emp0ckU4eVdxVlRZb0ZFeDVyT0ZoaC8zazFaQUZtUnJ5NGlGSEZ2VmFtQko0RUd0eDJHcVhpNElBUDRSSml0SUpnWGtQMGZyWktNZ3RoK3F6NVBYQUN2aUREdHNWTk42ODlkUG44RDRUNHJtNVZ2Y2lyZGVvcHd0R3JQbnIwZmQvdUJwSVZsN1QzaStWLzgvVUlDdTVCOHIxV1RsUlJGS1FkVXFRTVY5SHVwU1RBYVFxQlc3RnNtaHRhMXIrWkFXaEp3TGF6QUZjN1BxV2JiTnJ4VlpDTEhoYldYR0ZjeXl0ZVQ2ZzdjMjQwS2FKakFvdzUyczN0V2dkdWNRZ0xkeVN0YUNqV3VyU1plVnFENC9iRWlWaU9VK1dkd0hMaytmSDFiK3BFS1ZBQ3VDSzZNTlBPN3J2cWZTOCtZRCsrUjhOa2s4WUxvWi9jbUNsc1NBVVhtbVZ6U0Y2QlNEdW82ME8yNVVOa09HOERnNTNlSitiNmJXZm5wbExpV1libEQzRGxweWNSWWZDQmNuS1BVVk9hY2huWEJlSStISkN1UE94bUN6Q0k0TFo2bnVLQk15Q2NDbmtoVVZaRUpvV0MzdFB0RUc2UW9vVzJmRWVNWmZQMnpzMU1iWkRDSmRwSWc3ZS95MExLNzBzTExhVStKdGR5bnpXdHAvNlpaWitmMFRjdnlRSXZtUUpOWmRSdXJ0RnY3c21jRG14dDNmUXZFNkV1SmRhdlVZcmFNUWFrS1E2SDZOaW5MRFdDRUxJdkJpZ0JIelRFV21OMC9NdXdqOUx6N2pBd2ZYdkl1dS9VMm9WMTdMV0dzMDJsWXBwTHZDNHNvemJITU02U0ZtS1I2UEg1V2Jnbnp5UjJOZXJscXgwZnlZRExMaHl3SDJUSWYrWGxtbVJKbDdCc3JhWXhOZkJ6dzFjaE8rT2xkY0txaElrTXozWlI0d3FxRTZYS1BkLzB3RldMN0E4U2xwbW4wcGJWclpuM1ROb2tydU1sSnUxRm93SGhjS05WWDY1byt1ZEpwUUxtWW5wZEFmWC9vcmwxVkEwVHVJdXQ0RG1MSXNlYUM2T0kwTmphc3V6aHp1dEUrUGFvN0JKTjZvbVoydFN0aXVZRjBwNWRIeHlEWkVzVzdUczFnMkwrZzI2aDJkZHY0enE1Qll5SHpLN3VFdE45SzhNZkpJMWFTc2huM2VaM1dkYXlWVVJFOGxlNGVoNi95dkFZbjZSSTRGK25RNVgwNGpEK3ArMjVoRFFYRDd6RWF1ZHlVNlZjNjVKVmdZdVpWcTRGMGYzSml3cmt3bHFDY2FQUDBUdkZlanoyUkFyMFc1alVsaWtDYkhBK1JBMjV5NU9pK3MxVXVGSFJnMy92cUxJMU1RWVc4NkprTEhneng3aWFEektTcTQ5aDA0YlR4ZFJ1OGRaQ2pyZ3B1TE9GMUh0YmsvbzlHa0loUmdzMldMQVdEUlRsR0V1eEdBNnR0TTYwZFdlYkRLQXlHcFpzMUVFU1FYVkJkQmw0RUxaSXBJbGkrU2p0Sm52d2IvenZoQzdtRlBreHVBOTEzVEljMGE1bDZ6eXc0RkdRWHRnZG1rcEYwclBRQnM4RjRyVkJ5NENjb21qNjUwaDF2NUdtSUlPcmVKelF1bHZSRDRvcWhXNlhRNnZlYVJsU0RXTGVmaHhKaFhMR09wWlMxYnVZL0wrcFl6UURYT1JJb1JzcEdVbmo4UFl5ZXM5Vk8rOTJ0ZEN3UCtTWW1Ec3dDVXVEdEJIbG5MV3NucVRJYzhkTmtGNUQ3YkszUjFpa1hCNzczSTRMaHM3MkFwU2RDLzZZUGJWZHNCazhHa1Y3eEMvSCsvZ2V2ZkJUNlRQODE3M1phTXJVQkl1RTh5Y2I4bWpSQXVlQnB0TGNwM1ltYTVKbGlPTXN5SEVZNTlwVFVYc1NMWUMyZnBiSTdUVHJIaU9JdXFuUFN4YjVNY1c3YUt3YkJORXNDUHdOK1c5T2lTVlFuQkFsNTJRZ3QwalhnZ3BBOEF0RHNkbGs1SnNUMW9YSzQwRjBaYjNPN2pleTJGcXhnSnVrZ3A4V01pY0V0UlYzQXpKc2l4NzNPRzEveEwra1NEUElzWkc1bllheTQ5cm50dUpuWmwwZEEyN2trNmo3aG43Y3lWQmVOSzY1VUVZZ3UrKzVlTkFUTVl5K2I2ZGlVbG1aS3BZMStZSVpUN2VrNlA3NUJHZVl6a3FPTk9UVExsWVMzait3dUVZcjFPWm9YQU1MdnpCNlI5L0JEZEhKOFpvYmI3U3diVnVwM1hzQ2N0YjBaaUZ5SDMzbU9Qcmp6bmdvS0JjeW0vc1ZaS1Y3bDIyWmhkaHNoYkpURThGMU0vNEpCZHhBYjRMdDI5cVltd2EvdG5iT1NLUEJTTEdRVlNmUzQyQ0lmbytrOStzZUo1OW8rT1RuUFZuQnozTEVpM1VxT2N0dWZUYkxOM3JhZmkxYXozUi8zRnIyUDlHL1pZTzBGWVRJVnBzTGtSenRGMDdRMVovZGdyS0RxNlJkbmd0VzhGcnhKcXdmODkwUVA5eW9Bb1h1NWdGOEFFSDEzMGxnTDl4Y0oyTHhCb2NFRzN0RlU5RW9nMXpRV2JlU2dQNGQ0Zlh2Z1orTmlrcGEvb2pmbjlBRVA4UXllelR5UnZTa3lRYlpKVm1hMHlxUnF6QnN2aU9qQnJPQ2ZLVzJhT1NEUXBGdGxDTHFDNFFrQkNXY2lxQ1ZaNnFzUmlTcUs1WGE5ZmRqZHY5bDRWeHc1V3d2T3FLRnlJRUNtSUJaSVExenA5ZlM3L0xaQlFMWW5FcWVoc2o5SG9BL0ppSS8zQnczWFBncGpqN0xRRUtnYUk1UllxVmxTY2NYbnN0Z0N0cDN1d1JDdTA4cWdNMUV6Q2VSRnVabUJPeWFaYXVjM0duZG1SY1IzaGtvWE1YOStCYXJESTFvc3dwWEJIa0dJVzA1QkViVDF5N0pEUkVTZUNwa0Q2ejNlUXBTOU1NS2c1UVFlMEMxUUF3QlJPNDRRcWZGZjNJZWFWcm5ZR1RkV2FMMXZ2RHREQUFVNFB5bVlLRUFmZUZ6aFdkaDcyV0Vwd255K0o2Qi9LbzFlTHNWNHY1bVVabnBGTHNkcElGM0JZakFNd1JyWGNMMlhHd0lGQXBweGN0R2NUZVA1Wk5DUUEzd1UzaWtvNGsyVVFBQ2FYZzE0RXNXNFFXeFdxMTNhbDI0QkFUcTEwT3o3T0lvOVllcXR4emtNZHJnbXJKMnRIUlVmb3daVTBJZWYwb1NrQUp3SGNkanZNeDhJdGtsMmdpbDJvUWJORWE0NHdnNlJuNEx1VnQ4RE9zYkZLNXRHckFjM2k3c0VBQTRHTWQwTGJQMCtzQXpWRWwyZFpsUEFEOFp3elgvbnZ5Z0t5RlgrMXFjeDJ1a1B2cy9URHBQYy9zNUE1MG5RYzFCUUNqNDVONTBSa3lUTHNSOTJoQ2tFSlJXSUpNWWpLZk1GODdnOXFKem9Nc1dmc01LeXh5VFlZUWROUitaU0l2Q09LUHNpKzN4ZkZZZnc0bUdYdFFXMnZsc0pYdkplQUhVaFZJZXp4RENOd0JhQlRuYWdIdm42MFR3dS9YTVZnOGplQUdBRDhURmxGUS9FUk9oeTRTY2tKKzVXRktXWDQ4aHZ1OEJzYlRkaHpKanFkUVA3L3pXZ0IvUWZQdHRFN3Z5RGoyWkJNa2JGTm9QaUpYUmdaTFM3WmlrYXlkRlNyUjRQVi9UOFJURTJOOGpyVU0vNXl2akc3Mm1uaUdoRVcwU3czMCtUMHhhT0hYb3JvcWoxeFFzdStHQWhRUy9uMkdYazhDY0J2TS90ZGxRckRwTWFIVkFkNkQzMDJFVzdZc3laWEFsK29vN0N5a0ZkSGtGNE1qczc4WDA3M09namxyZlN1QUZ3TjROc3hXMURETnJXSDYrM2dpMVMvQ0JFOGQyZzBkNllwa2JaZXFKS2xtTE1FZ3k3TnN1UW42NGUvOWNtRUFtZjNKdm1jbGdEaGtzZ3NQeTZOK1paR0FXbjJXUk8zZ0o2QTZhMVVVSXZvdkFQL3NlTHdQQW5BaldhQUhpTDdoeE95Y1NHVFdhcjhNUENqQjdIdkpoQmtmaG9saUJqcWphTHNpWHRqYk5VV3h2cTVHZGZMM2R1RW5ZazRPaUhVcGF3T3JseVU2cEVkcmxoVHhuOEd2aGhZSC9oU21KdXl2WU1yNDdZUi9LbU1yZ0hzQjNBSGdEZDNVa2EyU0xKZHBrL3VaV2ZpQk5VR1J1VEpwZzAxT01sR0V6TmJFbFhoNEU1eHJ1ODdSQU95Qk9Xb3pUUk9DNjZiT2llL3d6eEw4b3p0RlZKL0JaUXM1amVEdytFcUlvaURKT0NXc2FpWnZkbmRIVlRSWVNOd1owN2pmUmdMcGphaU9CcTVndWJ1WTIzOGdnRS9TT0x3MTRKcG53bFJsV1ZUNTFQUHdhZ2prSXR3VkRtZ0VOd2tyZFU3TVo2a3dydFdoYXdoRFFySHVnNGt3L3FzMjNqOEQzeXZhdFhCUlpVR1NDUWM5Y2FUWUd2aUZ2WlB3MHhibUxjRnU1eUxPQzJMS2tHWlRJUkxOd0J4OEx4T1Jib2VmQVdvWENma2xRWll5RTVWZHhQdFJtTFNEQlNMcHcwaHpLc0djaloybVY3WkFaeEJlWkY0K3l5TDhDRGgrZHE0cHV6dENuN0tRK0NwTTFPYmhNWXo5NFRCN1dHVzZ6L2VwUDJhcEwwYko4dDBBVXhYb0ZSR3VlU24xNGZrSWovVE9oQkM1V2hyZGhWcHUxK3NBZkxUTjdiazV3bWQyNjdBMXhBVlNRWm1tMTF0SlBtelVMb3VYWktVQVRRcWk1UnFxN01ybDZHQitsY2R0Z2l4WWZ0OCtGOHYxSUF2MHY2MWs1V1hnVitSWkJ4UGh5aW5VT1BpcXo3Sk9wVXViTTBVVmhJdUxpd0Zrc1R4SGNoZ0oySmE2Zko1eWdMWmZEd09DYUY4TmM2UW5McVRJQ25VVm9YY2U5ZDNaOVBkbXk4V2srV043SDl0aDl1ci9ySTFXN05QYTdXM0RxMkJjdDRvWVNWWmFoV1ZVNzE5bUJTbkpCQThwOFR0YmQweHU3TEpOVzRRbUs5Wnd5c05GQUk5T1RZenRFa1JlSkl2NVFQby9FMnRXUkRyTHd1czVBUHVUZGpZQzRCRVkveitIL0V2M2J3TFZoZHVqa0FRckhrVkJzSTJReTRJWW53ZGd3dWRQNjZKNWRSWXBQMjhtZ3MzRGR5TnJZTlRxd0tWdEpOa3JWSGxySys2RFNWdDV1blpGZkNSckJ4RjVncFF5cUE2Q1lzdVNhN2hXaE1CZHd2S2dKS0M2Q2s5NWFtSk1aaHNxRVRGdUoxSWNKRGZRZGlKS1RtT1lBcENlbWhoamdwUTVsV2RoM0tBbG1NUHZlMkgyZFlmaDc4dG14RThhd1VkdmFpWGJrTmE3TnpVeE5nKy9LSHdqL1RzQXMzZTZxOHZtbHJSb0Y2a1BWUkN1SGp3QTRFbFNadVBFM2ZDcjdTamFnd3pNMGIwSDRhNzJ0WkpzQ0lIWWYwdHJrUWxSSHJWaFFic2svaSt2WVFjT3BWQWRxTVRmNFFvZ0JiS1NLc0lDTEFock80Z1UyZnJlRGQvVnpFRlUvQm5PdVN5VGJXVEUzMUVqcERrZ3JJTEdDaDluVUgwMmVBNG1POG8vZHRuOE9vdjY4VXg2RGlYYTFRSGU3cmdNd0JkaXZ0ZEh0THZiRHZZc3ZoNXV5aHoyTkZ3YzRXRXJrWWswaStyOTJJcGw0U1lEckxXa1JiSkpRWEx5NkF1VDVyeXdvcWZGOVpnb0MvQ2ppK1VQUng2bjRlY3NucWIzWkhJTG1SSlNscitUN1E2TGVKUHVjV2w5RjdDOG1sQ3RTU3dWb0g2WWcrRGY3c0k1ZGdhQWI1RXlwQVM3T3NEcjhPcVk3L013VE1hZnRIWjUyN0VaNWtqUHVkb1Y4WkJza0NWbjE1Sk5XT1NiRVFRc2lUUkhBcmdQZnJDU0pEbysreXFKS1N1K0Z3VUpRWm9KWWUxS2k1dnYyd2MvK2JSTnVMWE93NFpac2t5OGkyZ3NxUVVmclJrU1NzV2I0YWFrV0x0eENreFVvbUwxNGFvWXIvMEpheDByMm9jbDZ2Y2JBVnlvM1JFL3lVcnlrZEhHWmV2L01xQklFbTdHK3JFelBiSExWWkprUlZoR1NmaHB3SUxPdDNxV0ZjbVpsd2F0WnlvRHdPajRKTGN0TGF6WXBMZ1dzUHdvVDhXeVptWDcyWkp0SkFNV0h6ZVlGWnJqRXdCZTI2Vno3WFMxT2xZTnBQSWJad2FvcndvbEdUWFd2OEl0RWlTZlNqQjdzdGNwMGJvbldmbDl1ZC9JeE1SUndITkM0NUhGMU8wcVBTa2hmUGx2SnFaZHFIYTlTc0t6azlkek12NEV3dXVsc3ViTHJtS3BDUStRNWNpMUZBZmhweFRqZlZKK0ZpWjh1eWg4R2NhOSt3VE0rZDArbUx5ZktmZzFacHVKc09Wak1OOERjRlNYenJmNzRPL04ya29RNEM3eTJNWGg5WkxqTnVVNjBPcEt4blJkbVpEa2taaUk5dU13Z1k0REZza1dZN2hYdGdOSnp2WDROWEl0VDhqZHgwbmVYUWVUaDdnWDBFcDUxbGdXMmU4amFJbFE5Nkc2RG15SnJMRUZFbjVyc0R3WHNTd0Z0dzkrRW9jRituc2ZqTXQwcWNFSERoT1FSYkVZTXlRQTVWNXlIdjQ1V2JaK3VZMWxMRS96YU9kWGxrVUhacW45c2tCOHEzZ1F3QXRpRWloeDRTSUFINEpKNTFodWs3QjN1ZEFVamN1VkRLM2pyOFp3ajgvU091WDkzMkhyMVNWYzVoRHZsWVFyeFFDbDZuYVlhUElkdWdTcUxicG1KNHFkNjVjN2V5ZE1scUlDZkxjeHV6NTV2M01QL014UGVkS0UySm90azRXNUlJaEpmclpBL3k4NUVJUkpRYTRjd0NVelVrbFhMNTk3dFJkYzJTSmFWaXdxNGhsWVFTZzdJbGtBK0NsWjNUOGd3dTFVN0FYd1hKaFNWbmtFRjM5T1FrdVNyUVRpNm5OUGVCU0tNR1ViRjRSWHFGVnNJUmt6SWdSODBscVBpdmJOQmE3VXN3ampjZHNQNW96MHpXMXMvMUV3Ky8rbmRLckcyU2hTSWRyK0Fta3hVeVJVOXdweVdhQy9PWWtFdTRBWDZiMG5ZZHlxajlBMW5vWTUrL28wRWZjMGtmTmVMQytabHdqNXFhVWtCT1ZONWgrWlVFUHUveGJFWjd3QWE3d2lucFZkeWt2MFBRL1Y1ZnBhQWVjMkxnQTRFWjE3ak9GMm1CU2JUNU5Dc0lqVnUyZm0yaVcra3VzL3lyTnVFZ1JZZ2R1Y3QrK2gxMm40QVpUVHBNRFBkY2s4Nk1SeGErVCtHZmpsRGxtT2o0alAzQUtUbWpWdTJmUkpBRWZEZVBjNk1tOTZLOGtvWkdwRkRpb3F3Q1NQdUJQQTF0SHh5VzB3V1poazFEQ2ZnMDJSNE9YSVlpWmVkczh1Q0lLU0xsZ3ZBdmxIMVdiTEZ1bXhPNWZKY1o3YXR5UklFbGgrbnRjbTJhV0FQbkxwSnBwRDlkbmtEeEdoM2QxQnJxUkxBSHdaZnVCV01jRE5aSHNET3RHVlZuRjhuVTZ5Mk9QczcxbnI3eThDK0JjSDEzMGN4djBzMDNVbWFzeXRYc1pLN2NsV2hPRWh6NzdQME9zR01vd2VJTmwwRGN6SmlNc2R0dmRhQUcrQjJSN2dRZ1pEdlVTeVhvaWc1SW90OHdEMlRVMk0vWmFzTHQ3enpCRTV6ZFBmSTZQamt5TXdXWmU0ZG1BSy9uN3MzTlRFR0Nmczc2UC83UTBRVlBJOGFpUFBJQzFWSmxhN1dnK0VtNHNMRDBpck4yMzlMWW1iOTZrWFJkKzRRRC8xSVVkamwySHF6eVlBZkIzQTYxWndUdTBBOER3c2R3dFh1c3pLaTFNdzlycHJQRVB6YzhnaTIydlJlaFRxbCtnMWF3bDhYaFA4Mm1uV3AwdkZKZzZGcmRrU3BFTXdIc1lFeWZBNUl0ak5KRnYza0dKMEJmME1DeVhwY1BoZXVYcllDcE1uNER1a3ZPY0VzYzhJMmROVEpDdWphMlVnVUFXbVFrT1pPbndhZnJZa1BwNHpTUDkvY21waXJDSXNRd2ozRCsrRHpzQzRramtxdWRMaUJQY1FYcXBMVnM1aG9wZWFXaG5MaThPWFEvb0dSSzdUVXhOak0yZ3M0MU05ekpPSFlCdTFmUzFOWnNCa1lRR0Fkd0g0dXdZbWNhdjRJWUFMWUJJRWNGOXlsRGludVp5dVF6eWR0SitXY0N4Y2syTE5kVXBTanJqNm0vZGlVNVppZUtVRGtyMUJDRjJwc0JRNzBGTVFGMkZYbWpBcVhMWkw1aUxmSTc0djF6ZDdHYVJzV2t0RzBxbjA5ekJNNGZYOXlQcGRTOXpBTVR1N0FUeEVKRzNMRHM1MWtLTzV0WWVJdTJkSWxnYzZZVm1GdkdpZkVJS0tFenN3Y1hwQzgrQzkwVHlxejhuT3dTOGl3TWRtZUErMUdiOTdJdUlrNDJlWXB3Rk9rU2JPazNrZi9LaGpEdUpLb2pxNm1vT2V1Sll0Rng3ZVI4L21hdDlnbXhBeWV3Skk0VlBrbmp1T0JOdjVNY3lmcHdCOEdxWWkwby9vdlJFYVgzbU9lVGFpZGRmTEZsNUNFRkNuSUM2U1hhUXh0UVhqRnJKRW1nMU91WmFVdUl5bEdHOGdLeWJwYUgzWmE4bWxzdVhTcGUydDBGeFlERmkvV2V2OUVmaHhORXlHZXl5RmN3YkEvUzIwZVIzSjZVSUhyaTEvTW5tZTF3N0JFcVRwU3JKbUljdkJVR2xVbnozMUVMOHJrU2RLSHFZbTZoQjhkL1lBUkdVZm1rQTUrcEh2OC9Qa2lRUWZuSm9ZK3pWTW5kWW5pV3phNFJLVnBmSWtYZ3ZnSEFBbnc0VGFON09uczVXRTNWMW9QYzJqN1RvZEV0cHNLNjZ0UitFbSt0eHVFNS9EcnJlWTJaTGo0Mkd6TUlHQXJ0eVlyWjZUNXBpSGFhSHd0aFAxMmo5SWZiVm9DZkFkRVJTMk9EQU1jL1F3SDFHUVo0WENuUlovN3lLaWNXV0JqcUI2bTQyTmhGU0U5U09qc2VmSndteEdQdG1lR1M2OE1vM2x0YVB6TFJoSjNDNitKaE1zLzIrSVpKT0xJMXljWENPSDJuV1RPNEprdXdtOG1GT29UcXRvbDk5THdld2g4eDV6MXJMV2VRTHZKYUd3Z3lhY1RBMVphT056YlNDQk9oZnl2d09JY0ErQWlRUmVUNHJEZHBobzc5K1NaK0ozTlFSY0d0WDVvSnUxR0FBM2UycDZKTWlkRmRkSjY3UFNnL2ZxWmh5QTZ0aUxnMGxPMk9DdExWWlk2aWwybVRweUpJajh6b0ZKOGVnQ2Z3dmdZM0MwdGFNa1d5MWMrS3dzVzZleUNvOU1GeW0xS3JaV09GVmtXWkRxdlBocHB4QUxtb1JwY1grT21HNlU3RmtybjdldTJXdUovKzNGeGVrMWl3M01KYTlCTDROaWRTanlTUWZySlczSklaY3lFQkd2eS9ONEJOWGJBaStEMlE3NFlJQXNPb3dVZHhmcmsrVU9FL0xYQUx6QlVUKzhCR1lMVENwYlRTdGVTckxWRTB3RzYyUUZxZlNoT2xuR0x2aHViYnNvQXJ0Z1NvTElDaXV3bUtPNjJCUENJcmZUWkNMRU9zMWgrZkVudmxZZjNFZDNkb0p3NUNOYlVSWmFQVTFjMFQxV3RXd0RlMndXVzJoM25NL0U4cWdRWVg0MmtrZTlIamJCZUw2T0IzQXZ2WGNzZ0YrZ09zTGNoWUxKTW9vRHFoSjAveWNkOXVNQXlUQkpyRTFidFVxeXdVUXJDeHJZV2w0cFlCSW5CTWtHVFY2K25oZVRCdHFvc0crRWhGMXJ3TFg2WFYxMGltNGdYb1dCUEt0OENwYkhhTHdkcHA3d0JwakF6MFVzZHpIYlNrSlVqMUVlL2hITXV3Q2M1T2laZmdtVG9RNnVTRllyb2xSRGFxeDJNSmFzNUpNUmhHblhtUTF5Sy9EM0UyMFdFbmJRUVQrMWIyZkVlVkd1bzVHbkErN1RiTDkza3VCTWhDZ1F6YlJSMWlWT1JyUTBGTDJsdEx1ZTR6eW5JR1JQcGNVMkp0RllVbytjSU5pakVSd0UrWGtBejRHZjdXc2RFV3lZdXpzcWlYR3lpMkdZbk9nbk9SeXppUkJTYmRvQVVFczJIazJhM2FudHRGcGRXWm10YlBaenhQV01UcE9PUnNaU0dqdXhmV1dvWjZOVElRMkpFMkR5cU5mQ3oyRktYVzRUMzI5VzZaRHk5eklBSDNiOGJJZkNuTXZsKzdRY2lLa2tXOXVTczFOSE11eWN4M0x5Qldsa3NtQjhPNFJIclUxNkdVYmY3R1R2WnBkZDFMWW5POVRLWHEyS0xicG9IT0pPT05JcDYrOWttSFBQVVVzQmZnWEEyU0hQazdhVXJDVWhXKzFuUFFZbWpleEJNVHpUZ0VXcUkvQUR1NXJxZHlYWjVoYTdKT0phaDdoVFdKN05xa0tEcUIydlVDZzZFVEpMazMxU1lZRCtQZ0ltQW5kakU5Zi9BTXplNTkySW5ncHhBOHkrN3dzQmpNZjAzQmNCdU5vNWFTakpOazIyVWJUcmhFVzBuTUdxb0NTclVDaTZRTTRGeWFubkFmaVpnK3N2d0xpYUg0UTVYOHVaOGJpczZYb0F6eURMOWJnMlBPODZvVndveVhZNCtYcDFyR0RkYTFJb0ZKMEtUaGlSZzNHWGJoZnZlekFaMVRiMjJETi9Ec0E3WWlFRkpWbW5CQnNGMnVFS2hhTFR3V2tMQWQ5OWZEU01tN2NYY1JEOHdDeW5TT3BjY2diUDBXY1VDb1ZpSlpFWEJNdUovVThFOE4wZWZkNWppV0JqcVVlcjUyVGJUN1FLaFVMUnlWaUNIL0ZiZ0hFVC93Tk1TYnBldy9Vd21hbUFtSXBQckdaTE51SDRXdkpBZDlMeDlSVUtoYUpka0RYQ2t6RDdzL2YyNEhQdWdDa0J1aForRWZpTWtteG5rcldNTms1WTd5c1VDa1czeWJSTnFFNVc4ajloanQ3MEVvNmgxd1g0eDVTYzV4elh3Q2VGUXFGUTJKQkphK1J4eFcvRG5GZnRkaHdGYzNTSWN4ZkVsdUJETFZtRlFxRlFTR1Fzd3BGWnowNEY4STB1Zjc0VGlHRFQ4SXU4eDJadEtza3FGQXFGUXFJSTMyMDZRSzlwbU9MckFQQTZBUC9VaGMrMWpaN2hQbUdoVHd2RkloWStWSkpWS0JRS2hRMU9CY3YxWDBzdzZXRFpkVHhPWk5zdHVBRW1VOVVUTUVuLzg2amVmMjI2S0x1U3JFS2hVQ2lhc1dhWlVQUEVGWHZndTFWZkRPTTJUZ0M0cDhPZjVZMEEzaVNzMW5sU0d2Z2tDQjlWaW9VVGxXUVZDb1ZDRVFUT296QUNvSTkrUHdBbVdmK1A2TzloQUM4QzhCSUFXenVzL2RmQXBILzhNaEdxckl6RVpVZ3JpRG5sclVZWEt4UUtoU0lJR1N3LzBzSlJ1TVBDSXVUUDVRQ2NBZUR2QUJ5K2d1MytCb0QzQWZoMVFOdlRNS1g1UEN5dkV6dUVHQkpTS01rcUZBcUZvaGJSNW9sOGpnYndLNHRzRWZMM2FRRE9CZkFhQUd2YTBNNnRBTDRJNEE0QVAyN2dlN0lvZThzRjJwVmtGUXFGUWhFM1pBM2FKSUNUWUlxMS96bE00UUdYeEhvVGtldURuZG9aU3JJS2hVS2hhQ2VlRGVCSUFDOEFjRHhNemRoTklSYnZVd0FlQi9BYnNxSWZoZGtQZmhKK3NveU9ocEtzUXFGUUtGeUQzY3dnTXBSN3UySFpsUTRCY0RCTUZQTWlURzdoS0h1a1NYR3ZJbUpJamFna3ExQW9GSXB1UUJwK2xPOEFUTlJ5Q2Y3eEdvU1FjWnIrTHNPUEFJN3RiS3VTckVLaFVDZzZGVnpSaGdtd0hKRU0rNGxNWnlKWXJoWExhazdCbE9qck9OSlZrbFVvRkFwRko2RWZ4bDFjc1N4Z0p1SHBickJnbFdRVkNvVkNFUWN5TUM3Z1Zza2xRVmF4Qno5YUdSYnhscXozQnVDbmdsU1NWU2dVQ3NXcVJWQUFWRkFDREp0WUVVQ3Vhc2txRkFxRlFySGFvTG1MRlFxRlFxRlFrbFVvRkFxRlFrbFdvVkFvRkFxRmtxeENvVkFvRkVxeUNvVkNvVkFveVNvVUNvVkNvVkNTVlNnVUNvVkNTVmFoVUNnVUNpVlpoVUtoVUNnVVNySUtoVUtoVUNqSktoUUtoVUtoSkt0UUtCUUtoVUxpdndIa0VSWkZ1dGw4aHdBQUFBQkpSVTVFcmtKZ2dnPT0iOyAgLyogd2hpdGUgd29yZG1hcmsgZm9yIGRhcmsgYmcgKi8KCmNvbnN0IHN0YXRlPXsKICBtb2RlOiJzaW5nbGUiLCB0aGVtZToibGlnaHQiLCBzaG93RWRpdDpmYWxzZSwgZ2FtZXM6W10sCiAgY29tcDoiVG9kYXkncyBQaWNrcyIsIHN1YjoiTWF0Y2hkYXkgMSIsCiAgc2luZ2xlOnsgdGVhbUE6e25hbWU6IkZyYW5jZSIsY29kZToiRlJBIixpbWc6dGVhbUxvZ29VUkwoIkZyYW5jZSIpfSwgdGVhbUI6e25hbWU6IkJyYXppbCIsY29kZToiQlJBIixpbWc6dGVhbUxvZ29VUkwoIkJyYXppbCIpfSwKICAgICAgICAgICBzYToiIiwgc2I6IiIsIHBpY2s6IkZyYW5jZSBvciBEcmF3IiwgcGN0OjczLCBfb3B0czpbXSB9LAogIHNsaXA6eyB0aXRsZToiQWNjdW11bGF0b3IiLCB0b3RhbDoiIiwgbGVnczpbXSB9Cn07CmNvbnN0IGVzYz1zPT5TdHJpbmcocz09bnVsbD8iIjpzKS5yZXBsYWNlKC9bJjw+Il0vZyxjPT4oeyImIjoiJmFtcDsiLCI8IjoiJmx0OyIsIj4iOiImZ3Q7IiwnIic6IiZxdW90OyJ9W2NdKSk7CmNvbnN0IGNvZGUzPXM9PihzfHwiIikudHJpbSgpLnNwbGl0KC9ccysvKVswXS5zbGljZSgwLDMpLnRvVXBwZXJDYXNlKCl8fCLigJQiOwpjb25zdCAkPWlkPT5kb2N1bWVudC5nZXRFbGVtZW50QnlJZChpZCk7CgpmdW5jdGlvbiBtZWRhbChjb2RlLGltZyl7CiAgcmV0dXJuIGA8ZGl2IGNsYXNzPSJtZWRhbCI+PGRpdiBjbGFzcz0iaW5uZXIiPiR7aW1nP2A8aW1nIHNyYz0iJHtpbWd9IiBkYXRhLWNvZGU9IiR7ZXNjKGNvZGUpfSIgb25lcnJvcj0ibG9nb0Vycih0aGlzLCcke2VzYyhjb2RlKX0nKSI+YDpgPHNwYW4gY2xhc3M9Im1vbm8iPiR7ZXNjKGNvZGUpfTwvc3Bhbj5gfTwvZGl2PjwvZGl2PmA7Cn0KCmZ1bmN0aW9uIHJlbmRlckNhcmQoKXsKICBjb25zdCBjPSQoImNhcmQiKTsgYy5jbGFzc05hbWU9ImNhcmQgIitzdGF0ZS5tb2RlOwogIGNvbnN0IGxvZ28gPSBzdGF0ZS50aGVtZT09PSJsaWdodCI/TE9HT19MSUdIVDpMT0dPX0RBUks7CiAgY29uc3QgaGVhZCA9IGA8ZGl2IGNsYXNzPSJjaGVhZCI+PGltZyBzcmM9IiR7bG9nb30iIGFsdD0iY212bmciPgogICAgICA8ZGl2IGNsYXNzPSJja2ljayI+PHNwYW4gY2xhc3M9ImNvbXAiPiR7ZXNjKHN0YXRlLmNvbXApfTwvc3Bhbj48c3BhbiBjbGFzcz0ic3ViIj4ke2VzYyhzdGF0ZS5zdWIpfTwvc3Bhbj48L2Rpdj48L2Rpdj5gOwogIGNvbnN0IGZvb3QgPSBgPGRpdiBjbGFzcz0iY2Zvb3QiPjxkaXYgY2xhc3M9ImhyIj48L2Rpdj4KICAgICAgPGRpdiBjbGFzcz0iZGlzYyI+Rm9yIGVudGVydGFpbm1lbnQmbmJzcDvCtyZuYnNwO05vdCBmaW5hbmNpYWwgYWR2aWNlJm5ic3A7wrcmbmJzcDsxOCs8L2Rpdj48L2Rpdj5gOwoKICBpZihzdGF0ZS5tb2RlPT09InNpbmdsZSIpewogICAgY29uc3Qgcz1zdGF0ZS5zaW5nbGU7CiAgICBjLmlubmVySFRNTD1gPGRpdiBjbGFzcz0iYXRtb3MiPjwvZGl2PjxkaXYgY2xhc3M9InBhZCI+JHtoZWFkfQogICAgICA8ZGl2IGNsYXNzPSJjc3RhZ2UiPgogICAgICAgIDxkaXYgY2xhc3M9Im1pY3JvIj5QcmVkaWN0ZWQgRnVsbC1UaW1lPC9kaXY+CiAgICAgICAgPGRpdiBjbGFzcz0ibWF0Y2h1cCI+CiAgICAgICAgICA8ZGl2IGNsYXNzPSJ0ZWFtIj4ke21lZGFsKHMudGVhbUEuY29kZXx8Y29kZTMocy50ZWFtQS5uYW1lKSxzLnRlYW1BLmltZyl9PGRpdiBjbGFzcz0idG5hbWUiPiR7ZXNjKHMudGVhbUEubmFtZSl9PC9kaXY+PC9kaXY+CiAgICAgICAgICA8ZGl2IGNsYXNzPSJzY29yZSI+PHNwYW4gY2xhc3M9InNuIj4ke2VzYyhzLnNhKX08L3NwYW4+PHNwYW4gY2xhc3M9InNlcCI+PC9zcGFuPjxzcGFuIGNsYXNzPSJzbiI+JHtlc2Mocy5zYil9PC9zcGFuPjwvZGl2PgogICAgICAgICAgPGRpdiBjbGFzcz0idGVhbSI+JHttZWRhbChzLnRlYW1CLmNvZGV8fGNvZGUzKHMudGVhbUIubmFtZSkscy50ZWFtQi5pbWcpfTxkaXYgY2xhc3M9InRuYW1lIj4ke2VzYyhzLnRlYW1CLm5hbWUpfTwvZGl2PjwvZGl2PgogICAgICAgIDwvZGl2PgogICAgICA8L2Rpdj4KICAgICAgPGRpdiBjbGFzcz0iY3BpY2siPjxkaXYgY2xhc3M9InBpbGwiPjxzcGFuIGNsYXNzPSJwZG90Ij48L3NwYW4+PHNwYW4gY2xhc3M9InBsYWJlbCI+JHtlc2Mocy5waWNrKX08L3NwYW4+PHNwYW4gY2xhc3M9InBiYXIiPjwvc3Bhbj48c3BhbiBjbGFzcz0icHBjdCI+JHtlc2Mocy5wY3QpfSU8L3NwYW4+PC9kaXY+PC9kaXY+CiAgICAgICR7Zm9vdH08L2Rpdj48ZGl2IGNsYXNzPSJncmFpbiI+PC9kaXY+YDsKICB9IGVsc2UgewogICAgY29uc3Qgc2w9c3RhdGUuc2xpcDsKICAgIGNvbnN0IHJvd3M9KHNsLmxlZ3MubGVuZ3RoP3NsLmxlZ3MubWFwKGw9PmA8ZGl2IGNsYXNzPSJsZWciPiR7bWVkYWwobC5jb2RlfHxjb2RlMyhsLm1hdGNoKSxsLmltZyl9CiAgICAgICAgPGRpdiBjbGFzcz0ibWlkIj48ZGl2IGNsYXNzPSJtYXRjaCI+JHtlc2MobC5tYXRjaCl9PC9kaXY+PGRpdiBjbGFzcz0ibHBpY2siPiR7ZXNjKGwucGljayl9PC9kaXY+PC9kaXY+CiAgICAgICAgPGRpdiBjbGFzcz0icmlnaHQiPiR7bC5zY29yZT9gPHNwYW4gY2xhc3M9ImxzYyI+JHtlc2MobC5zY29yZSl9PC9zcGFuPmA6IiJ9PHNwYW4gY2xhc3M9ImxwY3QiPiR7ZXNjKGwucGN0KX0lPC9zcGFuPjwvZGl2PjwvZGl2PmApLmpvaW4oIiIpOmA8ZGl2IGNsYXNzPSJzbGlwZW1wdHkiPlBpY2sgZ2FtZXMgZnJvbSB5b3VyIGxpc3QgdG8gYnVpbGQgdGhpcyBzbGlwLjwvZGl2PmApOwogICAgY29uc3QgdG90PXNsLnRvdGFsP2A8ZGl2IGNsYXNzPSJzbGlwdG90Ij48c3BhbiBjbGFzcz0ibCI+VG90YWwgb2Rkczwvc3Bhbj48c3BhbiBjbGFzcz0iciI+JHtlc2Moc2wudG90YWwpfTwvc3Bhbj48L2Rpdj5gOiIiOwogICAgYy5pbm5lckhUTUw9YDxkaXYgY2xhc3M9ImF0bW9zIj48L2Rpdj48ZGl2IGNsYXNzPSJwYWQiPiR7aGVhZH0KICAgICAgPGRpdiBjbGFzcz0ic2xpcHRpdGxlIj48c3BhbiBjbGFzcz0ibWFpbiI+JHtlc2Moc2wudGl0bGUpfTwvc3Bhbj48c3BhbiBjbGFzcz0ibGVncyI+JHtzbC5sZWdzLmxlbmd0aH0gbGVnczwvc3Bhbj48L2Rpdj4KICAgICAgPGRpdiBjbGFzcz0ibGVnbGlzdCI+JHtyb3dzfTwvZGl2PiR7dG90fSR7Zm9vdH08L2Rpdj48ZGl2IGNsYXNzPSJncmFpbiI+PC9kaXY+YDsKICB9CiAgZml0KCk7Cn0KCmZ1bmN0aW9uIGZpdCgpewogIGNvbnN0IGNhcmQ9JCgiY2FyZCIpLCBzY2FsZXI9JCgic2NhbGVyIiksIHN0YWdlPWNhcmQucGFyZW50RWxlbWVudC5wYXJlbnRFbGVtZW50OwogIHNjYWxlci5zdHlsZS50cmFuc2Zvcm09InNjYWxlKDEpIjsKICBjb25zdCBhdmFpbD1zdGFnZS5jbGllbnRXaWR0aC00OwogIGNvbnN0IHM9TWF0aC5taW4oMSwgYXZhaWwvNTQwKTsKICBzY2FsZXIuc3R5bGUudHJhbnNmb3JtPWBzY2FsZSgke3N9KWA7CiAgc2NhbGVyLnN0eWxlLmhlaWdodD0oY2FyZC5vZmZzZXRIZWlnaHQqcykrInB4IjsKfQp3aW5kb3cuYWRkRXZlbnRMaXN0ZW5lcigicmVzaXplIixmaXQpOwoKLyogLS0tLS0tLS0tLS0tLS0tLSBjb250cm9scyAtLS0tLS0tLS0tLS0tLS0tICovCmZ1bmN0aW9uIGJpbmQoZWxtLGZuKXtlbG0uYWRkRXZlbnRMaXN0ZW5lcigiaW5wdXQiLGU9PntmbihlLnRhcmdldC52YWx1ZSk7cmVuZGVyQ2FyZCgpO30pO30KZnVuY3Rpb24gaW1nRmllbGQobGFiZWwsZ2V0SW1nLHNldEltZyl7CiAgY29uc3Qgd3JhcD1kb2N1bWVudC5jcmVhdGVFbGVtZW50KCJkaXYiKTt3cmFwLmNsYXNzTmFtZT0iZmxkIjsKICB3cmFwLmlubmVySFRNTD1gPGxhYmVsPiR7bGFiZWx9PC9sYWJlbD48ZGl2IGNsYXNzPSJ1cGxvYWQiPgogICAgJHtnZXRJbWcoKT9gPGltZyBjbGFzcz0idGh1bWIiIHNyYz0iJHtnZXRJbWcoKX0iIG9uZXJyb3I9InRoaXMuc3R5bGUuZGlzcGxheT0nbm9uZSciPmA6IiJ9CiAgICA8bGFiZWwgY2xhc3M9ImZha2VidG4iPiR7Z2V0SW1nKCk/IlJlcGxhY2UgaW1hZ2UiOiJVcGxvYWQgZmxhZyAvIGxvZ28ifTxpbnB1dCB0eXBlPSJmaWxlIiBhY2NlcHQ9ImltYWdlLyoiPjwvbGFiZWw+CiAgICAke2dldEltZygpP2A8YnV0dG9uIGNsYXNzPSJjbGVhciIgdGl0bGU9IlJlbW92ZSI+4pyVPC9idXR0b24+YDoiIn08L2Rpdj5gOwogIHdyYXAucXVlcnlTZWxlY3RvcigiaW5wdXRbdHlwZT1maWxlXSIpLmFkZEV2ZW50TGlzdGVuZXIoImNoYW5nZSIsZT0+ewogICAgY29uc3QgZj1lLnRhcmdldC5maWxlc1swXTsgaWYoIWYpcmV0dXJuOyBjb25zdCByPW5ldyBGaWxlUmVhZGVyKCk7CiAgICByLm9ubG9hZD0oKT0+e3NldEltZyhyLnJlc3VsdCk7cmVuZGVyQ29udHJvbHMoKTtyZW5kZXJDYXJkKCk7fTsgci5yZWFkQXNEYXRhVVJMKGYpOwogIH0pOwogIGNvbnN0IGNscj13cmFwLnF1ZXJ5U2VsZWN0b3IoIi5jbGVhciIpOyBpZihjbHIpY2xyLmFkZEV2ZW50TGlzdGVuZXIoImNsaWNrIiwoKT0+e3NldEltZygiIik7cmVuZGVyQ29udHJvbHMoKTtyZW5kZXJDYXJkKCk7fSk7CiAgcmV0dXJuIHdyYXA7Cn0KZnVuY3Rpb24gZmllbGQobGFiZWwsdmFsLGZuLHR5cGU9InRleHQiKXsKICBjb25zdCBmPWRvY3VtZW50LmNyZWF0ZUVsZW1lbnQoImRpdiIpO2YuY2xhc3NOYW1lPSJmbGQiOwogIGYuaW5uZXJIVE1MPWA8bGFiZWw+JHtsYWJlbH08L2xhYmVsPjxpbnB1dCB0eXBlPSIke3R5cGV9IiB2YWx1ZT0iJHtlc2ModmFsKX0iPmA7CiAgYmluZChmLnF1ZXJ5U2VsZWN0b3IoImlucHV0IiksZm4pOyByZXR1cm4gZjsKfQoKZnVuY3Rpb24gbG9nb0VycihlbCxjb2RlKXt0cnl7ZWwucGFyZW50Tm9kZS5pbm5lckhUTUw9JzxzcGFuIGNsYXNzPSJtb25vIj4nKyhjb2RlfHwiIikrJzwvc3Bhbj4nO31jYXRjaChlKXt9fQpmdW5jdGlvbiB0ZWFtTG9nb1VSTChuYW1lKXtyZXR1cm4gIi9hcHAvdGVhbS1sb2dvP25hbWU9IitlbmNvZGVVUklDb21wb25lbnQobmFtZXx8IiIpO30KZnVuY3Rpb24gcmVuZGVyQ29tcFNlbGVjdChyb290KXsKICB2YXIgb3B0cz1bIlRvZGF5J3MgUGlja3MiLCJQcmVtaWVyIExlYWd1ZSIsIkNoYW1waW9ucyBMZWFndWUiLCJMYSBMaWdhIiwiU2VyaWUgQSIsIkJ1bmRlc2xpZ2EiLCJMaWd1ZSAxIiwiSW50ZXJuYXRpb25hbCBGcmllbmRsaWVzIiwiRkEgQ3VwIiwiV29ybGQgQ3VwIDIwMjYiXTsKICB2YXIgbGlzdD1vcHRzLnNsaWNlKCk7CiAgaWYoc3RhdGUuY29tcCAmJiBsaXN0LmluZGV4T2Yoc3RhdGUuY29tcCk8MCkgbGlzdD1bc3RhdGUuY29tcF0uY29uY2F0KGxpc3QpOwogIHZhciB3PWRvY3VtZW50LmNyZWF0ZUVsZW1lbnQoImRpdiIpO3cuY2xhc3NOYW1lPSJmbGQiOwogIHcuaW5uZXJIVE1MPSc8bGFiZWw+Q29tcGV0aXRpb248L2xhYmVsPjxzZWxlY3Q+JytsaXN0Lm1hcChmdW5jdGlvbihvKXtyZXR1cm4gJzxvcHRpb24nKyhvPT09c3RhdGUuY29tcD8nIHNlbGVjdGVkJzonJykrJz4nK2VzYyhvKSsnPC9vcHRpb24+Jzt9KS5qb2luKCcnKSsnPC9zZWxlY3Q+JzsKICB3LnF1ZXJ5U2VsZWN0b3IoInNlbGVjdCIpLmFkZEV2ZW50TGlzdGVuZXIoImNoYW5nZSIsZnVuY3Rpb24oZSl7c3RhdGUuY29tcD1lLnRhcmdldC52YWx1ZTtyZW5kZXJDYXJkKCk7fSk7CiAgcm9vdC5hcHBlbmRDaGlsZCh3KTsKfQpmdW5jdGlvbiByZW5kZXJHYW1lUGlja2VyKHJvb3QpewogIGNvbnN0IHdyYXA9ZG9jdW1lbnQuY3JlYXRlRWxlbWVudCgiZGl2Iik7CiAgd3JhcC5pbm5lckhUTUw9YDxkaXYgY2xhc3M9InN1YmhlYWQiPiR7c3RhdGUubW9kZT09PSJzaW5nbGUiPyJQaWNrIGEgZ2FtZSI6IkFkZCBnYW1lcyB0byBzbGlwIn08L2Rpdj5gOwogIGlmKCFzdGF0ZS5nYW1lcy5sZW5ndGgpewogICAgY29uc3Qgbj1kb2N1bWVudC5jcmVhdGVFbGVtZW50KCJkaXYiKTtuLmNsYXNzTmFtZT0iaGludCI7bi5zdHlsZS5tYXJnaW5Ub3A9Ii00cHgiOwogICAgbi50ZXh0Q29udGVudD0iTm8gbGl2ZSBwaWNrcyBsb2FkZWQgeWV0IOKAlCB0aGUgZW5naW5lIHJ1bnMgZXZlcnkgZmV3IGhvdXJzLiBZb3UgY2FuIHN0aWxsIGJ1aWxkIG9uZSBpbiBDdXN0b21pemUgYmVsb3cuIjsKICAgIHdyYXAuYXBwZW5kQ2hpbGQobik7IHJvb3QuYXBwZW5kQ2hpbGQod3JhcCk7IHJldHVybjsKICB9CiAgY29uc3QgbGlzdD1kb2N1bWVudC5jcmVhdGVFbGVtZW50KCJkaXYiKTtsaXN0LmNsYXNzTmFtZT0iZ2FtZWxpc3QiOwogIHN0YXRlLmdhbWVzLmZvckVhY2goZz0+ewogICAgY29uc3QgbmFtZT1nLmhvbWUrIiB2ICIrZy5hd2F5OwogICAgY29uc3QgYWRkZWQ9c3RhdGUubW9kZT09PSJzbGlwIiYmc3RhdGUuc2xpcC5sZWdzLnNvbWUobD0+bC5tYXRjaD09PW5hbWUpOwogICAgY29uc3Qgcm93PWRvY3VtZW50LmNyZWF0ZUVsZW1lbnQoImJ1dHRvbiIpO3Jvdy50eXBlPSJidXR0b24iO3Jvdy5jbGFzc05hbWU9ImdhbWVyb3ciKyhhZGRlZD8iIGFkZGVkIjoiIik7CiAgICBjb25zdCBjb25mPShnLnBpY2tzJiZnLnBpY2tzWzBdKT9nLnBpY2tzWzBdLmNvbmZpZGVuY2U6IiI7CiAgICByb3cuaW5uZXJIVE1MPWA8ZGl2IGNsYXNzPSJnci1tYWluIj4ke2VzYyhnLmhvbWUpfSA8c3BhbiBjbGFzcz0iZ3ItdiI+djwvc3Bhbj4gJHtlc2MoZy5hd2F5KX08L2Rpdj5gKwogICAgICBgPGRpdiBjbGFzcz0iZ3Itc3ViIj4ke2VzYyhnLmxlYWd1ZXx8IiIpfSR7Zy5raWNrb2ZmPygiIMK3ICIrZXNjKGcua2lja29mZikpOiIifSDCtyAkeyhnLnBpY2tzfHxbXSkubGVuZ3RofSBwaWNrczwvZGl2PmA7CiAgICBjb25zdCBiPWRvY3VtZW50LmNyZWF0ZUVsZW1lbnQoInNwYW4iKTtiLmNsYXNzTmFtZT0iZ3ItY29uZiI7CiAgICBiLnRleHRDb250ZW50PWFkZGVkPyLinJMgQWRkZWQiOihjb25mIT09IiI/Y29uZisiJSI6IiIpOwogICAgaWYoYi50ZXh0Q29udGVudCkgcm93LmFwcGVuZENoaWxkKGIpOwogICAgcm93LmFkZEV2ZW50TGlzdGVuZXIoImNsaWNrIiwoKT0+IHN0YXRlLm1vZGU9PT0ic2luZ2xlIj9waWNrR2FtZShnKTp0b2dnbGVMZWcoZykpOwogICAgbGlzdC5hcHBlbmRDaGlsZChyb3cpOwogIH0pOwogIHdyYXAuYXBwZW5kQ2hpbGQobGlzdCk7IHJvb3QuYXBwZW5kQ2hpbGQod3JhcCk7Cn0KZnVuY3Rpb24gdG9nZ2xlTGVnKGcpewogIGNvbnN0IG5hbWU9Zy5ob21lKyIgdiAiK2cuYXdheTsKICBjb25zdCBpZHg9c3RhdGUuc2xpcC5sZWdzLmZpbmRJbmRleChsPT5sLm1hdGNoPT09bmFtZSk7CiAgaWYoaWR4Pj0wKXsgc3RhdGUuc2xpcC5sZWdzLnNwbGljZShpZHgsMSk7IHJlbmRlckNvbnRyb2xzKCk7IHJlbmRlckNhcmQoKTsgfQogIGVsc2UgeyBhZGRMZWdGcm9tR2FtZShnKTsgfQp9CmZ1bmN0aW9uIHBpY2tHYW1lKGcpewogIGNvbnN0IHM9c3RhdGUuc2luZ2xlOwogIHMudGVhbUEubmFtZT1nLmhvbWU7IHMudGVhbUEuY29kZT1jb2RlMyhnLmhvbWUpOyBzLnRlYW1BLmltZz10ZWFtTG9nb1VSTChnLmhvbWUpOwogIHMudGVhbUIubmFtZT1nLmF3YXk7IHMudGVhbUIuY29kZT1jb2RlMyhnLmF3YXkpOyBzLnRlYW1CLmltZz10ZWFtTG9nb1VSTChnLmF3YXkpOwogIHMuc2E9IiI7IHMuc2I9IiI7CiAgaWYoZy5waWNrcyYmZy5waWNrcy5sZW5ndGgpeyBzLnBpY2s9Zy5waWNrc1swXS5waWNrOyBzLnBjdD1nLnBpY2tzWzBdLmNvbmZpZGVuY2U7IH0KICBzLl9vcHRzPWcucGlja3N8fFtdOwogIGlmKGcubGVhZ3VlKSBzdGF0ZS5jb21wPWcubGVhZ3VlOwogIGlmKGcud2hlbnx8Zy5raWNrb2ZmKSBzdGF0ZS5zdWI9Zy53aGVufHxnLmtpY2tvZmY7CiAgcmVuZGVyQ29udHJvbHMoKTsgcmVuZGVyQ2FyZCgpOwp9CmZ1bmN0aW9uIHJlbmRlckJlc3RQaWNrcyhyb290KXsKICBjb25zdCBzPXN0YXRlLnNpbmdsZTsgaWYoIXMuX29wdHN8fCFzLl9vcHRzLmxlbmd0aCkgcmV0dXJuOwogIGNvbnN0IHdyYXA9ZG9jdW1lbnQuY3JlYXRlRWxlbWVudCgiZGl2Iik7CiAgd3JhcC5pbm5lckhUTUw9YDxkaXYgY2xhc3M9InN1YmhlYWQiPkJlc3QgcGlja3MgZm9yIHRoaXMgZ2FtZTwvZGl2PmA7CiAgY29uc3QgY2hpcHM9ZG9jdW1lbnQuY3JlYXRlRWxlbWVudCgiZGl2Iik7Y2hpcHMuY2xhc3NOYW1lPSJwaWNrY2hpcHMiOwogIHMuX29wdHMuZm9yRWFjaChwPT57CiAgICBjb25zdCBjPWRvY3VtZW50LmNyZWF0ZUVsZW1lbnQoImJ1dHRvbiIpO2MudHlwZT0iYnV0dG9uIjsKICAgIGMuY2xhc3NOYW1lPSJwY2hpcCIrKHAucGljaz09PXMucGljaz8iIG9uIjoiIik7CiAgICBjLmlubmVySFRNTD1gJHtlc2MocC5waWNrKX0gPGI+JHtwLmNvbmZpZGVuY2V9JTwvYj5gOwogICAgYy5hZGRFdmVudExpc3RlbmVyKCJjbGljayIsKCk9PntzLnBpY2s9cC5waWNrO3MucGN0PXAuY29uZmlkZW5jZTtyZW5kZXJDb250cm9scygpO3JlbmRlckNhcmQoKTt9KTsKICAgIGNoaXBzLmFwcGVuZENoaWxkKGMpOwogIH0pOwogIHdyYXAuYXBwZW5kQ2hpbGQoY2hpcHMpOyByb290LmFwcGVuZENoaWxkKHdyYXApOwp9CmZ1bmN0aW9uIGFkZExlZ0Zyb21HYW1lKGcpewogIGlmKHN0YXRlLnNsaXAubGVncy5sZW5ndGg+PTgpIHJldHVybjsKICBjb25zdCBuYW1lPWcuaG9tZSsiIHYgIitnLmF3YXk7CiAgaWYoc3RhdGUuc2xpcC5sZWdzLnNvbWUobD0+bC5tYXRjaD09PW5hbWUpKSByZXR1cm47CiAgY29uc3QgdG9wPShnLnBpY2tzJiZnLnBpY2tzWzBdKXx8e3BpY2s6IlBpY2siLGNvbmZpZGVuY2U6NjV9OwogIHN0YXRlLnNsaXAubGVncy5wdXNoKHttYXRjaDpuYW1lLGNvZGU6Y29kZTMoZy5ob21lKSxwaWNrOnRvcC5waWNrLHNjb3JlOiIiLHBjdDp0b3AuY29uZmlkZW5jZSxpbWc6dGVhbUxvZ29VUkwoZy5ob21lKSxfb3B0czpnLnBpY2tzfHxbXX0pOwogIHJlbmRlckNvbnRyb2xzKCk7IHJlbmRlckNhcmQoKTsKfQpmdW5jdGlvbiBsZWdQaWNrQ2hpcHMobCl7CiAgY29uc3Qgd3JhcD1kb2N1bWVudC5jcmVhdGVFbGVtZW50KCJkaXYiKTt3cmFwLnN0eWxlLm1hcmdpbj0iMnB4IDAgNnB4IjsKICBjb25zdCBjaGlwcz1kb2N1bWVudC5jcmVhdGVFbGVtZW50KCJkaXYiKTtjaGlwcy5jbGFzc05hbWU9InBpY2tjaGlwcyI7CiAgbC5fb3B0cy5mb3JFYWNoKHA9PnsKICAgIGNvbnN0IGM9ZG9jdW1lbnQuY3JlYXRlRWxlbWVudCgiYnV0dG9uIik7Yy50eXBlPSJidXR0b24iOwogICAgYy5jbGFzc05hbWU9InBjaGlwIisocC5waWNrPT09bC5waWNrPyIgb24iOiIiKTsKICAgIGMuaW5uZXJIVE1MPWAke2VzYyhwLnBpY2spfSA8Yj4ke3AuY29uZmlkZW5jZX0lPC9iPmA7CiAgICBjLmFkZEV2ZW50TGlzdGVuZXIoImNsaWNrIiwoKT0+e2wucGljaz1wLnBpY2s7bC5wY3Q9cC5jb25maWRlbmNlO3JlbmRlckNvbnRyb2xzKCk7cmVuZGVyQ2FyZCgpO30pOwogICAgY2hpcHMuYXBwZW5kQ2hpbGQoYyk7CiAgfSk7CiAgd3JhcC5hcHBlbmRDaGlsZChjaGlwcyk7IHJldHVybiB3cmFwOwp9CmFzeW5jIGZ1bmN0aW9uIGxvYWRHYW1lcygpewogIHRyeXsKICAgIGNvbnN0IHI9YXdhaXQgZmV0Y2goIi9hcHAvY2FyZHMtZGF0YSIse2NhY2hlOiJuby1zdG9yZSJ9KTsKICAgIGNvbnN0IGQ9YXdhaXQgci5qc29uKCk7CiAgICBzdGF0ZS5nYW1lcz0oZCYmQXJyYXkuaXNBcnJheShkLmdhbWVzKSk/ZC5nYW1lczpbXTsKICAgIGlmKGQmJmQuZGF0ZSkgc3RhdGUuc3ViPWQuZGF0ZTsKICB9Y2F0Y2goZSl7IHN0YXRlLmdhbWVzPXdpbmRvdy5fX1NBTVBMRV9HQU1FU3x8W107IH0KICBpZighc3RhdGUuZ2FtZXMubGVuZ3RoJiZ3aW5kb3cuX19TQU1QTEVfR0FNRVMpIHN0YXRlLmdhbWVzPXdpbmRvdy5fX1NBTVBMRV9HQU1FUzsKICByZW5kZXJDb250cm9scygpOyByZW5kZXJDYXJkKCk7Cn0KZnVuY3Rpb24gZWRpdFRvZ2dsZSgpewogIGNvbnN0IGI9ZG9jdW1lbnQuY3JlYXRlRWxlbWVudCgiYnV0dG9uIik7Yi5jbGFzc05hbWU9ImVkaXRidG4iOwogIGIudGV4dENvbnRlbnQ9c3RhdGUuc2hvd0VkaXQ/IuKWviAgSGlkZSBkZXRhaWxzIjoi4pa4ICBDdXN0b21pemUgY2FyZCI7CiAgYi5hZGRFdmVudExpc3RlbmVyKCJjbGljayIsKCk9PntzdGF0ZS5zaG93RWRpdD0hc3RhdGUuc2hvd0VkaXQ7cmVuZGVyQ29udHJvbHMoKTt9KTsKICByZXR1cm4gYjsKfQpmdW5jdGlvbiByZW5kZXJDb250cm9scygpewogIGNvbnN0IHJvb3Q9JCgiY29udHJvbHMiKTsgcm9vdC5pbm5lckhUTUw9IiI7CiAgY29uc3QgaD1kb2N1bWVudC5jcmVhdGVFbGVtZW50KCJkaXYiKTsKICBoLmlubmVySFRNTD1gPGgyPiR7c3RhdGUubW9kZT09PSJzaW5nbGUiPyJNYWtlIGEgc2hhcmUgY2FyZCI6IkJ1aWxkIGFuIGFjY3VtdWxhdG9yIGNhcmQifTwvaDI+CiAgICA8ZGl2IGNsYXNzPSJoaW50Ij4ke3N0YXRlLmdhbWVzLmxlbmd0aD8iVGFwIGEgZ2FtZSBmcm9tIHlvdXIgbGl2ZSBwaWNrcyDigJQgdGhlIGNhcmQgZmlsbHMgaW4gd2l0aCBjcmVzdCwgcGljayBhbmQgY29uZmlkZW5jZSBhdXRvbWF0aWNhbGx5LiI6Ik5vIHBpY2tzIGxvYWRlZCB5ZXQuIEJ1aWxkIG9uZSBtYW51YWxseSBpbiBDdXN0b21pemUgYmVsb3cuIn08L2Rpdj5gOwogIHJvb3QuYXBwZW5kQ2hpbGQoaCk7CiAgcmVuZGVyQ29tcFNlbGVjdChyb290KTsKICByZW5kZXJHYW1lUGlja2VyKHJvb3QpOwoKICBpZihzdGF0ZS5tb2RlPT09InNpbmdsZSIpewogICAgY29uc3Qgcz1zdGF0ZS5zaW5nbGU7CiAgICByZW5kZXJCZXN0UGlja3Mocm9vdCk7CiAgICBpZihzLl9vcHRzJiZzLl9vcHRzLmxlbmd0aCl7CiAgICAgIGNvbnN0IHNtPWRvY3VtZW50LmNyZWF0ZUVsZW1lbnQoImRpdiIpO3NtLmNsYXNzTmFtZT0ic2Vsbm90ZSI7CiAgICAgIHNtLmlubmVySFRNTD1gT24gdGhlIGNhcmQ6IDxiPiR7ZXNjKHMudGVhbUEubmFtZSl9IHYgJHtlc2Mocy50ZWFtQi5uYW1lKX08L2I+IOKAlCAke2VzYyhzLnBpY2spfSDCtyAke2VzYyhzLnBjdCl9JWA7CiAgICAgIHJvb3QuYXBwZW5kQ2hpbGQoc20pOwogICAgfQogICAgcm9vdC5hcHBlbmRDaGlsZChlZGl0VG9nZ2xlKCkpOwogICAgaWYoc3RhdGUuc2hvd0VkaXQpewogICAgICBjb25zdCB3PWRvY3VtZW50LmNyZWF0ZUVsZW1lbnQoImRpdiIpO3cuY2xhc3NOYW1lPSJlZGl0d3JhcCI7CiAgICAgIGNvbnN0IHI9ZG9jdW1lbnQuY3JlYXRlRWxlbWVudCgiZGl2Iik7ci5jbGFzc05hbWU9InJvdzIiOwogICAgICByLmFwcGVuZENoaWxkKGZpZWxkKCJDb21wZXRpdGlvbiIsc3RhdGUuY29tcCx2PT5zdGF0ZS5jb21wPXYpKTsKICAgICAgci5hcHBlbmRDaGlsZChmaWVsZCgiU3VibGluZSIsc3RhdGUuc3ViLHY9PnN0YXRlLnN1Yj12KSk7CiAgICAgIHcuYXBwZW5kQ2hpbGQocik7CiAgICAgIHcuYXBwZW5kQ2hpbGQoc3ViKCJIb21lIikpOwogICAgICBjb25zdCByYT1kb2N1bWVudC5jcmVhdGVFbGVtZW50KCJkaXYiKTtyYS5jbGFzc05hbWU9InJvdzIiOwogICAgICByYS5hcHBlbmRDaGlsZChmaWVsZCgiVGVhbSBuYW1lIixzLnRlYW1BLm5hbWUsdj0+e3MudGVhbUEubmFtZT12O30pKTsKICAgICAgcmEuYXBwZW5kQ2hpbGQoZmllbGQoIk1vbm9ncmFtIixzLnRlYW1BLmNvZGUsdj0+cy50ZWFtQS5jb2RlPXYudG9VcHBlckNhc2UoKSkpOwogICAgICB3LmFwcGVuZENoaWxkKHJhKTsKICAgICAgdy5hcHBlbmRDaGlsZChpbWdGaWVsZCgiQ3Jlc3QgLyBmbGFnIChvdmVycmlkZSkiLCgpPT5zLnRlYW1BLmltZyx2PT5zLnRlYW1BLmltZz12KSk7CiAgICAgIHcuYXBwZW5kQ2hpbGQoc3ViKCJBd2F5IikpOwogICAgICBjb25zdCByYj1kb2N1bWVudC5jcmVhdGVFbGVtZW50KCJkaXYiKTtyYi5jbGFzc05hbWU9InJvdzIiOwogICAgICByYi5hcHBlbmRDaGlsZChmaWVsZCgiVGVhbSBuYW1lIixzLnRlYW1CLm5hbWUsdj0+e3MudGVhbUIubmFtZT12O30pKTsKICAgICAgcmIuYXBwZW5kQ2hpbGQoZmllbGQoIk1vbm9ncmFtIixzLnRlYW1CLmNvZGUsdj0+cy50ZWFtQi5jb2RlPXYudG9VcHBlckNhc2UoKSkpOwogICAgICB3LmFwcGVuZENoaWxkKHJiKTsKICAgICAgdy5hcHBlbmRDaGlsZChpbWdGaWVsZCgiQ3Jlc3QgLyBmbGFnIChvdmVycmlkZSkiLCgpPT5zLnRlYW1CLmltZyx2PT5zLnRlYW1CLmltZz12KSk7CiAgICAgIHcuYXBwZW5kQ2hpbGQoc3ViKCJQcmVkaWN0aW9uIikpOwogICAgICBjb25zdCBycz1kb2N1bWVudC5jcmVhdGVFbGVtZW50KCJkaXYiKTtycy5jbGFzc05hbWU9InJvdy1zYiI7CiAgICAgIHJzLmFwcGVuZENoaWxkKGZpZWxkKCJQaWNrIixzLnBpY2ssdj0+cy5waWNrPXYpKTsKICAgICAgcnMuYXBwZW5kQ2hpbGQoZmllbGQoIlNjb3JlIixzLnNhLHY9PnMuc2E9dikpOwogICAgICBycy5hcHBlbmRDaGlsZChmaWVsZCgiU2NvcmUiLHMuc2Isdj0+cy5zYj12KSk7CiAgICAgIHcuYXBwZW5kQ2hpbGQocnMpOwogICAgICB3LmFwcGVuZENoaWxkKHJhbmdlRmllbGQoIkNvbmZpZGVuY2UiLHMucGN0LHY9PntzLnBjdD0rdjt9KSk7CiAgICAgIHJvb3QuYXBwZW5kQ2hpbGQodyk7CiAgICB9CiAgfSBlbHNlIHsKICAgIGNvbnN0IHNsPXN0YXRlLnNsaXA7CiAgICBpZihzbC5sZWdzLmxlbmd0aCl7CiAgICAgIHJvb3QuYXBwZW5kQ2hpbGQoc3ViKHNsLmxlZ3MubGVuZ3RoKyIgcGlja3Mgb24gdGhpcyBzbGlwIikpOwogICAgICBzbC5sZWdzLmZvckVhY2goKGwsaSk9PnsKICAgICAgICBjb25zdCByb3c9ZG9jdW1lbnQuY3JlYXRlRWxlbWVudCgiZGl2Iik7cm93LmNsYXNzTmFtZT0ibGVnbWluaSI7CiAgICAgICAgcm93LmlubmVySFRNTD1gPGRpdiBjbGFzcz0ibG0tbWFpbiI+PGI+JHtlc2MobC5tYXRjaCl9PC9iPjxzcGFuPiR7ZXNjKGwucGljayl9IMK3ICR7ZXNjKGwucGN0KX0lPC9zcGFuPjwvZGl2PmA7CiAgICAgICAgY29uc3Qgcm09ZG9jdW1lbnQuY3JlYXRlRWxlbWVudCgiYnV0dG9uIik7cm0uY2xhc3NOYW1lPSJsbS1ybSI7cm0udGl0bGU9IlJlbW92ZSI7cm0udGV4dENvbnRlbnQ9IuKclSI7CiAgICAgICAgcm0uYWRkRXZlbnRMaXN0ZW5lcigiY2xpY2siLCgpPT57c2wubGVncy5zcGxpY2UoaSwxKTtyZW5kZXJDb250cm9scygpO3JlbmRlckNhcmQoKTt9KTsKICAgICAgICByb3cuYXBwZW5kQ2hpbGQocm0pOyByb290LmFwcGVuZENoaWxkKHJvdyk7CiAgICAgICAgaWYobC5fb3B0cyYmbC5fb3B0cy5sZW5ndGgpIHJvb3QuYXBwZW5kQ2hpbGQobGVnUGlja0NoaXBzKGwpKTsKICAgICAgfSk7CiAgICB9CiAgICByb290LmFwcGVuZENoaWxkKGVkaXRUb2dnbGUoKSk7CiAgICBpZihzdGF0ZS5zaG93RWRpdCl7CiAgICAgIGNvbnN0IHc9ZG9jdW1lbnQuY3JlYXRlRWxlbWVudCgiZGl2Iik7dy5jbGFzc05hbWU9ImVkaXR3cmFwIjsKICAgICAgY29uc3QgcjI9ZG9jdW1lbnQuY3JlYXRlRWxlbWVudCgiZGl2Iik7cjIuY2xhc3NOYW1lPSJyb3cyIjsKICAgICAgcjIuYXBwZW5kQ2hpbGQoZmllbGQoIlNsaXAgdGl0bGUiLHNsLnRpdGxlLHY9PnNsLnRpdGxlPXYpKTsKICAgICAgcjIuYXBwZW5kQ2hpbGQoZmllbGQoIlRvdGFsIG9kZHMgKG9wdGlvbmFsKSIsc2wudG90YWwsdj0+c2wudG90YWw9dikpOwogICAgICB3LmFwcGVuZENoaWxkKHIyKTsKICAgICAgc2wubGVncy5mb3JFYWNoKChsLGkpPT57CiAgICAgICAgY29uc3QgY2FyZD1kb2N1bWVudC5jcmVhdGVFbGVtZW50KCJkaXYiKTtjYXJkLmNsYXNzTmFtZT0ibGVnY2FyZCI7CiAgICAgICAgY2FyZC5pbm5lckhUTUw9YDxkaXYgY2xhc3M9ImxoZWFkIj48Yj5MZWcgJHtpKzF9PC9iPjwvZGl2PmA7CiAgICAgICAgY2FyZC5hcHBlbmRDaGlsZChmaWVsZCgiTWF0Y2giLGwubWF0Y2gsdj0+bC5tYXRjaD12KSk7CiAgICAgICAgY29uc3QgcnI9ZG9jdW1lbnQuY3JlYXRlRWxlbWVudCgiZGl2Iik7cnIuY2xhc3NOYW1lPSJyb3ctc2IiOwogICAgICAgIHJyLmFwcGVuZENoaWxkKGZpZWxkKCJQaWNrIixsLnBpY2ssdj0+bC5waWNrPXYpKTsKICAgICAgICByci5hcHBlbmRDaGlsZChmaWVsZCgiU2NvcmUiLGwuc2NvcmUsdj0+bC5zY29yZT12KSk7CiAgICAgICAgcnIuYXBwZW5kQ2hpbGQoZmllbGQoIk1vbm8iLGwuY29kZSx2PT5sLmNvZGU9di50b1VwcGVyQ2FzZSgpKSk7CiAgICAgICAgY2FyZC5hcHBlbmRDaGlsZChycik7CiAgICAgICAgY2FyZC5hcHBlbmRDaGlsZChyYW5nZUZpZWxkKCJDb25maWRlbmNlIixsLnBjdCx2PT57bC5wY3Q9K3Y7fSkpOwogICAgICAgIGNhcmQuYXBwZW5kQ2hpbGQoaW1nRmllbGQoIkNyZXN0IC8gZmxhZyAob3ZlcnJpZGUpIiwoKT0+bC5pbWcsdj0+bC5pbWc9dikpOwogICAgICAgIHcuYXBwZW5kQ2hpbGQoY2FyZCk7CiAgICAgIH0pOwogICAgICByb290LmFwcGVuZENoaWxkKHcpOwogICAgfQogICAgaWYoIXN0YXRlLmdhbWVzLmxlbmd0aCl7CiAgICAgIGNvbnN0IGFkZD1kb2N1bWVudC5jcmVhdGVFbGVtZW50KCJidXR0b24iKTthZGQuY2xhc3NOYW1lPSJhZGRsZWciO2FkZC50ZXh0Q29udGVudD0iKyBBZGQgbGVnIG1hbnVhbGx5IjsKICAgICAgYWRkLmRpc2FibGVkPXNsLmxlZ3MubGVuZ3RoPj04OwogICAgICBhZGQuYWRkRXZlbnRMaXN0ZW5lcigiY2xpY2siLCgpPT57IGlmKHNsLmxlZ3MubGVuZ3RoPj04KXJldHVybjsKICAgICAgICBzbC5sZWdzLnB1c2goe21hdGNoOiJUZWFtIEEgdiBUZWFtIEIiLGNvZGU6IiIscGljazoiUGljayIsc2NvcmU6IiIscGN0OjY1LGltZzoiIixfb3B0czpbXX0pOwogICAgICAgIHJlbmRlckNvbnRyb2xzKCk7cmVuZGVyQ2FyZCgpO30pOwogICAgICByb290LmFwcGVuZENoaWxkKGFkZCk7CiAgICB9CiAgfQp9CgpmdW5jdGlvbiBzdWIodCl7Y29uc3QgZD1kb2N1bWVudC5jcmVhdGVFbGVtZW50KCJkaXYiKTtkLmNsYXNzTmFtZT0ic3ViaGVhZCI7ZC50ZXh0Q29udGVudD10O3JldHVybiBkO30KZnVuY3Rpb24gcmFuZ2VGaWVsZChsYWJlbCx2YWwsZm4pewogIGNvbnN0IGY9ZG9jdW1lbnQuY3JlYXRlRWxlbWVudCgiZGl2Iik7Zi5jbGFzc05hbWU9ImZsZCI7CiAgZi5pbm5lckhUTUw9YDxsYWJlbD4ke2xhYmVsfTwvbGFiZWw+PGRpdiBjbGFzcz0icm5nIj48aW5wdXQgdHlwZT0icmFuZ2UiIG1pbj0iNDAiIG1heD0iOTkiIHZhbHVlPSIke3ZhbH0iPjxzcGFuIGNsYXNzPSJ2YWwiPiR7dmFsfSU8L3NwYW4+PC9kaXY+YDsKICBjb25zdCBpbnA9Zi5xdWVyeVNlbGVjdG9yKCJpbnB1dCIpLGxhYj1mLnF1ZXJ5U2VsZWN0b3IoIi52YWwiKTsKICBpbnAuYWRkRXZlbnRMaXN0ZW5lcigiaW5wdXQiLGU9PntsYWIudGV4dENvbnRlbnQ9ZS50YXJnZXQudmFsdWUrIiUiO2ZuKGUudGFyZ2V0LnZhbHVlKTtyZW5kZXJDYXJkKCk7fSk7CiAgcmV0dXJuIGY7Cn0KCi8qIC0tLS0tLS0tLS0tLS0tLS0gYmFyIGFjdGlvbnMgLS0tLS0tLS0tLS0tLS0tLSAqLwokKCJtb2Rlc2VnIikucXVlcnlTZWxlY3RvckFsbCgiYnV0dG9uIikuZm9yRWFjaChiPT5iLmFkZEV2ZW50TGlzdGVuZXIoImNsaWNrIiwoKT0+ewogIHN0YXRlLm1vZGU9Yi5kYXRhc2V0Lm1vZGU7CiAgJCgibW9kZXNlZyIpLnF1ZXJ5U2VsZWN0b3JBbGwoImJ1dHRvbiIpLmZvckVhY2goeD0+eC5jbGFzc0xpc3QudG9nZ2xlKCJvbiIseD09PWIpKTsKICAkKCJzdGFnZWxhYmVsIikudGV4dENvbnRlbnQ9c3RhdGUubW9kZT09PSJzaW5nbGUiPyJMaXZlIHByZXZpZXcg4oCUIHNpbmdsZSBtYXRjaCI6IkxpdmUgcHJldmlldyDigJQgYWNjdW11bGF0b3IiOwogIHJlbmRlckNvbnRyb2xzKCk7cmVuZGVyQ2FyZCgpOwp9KSk7CiQoInRoZW1lYnRuIikuYWRkRXZlbnRMaXN0ZW5lcigiY2xpY2siLCgpPT57CiAgc3RhdGUudGhlbWU9c3RhdGUudGhlbWU9PT0ibGlnaHQiPyJkYXJrIjoibGlnaHQiOwogIGRvY3VtZW50LmRvY3VtZW50RWxlbWVudC5zZXRBdHRyaWJ1dGUoImRhdGEtdGhlbWUiLHN0YXRlLnRoZW1lKTtsb2NhbFN0b3JhZ2Uuc2V0SXRlbSgiY212bmctdGhlbWUiLHN0YXRlLnRoZW1lKTsKICAkKCJ0aGVtZWJ0biIpLnRleHRDb250ZW50PXN0YXRlLnRoZW1lPT09ImxpZ2h0Ij8i8J+MmSI6IuKYgO+4jyI7CiAgc2V0TG9nb3MoKTtyZW5kZXJDYXJkKCk7Cn0pOwpmdW5jdGlvbiBzZXRMb2dvcygpeyAkKCJiYXJsb2dvIikuc3JjID0gc3RhdGUudGhlbWU9PT0ibGlnaHQiP0xPR09fTElHSFQ6TE9HT19EQVJLOyB9CgokKCJkbGJ0biIpLmFkZEV2ZW50TGlzdGVuZXIoImNsaWNrIixhc3luYygpPT57CiAgY29uc3QgYnRuPSQoImRsYnRuIiksY2FyZD0kKCJjYXJkIiksc2NhbGVyPSQoInNjYWxlciIpOwogIGJ0bi50ZXh0Q29udGVudD0iUmVuZGVyaW5n4oCmIjsgYnRuLmRpc2FibGVkPXRydWU7CiAgY29uc3QgcHJldj1zY2FsZXIuc3R5bGUudHJhbnNmb3JtOyBzY2FsZXIuc3R5bGUudHJhbnNmb3JtPSJzY2FsZSgxKSI7CiAgZnVuY3Rpb24gY292ZXJGaXgoZG9jKXt0cnl7ZG9jLmRvY3VtZW50RWxlbWVudC5zZXRBdHRyaWJ1dGUoImRhdGEtdGhlbWUiLGRvY3VtZW50LmRvY3VtZW50RWxlbWVudC5nZXRBdHRyaWJ1dGUoImRhdGEtdGhlbWUiKXx8ImxpZ2h0Iik7fWNhdGNoKGUpe312YXIgZz1kb2MucXVlcnlTZWxlY3RvcigiLmdyYWluIik7aWYoZylnLnN0eWxlLmRpc3BsYXk9Im5vbmUiO3ZhciBMPWRvY3VtZW50LnF1ZXJ5U2VsZWN0b3JBbGwoIiNjYXJkIC5tZWRhbCBpbWciKSxDPWRvYy5xdWVyeVNlbGVjdG9yQWxsKCIjY2FyZCAubWVkYWwgaW1nIik7Zm9yKHZhciBpPTA7aTxDLmxlbmd0aDtpKyspe3ZhciBsdj1MW2ldO2lmKCFsdiljb250aW51ZTt2YXIgbnc9bHYubmF0dXJhbFdpZHRoLG5oPWx2Lm5hdHVyYWxIZWlnaHQscj1sdi5nZXRCb3VuZGluZ0NsaWVudFJlY3QoKSxjdz1yLndpZHRoLGNoPXIuaGVpZ2h0O2lmKG53PjAmJm5oPjAmJmN3PjAmJmNoPjApe3ZhciBzYz1NYXRoLm1heChjdy9udyxjaC9uaCk7Q1tpXS5zdHlsZS5vYmplY3RGaXQ9ImZpbGwiO0NbaV0uc3R5bGUuZmxleFNocmluaz0iMCI7Q1tpXS5zdHlsZS53aWR0aD1NYXRoLnJvdW5kKG53KnNjKSsicHgiO0NbaV0uc3R5bGUuaGVpZ2h0PU1hdGgucm91bmQobmgqc2MpKyJweCI7Q1tpXS5zdHlsZS5tYXhXaWR0aD0ibm9uZSI7Q1tpXS5zdHlsZS5tYXhIZWlnaHQ9Im5vbmUiO319fQogIGZ1bmN0aW9uIHNob290KHNhZmUpe3JldHVybiBodG1sMmNhbnZhcyhjYXJkLHtzY2FsZTo0LGJhY2tncm91bmRDb2xvcjpudWxsLHVzZUNPUlM6dHJ1ZSxsb2dnaW5nOmZhbHNlLGltYWdlVGltZW91dDo2MDAwLHJlbW92ZUNvbnRhaW5lcjp0cnVlLG9uY2xvbmU6ZnVuY3Rpb24oZG9jKXtjb3ZlckZpeChkb2MpO2lmKHNhZmUpe3ZhciBzdD1kb2MuY3JlYXRlRWxlbWVudCgic3R5bGUiKTtzdC50ZXh0Q29udGVudD0iLmF0bW9ze2JhY2tncm91bmQ6bGluZWFyLWdyYWRpZW50KDE2MmRlZyx2YXIoLS1jMSksdmFyKC0tYzIpKSFpbXBvcnRhbnR9Lm1lZGFsOjphZnRlcntkaXNwbGF5Om5vbmUhaW1wb3J0YW50fS5ocntiYWNrZ3JvdW5kOnZhcigtLWMtbGluZSkhaW1wb3J0YW50fSI7ZG9jLmhlYWQuYXBwZW5kQ2hpbGQoc3QpO319fSk7fQogIHRyeXsKICAgIGF3YWl0IGRvY3VtZW50LmZvbnRzLnJlYWR5OwogICAgYXdhaXQgUHJvbWlzZS5hbGwoW10uc2xpY2UuY2FsbChjYXJkLnF1ZXJ5U2VsZWN0b3JBbGwoImltZyIpKS5tYXAoZnVuY3Rpb24oaW0pe2lmKGltLmNvbXBsZXRlJiZpbS5uYXR1cmFsV2lkdGg+MClyZXR1cm4gUHJvbWlzZS5yZXNvbHZlKCk7cmV0dXJuIG5ldyBQcm9taXNlKGZ1bmN0aW9uKHJlcyl7aW0uYWRkRXZlbnRMaXN0ZW5lcigibG9hZCIscmVzLHtvbmNlOnRydWV9KTtpbS5hZGRFdmVudExpc3RlbmVyKCJlcnJvciIsZnVuY3Rpb24oKXt0cnl7aW0ucGFyZW50Tm9kZS5pbm5lckhUTUw9JzxzcGFuIGNsYXNzPSJtb25vIj4nKyhpbS5nZXRBdHRyaWJ1dGUoImRhdGEtY29kZSIpfHwiIikrJzwvc3Bhbj4nO31jYXRjaChlKXt9cmVzKCk7fSx7b25jZTp0cnVlfSk7c2V0VGltZW91dChyZXMsMzAwMCk7fSk7fSkpOwogICAgdmFyIGNhbnZhczsgdHJ5eyBjYW52YXM9YXdhaXQgc2hvb3QoZmFsc2UpOyB9Y2F0Y2goZTEpeyBjb25zb2xlLndhcm4oImZ1bGwgcmVuZGVyIGZhaWxlZCwgcmV0cnlpbmcgc2FmZToiLGUxJiZlMS5tZXNzYWdlKTsgY2FudmFzPWF3YWl0IHNob290KHRydWUpOyB9CiAgICBjb25zdCBhPWRvY3VtZW50LmNyZWF0ZUVsZW1lbnQoImEiKTsKICAgIGEuZG93bmxvYWQ9YGNtdm5nXyR7c3RhdGUubW9kZX1fY2FyZC5wbmdgOyBhLmhyZWY9Y2FudmFzLnRvRGF0YVVSTCgiaW1hZ2UvcG5nIik7IGEuY2xpY2soKTsKICB9Y2F0Y2goZSl7IGFsZXJ0KCJFeHBvcnQgZmFpbGVkOiAiK2UubWVzc2FnZSk7IH0KICBzY2FsZXIuc3R5bGUudHJhbnNmb3JtPXByZXY7IGJ0bi50ZXh0Q29udGVudD0i4qSTIERvd25sb2FkIFBORyI7IGJ0bi5kaXNhYmxlZD1mYWxzZTsKfSk7CgovKiBpbml0ICovCihmdW5jdGlvbigpe3ZhciBfdD1sb2NhbFN0b3JhZ2UuZ2V0SXRlbSgiY212bmctdGhlbWUiKTtpZihfdCl7c3RhdGUudGhlbWU9X3Q7ZG9jdW1lbnQuZG9jdW1lbnRFbGVtZW50LnNldEF0dHJpYnV0ZSgiZGF0YS10aGVtZSIsX3QpO312YXIgX2I9ZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoInRoZW1lYnRuIik7aWYoX2IpX2IudGV4dENvbnRlbnQ9c3RhdGUudGhlbWU9PT0iZGFyayI/IuKYgO+4jyI6IvCfjJkiO30pKCk7c2V0TG9nb3MoKTtyZW5kZXJDb250cm9scygpO2xvYWRHYW1lcygpOwpkb2N1bWVudC5mb250cy5yZWFkeS50aGVuKHJlbmRlckNhcmQpOyByZW5kZXJDYXJkKCk7Cjwvc2NyaXB0Pgo8ZGl2IGNsYXNzPSJjYi10YWJiYXIiPjxhIGhyZWY9Ii8iPjxzcGFuIGNsYXNzPSJpYyI+PHN2ZyB3aWR0aD0iMjIiIGhlaWdodD0iMjIiIHZpZXdCb3g9IjAgMCAyNCAyNCIgZmlsbD0ibm9uZSIgc3Ryb2tlPSJjdXJyZW50Q29sb3IiIHN0cm9rZS13aWR0aD0iMiIgc3Ryb2tlLWxpbmVjYXA9InJvdW5kIiBzdHJva2UtbGluZWpvaW49InJvdW5kIiBzdHlsZT0iZGlzcGxheTpibG9jayI+PHBhdGggZD0iTTMgMTAuNCAxMiAzbDkgNy40Ii8+PHBhdGggZD0iTTUuNSA5LjJWMjBhMSAxIDAgMCAwIDEgMWgxMWExIDEgMCAwIDAgMS0xVjkuMiIvPjxwYXRoIGQ9Ik05LjUgMjF2LTUuNWExIDEgMCAwIDEgMS0xaDNhMSAxIDAgMCAxIDEgMVYyMSIvPjwvc3ZnPjwvc3Bhbj48c3BhbiBjbGFzcz0idGwiPkhvbWU8L3NwYW4+PC9hPjxhIGhyZWY9Ii9hcHAvcGlja3MiPjxzcGFuIGNsYXNzPSJpYyI+PHN2ZyB3aWR0aD0iMjIiIGhlaWdodD0iMjIiIHZpZXdCb3g9IjAgMCAyNCAyNCIgZmlsbD0ibm9uZSIgc3Ryb2tlPSJjdXJyZW50Q29sb3IiIHN0cm9rZS13aWR0aD0iMiIgc3Ryb2tlLWxpbmVjYXA9InJvdW5kIiBzdHJva2UtbGluZWpvaW49InJvdW5kIiBzdHlsZT0iZGlzcGxheTpibG9jayI+PGNpcmNsZSBjeD0iMTIiIGN5PSIxMiIgcj0iOSIvPjxwYXRoIGQ9Im0xMiA3LjEgMy4zIDIuNC0xLjI2IDMuOUg5Ljk2TDguNyA5LjV6Ii8+PHBhdGggZD0iTTEyIDN2NC4xTTUuMSA5bDIuODUgMi4yNU0xOC45IDlsLTIuODUgMi4yNU04LjQ1IDIwLjEgOS45NiAxMy40TTE1LjU1IDIwLjEgMTQuMDQgMTMuNCIvPjwvc3ZnPjwvc3Bhbj48c3BhbiBjbGFzcz0idGwiPlBpY2tzPC9zcGFuPjwvYT48YSBocmVmPSIvYXBwL2NvZGVzIj48c3BhbiBjbGFzcz0iaWMiPjxzdmcgd2lkdGg9IjIyIiBoZWlnaHQ9IjIyIiB2aWV3Qm94PSIwIDAgMjQgMjQiIGZpbGw9Im5vbmUiIHN0cm9rZT0iY3VycmVudENvbG9yIiBzdHJva2Utd2lkdGg9IjIiIHN0cm9rZS1saW5lY2FwPSJyb3VuZCIgc3Ryb2tlLWxpbmVqb2luPSJyb3VuZCIgc3R5bGU9ImRpc3BsYXk6YmxvY2siPjxwYXRoIGQ9Ik0zLjUgOC42QTEuNiAxLjYgMCAwIDAgNSA3VjYuMkExLjIgMS4yIDAgMCAxIDYuMiA1aDExLjZBMS4yIDEuMiAwIDAgMSAxOSA2LjJWN2ExLjYgMS42IDAgMCAwIDEuNSAxLjZ2MkExLjYgMS42IDAgMCAwIDE5IDEyLjJ2NS42YTEuMiAxLjIgMCAwIDEtMS4yIDEuMkg2LjJBMS4yIDEuMiAwIDAgMSA1IDE3Ljh2LTUuNkExLjYgMS42IDAgMCAwIDMuNSAxMC42eiIvPjxwYXRoIGQ9Ik0xMiA3LjV2MS42TTEyIDExLjJ2MS42TTEyIDE0Ljl2MS42Ii8+PC9zdmc+PC9zcGFuPjxzcGFuIGNsYXNzPSJ0bCI+Q29kZXM8L3NwYW4+PC9hPjxhIGhyZWY9Ii9hcHAvY2FyZHMiIGNsYXNzPSJhY3RpdmUiPjxzcGFuIGNsYXNzPSJpYyI+PHN2ZyB3aWR0aD0iMjIiIGhlaWdodD0iMjIiIHZpZXdCb3g9IjAgMCAyNCAyNCIgZmlsbD0ibm9uZSIgc3Ryb2tlPSJjdXJyZW50Q29sb3IiIHN0cm9rZS13aWR0aD0iMiIgc3Ryb2tlLWxpbmVjYXA9InJvdW5kIiBzdHJva2UtbGluZWpvaW49InJvdW5kIiBzdHlsZT0iZGlzcGxheTpibG9jayI+PHJlY3QgeD0iMyIgeT0iNC41IiB3aWR0aD0iMTgiIGhlaWdodD0iMTUiIHJ4PSIyLjUiLz48Y2lyY2xlIGN4PSI4LjUiIGN5PSI5LjUiIHI9IjEuNiIvPjxwYXRoIGQ9Im0zLjggMTcuNSA0LjQtNC4zYTIgMiAwIDAgMSAyLjggMGw1LjIgNS4xIi8+PHBhdGggZD0ibTEzLjUgMTQgMi0yYTIgMiAwIDAgMSAyLjggMGwyIDIiLz48L3N2Zz48L3NwYW4+PHNwYW4gY2xhc3M9InRsIj5DYXJkczwvc3Bhbj48L2E+PGEgaHJlZj0iL2FwcC9wYXBlci1wb2x5Ij48c3BhbiBjbGFzcz0iaWMiPjxzdmcgd2lkdGg9IjIyIiBoZWlnaHQ9IjIyIiB2aWV3Qm94PSIwIDAgMjQgMjQiIGZpbGw9Im5vbmUiIHN0cm9rZT0iY3VycmVudENvbG9yIiBzdHJva2Utd2lkdGg9IjIiIHN0cm9rZS1saW5lY2FwPSJyb3VuZCIgc3Ryb2tlLWxpbmVqb2luPSJyb3VuZCIgc3R5bGU9ImRpc3BsYXk6YmxvY2siPjxjaXJjbGUgY3g9IjEyIiBjeT0iMTIiIHI9IjkiLz48cGF0aCBkPSJNMTIgNi40djExLjIiLz48cGF0aCBkPSJNMTQuOSA5Yy0uNS0uOS0xLjYtMS40NS0yLjktMS40NS0xLjc1IDAtMy4wNS45NS0zLjA1IDIuMzUgMCAxLjMgMSAxLjk1IDMuMDUgMi4zNXMzLjA1Ljk1IDMuMDUgMi4zNWMwIDEuNC0xLjMgMi4zNS0zLjA1IDIuMzUtMS4zNSAwLTIuNDUtLjU1LTIuOTUtMS40NSIvPjwvc3ZnPjwvc3Bhbj48c3BhbiBjbGFzcz0idGwiPkNyeXB0bzwvc3Bhbj48L2E+PGEgaHJlZj0iL2FwcC9yZXN1bHRzIj48c3BhbiBjbGFzcz0iaWMiPjxzdmcgd2lkdGg9IjIyIiBoZWlnaHQ9IjIyIiB2aWV3Qm94PSIwIDAgMjQgMjQiIGZpbGw9Im5vbmUiIHN0cm9rZT0iY3VycmVudENvbG9yIiBzdHJva2Utd2lkdGg9IjIiIHN0cm9rZS1saW5lY2FwPSJyb3VuZCIgc3Ryb2tlLWxpbmVqb2luPSJyb3VuZCIgc3R5bGU9ImRpc3BsYXk6YmxvY2siPjxwYXRoIGQ9Ik0zIDN2MTYuNUExLjUgMS41IDAgMCAwIDQuNSAyMUgyMSIvPjxwYXRoIGQ9Im03IDE0LjUgMy40LTMuNCAzIDMgNC42LTUuMSIvPjxwYXRoIGQ9Ik0xOCA1aDJ2MiIvPjwvc3ZnPjwvc3Bhbj48c3BhbiBjbGFzcz0idGwiPlJlc3VsdHM8L3NwYW4+PC9hPjwvZGl2PjwvYm9keT4KPC9odG1sPgo="
-).decode("utf-8")
-
-
-@app.route("/app/cards")
-def share_cards():
-    return SHARE_STUDIO_HTML
-
-
-@app.route("/app/cards-data")
-def cards_data():
-    """Read-only feed of today's games + best picks for the Cards builder."""
-    mp = _FB_CACHE.get("match_picks", {}) or {}
-    games = []
-    for match, picks in mp.items():
-        if not picks:
-            continue
-        first = picks[0]
-        games.append({
-            "match": match,
-            "home": first.get("home", ""),
-            "away": first.get("away", ""),
-            "league": first.get("league", ""),
-            "kickoff": _fb_fmt_kickoff(first.get("kickoff_ts")),
-            "when": _fb_fmt_when(first.get("kickoff_ts")),
-            "picks": [{"pick": p.get("pick", ""),
-                       "confidence": int(round(p.get("confidence", 0) or 0))}
-                      for p in picks if p.get("pick")],
-        })
-    return jsonify({"date": _FB_CACHE.get("date") or _fb_today_human(), "games": games})
-
-
-_COUNTRY_ISO = {
- "qatar":"qa","ecuador":"ec","senegal":"sn","netherlands":"nl","holland":"nl","england":"gb-eng",
- "iran":"ir","usa":"us","united states":"us","wales":"gb-wls","argentina":"ar","saudi arabia":"sa",
- "mexico":"mx","poland":"pl","france":"fr","australia":"au","denmark":"dk","tunisia":"tn","spain":"es",
- "costa rica":"cr","germany":"de","japan":"jp","belgium":"be","canada":"ca","morocco":"ma","croatia":"hr",
- "brazil":"br","serbia":"rs","switzerland":"ch","cameroon":"cm","portugal":"pt","ghana":"gh","uruguay":"uy",
- "south korea":"kr","korea republic":"kr","korea":"kr","north korea":"kp","ivory coast":"ci","cote d'ivoire":"ci",
- "italy":"it","scotland":"gb-sct","northern ireland":"gb-nir","ireland":"ie","republic of ireland":"ie",
- "sweden":"se","norway":"no","finland":"fi","iceland":"is","austria":"at","czech republic":"cz","czechia":"cz",
- "slovakia":"sk","slovenia":"si","hungary":"hu","romania":"ro","bulgaria":"bg","greece":"gr","turkey":"tr",
- "ukraine":"ua","russia":"ru","belarus":"by","georgia":"ge","armenia":"am","azerbaijan":"az","israel":"il",
- "egypt":"eg","algeria":"dz","nigeria":"ng","south africa":"za","kenya":"ke","mali":"ml","burkina faso":"bf",
- "dr congo":"cd","congo":"cg","angola":"ao","zambia":"zm","zimbabwe":"zw","tanzania":"tz","uganda":"ug",
- "sudan":"sd","guinea":"gn","gabon":"ga","cape verde":"cv","mauritania":"mr","benin":"bj","togo":"tg",
- "niger":"ne","madagascar":"mg","mozambique":"mz","namibia":"na","botswana":"bw","libya":"ly","ethiopia":"et",
- "chile":"cl","colombia":"co","peru":"pe","paraguay":"py","bolivia":"bo","venezuela":"ve","panama":"pa",
- "honduras":"hn","el salvador":"sv","guatemala":"gt","jamaica":"jm","trinidad and tobago":"tt","haiti":"ht",
- "curacao":"cw","china":"cn","india":"in","indonesia":"id","thailand":"th","vietnam":"vn","malaysia":"my",
- "singapore":"sg","philippines":"ph","uae":"ae","united arab emirates":"ae","iraq":"iq","jordan":"jo",
- "syria":"sy","lebanon":"lb","oman":"om","kuwait":"kw","bahrain":"bh","yemen":"ye","palestine":"ps",
- "uzbekistan":"uz","kazakhstan":"kz","new zealand":"nz","albania":"al","north macedonia":"mk","macedonia":"mk",
- "bosnia":"ba","bosnia and herzegovina":"ba","montenegro":"me","kosovo":"xk","moldova":"md","luxembourg":"lu",
- "cyprus":"cy","malta":"mt","estonia":"ee","latvia":"lv","lithuania":"lt","gibraltar":"gi","faroe islands":"fo",
-}
-
-
-def _flag_url(name):
-    iso = _COUNTRY_ISO.get((name or "").lower().strip())
-    return ("https://flagcdn.com/w320/%s.png" % iso) if iso else None
-
-
-_TEAM_LOGO_URL = {}
-_TEAM_LOGO_IMG = {}
-
-
-@app.route("/app/team-logo")
-def team_logo():
-    """Same-origin badge proxy. National team -> free flag (flagcdn, no key);
-    club -> API-Football crest. Served as image bytes so cards render AND export
-    without CORS. 404 -> the card falls back to a monogram. URL + bytes cached so
-    each team is fetched at most once."""
-    name = (request.args.get("name", "") or "").strip()
-    if not name:
-        return ("", 404)
-    key = name.lower()
-    url = _TEAM_LOGO_URL.get(key, "__miss__")
-    if url == "__miss__":
-        url = _flag_url(name)
-        if not url:
-            try:
-                data = _apifootball_get("/teams", {"search": name})
-                resp = (data or {}).get("response") or []
-                if resp:
-                    url = (resp[0].get("team") or {}).get("logo")
-            except Exception:
-                url = None
-        _TEAM_LOGO_URL[key] = url
-    if not url:
-        return ("", 404)
-    cached = _TEAM_LOGO_IMG.get(url)
-    if cached is None:
-        try:
-            r = _sports_req.get(url, timeout=8, headers={"User-Agent": "Mozilla/5.0"})
-            if r.status_code == 200 and r.content:
-                cached = (r.content, r.headers.get("Content-Type", "image/png"))
-                if len(_TEAM_LOGO_IMG) < 600:
-                    _TEAM_LOGO_IMG[url] = cached
-        except Exception:
-            cached = None
-    if not cached:
-        return ("", 404)
-    from flask import Response
-    out = Response(cached[0], mimetype=cached[1])
-    out.headers["Cache-Control"] = "public, max-age=604800"
-    return out
-
-
 @app.route("/app/picks")
 def fb_picks_page():
     return render_picks_page(_FB_CACHE.get("match_picks", {}),
@@ -12143,33 +10635,6 @@ def fb_picks_page():
 def fb_codes_page():
     return render_codes_page(_FB_CACHE.get("accumulators", []),
                              _FB_CACHE.get("date") or _fb_today_human())
-
-
-@app.route("/app/fb-rescan")
-def fb_rescan_now():
-    """Manual 'Rescan now' trigger: re-runs the football engine immediately in the
-    background and re-anchors the 12h schedule (the scheduler keys off
-    last_run_ts, which the run updates). Refresh picks/codes WITHOUT a deploy."""
-    back = ("<p style='font:15px system-ui;margin-top:14px'>"
-            "<a href='/app/codes'>← Back to Codes</a></p>")
-    if _FB_CACHE.get("running"):
-        return ("<h3 style='font:600 18px system-ui'>Rescan already in progress…</h3>"
-                "<p style='font:15px system-ui'>The engine is running now. Give it a "
-                "minute, then refresh Codes.</p>" + back), 200
-    age = time.time() - (_FB_CACHE.get("last_run_ts") or 0)
-    if age < 120:
-        return ("<h3 style='font:600 18px system-ui'>Just scanned {}s ago.</h3>"
-                "<p style='font:15px system-ui'>To avoid hammering the sources, wait a "
-                "moment before forcing another rescan.</p>".format(int(age)) + back), 200
-    def _bg():
-        try:
-            run_football_engine(get_db, TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, send_telegram)
-        except Exception as e:
-            print("[FB] manual rescan error: {}".format(e))
-    threading.Thread(target=_bg, daemon=True).start()
-    return ("<h3 style='font:600 18px system-ui'>Rescan started ✅</h3>"
-            "<p style='font:15px system-ui'>Fresh picks + codes are building now and the "
-            "12-hour clock has been reset. Refresh Codes in ~1–2 minutes.</p>" + back), 200
 
 
 @app.route("/app/builder")
