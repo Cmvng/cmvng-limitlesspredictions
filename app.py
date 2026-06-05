@@ -1131,7 +1131,14 @@ def sign_order(
     encoded_message = encode_typed_data(domain_data, ORDER_TYPES, message_data)
     signed_message = account.sign_message(encoded_message)
 
-    return signed_message.signature.hex()
+    # hexbytes 1.x changed .hex() to NOT include the '0x' prefix (was
+    # included pre-1.0 when this SDK was written). Limitless's API
+    # validates "signature must be a 0x-prefixed hex string" and rejects
+    # bare-hex with HTTP 400. Mirror the auth-path safety check at line ~571.
+    sig_hex = signed_message.signature.hex()
+    if not sig_hex.startswith("0x"):
+        sig_hex = "0x" + sig_hex
+    return sig_hex
 
 
 def submit_order(
