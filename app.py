@@ -4993,10 +4993,8 @@ def _lmts_place_live(paper_trade_id, market_data, asset, tf_label, direction,
     # shares = USDC budget / (price in dollars). e.g. $2 @ 70c -> ~2.857 shares.
     shares = round(capped_stake / max(limit_price_cents / 100.0, 0.01), 4)
 
-    try:
-        pass  # limitless_sdk inlined above
-    except Exception:
-        ORDER_TYPE_FOK = "FOK"
+    # ORDER_TYPE_FOK is a module-level constant (defined ~line 176 alongside
+    # the rest of the inlined SDK constants). No try/except shim needed.
 
     try:
         resp = client.buy(
