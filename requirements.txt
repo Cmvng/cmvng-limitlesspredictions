@@ -24,13 +24,3 @@ cloudscraper>=1.2.71
 # web3 signing stack, pydantic 2.x), so the Railway build will be noticeably
 # slower. If missing, Polymarket degrades gracefully — it does NOT block boot.
 py-clob-client==0.34.6
-# Limitless Exchange SDK — required for LIVE trading on Limitless (FOK orders,
-# USDC approval, and on-chain redemption of winning positions). Imports are
-# wrapped in try/except, so if this package is missing the app still boots and
-# all paper flows work — only the live toggle is non-functional (clicking
-# "Go Live" or "Approve USDC" records ERROR rows with "py-limitless missing").
-# Bundles eth-account, web3, aiohttp, and python-socketio as transitive deps,
-# which overlaps with what py-clob-client already pulled in — pip resolves the
-# overlap fine. Pinned because the SDK is young (0.1.x) and a minor bump could
-# rename internal modules; bump deliberately, not silently.
-py-limitless==0.1.1
