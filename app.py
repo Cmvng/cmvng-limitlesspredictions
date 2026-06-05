@@ -6,7 +6,7 @@
 # MECHANICAL — pure coded rules. Zero API cost. Instant execution.
 # ═══════════════════════════════════════════════════════════════════════════════
 
-from flask import Flask, request, jsonify, render_template_string
+from flask import Flask, request, jsonify, render_template_string, redirect
 import pg8000.native
 import os
 import re
@@ -33,6 +33,24 @@ POLY_API_PASSPHRASE = os.environ.get("POLY_API_PASSPHRASE", "")
 POLY_FUNDER_ADDRESS = os.environ.get("POLY_FUNDER_ADDRESS", "")
 POLY_PROXY_URL     = os.environ.get("POLY_PROXY_URL", "")
 LIMITLESS_PRIV_KEY = os.environ.get("LIMITLESS_PRIVATE_KEY", "")
+
+# ── Limitless LIVE trading (DB-backed toggle; env values below are only
+# defaults for first boot / cap overrides). The live ON/OFF switch lives in
+# the v2_settings table and is flipped from the paper bot page. Per-trade
+# and daily caps gate exposure while the strategy proves out.
+#
+# Prerequisites for live to actually execute (all checked at trade time):
+#   * py-limitless installed
+#   * LIMITLESS_PRIVATE_KEY env present
+#   * Wallet has USDC on Base
+#   * Limitless exchange contract approved as USDC spender (one click in app)
+LIMITLESS_LIVE_BOOTSTRAP = os.environ.get("LIMITLESS_LIVE", "0").strip().lower() in ("1", "true", "yes", "on")
+LIMITLESS_MAX_TRADE_USDC = float(os.environ.get("LIMITLESS_MAX_TRADE_USDC", "1.0"))
+# Balance floor: when wallet USDC drops below this, the bot pauses live trading
+# until winning trades top it back up. Replaces the old daily-cap model — the
+# floor is the natural circuit breaker since balance reflects actual capital.
+LIMITLESS_MIN_BALANCE_USDC = float(os.environ.get("LIMITLESS_MIN_BALANCE_USDC", "2.0"))
+LIMITLESS_BASE_RPC = os.environ.get("LIMITLESS_BASE_RPC", "https://mainnet.base.org")
 
 # ═══════════════════════════════════════════════════════════
 # PROXY PATCH — must happen before ClobClient import
@@ -181,6 +199,65 @@ def init_db():
         conn.run("ALTER TABLE v2_paper_trades ADD COLUMN IF NOT EXISTS order_status TEXT DEFAULT 'FILLED'")
     except:
         pass
+    # ── v2 LIVE trades — real Limitless fills (FOK only). Mirrors paper schema
+    # for easy side-by-side comparison; paper_trade_id links each live trade to
+    # the paper twin so we can measure the adverse-fill gap once real data lands.
+    conn.run("""
+        CREATE TABLE IF NOT EXISTS v2_live_trades (
+            id                  SERIAL PRIMARY KEY,
+            paper_trade_id      INTEGER,
+            platform            TEXT NOT NULL DEFAULT 'limitless',
+            timeframe           TEXT, asset TEXT, direction TEXT,
+            market_slug         TEXT, token_id TEXT, condition_id TEXT,
+            limit_price_cents   REAL,
+            stake_usdc          REAL,
+            size_shares         REAL,
+            fill_status         TEXT,        -- 'FILLED' | 'CANCELLED' | 'ERROR' | 'CAPPED'
+            order_id            TEXT,
+            fill_price_cents    REAL,
+            filled_size         REAL,
+            raw_response        TEXT,
+            error_message       TEXT,
+            fired_at            TIMESTAMPTZ DEFAULT NOW(),
+            -- Resolution lifecycle (filled in by _v2_resolve_live_trades) --
+            actual_result       TEXT,        -- 'UP' | 'DOWN' | 'FLAT'
+            outcome             TEXT,        -- 'WIN' | 'LOSS' | 'PUSH' | NULL (unresolved)
+            pnl                 REAL,
+            resolved_at         TIMESTAMPTZ,
+            -- On-chain redemption (auto-claim for WIN rows) --
+            redeem_status       TEXT,        -- 'PENDING' | 'DONE' | 'FAILED' | 'SKIPPED'
+            redeem_tx_hash      TEXT,
+            redeem_attempts     INTEGER DEFAULT 0,
+            redeem_last_attempt TIMESTAMPTZ
+        )
+    """)
+    # ── Migrations for existing v2_live_trades rows (older deploys won't
+    # have the resolution/redemption columns). Each ALTER is idempotent via
+    # IF NOT EXISTS so re-runs are safe.
+    for _alter in (
+        "ALTER TABLE v2_live_trades ADD COLUMN IF NOT EXISTS condition_id TEXT",
+        "ALTER TABLE v2_live_trades ADD COLUMN IF NOT EXISTS actual_result TEXT",
+        "ALTER TABLE v2_live_trades ADD COLUMN IF NOT EXISTS outcome TEXT",
+        "ALTER TABLE v2_live_trades ADD COLUMN IF NOT EXISTS pnl REAL",
+        "ALTER TABLE v2_live_trades ADD COLUMN IF NOT EXISTS resolved_at TIMESTAMPTZ",
+        "ALTER TABLE v2_live_trades ADD COLUMN IF NOT EXISTS redeem_status TEXT",
+        "ALTER TABLE v2_live_trades ADD COLUMN IF NOT EXISTS redeem_tx_hash TEXT",
+        "ALTER TABLE v2_live_trades ADD COLUMN IF NOT EXISTS redeem_attempts INTEGER DEFAULT 0",
+        "ALTER TABLE v2_live_trades ADD COLUMN IF NOT EXISTS redeem_last_attempt TIMESTAMPTZ",
+    ):
+        try:
+            conn.run(_alter)
+        except Exception as _e:
+            print("[V2-MIGRATE] {} -> {}".format(_alter[:60], str(_e)[:80]))
+    # ── v2 settings (key/value) — DB-backed runtime config so toggles flip
+    # without redeploy and survive restarts. Live ON/OFF lives here.
+    conn.run("""
+        CREATE TABLE IF NOT EXISTS v2_settings (
+            key         TEXT PRIMARY KEY,
+            value       TEXT,
+            updated_at  TIMESTAMPTZ DEFAULT NOW()
+        )
+    """)
     # v2 balance tracking
     conn.run("""
         CREATE TABLE IF NOT EXISTS v2_balances (
@@ -1321,6 +1398,425 @@ def _v2_record_paper_trade(platform, timeframe, asset, direction, ptb,
 
 
 # ═══════════════════════════════════════════════════════════
+# LIMITLESS LIVE EXECUTION  (DB-backed toggle, FOK orders only)
+# ═══════════════════════════════════════════════════════════
+#
+# Behaviour: the v2_settings row {limitless_live=1} flips the scanner into
+# live mode (either-or — paper does NOT record while live is on). On a
+# confirmed Limitless signal we place a FOK BUY at the paper limit price as
+# a slippage cap; FOK fills the full size at <= price, OR cancels entirely
+# — no resting orders, so the GTC adverse-fill dynamic can't occur.
+#
+# Gates (any failure -> CAPPED/ERROR audit row, no exception bubbles up):
+#   * py-limitless installed
+#   * LIMITLESS_PRIVATE_KEY env present
+#   * USDC approved as a spender on the Limitless exchange contract
+#     (one-click from the paper bot page)
+#   * Trade stake within LIMITLESS_MAX_TRADE_USDC
+#   * Wallet USDC balance at or above LIMITLESS_MIN_BALANCE_USDC (the floor —
+#     bot auto-pauses below it and auto-resumes when redemptions top it up)
+
+_lmts_client_singleton = None
+_lmts_client_error_logged = False
+_lmts_live_cache = {"value": None, "ts": 0.0}   # in-process cache, refreshes every few sec
+
+
+def _settings_get(key, default=None):
+    """Read a single v2_settings value. Returns default on any error."""
+    try:
+        conn = get_db()
+        rows = conn.run("SELECT value FROM v2_settings WHERE key = :k", k=key)
+        conn.close()
+        if rows and rows[0] and rows[0][0] is not None:
+            return rows[0][0]
+    except Exception:
+        pass
+    return default
+
+
+def _settings_set(key, value):
+    """Upsert a v2_settings value."""
+    try:
+        conn = get_db()
+        conn.run(
+            "INSERT INTO v2_settings (key, value, updated_at) VALUES (:k, :v, NOW()) "
+            "ON CONFLICT (key) DO UPDATE SET value = :v, updated_at = NOW()",
+            k=key, v=str(value))
+        conn.close()
+        return True
+    except Exception as e:
+        print("[SETTINGS] write error {}={}: {}".format(key, value, e))
+        return False
+
+
+def _lmts_live_enabled():
+    """True if Limitless live trading is currently switched ON. DB-backed and
+    cached for ~3s so the per-signal hot path doesn't hit DB every check.
+    Falls back to LIMITLESS_LIVE_BOOTSTRAP only when no DB row exists yet (first
+    boot migration); after first read DB becomes the single source of truth."""
+    now = time.time()
+    if _lmts_live_cache["value"] is not None and (now - _lmts_live_cache["ts"]) < 3.0:
+        return _lmts_live_cache["value"]
+    v = _settings_get("limitless_live")
+    if v is None:
+        v = "1" if LIMITLESS_LIVE_BOOTSTRAP else "0"
+        _settings_set("limitless_live", v)
+    enabled = str(v).strip().lower() in ("1", "true", "yes", "on")
+    _lmts_live_cache["value"] = enabled
+    _lmts_live_cache["ts"] = now
+    return enabled
+
+
+def _lmts_live_set(enabled):
+    """Flip the live switch and bust the in-process cache so the next scanner
+    pass picks up the change immediately."""
+    ok = _settings_set("limitless_live", "1" if enabled else "0")
+    _lmts_live_cache["value"] = bool(enabled) if ok else _lmts_live_cache["value"]
+    _lmts_live_cache["ts"] = time.time() if ok else _lmts_live_cache["ts"]
+    return ok
+
+
+def _lmts_get_client():
+    """Lazily import py-limitless and authenticate. Returns None on any
+    failure — caller treats None as 'live not available, keep going on paper'.
+    Cached after the first successful auth."""
+    global _lmts_client_singleton, _lmts_client_error_logged
+    if _lmts_client_singleton is not None:
+        return _lmts_client_singleton
+    if not LIMITLESS_PRIV_KEY:
+        if not _lmts_client_error_logged:
+            print("[LMTS-LIVE] no LIMITLESS_PRIVATE_KEY — live disabled")
+            _lmts_client_error_logged = True
+        return None
+    try:
+        from limitless_sdk import Limitless
+    except Exception as e:
+        if not _lmts_client_error_logged:
+            print("[LMTS-LIVE] py-limitless not installed ({}). Add `py-limitless` to requirements to enable live.".format(e))
+            _lmts_client_error_logged = True
+        return None
+    try:
+        client = Limitless(private_key=LIMITLESS_PRIV_KEY, wallet_type="eoa")
+        client.authenticate()
+        print("[LMTS-LIVE] client authenticated as {}".format(client.address))
+        _lmts_client_singleton = client
+        return client
+    except Exception as e:
+        if not _lmts_client_error_logged:
+            print("[LMTS-LIVE] authenticate error: {}".format(e))
+            _lmts_client_error_logged = True
+        return None
+
+
+def _lmts_today_spend_usdc():
+    """Sum of stake_usdc on v2_live_trades from the last 24h. Informational
+    only (shown on the dashboard) — NOT a gate. The gate is the balance floor
+    in _lmts_get_balance_usdc(). Defensive: any DB error returns 0."""
+    try:
+        conn = get_db()
+        rows = conn.run(
+            "SELECT COALESCE(SUM(stake_usdc), 0) FROM v2_live_trades "
+            "WHERE fired_at > NOW() - INTERVAL '24 hours' "
+            "AND fill_status IN ('FILLED', 'CANCELLED')")
+        conn.close()
+        if rows and rows[0] and rows[0][0] is not None:
+            return float(rows[0][0])
+    except Exception as e:
+        print("[LMTS-LIVE] daily spend lookup error: {}".format(e))
+    return 0.0
+
+
+# Wallet balance cache — RPC reads are ~500ms so we cache for 30s. Winning
+# redemptions invalidate freshness naturally on the next read after the cache
+# expires (worst case 30s lag before a topped-up wallet starts trading again).
+_lmts_balance_cache = {"value": None, "ts": 0.0}
+
+
+def _lmts_get_balance_usdc(force=False):
+    """Read the wallet's USDC balance on Base. Returns float USDC or None if
+    the RPC fails (the placer treats None as 'pause for safety')."""
+    import time as _t
+    now = _t.time()
+    if (not force and _lmts_balance_cache["value"] is not None
+            and (now - _lmts_balance_cache["ts"]) < 30.0):
+        return _lmts_balance_cache["value"]
+    if not LIMITLESS_PRIV_KEY:
+        return None
+    try:
+        from limitless_sdk import get_usdc_balance, USDC_DECIMALS
+        from web3 import Web3
+        from eth_account import Account
+        w3 = Web3(Web3.HTTPProvider(LIMITLESS_BASE_RPC))
+        addr = Account.from_key(LIMITLESS_PRIV_KEY).address
+        balance_raw = get_usdc_balance(w3, addr)
+        value = float(balance_raw) / (10 ** USDC_DECIMALS)
+        _lmts_balance_cache["value"] = value
+        _lmts_balance_cache["ts"] = now
+        return value
+    except Exception as e:
+        print("[LMTS-LIVE] balance read error: {}".format(str(e)[:120]))
+        return None
+
+
+def _lmts_extract_tokens(market):
+    """Extract (up_token, down_token) from a Limitless /markets/{slug} response.
+    The Limitless API doesn't publish a stable field name for token IDs and the
+    SDK doesn't reference one directly, so we try the conventions used by
+    CTF-fork markets in order of likelihood. Returns ("", "") if none match.
+
+    YES (UP) is outcome index 0; NO (DOWN) is index 1 — same convention as
+    Polymarket (confirmed by limitless_sdk.redemption.get_redeemable_positions
+    which uses winningOutcomeIndex 0=YES, 1=NO)."""
+    if not isinstance(market, dict):
+        return "", ""
+
+    # 1) Polymarket-style: clobTokenIds = ["yes_tok", "no_tok"] OR a JSON string.
+    clob = market.get("clobTokenIds")
+    if isinstance(clob, str):
+        try:
+            clob = json.loads(clob)
+        except Exception:
+            clob = None
+    if isinstance(clob, list) and len(clob) >= 2:
+        return str(clob[0]), str(clob[1])
+
+    # 2) tokens: [{"token_id": "...", "outcome": "YES"}, ...] — Limitless-style
+    toks = market.get("tokens")
+    if isinstance(toks, list) and len(toks) >= 2:
+        up = dn = ""
+        for t in toks:
+            if not isinstance(t, dict):
+                continue
+            tid = str(t.get("token_id") or t.get("tokenId") or t.get("id") or "")
+            label = str(t.get("outcome") or t.get("label") or t.get("name") or "").upper()
+            if not tid:
+                continue
+            if label in ("YES", "UP", "ABOVE") and not up:
+                up = tid
+            elif label in ("NO", "DOWN", "BELOW") and not dn:
+                dn = tid
+        if up or dn:
+            # Fallback: if only one labelled, assume the other is the remaining
+            if not up and len(toks) >= 2:
+                for t in toks:
+                    tid = str((t or {}).get("token_id") or (t or {}).get("tokenId") or "")
+                    if tid and tid != dn:
+                        up = tid; break
+            if not dn and len(toks) >= 2:
+                for t in toks:
+                    tid = str((t or {}).get("token_id") or (t or {}).get("tokenId") or "")
+                    if tid and tid != up:
+                        dn = tid; break
+            return up, dn
+
+    # 3) positionIds: [yes_id, no_id]
+    pids = market.get("positionIds") or market.get("position_ids")
+    if isinstance(pids, list) and len(pids) >= 2:
+        return str(pids[0]), str(pids[1])
+
+    # 4) Nested venue/clob/outcomes containers
+    for container_key in ("clob", "outcomes", "venue"):
+        sub = market.get(container_key)
+        if isinstance(sub, dict):
+            up, dn = _lmts_extract_tokens(sub)   # one-level recurse
+            if up or dn:
+                return up, dn
+        if isinstance(sub, list) and len(sub) >= 2:
+            up = str(((sub[0] or {}).get("tokenId") or (sub[0] or {}).get("token_id") or "")
+                     if isinstance(sub[0], dict) else sub[0])
+            dn = str(((sub[1] or {}).get("tokenId") or (sub[1] or {}).get("token_id") or "")
+                     if isinstance(sub[1], dict) else sub[1])
+            if up or dn:
+                return up, dn
+
+    return "", ""
+
+
+def _lmts_record_live_trade(paper_trade_id, asset, tf_label, direction,
+                            market_slug, token_id, limit_cents, stake,
+                            shares, fill_status, order_id=None,
+                            fill_price=None, filled_size=None,
+                            raw_response=None, error_message=None,
+                            condition_id=None):
+    """Single audit row per live attempt — FILLED / CANCELLED / ERROR / CAPPED.
+    condition_id is captured so the resolver/redeemer can find the on-chain
+    market without re-fetching from the API later."""
+    try:
+        conn = get_db()
+        conn.run("""
+            INSERT INTO v2_live_trades (
+                paper_trade_id, platform, timeframe, asset, direction,
+                market_slug, token_id, condition_id, limit_price_cents,
+                stake_usdc, size_shares, fill_status, order_id,
+                fill_price_cents, filled_size, raw_response, error_message
+            ) VALUES (
+                :ptid, 'limitless', :tf, :asset, :dir,
+                :slug, :tok, :cid, :lim,
+                :stake, :shares, :st, :oid,
+                :fp, :fs, :raw, :err
+            )
+        """,
+            ptid=paper_trade_id, tf=tf_label, asset=asset, dir=direction,
+            slug=market_slug, tok=token_id, cid=(condition_id or None),
+            lim=limit_cents, stake=stake, shares=shares, st=fill_status,
+            oid=order_id, fp=fill_price, fs=filled_size,
+            raw=(json.dumps(raw_response)[:4000] if raw_response else None),
+            err=(error_message[:1000] if error_message else None))
+        conn.close()
+    except Exception as e:
+        print("[LMTS-LIVE] record error: {}".format(e))
+
+
+def _lmts_place_live(paper_trade_id, market_data, asset, tf_label, direction,
+                     limit_price_cents, stake_usdc):
+    """Place an FOK BUY mirroring a just-recorded paper trade. All paths record
+    to v2_live_trades for audit (CAPPED for cap rejections, ERROR for failures).
+    Returns the fill_status string. NEVER raises — paper recording upstream
+    must be unaffected by any live failure."""
+    market_slug = (market_data or {}).get("slug") or ""
+    token_id = ((market_data or {}).get("up_token") if direction == "UP"
+                else (market_data or {}).get("down_token")) or ""
+    condition_id = (market_data or {}).get("condition_id") or ""
+
+    # The lightweight /markets/active/slugs feed used by the V2 scanner does
+    # NOT include conditionId OR the per-outcome token IDs. The SDK's
+    # client.buy() needs token_id; the redeemer needs condition_id. So we
+    # lazily fetch the full market once at order time and extract both.
+    # ~1 extra HTTP call per live trade — negligible at <20/day. Best-effort
+    # only; if it fails the trade still attempts to place with whatever
+    # market_data already had.
+    if (not condition_id or not token_id) and market_slug:
+        try:
+            import requests as _req
+            _r = _req.get("{}/markets/{}".format(LIMITLESS_API, market_slug), timeout=6)
+            if _r.status_code == 200:
+                _m = _r.json() or {}
+                if not condition_id:
+                    condition_id = (_m.get("conditionId")
+                                    or _m.get("condition_id") or "")
+                if not token_id:
+                    up_tok, dn_tok = _lmts_extract_tokens(_m)
+                    token_id = up_tok if direction == "UP" else dn_tok
+        except Exception as _e:
+            print("[LMTS-LIVE] market fetch failed for {}: {}".format(
+                market_slug[:40], str(_e)[:80]))
+
+    # Clamp stake to per-trade cap; reject if essential data missing.
+    if not market_slug or not token_id:
+        _lmts_record_live_trade(paper_trade_id, asset, tf_label, direction,
+                                market_slug, token_id, limit_price_cents,
+                                stake_usdc, 0.0, "ERROR",
+                                error_message="missing slug or token_id",
+                                condition_id=condition_id)
+        return "ERROR"
+
+    capped_stake = min(float(stake_usdc), LIMITLESS_MAX_TRADE_USDC)
+    if capped_stake <= 0 or limit_price_cents <= 0:
+        _lmts_record_live_trade(paper_trade_id, asset, tf_label, direction,
+                                market_slug, token_id, limit_price_cents,
+                                stake_usdc, 0.0, "CAPPED",
+                                error_message="stake or price non-positive",
+                                condition_id=condition_id)
+        return "CAPPED"
+
+    # Balance floor gate — read live USDC balance on Base and pause if below
+    # the floor. Replaces the old daily-cap model. Failing closed: if the RPC
+    # read returns None (transient failure), we PAUSE rather than guess.
+    # The cache (30s) ensures successful redemptions resume trading promptly.
+    balance = _lmts_get_balance_usdc()
+    if balance is None:
+        _lmts_record_live_trade(paper_trade_id, asset, tf_label, direction,
+                                market_slug, token_id, limit_price_cents,
+                                stake_usdc, 0.0, "CAPPED",
+                                error_message="balance read failed (RPC) — pausing for safety",
+                                condition_id=condition_id)
+        print("[LMTS-LIVE] balance read failed — pausing this signal")
+        return "CAPPED"
+    if balance < LIMITLESS_MIN_BALANCE_USDC:
+        _lmts_record_live_trade(paper_trade_id, asset, tf_label, direction,
+                                market_slug, token_id, limit_price_cents,
+                                stake_usdc, 0.0, "CAPPED",
+                                error_message="balance ${:.2f} below floor ${:.2f} — paused".format(
+                                    balance, LIMITLESS_MIN_BALANCE_USDC),
+                                condition_id=condition_id)
+        print("[LMTS-LIVE] balance ${:.2f} < floor ${:.2f} — paused, waiting for top-up".format(
+            balance, LIMITLESS_MIN_BALANCE_USDC))
+        return "CAPPED"
+    # Also guard against trying to spend more than we have (in case stake > balance)
+    if balance < capped_stake:
+        _lmts_record_live_trade(paper_trade_id, asset, tf_label, direction,
+                                market_slug, token_id, limit_price_cents,
+                                stake_usdc, 0.0, "CAPPED",
+                                error_message="balance ${:.2f} insufficient for ${:.2f} stake".format(
+                                    balance, capped_stake),
+                                condition_id=condition_id)
+        return "CAPPED"
+
+    client = _lmts_get_client()
+    if client is None:
+        _lmts_record_live_trade(paper_trade_id, asset, tf_label, direction,
+                                market_slug, token_id, limit_price_cents,
+                                capped_stake, 0.0, "ERROR",
+                                error_message="client unavailable",
+                                condition_id=condition_id)
+        return "ERROR"
+
+    # shares = USDC budget / (price in dollars). e.g. $2 @ 70c -> ~2.857 shares.
+    shares = round(capped_stake / max(limit_price_cents / 100.0, 0.01), 4)
+
+    try:
+        from limitless_sdk import ORDER_TYPE_FOK
+    except Exception:
+        ORDER_TYPE_FOK = "FOK"
+
+    try:
+        resp = client.buy(
+            market_slug=market_slug,
+            token_id=str(token_id),
+            price_cents=float(limit_price_cents),
+            amount=float(shares),
+            token_type=("YES" if direction == "UP" else "NO"),
+            order_type=ORDER_TYPE_FOK,
+        )
+    except Exception as e:
+        _lmts_record_live_trade(paper_trade_id, asset, tf_label, direction,
+                                market_slug, token_id, limit_price_cents,
+                                capped_stake, shares, "ERROR",
+                                error_message=str(e)[:1000],
+                                condition_id=condition_id)
+        print("[LMTS-LIVE] order error {} {} {}: {}".format(
+            asset, tf_label, direction, str(e)[:200]))
+        return "ERROR"
+
+    # Parse common response shapes defensively — exact response is API-shaped
+    # and we record the raw JSON for any field we don't pull out.
+    resp_d = resp if isinstance(resp, dict) else {}
+    order_id = (resp_d.get("orderId") or resp_d.get("order_id")
+                or resp_d.get("id") or "")
+    matches = (resp_d.get("makerMatches") or resp_d.get("maker_matches")
+               or resp_d.get("matches") or [])
+    filled_size = sum(float(m.get("size", m.get("amount", 0)) or 0)
+                      for m in matches) if isinstance(matches, list) else 0.0
+    fill_price = None
+    if matches and isinstance(matches, list):
+        prices = [float(m.get("price", 0) or 0) for m in matches if m.get("price")]
+        if prices:
+            fill_price = sum(prices) / len(prices)
+    status = (resp_d.get("status") or "").upper()
+    fill_status = "FILLED" if (filled_size > 0 or status in ("FILLED", "MATCHED")) else "CANCELLED"
+
+    _lmts_record_live_trade(paper_trade_id, asset, tf_label, direction,
+                            market_slug, token_id, limit_price_cents,
+                            capped_stake, shares, fill_status,
+                            order_id=str(order_id) if order_id else None,
+                            fill_price=fill_price, filled_size=filled_size,
+                            raw_response=resp_d, condition_id=condition_id)
+    print("[LMTS-LIVE] {} {} {} {} @ {:.0f}c x {:.4f} shares -> {}".format(
+        fill_status, asset, tf_label, direction, limit_price_cents, shares, order_id or "(no id)"))
+    return fill_status
+
+
+# ═══════════════════════════════════════════════════════════
 # V2 ORDER BOOK READING (for paper odds accuracy)
 # ═══════════════════════════════════════════════════════════
 
@@ -1961,6 +2457,289 @@ def _v2_resolve_trades():
 
 
 # ═══════════════════════════════════════════════════════════
+# LIMITLESS LIVE — RESOLUTION + ON-CHAIN REDEMPTION
+# ═══════════════════════════════════════════════════════════
+# Mirrors the paper resolver but reads v2_live_trades. When a FILLED row's
+# market resolves, we mark WIN/LOSS/PUSH, compute realized P&L from the
+# actual fill (not the limit), then queue a WIN row for on-chain redemption
+# of the YES/NO conditional tokens into USDC via the CTF contract.
+#
+# The redeemer runs as its own pass so a flaky RPC, a not-yet-settled-on-chain
+# condition, or a single failure can't block resolution of new rows.
+
+_LMTS_LIVE_RESOLVE_DIAG = [0]   # at-most-N diagnostic prints per process
+_LMTS_REDEEM_MAX_ATTEMPTS = 10  # docs warn API can mark resolved before CTF on-chain;
+                                # we retry with cooldown so the pass-through is forgiving
+
+
+def _v2_resolve_live_trades():
+    """Resolve FILLED rows in v2_live_trades by polling Limitless for market
+    outcome (same logic as the paper resolver's limitless branch). Updates
+    outcome / pnl / actual_result / resolved_at, and queues WIN rows for
+    on-chain redemption by setting redeem_status='PENDING'."""
+    import requests as req
+    try:
+        conn = get_db()
+        rows = conn.run("""
+            SELECT id, timeframe, asset, direction, market_slug, condition_id,
+                   limit_price_cents, fill_price_cents, filled_size, stake_usdc,
+                   fired_at
+            FROM v2_live_trades
+            WHERE fill_status = 'FILLED' AND outcome IS NULL
+            ORDER BY id ASC
+        """)
+        cols = ["id", "timeframe", "asset", "direction", "market_slug",
+                "condition_id", "limit_price_cents", "fill_price_cents",
+                "filled_size", "stake_usdc", "fired_at"]
+        trades = [dict(zip(cols, r)) for r in rows]
+        conn.close()
+
+        if not trades:
+            return 0
+
+        resolved = 0
+        for t in trades:
+            slug = t.get("market_slug") or ""
+            asset = t.get("asset") or ""
+            direction = t.get("direction") or ""
+            if not slug or not direction:
+                continue
+
+            # Skip if too young — give the market time to actually resolve.
+            fired = t.get("fired_at")
+            if fired:
+                if isinstance(fired, str):
+                    try:
+                        fired = datetime.fromisoformat(fired.replace("Z", "+00:00"))
+                    except Exception:
+                        fired = None
+                if fired:
+                    if not fired.tzinfo:
+                        fired = fired.replace(tzinfo=timezone.utc)
+                    tf = t.get("timeframe") or "1H"
+                    min_age = {"5M": 1, "15M": 2, "1H": 61, "DAILY": 1441}.get(tf, 61)
+                    if (datetime.now(timezone.utc) - fired).total_seconds() / 60 < min_age:
+                        continue
+
+            # Poll Limitless for the resolved outcome — exact same logic as
+            # the paper resolver's limitless branch (lines ~2111 of paper path).
+            actual = None
+            captured_cid = None
+            try:
+                r = req.get("{}/markets/{}".format(LIMITLESS_API, slug), timeout=8)
+                if r.status_code == 200:
+                    market = r.json()
+                    # Defensive: if this row was placed before the order-time
+                    # condition_id fetch landed, grab it here so the redeemer
+                    # can still claim winnings.
+                    if not t.get("condition_id"):
+                        captured_cid = (market.get("conditionId")
+                                        or market.get("condition_id") or None)
+                    status = str(market.get("status", "")).lower()
+                    is_done = (status in ("resolved", "closed", "settled", "expired", "ended")
+                               or market.get("closed") is True
+                               or market.get("resolved") is True
+                               or market.get("expired") is True
+                               or market.get("winningOutcomeIndex") is not None
+                               or market.get("winningOutcome") not in (None, ""))
+                    if is_done:
+                        winner = (market.get("winningOutcome") or market.get("winner") or "")
+                        widx = market.get("winningOutcomeIndex")
+                        if str(winner).lower() in ("yes", "up", "above"):
+                            actual = "UP"
+                        elif str(winner).lower() in ("no", "down", "below"):
+                            actual = "DOWN"
+                        elif widx is not None:
+                            actual = "UP" if int(widx) == 0 else "DOWN"
+                        else:
+                            op = market.get("outcomePrices") or market.get("prices")
+                            if isinstance(op, list) and len(op) >= 2:
+                                if float(op[0]) > 0.9: actual = "UP"
+                                elif float(op[0]) < 0.1: actual = "DOWN"
+                    if not actual and _LMTS_LIVE_RESOLVE_DIAG[0] < 6:
+                        _LMTS_LIVE_RESOLVE_DIAG[0] += 1
+                        print("[LMTS-LIVE-RESOLVE-DIAG] {} status={} keys={} winner={} widx={}".format(
+                            slug[:40], status, list(market.keys())[:14],
+                            market.get("winningOutcome"), market.get("winningOutcomeIndex")))
+            except Exception as e:
+                print("[LMTS-LIVE] resolve check error {}: {}".format(slug[:30], e))
+
+            if not actual:
+                continue  # try again next cycle
+
+            # Realized P&L from the actual fill (not the limit). Each share is
+            # worth $1 USDC if direction wins, $0 otherwise.
+            filled_size = float(t.get("filled_size") or 0)
+            fill_px = float(t.get("fill_price_cents") or t.get("limit_price_cents") or 0)
+            cost = filled_size * (fill_px / 100.0)
+            if actual == direction:
+                outcome = "WIN"
+                pnl = filled_size - cost            # receive $1/share, paid `cost`
+                redeem_status = "PENDING"           # queue for on-chain claim
+            elif actual == "FLAT":
+                outcome = "PUSH"
+                pnl = 0.0
+                redeem_status = "SKIPPED"
+            else:
+                outcome = "LOSS"
+                pnl = -cost
+                redeem_status = "SKIPPED"
+
+            try:
+                conn2 = get_db()
+                # If we captured a condition_id this pass, persist it too so
+                # the redeemer can pick this row up next cycle.
+                if captured_cid:
+                    conn2.run("""
+                        UPDATE v2_live_trades SET
+                            actual_result = :ar,
+                            outcome       = :oc,
+                            pnl           = :pnl,
+                            resolved_at   = NOW(),
+                            redeem_status = :rs,
+                            condition_id  = :cid
+                        WHERE id = :tid
+                    """, ar=actual, oc=outcome, pnl=round(pnl, 4),
+                        rs=redeem_status, cid=captured_cid, tid=t["id"])
+                else:
+                    conn2.run("""
+                        UPDATE v2_live_trades SET
+                            actual_result = :ar,
+                            outcome       = :oc,
+                            pnl           = :pnl,
+                            resolved_at   = NOW(),
+                            redeem_status = :rs
+                        WHERE id = :tid
+                    """, ar=actual, oc=outcome, pnl=round(pnl, 4),
+                        rs=redeem_status, tid=t["id"])
+                conn2.close()
+                resolved += 1
+            except Exception as e:
+                print("[LMTS-LIVE] resolve update error: {}".format(e))
+                continue
+
+            emoji = "✅" if outcome == "WIN" else ("❌" if outcome == "LOSS" else "➖")
+            send_telegram("{} LIVE {} {} {} @ {:.0f}c → {} | P&L ${:+.2f}".format(
+                emoji, t.get("timeframe") or "?", asset, direction,
+                fill_px, outcome, pnl))
+
+        return resolved
+    except Exception as e:
+        print("[LMTS-LIVE] resolve error: {}".format(e))
+        return 0
+
+
+def _lmts_redeem_winnings(condition_id):
+    """Submit an on-chain redeemPositions() call for a resolved condition.
+    Returns {ok, tx_hash, error}. Caller persists tx_hash + status. The CTF
+    accepts redemption from any holder; calling it for a non-winning condition
+    just zeroes the dust positions (no harm, but a small gas cost), so we
+    only call this for WIN rows."""
+    if not LIMITLESS_PRIV_KEY:
+        return {"ok": False, "error": "LIMITLESS_PRIVATE_KEY not set"}
+    if not condition_id:
+        return {"ok": False, "error": "missing condition_id"}
+    try:
+        from limitless_sdk import (BASE_CTF_ADDRESS, BASE_CHAIN_ID,
+                                   USDC_ADDRESS)
+        from limitless_sdk.redemption import EOAPositionRedeemer
+        redeemer = EOAPositionRedeemer(
+            private_key=LIMITLESS_PRIV_KEY,
+            rpc_url=LIMITLESS_BASE_RPC,
+            ctf_address=BASE_CTF_ADDRESS,
+            collateral_token=USDC_ADDRESS,
+            chain_id=BASE_CHAIN_ID,
+        )
+        tx_hash = redeemer.redeem_position(condition_id)
+        return {"ok": True, "tx_hash": tx_hash}
+    except ImportError as e:
+        return {"ok": False, "error": "py-limitless missing: {}".format(e)}
+    except Exception as e:
+        # Common: "execution reverted" before CTF is settled on-chain (docs
+        # warn this can lag the API). We propagate the message; the caller
+        # decides whether to retry on a future pass.
+        return {"ok": False, "error": str(e)[:500]}
+
+
+def _v2_redeem_pending_live():
+    """Pick up PENDING rows from v2_live_trades and try on-chain redemption.
+    Re-tries with a per-row attempts counter. After _LMTS_REDEEM_MAX_ATTEMPTS
+    the row is marked FAILED so we stop spamming the RPC; the operator can
+    re-queue it manually from the dashboard later."""
+    try:
+        conn = get_db()
+        rows = conn.run("""
+            SELECT id, condition_id, asset, timeframe, direction, pnl,
+                   COALESCE(redeem_attempts, 0) AS attempts
+            FROM v2_live_trades
+            WHERE redeem_status = 'PENDING'
+              AND condition_id IS NOT NULL AND condition_id <> ''
+            ORDER BY id ASC
+            LIMIT 8
+        """)
+        cols = ["id", "condition_id", "asset", "timeframe", "direction",
+                "pnl", "attempts"]
+        pending = [dict(zip(cols, r)) for r in rows]
+        conn.close()
+    except Exception as e:
+        print("[LMTS-LIVE] redeem fetch error: {}".format(e))
+        return 0
+
+    if not pending:
+        return 0
+
+    done = 0
+    for p in pending:
+        attempts = int(p.get("attempts") or 0)
+        cid = p.get("condition_id") or ""
+        res = _lmts_redeem_winnings(cid)
+        if res.get("ok"):
+            tx_hash = res.get("tx_hash") or ""
+            try:
+                conn2 = get_db()
+                conn2.run("""
+                    UPDATE v2_live_trades SET
+                        redeem_status       = 'DONE',
+                        redeem_tx_hash      = :tx,
+                        redeem_attempts     = :a,
+                        redeem_last_attempt = NOW()
+                    WHERE id = :tid
+                """, tx=tx_hash, a=attempts + 1, tid=p["id"])
+                conn2.close()
+                done += 1
+                print("[LMTS-LIVE] redeemed {} {} {} -> {}".format(
+                    p.get("timeframe"), p.get("asset"), p.get("direction"),
+                    tx_hash[:14] + "…" if len(tx_hash) > 14 else tx_hash))
+                send_telegram("💰 LIVE redeemed {} {} {} → tx {}".format(
+                    p.get("timeframe"), p.get("asset"), p.get("direction"),
+                    tx_hash[:10] + "…"))
+            except Exception as e:
+                print("[LMTS-LIVE] redeem update error: {}".format(e))
+        else:
+            err = res.get("error") or "unknown"
+            new_status = "FAILED" if attempts + 1 >= _LMTS_REDEEM_MAX_ATTEMPTS else "PENDING"
+            try:
+                conn2 = get_db()
+                conn2.run("""
+                    UPDATE v2_live_trades SET
+                        redeem_status       = :rs,
+                        redeem_attempts     = :a,
+                        redeem_last_attempt = NOW(),
+                        error_message       = COALESCE(error_message, '') || :err_suffix
+                    WHERE id = :tid
+                """, rs=new_status, a=attempts + 1,
+                    err_suffix=(" [redeem {}: {}]".format(attempts + 1, err))[:300],
+                    tid=p["id"])
+                conn2.close()
+                print("[LMTS-LIVE] redeem attempt {} for id={} -> {} ({})".format(
+                    attempts + 1, p["id"], new_status, err[:120]))
+            except Exception as e:
+                print("[LMTS-LIVE] redeem fail-update error: {}".format(e))
+
+    return done
+
+
+# ═══════════════════════════════════════════════════════════
 # V2 WATCHER THREADS
 # ═══════════════════════════════════════════════════════════
 
@@ -2225,59 +3004,84 @@ def _v2_scan_timeframe(timeframe):
 
                     # Record paper trade as PENDING
                     market_url = _v2_market_url(platform, market_data, asset, tf_label)
-                    try:
-                        conn = get_db()
-                        conn.run("""
-                            INSERT INTO v2_paper_trades (
-                                platform, timeframe, asset, direction, ptb, entry_odds,
-                                entry_price, stake, entry_note, hh_count, hl_count, ll_count, lh_count,
-                                grind_rate, ptb_distance, session_label, volatility,
-                                prev_candle, market_id, slug, condition_id,
-                                up_token, down_token, confidence, market_url,
-                                limit_price, book_ask, order_status, status
-                            ) VALUES (
-                                :plat, :tf, :asset, :dir, :ptb, :odds,
-                                :price, :stake, :note, :hh, :hl, :ll, :lh,
-                                :grind, :ptb_dist, :sess, :vol,
-                                :prev, :mid, :slug, :cid,
-                                :up_tok, :dn_tok, :conf, :murl,
-                                :lim, :bask, 'PENDING', 'OPEN'
+
+                    # ── Either-or mode (toggled from the paper bot page) ──
+                    # When live trading is ON for a Limitless market, the scanner
+                    # SKIPS the paper insert entirely and places a real FOK on
+                    # Limitless — paper does not record. When OFF (or non-Limitless
+                    # platform), the original paper path runs unchanged.
+                    go_live = (platform == "limitless" and _lmts_live_enabled())
+
+                    if go_live:
+                        try:
+                            live_status = _lmts_place_live(
+                                None, market_data, asset, tf_label, direction,
+                                float(limit_price), float(FLAT_STAKE))
+                        except Exception as _lmts_e:
+                            print("[LMTS-LIVE] place exception (signal not recorded): {}".format(_lmts_e))
+                            continue
+                    else:
+                        try:
+                            conn = get_db()
+                            conn.run("""
+                                INSERT INTO v2_paper_trades (
+                                    platform, timeframe, asset, direction, ptb, entry_odds,
+                                    entry_price, stake, entry_note, hh_count, hl_count, ll_count, lh_count,
+                                    grind_rate, ptb_distance, session_label, volatility,
+                                    prev_candle, market_id, slug, condition_id,
+                                    up_token, down_token, confidence, market_url,
+                                    limit_price, book_ask, order_status, status
+                                ) VALUES (
+                                    :plat, :tf, :asset, :dir, :ptb, :odds,
+                                    :price, :stake, :note, :hh, :hl, :ll, :lh,
+                                    :grind, :ptb_dist, :sess, :vol,
+                                    :prev, :mid, :slug, :cid,
+                                    :up_tok, :dn_tok, :conf, :murl,
+                                    :lim, :bask, 'PENDING', 'OPEN'
+                                )
+                            """,
+                                plat=platform, tf=tf_label, asset=asset, dir=direction,
+                                ptb=ptb, odds=entry_odds, price=price,
+                                stake=FLAT_STAKE, note=note,
+                                hh=structure.get("hh_count", 0) if structure else 0,
+                                hl=structure.get("hl_count", 0) if structure else 0,
+                                ll=structure.get("ll_count", 0) if structure else 0,
+                                lh=structure.get("lh_count", 0) if structure else 0,
+                                grind=structure.get("grind_type", "") if structure else "",
+                                ptb_dist=0, sess=session_label, vol=vol_label,
+                                prev=prev_str or "",
+                                mid=market_data.get("market_id", "") if market_data else "",
+                                slug=market_data.get("slug", "") if market_data else "",
+                                cid=market_data.get("condition_id", "") if market_data else "",
+                                up_tok=market_data.get("up_token", "") if market_data else "",
+                                dn_tok=market_data.get("down_token", "") if market_data else "",
+                                conf=str(confidence) if confidence else "",
+                                murl=market_url,
+                                lim=limit_price, bask=book_ask,
                             )
-                        """,
-                            plat=platform, tf=tf_label, asset=asset, dir=direction,
-                            ptb=ptb, odds=entry_odds, price=price,
-                            stake=FLAT_STAKE, note=note,
-                            hh=structure.get("hh_count", 0) if structure else 0,
-                            hl=structure.get("hl_count", 0) if structure else 0,
-                            ll=structure.get("ll_count", 0) if structure else 0,
-                            lh=structure.get("lh_count", 0) if structure else 0,
-                            grind=structure.get("grind_type", "") if structure else "",
-                            ptb_dist=0, sess=session_label, vol=vol_label,
-                            prev=prev_str or "",
-                            mid=market_data.get("market_id", "") if market_data else "",
-                            slug=market_data.get("slug", "") if market_data else "",
-                            cid=market_data.get("condition_id", "") if market_data else "",
-                            up_tok=market_data.get("up_token", "") if market_data else "",
-                            dn_tok=market_data.get("down_token", "") if market_data else "",
-                            conf=str(confidence) if confidence else "",
-                            murl=market_url,
-                            lim=limit_price, bask=book_ask,
-                        )
-                        conn.close()
-                    except Exception as e:
-                        print("[V2] Record PENDING error: {}".format(e))
-                        continue
+                            conn.close()
+                        except Exception as e:
+                            print("[V2] Record PENDING error: {}".format(e))
+                            continue
 
                     _v2_active_boundaries[boundary_key] = True
                     entered += 1
 
                     url_str = "\n🔗 {}".format(market_url) if market_url else ""
-                    send_telegram(
-                        "📋 V2 LIMIT {} {} {} {} @ {:.0f}c (book {:.0f}c)\n"
-                        "Conf {} | ${:.2f} | BEST {}/{}{}".format(
-                            platform[:4].upper(), tf_label, asset, direction,
-                            limit_price, book_ask or 0, confidence,
-                            FLAT_STAKE, entered, len(_scan_candidates), url_str))
+                    if go_live:
+                        send_telegram(
+                            "🟢 LIVE FOK {} {} {} {} @ {:.0f}c → {}\n"
+                            "Conf {} | ${:.2f} | {}/{}{}".format(
+                                platform[:4].upper(), tf_label, asset, direction,
+                                limit_price, live_status,
+                                confidence, FLAT_STAKE, entered, len(_scan_candidates), url_str))
+                    else:
+                        send_telegram(
+                            "📋 V2 LIMIT {} {} {} {} @ {:.0f}c (book {:.0f}c)\n"
+                            "Conf {} | ${:.2f} | BEST {}/{}{}".format(
+                                platform[:4].upper(), tf_label, asset, direction,
+                                limit_price, book_ask or 0, confidence,
+                                FLAT_STAKE, entered, len(_scan_candidates), url_str))
 
                 if _scan_candidates:
                     print("[V2] {} scan: {} candidates, entered {}".format(
@@ -2402,7 +3206,9 @@ def _v2_monitor_thread():
 
 
 def _v2_resolve_loop():
-    """Background thread to resolve paper trades periodically."""
+    """Background thread to resolve paper + live trades, then attempt on-chain
+    redemption of pending live wins. All three pieces run on the same 60s
+    cadence; each is wrapped so one failing path can't stall the others."""
     print("[V2] Resolve loop started")
     while True:
         try:
@@ -2411,6 +3217,18 @@ def _v2_resolve_loop():
                 print("[V2] Resolved {} trades".format(resolved))
         except Exception as e:
             print("[V2] Resolve loop error: {}".format(e))
+        try:
+            live_resolved = _v2_resolve_live_trades()
+            if live_resolved:
+                print("[LMTS-LIVE] Resolved {} live trades".format(live_resolved))
+        except Exception as e:
+            print("[LMTS-LIVE] resolve loop error: {}".format(e))
+        try:
+            redeemed = _v2_redeem_pending_live()
+            if redeemed:
+                print("[LMTS-LIVE] Redeemed {} positions on-chain".format(redeemed))
+        except Exception as e:
+            print("[LMTS-LIVE] redeem loop error: {}".format(e))
         time.sleep(60)
 
 
@@ -2728,11 +3546,80 @@ def _v2_dashboard_html(platform, trades, bal):
     h += '<div class="nav">'
     h += '<a href="/app/paper-poly" class="{}">Polymarket</a>'.format("active" if platform == "polymarket" else "")
     h += '<a href="/app/paper-limitless" class="{}">Limitless</a>'.format("active" if platform == "limitless" else "")
+    if platform == "limitless":
+        h += '<a href="/app/live-limitless">Limitless Live</a>'
     h += '<a href="/app/picks">⚽ Picks</a>'
     h += '<a href="/app/codes">🎫 Codes</a>'
     h += '<a href="/app/results">📈 Results</a>'
     h += '<a href="/v2/status">Engine Status</a>'
     h += '</div>'
+
+    # ── Limitless mode banner (toggle + approve + status, in-page) ──
+    if platform == "limitless":
+        live = _lmts_live_enabled()
+        appr = _lmts_get_approval_state()
+        addr = appr.get("wallet", "—")
+        err = appr.get("error")
+        flow_msg = request.args.get("msg", "") if request else ""
+        flow_ok = request.args.get("approved") == "1" if request else False
+        mode_bg = "#16a34a" if live else "#475569"
+        mode_txt = "LIVE TRADING" if live else "PAPER MODE"
+        flip_to = "0" if live else "1"
+        flip_label = "Switch to Paper" if live else "Go Live →"
+        flip_bg = "#475569" if live else "#16a34a"
+        flip_confirm = ("'Switch to PAPER mode? Live trading will stop until you turn it back on.'"
+                        if live else
+                        "'Activate LIVE trading? Real USDC on Base will be used. $%.2f per trade, pauses below $%.2f balance.'" % (
+                            LIMITLESS_MAX_TRADE_USDC, LIMITLESS_MIN_BALANCE_USDC))
+        # Approval state line
+        if err:
+            appr_html = ("<span style='color:#b91c1c;font:12px ui-monospace,monospace'>"
+                         "Approval check failed: {}</span>").format(_html.escape(err)[:160])
+            approve_btn = ""
+        else:
+            allow = appr.get("allowance_usdc", 0)
+            bal_u = appr.get("balance_usdc", 0)
+            eth = appr.get("eth_balance", 0)
+            needs = appr.get("needs_approval", True)
+            allow_color = "#16a34a" if not needs else "#a16207"
+            appr_html = ("<span style='color:#475569;font:12px ui-monospace,monospace'>"
+                         "USDC <b style='color:{ac}'>${al:.2f}</b> approved | "
+                         "Balance <b>${bu:.2f}</b> | ETH gas <b>{eth:.5f}</b>"
+                         "</span>").format(ac=allow_color, al=allow, bu=bal_u, eth=eth)
+            if needs:
+                approve_btn = ('<form action="/app/limitless-approve" method="post" style="margin:0">'
+                               '<button type="submit" onclick="return confirm(\'Approve USDC for the Limitless exchange contract on Base? This is a one-time on-chain transaction and costs a tiny amount of ETH for gas.\')"'
+                               ' style="background:#2563eb;color:#fff;border:0;padding:8px 14px;border-radius:8px;'
+                               'font:600 13px system-ui;cursor:pointer">Approve USDC</button></form>')
+            else:
+                approve_btn = ('<span style="color:#16a34a;font:600 12px system-ui">✓ Approved</span>')
+
+        flash_html = ""
+        if flow_msg:
+            flash_bg = "#dcfce7" if flow_ok else "#fee2e2"
+            flash_color = "#166534" if flow_ok else "#7f1d1d"
+            flash_html = ('<div style="background:{bg};color:{c};padding:8px 14px;border-radius:8px;'
+                          'margin:8px 0;font:13px system-ui">{m}</div>').format(
+                              bg=flash_bg, c=flash_color, m=_html.escape(flow_msg.replace("+", " "))[:200])
+
+        h += ('<div style="background:var(--card-bg,#f8fafc);border:1px solid var(--border,#e5e7eb);'
+              'border-radius:12px;padding:14px 16px;margin:12px 0 16px">{flash}'
+              '<div style="display:flex;flex-wrap:wrap;align-items:center;gap:14px">'
+              '<span style="background:{bg};color:#fff;padding:6px 14px;border-radius:8px;'
+              'font:700 13px system-ui">{txt}</span>'
+              '<span style="color:var(--muted,#64748b);font:12px ui-monospace,monospace">{addr}</span>'
+              '{appr}'
+              '<div style="margin-left:auto;display:flex;gap:8px;align-items:center">'
+              '{approve}'
+              '<form action="/app/limitless-toggle" method="post" style="margin:0">'
+              '<input type="hidden" name="to" value="{to}">'
+              '<button type="submit" onclick="return confirm({conf})" '
+              'style="background:{bbg};color:#fff;border:0;padding:8px 16px;border-radius:8px;'
+              'font:600 13px system-ui;cursor:pointer">{lbl}</button></form>'
+              '</div></div></div>').format(
+                  flash=flash_html, bg=mode_bg, txt=mode_txt, addr=addr,
+                  appr=appr_html, approve=approve_btn, to=flip_to, conf=flip_confirm,
+                  bbg=flip_bg, lbl=flip_label)
 
     # Stats
     h += '<div class="stats-grid">'
@@ -3045,6 +3932,314 @@ def paper_limitless():
         trades = []
     bal = _v2_balances.get("limitless", {"balance": 100, "peak_balance": 100})
     return _v2_dashboard_html("limitless", trades, bal)
+
+
+# ═══════════════════════════════════════════════════════════
+# LIMITLESS LIVE — in-app controls (toggle + approve + records)
+# ═══════════════════════════════════════════════════════════
+
+def _lmts_get_approval_state():
+    """Read-only on-chain state for the wallet: USDC allowance + balance + ETH
+    for gas. Returns dict with 'error' on any failure so the UI can show it."""
+    if not LIMITLESS_PRIV_KEY:
+        return {"error": "LIMITLESS_PRIVATE_KEY not set"}
+    try:
+        from limitless_sdk import (check_usdc_allowance, get_usdc_balance,
+                                   CLOB_ADDRESS, USDC_DECIMALS)
+        from web3 import Web3
+        from eth_account import Account
+        w3 = Web3(Web3.HTTPProvider(LIMITLESS_BASE_RPC))
+        addr = Account.from_key(LIMITLESS_PRIV_KEY).address
+        allowance_raw = check_usdc_allowance(w3, addr, CLOB_ADDRESS)
+        balance_raw = get_usdc_balance(w3, addr)
+        eth_wei = w3.eth.get_balance(Web3.to_checksum_address(addr))
+        return {
+            "wallet": addr,
+            "allowance_usdc": allowance_raw / (10 ** USDC_DECIMALS),
+            "balance_usdc": balance_raw / (10 ** USDC_DECIMALS),
+            "eth_balance": float(eth_wei) / 1e18,
+            "needs_approval": allowance_raw < (10 ** USDC_DECIMALS),  # < $1 allowance
+        }
+    except ImportError:
+        return {"error": "py-limitless not installed — add to requirements.txt"}
+    except Exception as e:
+        return {"error": str(e)[:200]}
+
+
+def _lmts_run_approval():
+    """Sends the USDC approval transaction to Base. One-time on-chain step
+    that lets the Limitless exchange contract spend the wallet's USDC. Needs
+    a small amount of ETH on Base for gas."""
+    if not LIMITLESS_PRIV_KEY:
+        return {"ok": False, "error": "LIMITLESS_PRIVATE_KEY not set"}
+    try:
+        from limitless_sdk import ensure_usdc_approved, CLOB_ADDRESS
+        from web3 import Web3
+        w3 = Web3(Web3.HTTPProvider(LIMITLESS_BASE_RPC))
+        result = ensure_usdc_approved(w3, LIMITLESS_PRIV_KEY, CLOB_ADDRESS, min_amount=0)
+        return {"ok": True,
+                "already_approved": result.get("already_approved", False),
+                "tx_hash": result.get("tx_hash"),
+                "allowance": result.get("allowance", 0)}
+    except ImportError:
+        return {"ok": False, "error": "py-limitless not installed"}
+    except Exception as e:
+        return {"ok": False, "error": str(e)[:500]}
+
+
+@app.route("/app/limitless-toggle", methods=["POST", "GET"])
+def limitless_toggle():
+    """Flip the live trading switch (DB-backed). POST changes state; GET is
+    treated the same so a simple link works on mobile. The toggle takes
+    effect on the next signal — no redeploy needed."""
+    cur = _lmts_live_enabled()
+    target = request.values.get("to", "").strip().lower()
+    if target in ("1", "live", "on", "yes", "true"):
+        new = True
+    elif target in ("0", "paper", "off", "no", "false"):
+        new = False
+    else:
+        new = not cur
+    ok = _lmts_live_set(new)
+    print("[LMTS-LIVE] toggled {} -> {} (ok={})".format(
+        "live" if cur else "paper", "live" if new else "paper", ok))
+    return redirect("/app/paper-limitless")
+
+
+@app.route("/app/limitless-approve", methods=["POST", "GET"])
+def limitless_approve():
+    """Trigger the one-time on-chain USDC approval. Result is shown back on
+    the paper bot page via a flash query param so the UX is one click + one
+    confirmation message."""
+    if _FB_CACHE.get("running"):
+        pass  # not relevant; placeholder to keep style consistent
+    res = _lmts_run_approval()
+    if res.get("ok"):
+        if res.get("already_approved"):
+            msg = "Already approved (allowance OK)"
+        else:
+            tx = res.get("tx_hash") or ""
+            msg = "Approval submitted: {}{}".format(tx[:14], "…" if len(tx) > 14 else "")
+        print("[LMTS-LIVE] approve: {}".format(msg))
+        return redirect("/app/paper-limitless?approved=1&msg=" + msg.replace(" ", "+"))
+    err = res.get("error") or "unknown error"
+    print("[LMTS-LIVE] approve error: {}".format(err))
+    return redirect("/app/paper-limitless?approved=0&msg=" + err.replace(" ", "+")[:120])
+
+
+@app.route("/app/live-limitless")
+def live_limitless():
+    """Live trades records page — mirrors the paper dashboard's UI/UX but
+    reads from v2_live_trades. Live status badge + toggle live."""
+    try:
+        conn = get_db()
+        rows = conn.run("SELECT * FROM v2_live_trades ORDER BY id DESC LIMIT 200")
+        cols = [c['name'] for c in conn.columns]
+        trades = [dict(zip(cols, r)) for r in rows]
+        conn.close()
+    except Exception:
+        trades = []
+    return _v2_live_dashboard_html(trades)
+
+
+def _v2_live_dashboard_html(trades):
+    """Live trades dashboard. Same theme/structure as _v2_dashboard_html — uses
+    the shared DASHBOARD_CSS, header, and nav so paper and live feel like two
+    tabs of one product. Stats and table columns are adapted to live data."""
+    import html as _html
+
+    total = len(trades)
+    filled = sum(1 for t in trades if t.get("fill_status") == "FILLED")
+    cancelled = sum(1 for t in trades if t.get("fill_status") == "CANCELLED")
+    errored = sum(1 for t in trades if t.get("fill_status") == "ERROR")
+    capped = sum(1 for t in trades if t.get("fill_status") == "CAPPED")
+    fill_rate = round(filled / max(filled + cancelled, 1) * 100, 1)
+    spend = sum(float(t.get("stake_usdc") or 0) for t in trades if t.get("fill_status") == "FILLED")
+    today_spend = _lmts_today_spend_usdc()
+    balance_usdc = _lmts_get_balance_usdc()      # None if RPC failed
+    paused_low = (balance_usdc is not None and balance_usdc < LIMITLESS_MIN_BALANCE_USDC)
+
+    # Resolution + redemption tallies (FILLED rows only count toward W/L stats).
+    wins = sum(1 for t in trades if t.get("outcome") == "WIN")
+    losses = sum(1 for t in trades if t.get("outcome") == "LOSS")
+    pushes = sum(1 for t in trades if t.get("outcome") == "PUSH")
+    total_pnl = sum(float(t.get("pnl") or 0) for t in trades if t.get("outcome"))
+    open_filled = sum(1 for t in trades
+                      if t.get("fill_status") == "FILLED" and not t.get("outcome"))
+    redeem_done = sum(1 for t in trades if t.get("redeem_status") == "DONE")
+    redeem_pending = sum(1 for t in trades if t.get("redeem_status") == "PENDING")
+    redeem_failed = sum(1 for t in trades if t.get("redeem_status") == "FAILED")
+    win_rate = round(wins / max(wins + losses, 1) * 100, 1) if (wins + losses) else 0.0
+
+    appr = _lmts_get_approval_state()
+    addr = appr.get("wallet", "—")
+    live = _lmts_live_enabled()
+
+    h = '<!DOCTYPE html><html><head><meta charset="utf-8">'
+    h += '<meta name="viewport" content="width=device-width, initial-scale=1">'
+    h += '<title>Cmvng Bot v2 — Limitless Live</title>'
+    h += DASHBOARD_CSS
+    h += '</head><body><div class="container">'
+
+    # Header
+    h += '<div class="header"><div><h1>CMVNG BOT v2</h1>'
+    h += '<div class="subtitle">Confirmation Trading — Limitless <b>LIVE</b></div></div>'
+    h += '<div class="hd-right"><span class="rtds-dot {}"></span><span>{}</span>'.format(
+        "on" if _chainlink_connected else "off",
+        "RTDS Live" if _chainlink_connected else "RTDS Off")
+    h += '<button class="theme-toggle" id="cmvngThemeBtn" onclick="cmvngToggleTheme()" aria-label="Toggle theme">🌙</button></div></div>'
+
+    # Nav (same as paper, with active state on Limitless live)
+    h += '<div class="nav">'
+    h += '<a href="/app/paper-poly">Polymarket</a>'
+    h += '<a href="/app/paper-limitless">Limitless Paper</a>'
+    h += '<a href="/app/live-limitless" class="active">Limitless Live</a>'
+    h += '<a href="/app/picks">⚽ Picks</a>'
+    h += '<a href="/app/codes">🎫 Codes</a>'
+    h += '<a href="/app/results">📈 Results</a>'
+    h += '</div>'
+
+    # Mode banner: shows current state + lets you flip back to paper from here too
+    mode_bg = "#16a34a" if live else "#475569"
+    mode_txt = "LIVE TRADING" if live else "PAPER MODE"
+    flip_to = "0" if live else "1"
+    flip_label = "Switch to Paper" if live else "Go Live →"
+    h += ('<div style="display:flex;flex-wrap:wrap;align-items:center;gap:12px;'
+          'background:var(--card-bg,#f8fafc);border:1px solid var(--border,#e5e7eb);'
+          'border-radius:12px;padding:14px 16px;margin:12px 0 16px">'
+          '<span style="background:{bg};color:#fff;padding:6px 14px;border-radius:8px;'
+          'font:700 13px system-ui">{txt}</span>'
+          '<span style="color:var(--muted,#64748b);font:13px ui-monospace,monospace">{addr}</span>'
+          '<form action="/app/limitless-toggle" method="post" style="margin-left:auto">'
+          '<input type="hidden" name="to" value="{to}">'
+          '<button type="submit" onclick="return confirm({conf})" '
+          'style="background:{bbg};color:#fff;border:0;padding:8px 16px;border-radius:8px;'
+          'font:600 13px system-ui;cursor:pointer">{lbl}</button>'
+          '</form></div>'.format(
+              bg=mode_bg, txt=mode_txt, addr=addr, to=flip_to,
+              conf=("'Switch to PAPER mode? Live trading will stop until you turn it back on.'"
+                    if live else
+                    "'Activate LIVE trading? Real USDC on Base will be used. ${:.2f} per trade, pauses below ${:.2f} balance.'".format(
+                        LIMITLESS_MAX_TRADE_USDC, LIMITLESS_MIN_BALANCE_USDC)),
+              bbg="#475569" if live else "#16a34a", lbl=flip_label))
+
+    # Stats — entry side
+    h += '<div class="stats-grid">'
+    h += '<div class="stat-card"><div class="label">Total attempts</div><div class="value">{}</div></div>'.format(total)
+    h += '<div class="stat-card"><div class="label">Filled</div><div class="value green">{}</div></div>'.format(filled)
+    h += '<div class="stat-card"><div class="label">Cancelled</div><div class="value">{}</div></div>'.format(cancelled)
+    h += '<div class="stat-card"><div class="label">Errors</div><div class="value {}">{}</div></div>'.format("red" if errored else "", errored)
+    h += '<div class="stat-card"><div class="label">Fill rate</div><div class="value {}">{:.1f}%</div></div>'.format(
+        "green" if fill_rate >= 60 else "red" if fill_rate < 30 else "", fill_rate)
+    # Wallet balance vs floor — the live circuit breaker. RED if paused, GREEN
+    # if trading, GREY if balance read failed.
+    if balance_usdc is None:
+        bal_val_html = '<div class="value">RPC ✕</div>'
+    elif paused_low:
+        bal_val_html = '<div class="value red">${:.2f} ⏸</div>'.format(balance_usdc)
+    else:
+        bal_val_html = '<div class="value green">${:.2f}</div>'.format(balance_usdc)
+    h += '<div class="stat-card"><div class="label">Wallet / Floor ${:.2f}</div>{}</div>'.format(
+        LIMITLESS_MIN_BALANCE_USDC, bal_val_html)
+    h += '<div class="stat-card"><div class="label">24h volume</div><div class="value blue">${:.2f}</div></div>'.format(today_spend)
+    h += '</div>'
+
+    # Stats — resolution + redemption (only shown once any trade has resolved
+    # so an empty dashboard isn't cluttered with zeros)
+    if (wins + losses + pushes + open_filled) > 0:
+        h += '<div class="stats-grid" style="margin-top:8px">'
+        h += '<div class="stat-card"><div class="label">Open (awaiting resolve)</div><div class="value">{}</div></div>'.format(open_filled)
+        h += '<div class="stat-card"><div class="label">Wins</div><div class="value green">{}</div></div>'.format(wins)
+        h += '<div class="stat-card"><div class="label">Losses</div><div class="value red">{}</div></div>'.format(losses)
+        h += '<div class="stat-card"><div class="label">Win rate</div><div class="value {}">{:.1f}%</div></div>'.format(
+            "green" if win_rate >= 55 else "red" if win_rate < 45 else "", win_rate)
+        h += '<div class="stat-card"><div class="label">Realized P&L</div><div class="value {}">${:+.2f}</div></div>'.format(
+            "green" if total_pnl > 0 else "red" if total_pnl < 0 else "", total_pnl)
+        h += '<div class="stat-card"><div class="label">Redeemed on-chain</div><div class="value {}">{} done · {} pending{}</div></div>'.format(
+            "green" if redeem_done and not redeem_failed else "red" if redeem_failed else "",
+            redeem_done, redeem_pending,
+            " · {} failed".format(redeem_failed) if redeem_failed else "")
+        h += '</div>'
+
+    # Trade table
+    h += '<div class="table-wrap"><table><thead><tr>'
+    h += '<th>#</th><th>Time</th><th>TF</th><th>Asset</th><th>Dir</th>'
+    h += '<th>Limit</th><th>Fill px</th><th>Stake</th><th>Shares</th>'
+    h += '<th>Status</th><th>Outcome</th><th>P&L</th><th>Redeem</th><th>Order id</th>'
+    h += '</tr></thead><tbody>'
+
+    for i, t in enumerate(trades):
+        st = t.get("fill_status") or "—"
+        cls = {"FILLED": "green", "CANCELLED": "", "CAPPED": "",
+               "ERROR": "red"}.get(st, "")
+        ts_val = t.get("fired_at")
+        ts_txt = ts_val.strftime("%m-%d %H:%M:%S") if ts_val else "—"
+        lim = t.get("limit_price_cents") or 0
+        stake = t.get("stake_usdc") or 0
+        shares = t.get("size_shares") or 0
+        fp = t.get("fill_price_cents")
+        fs = t.get("filled_size")
+        oid = (t.get("order_id") or "")[:14]
+        err_msg = t.get("error_message") or ""
+
+        outcome = t.get("outcome") or ""
+        if outcome == "WIN":
+            oc_html = '<span class="badge green">WIN</span>'
+        elif outcome == "LOSS":
+            oc_html = '<span class="badge red">LOSS</span>'
+        elif outcome == "PUSH":
+            oc_html = '<span class="badge">PUSH</span>'
+        elif st == "FILLED":
+            oc_html = '<span class="badge" style="background:#fef3c7;color:#92400e">OPEN</span>'
+        else:
+            oc_html = '—'
+
+        pnl_val = t.get("pnl")
+        if pnl_val is None or outcome == "":
+            pnl_html = '—'
+        else:
+            pnl_html = '<span style="color:{}">${:+.2f}</span>'.format(
+                "#16a34a" if pnl_val > 0 else ("#dc2626" if pnl_val < 0 else "#475569"),
+                float(pnl_val))
+
+        rs = t.get("redeem_status") or ""
+        rtx = t.get("redeem_tx_hash") or ""
+        if rs == "DONE" and rtx:
+            short_tx = rtx[:10] + "…"
+            redeem_html = ('<a href="https://basescan.org/tx/{tx}" target="_blank" '
+                          'style="color:#16a34a;text-decoration:none;font:600 11px ui-monospace">'
+                          '✓ {short}</a>').format(tx=_html.escape(rtx), short=_html.escape(short_tx))
+        elif rs == "PENDING":
+            redeem_html = '<span class="badge" style="background:#fef3c7;color:#92400e">PENDING</span>'
+        elif rs == "FAILED":
+            redeem_html = '<span class="badge red">FAILED</span>'
+        elif rs == "SKIPPED":
+            redeem_html = '<span style="color:#94a3b8;font-size:11px">—</span>'
+        else:
+            redeem_html = '—'
+
+        h += '<tr><td>{}</td><td>{}</td><td>{}</td><td><b>{}</b></td><td><b>{}</b></td>'.format(
+            i + 1, ts_txt, t.get("timeframe") or "—",
+            t.get("asset") or "—", t.get("direction") or "—")
+        h += '<td>{:.0f}c</td><td>{}</td><td>${:.2f}</td><td>{:.4f}</td>'.format(
+            lim, "{:.1f}c".format(fp) if fp else "—", stake, shares)
+        h += '<td><span class="badge {}">{}</span>'.format(cls, st)
+        if err_msg:
+            h += '<div class="errmsg">{}</div>'.format(_html.escape(err_msg[:120]))
+        h += '</td>'
+        h += '<td>{}</td><td>{}</td><td>{}</td>'.format(oc_html, pnl_html, redeem_html)
+        h += '<td class="mono">{}</td></tr>'.format(oid or "—")
+    if not trades:
+        h += '<tr><td colspan="14" class="muted">No live trades yet — flip the toggle when ready.</td></tr>'
+    h += '</tbody></table></div>'
+
+    h += '<style>.badge{padding:3px 9px;border-radius:6px;font:600 11px system-ui;background:#e2e8f0;color:#475569}'
+    h += '.badge.green{background:#16a34a;color:#fff}.badge.red{background:#dc2626;color:#fff}'
+    h += '.errmsg{font:11px ui-monospace,monospace;color:#b91c1c;margin-top:3px;max-width:280px;white-space:normal}'
+    h += '.mono{font:12px ui-monospace,monospace;color:#64748b}.muted{color:#94a3b8;text-align:center;padding:24px}</style>'
+    h += '</div></body></html>'
+    return h
+
 
 
 @app.route("/v2/status")
@@ -8295,7 +9490,8 @@ def render_codes_page(accumulators, date_str, builders=None):
 <div class="wrap">
 <div class="page-head"><h1>Today's Codes</h1>
 <div class="sub">Accumulator booking codes for SportyBet</div>
-<div class="date">{date}</div></div>
+<div class="date">{date}</div>
+<a href="/app/fb-rescan" style="display:inline-block;margin-top:8px;font:600 13px system-ui;color:var(--brand,#2563eb);text-decoration:none;border:1px solid var(--line,#e5e7eb);border-radius:8px;padding:6px 12px">↻ Rescan now</a></div>
 {body}
 <div class="disclaimer">Codes are auto-generated from data analysis. Odds may shift before kickoff.
 Always review selections in your SportyBet app before staking. No bet is guaranteed.</div>
@@ -8820,6 +10016,7 @@ _FB_CACHE = {
     "match_picks": {},      # {match: [top picks]}
     "accumulators": [],     # [acca dict with code]
     "last_run": None,
+    "last_run_ts": 0,       # epoch of last scan; anchors the scheduler + survives restarts via DB restore
     "running": False,
 }
 
@@ -8840,6 +10037,7 @@ def fb_init_db(get_db):
                 market_type TEXT, pick TEXT,
                 confidence REAL, odds REAL,
                 reasoning TEXT,
+                kickoff_ts BIGINT,
                 result TEXT DEFAULT 'pending',
                 created_at TIMESTAMPTZ DEFAULT NOW()
             )
@@ -8873,6 +10071,7 @@ def fb_init_db(get_db):
             ("match_date", "DATE"), ("home", "TEXT"), ("away", "TEXT"),
             ("league", "TEXT"), ("market_type", "TEXT"), ("pick", "TEXT"),
             ("confidence", "REAL"), ("odds", "REAL"), ("reasoning", "TEXT"),
+            ("kickoff_ts", "BIGINT"),
             ("result", "TEXT DEFAULT 'pending'"), ("created_at", "TIMESTAMPTZ DEFAULT NOW()"),
         ]
         for col, typ in _fp_cols:
@@ -8932,11 +10131,11 @@ def fb_save_run(get_db, date_str, all_picks, accumulators):
         # Save top picks (limit to keep DB lean)
         for p in all_picks[:200]:
             conn.run("""INSERT INTO football_picks
-                (match_date, home, away, league, market_type, pick, confidence, odds, reasoning)
-                VALUES (:d,:h,:a,:l,:mt,:pk,:cf,:od,:rs)""",
+                (match_date, home, away, league, market_type, pick, confidence, odds, reasoning, kickoff_ts)
+                VALUES (:d,:h,:a,:l,:mt,:pk,:cf,:od,:rs,:kt)""",
                 d=today, h=p["home"], a=p["away"], l=p["league"],
                 mt=p["market_type"], pk=p["pick"], cf=p["confidence"],
-                od=p["odds"], rs=p["reasoning"])
+                od=p["odds"], rs=p["reasoning"], kt=int(p.get("kickoff_ts") or 0))
         # Save accumulators — tag every slip in this run with one shared run_id
         # so the history view can group them as a single "set".
         run_id = _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -8962,6 +10161,94 @@ def fb_save_run(get_db, date_str, all_picks, accumulators):
         conn.close()
     except Exception as e:
         print("[FB] save error: {}".format(e))
+
+
+def fb_load_latest(get_db):
+    """Repopulate the in-memory cache from the most recent run already saved in
+    the DB, so a redeploy shows the last scan immediately WITHOUT re-scraping.
+    Returns True if a run was restored, else False (caller then scans). Fully
+    defensive: any failure -> False -> normal boot scan, so it can't make a
+    deploy worse than today's behaviour."""
+    try:
+        conn = get_db()
+        # Accumulators from the latest run_id (ascending odds so the page lists
+        # banker -> moonshot, matching a live run).
+        accs = conn.run(
+            "SELECT tier, label, target_odds, total_odds, num_selections, "
+            "selections_json, sportybet_code, match_date, created_at "
+            "FROM sportybet_accumulators "
+            "WHERE run_id = (SELECT run_id FROM sportybet_accumulators "
+            "ORDER BY created_at DESC LIMIT 1) ORDER BY total_odds ASC")
+        accumulators = []
+        latest_date = None
+        latest_ts = None
+        for r in (accs or []):
+            tier, label, tgt, tot, ns, sj, code, mdate, created = r
+            try:
+                sels = json.loads(sj or "[]")
+            except Exception:
+                sels = []
+            if not sels:
+                continue
+            accumulators.append({
+                "tier": tier, "label": label,
+                "emoji": TIER_CONFIG.get(tier, {}).get("emoji", "🟢"),
+                "target_odds": tgt, "total_odds": tot,
+                "num_selections": ns or len(sels),
+                "selections": sels, "code": code or None,
+            })
+            if mdate is not None and latest_date is None:
+                latest_date = mdate
+            if created is not None and latest_ts is None:
+                latest_ts = created
+
+        # Per-match picks from the latest match_date (drives /app/picks + /app/cards).
+        prows = conn.run(
+            "SELECT home, away, league, market_type, pick, confidence, odds, "
+            "reasoning, kickoff_ts FROM football_picks "
+            "WHERE match_date = (SELECT MAX(match_date) FROM football_picks)")
+        conn.close()
+        by_match = {}
+        for r in (prows or []):
+            home, away, league, mt, pick, conf, odds, reason, kts = r
+            label = "{} vs {}".format(home, away)
+            by_match.setdefault(label, []).append({
+                "match": label, "home": home, "away": away, "league": league or "",
+                "market_type": mt or "", "pick": pick or "",
+                "confidence": float(conf or 0), "odds": float(odds or 0),
+                "reasoning": reason or "", "kickoff_ts": int(kts or 0),
+                "result": "pending",
+            })
+        match_picks = {}
+        for m, ps in by_match.items():
+            ps.sort(key=lambda x: x["confidence"], reverse=True)
+            match_picks[m] = ps[:3]
+
+        if not accumulators and not match_picks:
+            return False
+
+        date_human = ""
+        if latest_date is not None:
+            try:
+                date_human = latest_date.strftime("%A, %B %d, %Y")
+            except Exception:
+                date_human = str(latest_date)
+        _FB_CACHE["date"] = date_human or _fb_today_human()
+        _FB_CACHE["match_picks"] = match_picks
+        _FB_CACHE["accumulators"] = accumulators
+        if latest_ts is not None:
+            try:
+                _FB_CACHE["last_run_ts"] = latest_ts.timestamp()
+                _FB_CACHE["last_run"] = (latest_ts.replace(tzinfo=None)
+                                         if hasattr(latest_ts, "tzinfo") else latest_ts)
+            except Exception:
+                pass
+        print("[FB] restored last run from DB: {} codes, {} matches, date={}".format(
+            len(accumulators), len(match_picks), _FB_CACHE["date"]))
+        return True
+    except Exception as e:
+        print("[FB] restore error: {}".format(e))
+        return False
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -10134,6 +11421,7 @@ def run_football_engine(get_db, tg_token, tg_chat, send_telegram,
         _FB_CACHE["accumulators"] = accumulators
         _FB_CACHE["bet_builders"] = bet_builders
         _FB_CACHE["last_run"] = _dt.datetime.now()
+        _FB_CACHE["last_run_ts"] = time.time()
 
         try:
             fb_save_run(get_db, date_human, all_picks, accumulators)
@@ -10169,23 +11457,45 @@ def run_football_engine(get_db, tg_token, tg_chat, send_telegram,
 
 
 def fb_scanner_thread(get_db, tg_token, tg_chat, send_telegram, interval_hours=12):
-    """Background thread: run the engine on a schedule."""
+    """Keep the engine on a schedule, but DON'T re-scrape on every deploy. On boot
+    we restore the last run from the DB and only scan if that run is missing or
+    older than the interval. The schedule is anchored to the real last-scan time
+    (last_run_ts), so a redeploy no longer resets the clock, and a manual rescan
+    re-anchors it automatically."""
+    interval = interval_hours * 3600
     def loop():
         time.sleep(30)  # let app boot first
-        # Initial run
+        # Restore the last scan so the pages aren't blank after a redeploy.
+        restored = False
         try:
-            run_football_engine(get_db, tg_token, tg_chat, send_telegram)
+            restored = fb_load_latest(get_db)
         except Exception as e:
-            print("[FB] initial run error: {}".format(e))
-        # Periodic
-        while True:
-            time.sleep(interval_hours * 3600)
+            print("[FB] boot restore error: {}".format(e))
+        # Scan on boot ONLY if there's no usable run, or the restored one is stale.
+        age = time.time() - (_FB_CACHE.get("last_run_ts") or 0)
+        if not restored or age >= interval:
+            print("[FB] boot scan ({})".format(
+                "no saved run" if not restored else "last run {:.1f}h old".format(age / 3600)))
             try:
                 run_football_engine(get_db, tg_token, tg_chat, send_telegram)
             except Exception as e:
-                print("[FB] scheduled run error: {}".format(e))
+                print("[FB] initial run error: {}".format(e))
+        else:
+            print("[FB] boot: restored run {:.1f}h old — skipping re-scrape, "
+                  "next scan in {:.1f}h".format(age / 3600, (interval - age) / 3600))
+        # Schedule anchored to last_run_ts: wake every few minutes and run only
+        # when due, so deploys and manual rescans re-anchor instead of resetting.
+        while True:
+            time.sleep(300)  # 5-min tick
+            if _FB_CACHE.get("running"):
+                continue
+            if time.time() - (_FB_CACHE.get("last_run_ts") or 0) >= interval:
+                try:
+                    run_football_engine(get_db, tg_token, tg_chat, send_telegram)
+                except Exception as e:
+                    print("[FB] scheduled run error: {}".format(e))
     threading.Thread(target=loop, daemon=True).start()
-    print("[FB] scanner thread started (every {}h)".format(interval_hours))
+    print("[FB] scanner thread started (every {}h, anchored, no re-scrape on deploy)".format(interval_hours))
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -10833,6 +12143,33 @@ def fb_picks_page():
 def fb_codes_page():
     return render_codes_page(_FB_CACHE.get("accumulators", []),
                              _FB_CACHE.get("date") or _fb_today_human())
+
+
+@app.route("/app/fb-rescan")
+def fb_rescan_now():
+    """Manual 'Rescan now' trigger: re-runs the football engine immediately in the
+    background and re-anchors the 12h schedule (the scheduler keys off
+    last_run_ts, which the run updates). Refresh picks/codes WITHOUT a deploy."""
+    back = ("<p style='font:15px system-ui;margin-top:14px'>"
+            "<a href='/app/codes'>← Back to Codes</a></p>")
+    if _FB_CACHE.get("running"):
+        return ("<h3 style='font:600 18px system-ui'>Rescan already in progress…</h3>"
+                "<p style='font:15px system-ui'>The engine is running now. Give it a "
+                "minute, then refresh Codes.</p>" + back), 200
+    age = time.time() - (_FB_CACHE.get("last_run_ts") or 0)
+    if age < 120:
+        return ("<h3 style='font:600 18px system-ui'>Just scanned {}s ago.</h3>"
+                "<p style='font:15px system-ui'>To avoid hammering the sources, wait a "
+                "moment before forcing another rescan.</p>".format(int(age)) + back), 200
+    def _bg():
+        try:
+            run_football_engine(get_db, TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, send_telegram)
+        except Exception as e:
+            print("[FB] manual rescan error: {}".format(e))
+    threading.Thread(target=_bg, daemon=True).start()
+    return ("<h3 style='font:600 18px system-ui'>Rescan started ✅</h3>"
+            "<p style='font:15px system-ui'>Fresh picks + codes are building now and the "
+            "12-hour clock has been reset. Refresh Codes in ~1–2 minutes.</p>" + back), 200
 
 
 @app.route("/app/builder")
