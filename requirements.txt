@@ -5,18 +5,14 @@ Flask>=3.0
 pg8000>=1.30
 requests>=2.31
 beautifulsoup4>=4.12
-
 # Imported inside the Chainlink RTDS thread only — if missing, the app
 # still boots and trades; only the real-time price stream is disabled.
 websocket-client>=1.7
-
 # Cloudflare bypass for Sofascore/FBref (real Chrome TLS fingerprint).
 # Graceful fallback to plain requests if missing — app still boots either way.
 curl_cffi>=0.7.0
-
 # Cloudflare JS-challenge solver (pure Python, no browser) for FBref/Sofascore.
 cloudscraper>=1.2.71
-
 # Polymarket CLOB client — the V2 crypto engine needs this to READ Polymarket
 # prices and PLACE Polymarket trades. WITHOUT it the app still boots and
 # Limitless still works, but the Polymarket price read returns nothing, so the
@@ -28,3 +24,13 @@ cloudscraper>=1.2.71
 # web3 signing stack, pydantic 2.x), so the Railway build will be noticeably
 # slower. If missing, Polymarket degrades gracefully — it does NOT block boot.
 py-clob-client==0.34.6
+# Limitless Exchange SDK — required for LIVE trading on Limitless (FOK orders,
+# USDC approval, and on-chain redemption of winning positions). Imports are
+# wrapped in try/except, so if this package is missing the app still boots and
+# all paper flows work — only the live toggle is non-functional (clicking
+# "Go Live" or "Approve USDC" records ERROR rows with "py-limitless missing").
+# Bundles eth-account, web3, aiohttp, and python-socketio as transitive deps,
+# which overlaps with what py-clob-client already pulled in — pip resolves the
+# overlap fine. Pinned because the SDK is young (0.1.x) and a minor bump could
+# rename internal modules; bump deliberately, not silently.
+py-limitless==0.1.1
