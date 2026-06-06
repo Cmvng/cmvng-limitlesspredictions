@@ -7675,7 +7675,8 @@ def live_redemptions_page():
                    outcome, pnl, stake_usdc, filled_size,
                    fill_price_cents, condition_id, market_slug,
                    redeem_status, redeem_attempts, redeem_tx_hash,
-                   error_message, fired_at, resolved_at
+                   error_message, fired_at, resolved_at,
+                   raw_response, order_id, size_shares, limit_price_cents
             FROM v2_live_trades
             ORDER BY id DESC LIMIT 100
         """))
@@ -7685,7 +7686,8 @@ def live_redemptions_page():
 
     cols = ["id","asset","tf","dir","fill_status","outcome","pnl","stake",
             "filled","fill_px","cid","slug","redeem_status","redeem_attempts",
-            "redeem_tx","err","fired_at","resolved_at"]
+            "redeem_tx","err","fired_at","resolved_at","raw_response",
+            "order_id","shares","limit_cents"]
     trades = [dict(zip(cols, r)) for r in rows]
 
     # bucket
@@ -7704,38 +7706,59 @@ def live_redemptions_page():
         elif fs == "FILLED" and oc == "WIN":
             wins.append(t)
 
-    def _fmt_row(t, include_redeem=True):
+    def _fmt_raw(raw):
+        if not raw: return "—"
+        # raw_response is stored as JSON-encoded text. Try to pretty-print
+        # or fall back to the raw string.
+        try:
+            import json as _j
+            obj = _j.loads(raw) if isinstance(raw, str) else raw
+            return "<details><summary style='cursor:pointer;color:#2f6bd6'>view raw</summary><pre style='font:11px ui-monospace;background:#f8f8f8;padding:8px;border-radius:6px;white-space:pre-wrap;max-height:280px;overflow:auto'>" + _j.dumps(obj, indent=2)[:3000] + "</pre></details>"
+        except Exception:
+            return "<details><summary style='cursor:pointer;color:#2f6bd6'>view raw</summary><pre style='font:11px ui-monospace;background:#f8f8f8;padding:8px;border-radius:6px;white-space:pre-wrap;max-height:280px;overflow:auto'>" + (str(raw)[:3000]) + "</pre></details>"
+
+    def _fmt_row(t, include_redeem=True, include_raw=False):
         cid = (t.get("cid") or "")[:18]
         cid_html = ('<a href="/app/redeem-now?id={}">{}</a>'.format(t["id"], cid)
                     if include_redeem and cid else (cid or "—"))
         tx = (t.get("redeem_tx") or "")
         tx_html = ('<a href="https://basescan.org/tx/{}" target="_blank">{}…</a>'.format(
                     tx, tx[:14]) if tx else "—")
+        raw_html = _fmt_raw(t.get("raw_response")) if include_raw else ""
+        order_html = ""
+        if include_raw:
+            order_html = ('<div style="font:11px ui-monospace;color:#666">'
+                          'order_id={oid} · {shares}sh @ {lim}c</div>'.format(
+                          oid=(t.get("order_id") or "—")[:18],
+                          shares=t.get("shares") or "?",
+                          lim=t.get("limit_cents") or "?"))
+        err_cell = (t.get("err") or "")[:250]
         return (
             "<tr>"
-            "<td>{id}</td><td>{tf} {dir} {asset}</td><td>{fs}</td>"
+            "<td>{id}</td><td>{tf} {dir} {asset}{order}</td><td>{fs}</td>"
             "<td>{oc}</td><td>${pnl}</td><td>{cid}</td>"
             "<td>{rs} ({ra})</td><td>{tx}</td>"
-            "<td style='max-width:280px;color:#a00;font-size:11px'>{err}</td>"
+            "<td style='max-width:340px;color:#a00;font-size:11px'>{err}{raw}</td>"
             "</tr>".format(
             id=t["id"], tf=t.get("tf",""), dir=t.get("dir",""),
-            asset=t.get("asset",""), fs=t.get("fill_status",""),
+            asset=t.get("asset",""), order=order_html,
+            fs=t.get("fill_status",""),
             oc=t.get("outcome","") or "—", pnl=t.get("pnl") or "—",
             cid=cid_html, rs=t.get("redeem_status") or "—",
             ra=t.get("redeem_attempts") or 0, tx=tx_html,
-            err=(t.get("err") or "")[:200]))
+            err=err_cell, raw=("<br>" + raw_html if include_raw else "")))
 
-    def _section(title, items, hint, include_redeem=False):
+    def _section(title, items, hint, include_redeem=False, include_raw=False):
         if not items:
             body = "<p style='color:#888;font-size:13px;margin:8px 0 0'>(none)</p>"
         else:
-            rows_html = "".join(_fmt_row(t, include_redeem) for t in items)
+            rows_html = "".join(_fmt_row(t, include_redeem, include_raw) for t in items)
             body = (
                 "<table style='border-collapse:collapse;width:100%;font:13px system-ui'>"
                 "<thead><tr style='background:#f0f0f0;text-align:left'>"
                 "<th>id</th><th>trade</th><th>fill</th><th>outcome</th>"
                 "<th>pnl</th><th>condition_id</th><th>redeem (attempts)</th>"
-                "<th>tx</th><th>error</th></tr></thead>"
+                "<th>tx</th><th>error / raw response</th></tr></thead>"
                 "<tbody>" + rows_html + "</tbody></table>")
         return ("<h2 style='font:600 17px system-ui;margin-top:24px'>{} <span style='font-weight:400;font-size:13px;color:#888'>· {} row(s)</span></h2>"
                 "<p style='font:12px system-ui;color:#888;margin:0 0 8px'>{}</p>{}".format(
@@ -7744,21 +7767,25 @@ def live_redemptions_page():
     html = (
         "<!doctype html><html><head><meta charset='utf-8'>"
         "<title>Live Redemptions — Cmvng Bot</title>"
-        "<style>body{font:14px system-ui;max-width:1200px;margin:24px auto;padding:0 18px}"
+        "<style>body{font:14px system-ui;max-width:1280px;margin:24px auto;padding:0 18px}"
         "table td,table th{padding:6px 8px;border-bottom:1px solid #eee;vertical-align:top}"
-        "a{color:#2f6bd6;text-decoration:none}a:hover{text-decoration:underline}</style>"
+        "a{color:#2f6bd6;text-decoration:none}a:hover{text-decoration:underline}"
+        "details summary{user-select:none}</style>"
         "</head><body>"
         "<h1 style='font:600 24px system-ui'>Live Redemption Diagnostics</h1>"
-        "<p>Trace the full lifecycle of every live trade. Click a "
-        "<code>condition_id</code> in section 5 to force a redemption attempt "
-        "for that row right now.</p>")
+        "<p>Trace the full lifecycle of every live trade. <b>Click 'view raw'</b> "
+        "on CANCELLED or ERROR rows to see exactly what Limitless's API returned "
+        "— that's how we figure out which response field the parser is missing.</p>")
     html += _section("1. ERROR / CAPPED — never reached the exchange",
                      errored, "Order didn't even submit. Usual causes: token-id missing, "
-                     "tick violation, balance below floor, signature format.")
+                     "tick violation, balance below floor, signature format.",
+                     include_raw=True)
     html += _section("2. CANCELLED — submitted but didn't fill",
                      cancelled, "Marketable-limit didn't match a maker, OR Limitless's "
-                     "response shape isn't recognized by the parser. Check raw_response "
-                     "in the deploy logs.")
+                     "response shape isn't recognized by the parser. The raw response "
+                     "is the smoking gun — expand 'view raw' on any row to see what "
+                     "Limitless actually returned.",
+                     include_raw=True)
     html += _section("3. FILLED, unresolved — waiting for market to settle",
                      filled_unresolved, "Order filled on-chain. The resolver polls the "
                      "market every 60s; once Limitless returns winningOutcome / status=resolved, "
@@ -7770,7 +7797,7 @@ def live_redemptions_page():
                      wins, "redeem_status PENDING = scheduler will retry. DONE = on-chain "
                      "redemption tx submitted (click tx for BaseScan). FAILED = exceeded "
                      "max attempts (default 10); click the condition_id to retry manually.",
-                     include_redeem=True)
+                     include_redeem=True, include_raw=True)
     html += ("<p style='margin-top:32px;font:12px system-ui;color:#666'>"
              "<a href='/app/live-limitless'>← live-limitless dashboard</a> · "
              "<a href='/app/codes'>codes</a></p></body></html>")
