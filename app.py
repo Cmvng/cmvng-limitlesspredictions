@@ -6000,6 +6000,7 @@ def _v2_resolve_trades():
 # condition, or a single failure can't block resolution of new rows.
 
 _LMTS_LIVE_RESOLVE_DIAG = [0]   # at-most-N diagnostic prints per process
+_LMTS_RESOLVE_LOG_TS = {}        # per-slug timestamp dict (rate-limit verbose logs to once per 5 min)
 _LMTS_REDEEM_MAX_ATTEMPTS = 10  # docs warn API can mark resolved before CTF on-chain;
                                 # we retry with cooldown so the pass-through is forgiving
 
@@ -6241,11 +6242,24 @@ def _v2_resolve_live_trades():
                             if isinstance(op, list) and len(op) >= 2:
                                 if float(op[0]) > 0.9: actual = "UP"
                                 elif float(op[0]) < 0.1: actual = "DOWN"
-                    if not actual and _LMTS_LIVE_RESOLVE_DIAG[0] < 6:
-                        _LMTS_LIVE_RESOLVE_DIAG[0] += 1
-                        print("[LMTS-LIVE-RESOLVE-DIAG] {} status={} keys={} winner={} widx={}".format(
-                            slug[:40], status, list(market.keys())[:14],
-                            market.get("winningOutcome"), market.get("winningOutcomeIndex")))
+                    if not actual:
+                        # Verbose: print every time we check a FILLED row and
+                        # Limitless says the market isn't resolved yet. Use a
+                        # per-slug rate-limit (once per 5 min per slug) so
+                        # we don't flood logs across 100 retries.  This is
+                        # what the user was missing — they couldn't tell
+                        # whether the resolver was even running.
+                        slug_key = "lmts_resolve_log:" + slug
+                        last_log = _LMTS_RESOLVE_LOG_TS.get(slug_key, 0)
+                        nowts = time.time()
+                        if nowts - last_log > 300:  # 5 min throttle per slug
+                            _LMTS_RESOLVE_LOG_TS[slug_key] = nowts
+                            print("[LMTS-LIVE] resolver: row {} ({} {} {}) — market not yet resolved "
+                                  "(status={!r}, winner={!r}, widx={}, prices={})".format(
+                                t["id"], t.get("timeframe"), asset, direction,
+                                status, market.get("winningOutcome"),
+                                market.get("winningOutcomeIndex"),
+                                market.get("prices") or market.get("outcomePrices")))
             except Exception as e:
                 print("[LMTS-LIVE] resolve check error {}: {}".format(slug[:30], e))
 
@@ -7885,6 +7899,137 @@ def live_redemptions_page():
              "<a href='/app/live-limitless'>← live-limitless dashboard</a> · "
              "<a href='/app/codes'>codes</a></p></body></html>")
     return html
+
+
+@app.route("/app/resolve-now")
+def force_resolve_one():
+    """Force a market-resolution check for a specific FILLED row, bypassing
+    the min_age gate. Tells you exactly what Limitless is reporting for the
+    market right now — `status`, `winningOutcome`, `winningOutcomeIndex`,
+    `prices`. Use this when a row has been sitting in bucket 3 longer than
+    the candle period and you want to know whether the resolver is failing
+    or whether Limitless just hasn't settled the market yet.
+
+    Usage: /app/resolve-now?id=49"""
+    back = ("<p style='font:14px system-ui;margin-top:18px'>"
+            "<a href='/app/live-redemptions'>← back to diagnostics</a></p>")
+    try:
+        row_id = int(request.args.get("id") or "0")
+    except Exception:
+        row_id = 0
+    if not row_id:
+        return ("<h3>Missing or invalid <code>?id=</code> param.</h3>" + back), 400
+
+    try:
+        conn = get_db()
+        r = list(conn.run(
+            "SELECT id, market_slug, condition_id, timeframe, asset, direction, "
+            "filled_size, fill_price_cents, limit_price_cents, outcome, fill_status, fired_at "
+            "FROM v2_live_trades WHERE id = :i", i=row_id))
+        conn.close()
+    except Exception as e:
+        return "<pre>DB error: {}</pre>".format(e), 500
+    if not r:
+        return ("<h3>Row {} not found.</h3>".format(row_id) + back), 404
+
+    (_, slug, cid, tf, asset, direction, fsize, fpx, lpx, outcome, fstat, fired) = r[0]
+    if fstat != "FILLED":
+        return ("<h3>Row {} status = {}, not FILLED.</h3>".format(row_id, fstat) + back), 400
+
+    import requests as req
+    out_lines = []
+    out_lines.append("<h2 style='font:600 20px system-ui'>Force resolve · row {}</h2>".format(row_id))
+    out_lines.append("<p>{} {} {} · filled {} shares @ {}c · fired_at {}</p>".format(
+        tf, direction, asset, fsize, fpx or lpx, fired))
+    try:
+        r = req.get("{}/markets/{}".format(LIMITLESS_API, slug), timeout=8)
+        if r.status_code != 200:
+            return "<h3>Limitless API returned {}</h3><pre>{}</pre>".format(
+                r.status_code, (r.text or "")[:1000]) + back, 200
+        market = r.json()
+    except Exception as e:
+        return ("<h3 style='color:#b91c1c'>Limitless fetch failed</h3><pre>{}</pre>".format(e) + back), 500
+
+    status = str(market.get("status", "")).lower()
+    is_done = (status in ("resolved", "closed", "settled", "expired", "ended")
+               or market.get("closed") is True
+               or market.get("resolved") is True
+               or market.get("expired") is True
+               or market.get("winningOutcomeIndex") is not None
+               or market.get("winningOutcome") not in (None, ""))
+    winner = market.get("winningOutcome")
+    widx = market.get("winningOutcomeIndex")
+    prices = market.get("prices") or market.get("outcomePrices")
+
+    out_lines.append("<h3 style='font:600 16px system-ui;margin-top:16px'>Limitless market state</h3>")
+    out_lines.append(
+        "<table style='font:13px system-ui;border-collapse:collapse'>"
+        "<tr><td style='padding:4px 12px;color:#888'>status</td><td style='padding:4px'><code>{}</code></td></tr>"
+        "<tr><td style='padding:4px 12px;color:#888'>is_done</td><td style='padding:4px'><b>{}</b></td></tr>"
+        "<tr><td style='padding:4px 12px;color:#888'>winningOutcome</td><td style='padding:4px'><code>{}</code></td></tr>"
+        "<tr><td style='padding:4px 12px;color:#888'>winningOutcomeIndex</td><td style='padding:4px'><code>{}</code></td></tr>"
+        "<tr><td style='padding:4px 12px;color:#888'>prices</td><td style='padding:4px'><code>{}</code></td></tr>"
+        "<tr><td style='padding:4px 12px;color:#888'>expirationTimestamp</td><td style='padding:4px'><code>{}</code></td></tr>"
+        "</table>".format(status or "(empty)", is_done, winner, widx, prices,
+                          market.get("expirationTimestamp")))
+
+    if not is_done:
+        out_lines.append(
+            "<h3 style='color:#a16207;margin-top:18px'>Market not yet resolved on Limitless</h3>"
+            "<p>This is why the row hasn't moved out of bucket 3. The resolver checks every "
+            "60s but Limitless still considers this market open. Wait for Limitless to flip "
+            "it to resolved (usually a few minutes after candle close, sometimes longer for "
+            "low-volume markets).</p>")
+        return "".join(out_lines) + back, 200
+
+    # Determine actual outcome
+    actual = None
+    if str(winner).lower() in ("yes", "up", "above"): actual = "UP"
+    elif str(winner).lower() in ("no", "down", "below"): actual = "DOWN"
+    elif widx is not None: actual = "UP" if int(widx) == 0 else "DOWN"
+    elif isinstance(prices, list) and len(prices) >= 2:
+        if float(prices[0]) > 0.9: actual = "UP"
+        elif float(prices[0]) < 0.1: actual = "DOWN"
+
+    if not actual:
+        out_lines.append(
+            "<h3 style='color:#a16207'>Market is done but we couldn't determine the winner</h3>"
+            "<p>The market is closed but none of the recognized fields tell us the outcome. "
+            "Send a screenshot of this page and I'll patch the parser.</p>")
+        return "".join(out_lines) + back, 200
+
+    out_lines.append("<h3 style='font:600 16px system-ui;margin-top:18px'>Outcome determined: {}</h3>".format(actual))
+
+    # Compute P&L and write back
+    cost = float(fsize or 0) * (float(fpx or lpx or 0) / 100.0)
+    if actual == direction:
+        oc = "WIN"; pnl = float(fsize or 0) - cost; rs = "PENDING"
+    else:
+        oc = "LOSS"; pnl = -cost; rs = "SKIPPED"
+
+    try:
+        conn = get_db()
+        if cid:
+            conn.run("UPDATE v2_live_trades SET actual_result=:a, outcome=:o, pnl=:p, "
+                     "resolved_at=NOW(), redeem_status=:r WHERE id=:i",
+                     a=actual, o=oc, p=round(pnl, 4), r=rs, i=row_id)
+        else:
+            captured_cid = market.get("conditionId")
+            conn.run("UPDATE v2_live_trades SET actual_result=:a, outcome=:o, pnl=:p, "
+                     "resolved_at=NOW(), redeem_status=:r, condition_id=:c WHERE id=:i",
+                     a=actual, o=oc, p=round(pnl, 4), r=rs, c=captured_cid, i=row_id)
+        conn.close()
+    except Exception as e:
+        return "".join(out_lines) + "<pre style='color:red'>DB update failed: {}</pre>".format(e) + back, 500
+
+    if oc == "WIN":
+        out_lines.append(
+            "<p style='color:#15803d;font-weight:600;margin-top:10px'>WIN — P&L ${:.4f} · "
+            "redeem_status=PENDING · the redeemer will fire on the next 60s tick "
+            '(or click here to redeem now: <a href="/app/redeem-now?id={}">force redeem</a>).</p>'.format(pnl, row_id))
+    else:
+        out_lines.append("<p style='color:#b91c1c;font-weight:600'>LOSS — P&L ${:.4f}</p>".format(pnl))
+    return "".join(out_lines) + back, 200
 
 
 @app.route("/app/redeem-now")
