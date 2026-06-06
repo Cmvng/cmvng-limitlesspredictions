@@ -5253,7 +5253,9 @@ def _lmts_place_live(paper_trade_id, market_data, asset, tf_label, direction,
         if contracts_net > 0 and usd_net > 0:
             fill_price = (usd_net / contracts_net) * 100.0
 
-        if matched or settlement in ("MATCHED", "FILLED", "PARTIAL", "PARTIALLY_FILLED"):
+        if matched or settlement in ("MATCHED", "FILLED", "PARTIAL",
+                                     "PARTIALLY_FILLED", "MINED", "SETTLED",
+                                     "COMPLETED", "FINALIZED"):
             # PARTIAL counts as filled — we keep the partial position; the
             # resolver settles whatever we hold at market resolution.
             fill_status = "FILLED"
@@ -6098,7 +6100,27 @@ def _lmts_poll_pending_orders():
                     new_status = "CANCELLED"
                 else:
                     # Still open. Cancel if past the candle period.
-                    age_ms = now_ms - (int(fired_at) * 1000 if fired_at and fired_at < 1e12 else int(fired_at or 0))
+                    #
+                    # fired_at can come back in one of THREE shapes depending
+                    # on how it was originally inserted and the pg8000 binding:
+                    #   - datetime.datetime (TIMESTAMPTZ column → most common)
+                    #   - int/float epoch seconds (legacy rows < 1e12)
+                    #   - int epoch milliseconds (legacy rows ≥ 1e12)
+                    # Old code did `fired_at < 1e12` directly and crashed the
+                    # ENTIRE poll loop on every tick with `'<' not supported
+                    # between instances of 'datetime.datetime' and 'float'`.
+                    import datetime as _dt
+                    if fired_at is None:
+                        fired_ms = 0
+                    elif isinstance(fired_at, _dt.datetime):
+                        fired_ms = int(fired_at.timestamp() * 1000)
+                    else:
+                        try:
+                            v = float(fired_at)
+                            fired_ms = int(v * 1000) if v < 1e12 else int(v)
+                        except (TypeError, ValueError):
+                            fired_ms = 0
+                    age_ms = now_ms - fired_ms if fired_ms else 0
                     candle_ms = tf_to_ms.get(str(tf_label).upper(), 15 * 60_000)
                     if age_ms > candle_ms:
                         try:
