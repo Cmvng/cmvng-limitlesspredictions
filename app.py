@@ -6915,31 +6915,69 @@ def _v2_resolve_loop():
       4. Live redeem     ← picks redeem_status=PENDING wins, sends on-chain tx
     """
     print("[V2] Resolve loop started")
+    last_heartbeat = 0.0
     while True:
+        # Run all 4 steps and collect counts.  Track activity so a quiet loop
+        # still emits a heartbeat every 5 minutes — that way you can SEE the
+        # loop is alive and looking at zero PENDING rows, vs. "loop is dead".
+        resolved = polled = live_resolved = redeemed = 0
+        errs = []
         try:
-            resolved = _v2_resolve_trades()
+            resolved = _v2_resolve_trades() or 0
             if resolved:
                 print("[V2] Resolved {} trades".format(resolved))
         except Exception as e:
+            errs.append("paper-resolve:{}".format(e))
             print("[V2] Resolve loop error: {}".format(e))
         try:
-            polled = _lmts_poll_pending_orders()
+            polled = _lmts_poll_pending_orders() or 0
             if polled:
                 print("[LMTS-LIVE] Polled {} pending orders".format(polled))
         except Exception as e:
+            errs.append("poll:{}".format(e))
             print("[LMTS-LIVE] poll loop error: {}".format(e))
         try:
-            live_resolved = _v2_resolve_live_trades()
+            live_resolved = _v2_resolve_live_trades() or 0
             if live_resolved:
                 print("[LMTS-LIVE] Resolved {} live trades".format(live_resolved))
         except Exception as e:
+            errs.append("live-resolve:{}".format(e))
             print("[LMTS-LIVE] resolve loop error: {}".format(e))
         try:
-            redeemed = _v2_redeem_pending_live()
+            # Always query the DB to see how many PENDING redemptions exist
+            # right now — even when redeem isn't actively firing, this tells
+            # the user whether there's anything WAITING to be redeemed.
+            try:
+                _conn = get_db()
+                pending_rows = list(_conn.run(
+                    "SELECT COUNT(*) FROM v2_live_trades "
+                    "WHERE redeem_status='PENDING' AND condition_id IS NOT NULL "
+                    "AND condition_id <> ''"))
+                _conn.close()
+                pending_count = int(pending_rows[0][0]) if pending_rows else 0
+            except Exception:
+                pending_count = -1
+            redeemed = _v2_redeem_pending_live() or 0
             if redeemed:
                 print("[LMTS-LIVE] Redeemed {} positions on-chain".format(redeemed))
         except Exception as e:
+            errs.append("redeem:{}".format(e))
             print("[LMTS-LIVE] redeem loop error: {}".format(e))
+
+        # Heartbeat: print a summary line if ANY work happened this tick,
+        # OR if 5 min have passed since the last heartbeat. This is what
+        # makes the loop's status visible — without this you only see logs
+        # when something succeeds, leaving "is it running?" ambiguous.
+        nowts = time.time()
+        any_work = (resolved + polled + live_resolved + redeemed) > 0
+        if any_work or pending_count > 0 or nowts - last_heartbeat > 300:
+            print("[V2-LOOP] heartbeat: paper-resolved={} live-polled={} "
+                  "live-resolved={} pending-redeem={} redeemed-this-tick={}{}".format(
+                resolved, polled, live_resolved,
+                pending_count if pending_count >= 0 else "?",
+                redeemed,
+                " errs=" + "|".join(errs) if errs else ""))
+            last_heartbeat = nowts
         time.sleep(60)
 
 
