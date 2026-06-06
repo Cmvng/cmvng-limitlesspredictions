@@ -3445,6 +3445,26 @@ def init_db():
             updated_at  TIMESTAMPTZ DEFAULT NOW()
         )
     """)
+    # Persistent dedup log for sports-pick Telegram alerts. With the once-a-day
+    # sports scanner schedule, the same (home, away, pick) prediction will
+    # recur in the model output across days until the game is played — we use
+    # this table to ensure each pick fires Telegram exactly once, ever.
+    conn.run("""
+        CREATE TABLE IF NOT EXISTS sports_alerts_log (
+            id              SERIAL PRIMARY KEY,
+            home_lower      TEXT    NOT NULL,
+            away_lower      TEXT    NOT NULL,
+            pick            TEXT    NOT NULL,
+            market_label    TEXT,
+            url             TEXT,
+            confidence      INTEGER,
+            alerted_at      BIGINT  NOT NULL
+        )
+    """)
+    conn.run("""
+        CREATE INDEX IF NOT EXISTS idx_sports_alerts_dedup
+            ON sports_alerts_log (home_lower, away_lower, pick)
+    """)
     # v2 balance tracking
     conn.run("""
         CREATE TABLE IF NOT EXISTS v2_balances (
@@ -4608,6 +4628,139 @@ _lmts_client_error_logged = False
 _lmts_live_cache = {"value": None, "ts": 0.0}   # in-process cache, refreshes every few sec
 
 
+# ─────────────────────────────────────────────────────────────
+# WALL-CLOCK SLOT SCHEDULER
+# Used by both the football accumulator (08:00 + 16:00 Lagos) and the
+# sports-picks Telegram alerter (08:00 Lagos only).
+#
+# Lagos = WAT = UTC+1 year-round (no DST). So:
+#   08:00 Lagos = 07:00 UTC
+#   16:00 Lagos = 15:00 UTC
+#
+# Each scheduler stores a per-slot completion marker in v2_settings so we
+# never double-run a slot, and so a deploy/restart can tell which slots
+# already happened.  Boot policy: NO catch-up.  If a slot's wall-clock
+# time has already passed today, mark it complete-without-running so the
+# scheduler only fires for FUTURE slots (per user requirement).
+# ─────────────────────────────────────────────────────────────
+
+def _current_scheduled_slot_id(slot_hours_utc):
+    """Return the slot_id of the most recent passed slot today, or None if
+    no slot has fired yet today (e.g. 06:00 UTC with hours=(7,15))."""
+    from datetime import datetime, time as _time, timezone
+    now = datetime.now(timezone.utc)
+    today = now.date()
+    passed = []
+    for h in slot_hours_utc:
+        slot_dt = datetime.combine(today, _time(int(h), 0), tzinfo=timezone.utc)
+        if slot_dt <= now:
+            passed.append("{}_{:02d}".format(today.isoformat(), int(h)))
+    return passed[-1] if passed else None
+
+
+def _init_scheduler_no_catchup(slot_hours_utc, last_slot_key, name):
+    """On boot: mark any slot that has already passed today (or yesterday's
+    last slot if today's first hasn't passed yet) as completed, without
+    running it.  Honours the 'wait for next slot, no catch-up' rule.
+
+    Idempotent: safe to call repeatedly. Only writes a marker if the
+    most-recent-passed-slot id is different from what's already stored,
+    AND newer (so a later boot can't UN-complete a slot we already ran)."""
+    from datetime import datetime, time as _time, timezone, timedelta
+    now = datetime.now(timezone.utc)
+    today = now.date()
+    yesterday = today - timedelta(days=1)
+    candidates = []
+    for d in (yesterday, today):
+        for h in slot_hours_utc:
+            dt = datetime.combine(d, _time(int(h), 0), tzinfo=timezone.utc)
+            if dt <= now:
+                candidates.append(("{}_{:02d}".format(d.isoformat(), int(h)), dt))
+    if not candidates:
+        return  # nothing has passed yet (extremely early UTC time edge case)
+    latest_id, latest_dt = max(candidates, key=lambda x: x[1])
+    existing = _settings_get(last_slot_key)
+    # Only update if the existing marker is older (or absent). Compares as
+    # strings — slot_ids are YYYY-MM-DD_HH so lexicographic == chronological.
+    if not existing or existing < latest_id:
+        _settings_set(last_slot_key, latest_id)
+        print("[{}] boot: scheduler initialized — latest passed slot '{}' marked complete (no catch-up)".format(
+            name, latest_id))
+    else:
+        print("[{}] boot: scheduler resumed — last completed slot was '{}'".format(name, existing))
+
+
+def _scheduler_run_due_slot(slot_hours_utc, last_slot_key, run_fn, name):
+    """Called inside a tick loop. If there is a passed slot today AND we
+    haven't completed it yet, invoke run_fn() and mark it complete.
+    Returns True if a slot ran, False otherwise. run_fn must be safe to
+    call from any thread context."""
+    current = _current_scheduled_slot_id(slot_hours_utc)
+    if current is None:
+        return False
+    last = _settings_get(last_slot_key)
+    if current == last:
+        return False
+    print("[{}] firing scheduled slot '{}' (last completed: '{}')".format(
+        name, current, last or "(none)"))
+    try:
+        run_fn()
+        _settings_set(last_slot_key, current)
+        return True
+    except Exception as e:
+        # If the run fails we deliberately DO NOT mark the slot complete,
+        # so the next tick will retry.  Avoids a fault eating the day.
+        import traceback
+        print("[{}] slot '{}' run failed: {}".format(name, current, e))
+        traceback.print_exc()
+        return False
+
+
+# ─────────────────────────────────────────────────────────────
+# SPORTS-PICKS DEDUP
+# A given (home, away, pick) combination fires Telegram alerts at most
+# once, ever.  The dedup log survives deploys and restarts.
+# ─────────────────────────────────────────────────────────────
+
+def _sports_alert_seen(home, away, pick):
+    """True if we've already alerted this team/pick combo previously."""
+    try:
+        conn = get_db()
+        rows = list(conn.run(
+            "SELECT 1 FROM sports_alerts_log "
+            "WHERE home_lower = :h AND away_lower = :a AND pick = :p LIMIT 1",
+            h=(home or "").strip().lower(),
+            a=(away or "").strip().lower(),
+            p=(pick or "").strip()))
+        conn.close()
+        return bool(rows)
+    except Exception as e:
+        # If the dedup table read fails, fail OPEN (allow the alert) — it's
+        # better to risk a duplicate than to suppress a fresh pick.
+        print("[SPORTS] dedup read failed: {}".format(str(e)[:120]))
+        return False
+
+
+def _sports_alert_record(home, away, pick, market_label, url, confidence):
+    """Record an alert as sent so it won't fire again. Best-effort INSERT."""
+    try:
+        conn = get_db()
+        conn.run(
+            "INSERT INTO sports_alerts_log "
+            "(home_lower, away_lower, pick, market_label, url, confidence, alerted_at) "
+            "VALUES (:h, :a, :p, :m, :u, :c, :ts)",
+            h=(home or "").strip().lower(),
+            a=(away or "").strip().lower(),
+            p=(pick or "").strip(),
+            m=(market_label or "")[:200],
+            u=(url or "")[:500],
+            c=int(confidence) if confidence is not None else None,
+            ts=int(time.time()))
+        conn.close()
+    except Exception as e:
+        print("[SPORTS] dedup write failed: {}".format(str(e)[:120]))
+
+
 def _settings_get(key, default=None):
     """Read a single v2_settings value. Returns default on any error."""
     try:
@@ -5010,7 +5163,14 @@ def _lmts_place_live(paper_trade_id, market_data, asset, tf_label, direction,
             price_cents=float(limit_price_cents),
             amount=float(shares),
             token_type=("YES" if direction == "UP" else "NO"),
-            order_type=ORDER_TYPE_FOK,
+            order_type=ORDER_TYPE_GTC,  # GTC: rest on book until matched OR
+                                        # cancelled (by us at candle expiry, or
+                                        # by the exchange when the market
+                                        # settles). Matches paper-trading
+                                        # semantics where the limit is honoured
+                                        # if the book ever touches it. The
+                                        # poll loop (_lmts_poll_pending_orders)
+                                        # promotes PENDING → FILLED/CANCELLED.
         )
     except Exception as e:
         _lmts_record_live_trade(paper_trade_id, asset, tf_label, direction,
@@ -5037,7 +5197,24 @@ def _lmts_place_live(paper_trade_id, market_data, asset, tf_label, direction,
         if prices:
             fill_price = sum(prices) / len(prices)
     status = (resp_d.get("status") or "").upper()
-    fill_status = "FILLED" if (filled_size > 0 or status in ("FILLED", "MATCHED")) else "CANCELLED"
+    # GTC three-way classification:
+    #   FILLED   = makerMatches present OR API returned an immediate-fill status
+    #   PENDING  = order resting on book ("OPEN"/"ACTIVE"/"RESTING"/"PARTIALLY_FILLED")
+    #              — the poll loop will promote it later if it fills
+    #   CANCELLED = anything else (rejected, expired, etc.). Old FOK code
+    #               defaulted everything non-filled to CANCELLED; that was
+    #               correct for FOK but wrong for GTC, which submits as OPEN.
+    if filled_size > 0 or status in ("FILLED", "MATCHED"):
+        fill_status = "FILLED"
+    elif status in ("OPEN", "PENDING", "ACTIVE", "RESTING",
+                    "NEW", "PLACED", "ACCEPTED", "PARTIALLY_FILLED"):
+        fill_status = "PENDING"
+    elif not status and order_id:
+        # Empty status + order_id returned ⇒ the API accepted the order.
+        # Default to PENDING (we'll discover the true state via the poll loop).
+        fill_status = "PENDING"
+    else:
+        fill_status = "CANCELLED"
 
     _lmts_record_live_trade(paper_trade_id, asset, tf_label, direction,
                             market_slug, token_id, limit_price_cents,
@@ -5704,6 +5881,139 @@ def _v2_resolve_trades():
 _LMTS_LIVE_RESOLVE_DIAG = [0]   # at-most-N diagnostic prints per process
 _LMTS_REDEEM_MAX_ATTEMPTS = 10  # docs warn API can mark resolved before CTF on-chain;
                                 # we retry with cooldown so the pass-through is forgiving
+
+
+def _lmts_poll_pending_orders():
+    """For every v2_live_trades row in PENDING status: ask the Limitless API
+    what the order's current state is, and promote PENDING → FILLED /
+    CANCELLED accordingly. Also cancels orders that have sat unfilled past
+    the candle period (15M → 15min, 1H → 1h, DAILY → 24h) — a stale resting
+    order on a price-snap binary is just inventory risk after its thesis
+    candle closes.
+
+    Returns the number of orders whose fill_status changed.
+    """
+    client = _lmts_get_client()
+    if client is None:
+        return 0
+    try:
+        conn = get_db()
+        rows = list(conn.run("""
+            SELECT id, market_slug, order_id, timeframe, fired_at, direction,
+                   limit_price_cents, stake_usdc, size_shares
+              FROM v2_live_trades
+             WHERE fill_status = 'PENDING'
+               AND order_id IS NOT NULL
+               AND order_id <> ''
+             ORDER BY id DESC
+             LIMIT 50
+        """))
+        conn.close()
+    except Exception as e:
+        print("[LMTS-LIVE] poll DB read failed: {}".format(str(e)[:160]))
+        return 0
+    if not rows:
+        return 0
+
+    # Group by market_slug — one get_user_orders call covers every PENDING
+    # order on that market, so two orders on the same market = one API call.
+    by_slug = {}
+    for r in rows:
+        by_slug.setdefault(r[1], []).append(r)
+
+    import time as _t
+    now_ms = int(_t.time() * 1000)
+    tf_to_ms = {"15M": 15 * 60_000, "1H": 60 * 60_000,
+                "HOURLY": 60 * 60_000, "DAILY": 24 * 60 * 60_000}
+    changed = 0
+
+    for slug, slug_rows in by_slug.items():
+        try:
+            user_orders = client.get_user_orders(slug)
+        except Exception as e:
+            # Many transient causes (404 on expired market, network blip);
+            # leave PENDING for the next poll cycle.
+            print("[LMTS-LIVE] poll get_user_orders({}) failed: {}".format(
+                slug[:40], str(e)[:120]))
+            continue
+        if not isinstance(user_orders, list):
+            user_orders = []
+        # Index by order_id for O(1) lookup
+        oid_to_order = {}
+        for o in user_orders:
+            if not isinstance(o, dict):
+                continue
+            oid = (o.get("id") or o.get("orderId") or o.get("order_id") or "")
+            if oid:
+                oid_to_order[str(oid)] = o
+
+        for r in slug_rows:
+            (row_id, _slug, order_id, tf_label, fired_at,
+             direction, limit_cents, stake, shares) = r
+            order = oid_to_order.get(str(order_id))
+
+            new_status = None
+            fill_price = None
+            filled_size = None
+
+            if order is None:
+                # API doesn't list this order anymore. Two cases:
+                #   1. It was fully filled and moved off the open-orders feed
+                #      → check portfolio positions (best-effort)
+                #   2. It was cancelled (by exchange or by us)
+                # Without a definitive signal we mark CANCELLED, since the
+                # resolver's outcome step will still pay out a real fill via
+                # the position read at market settlement.
+                new_status = "CANCELLED"
+            else:
+                api_status = str(order.get("status") or "").upper()
+                api_filled = float(order.get("filledSize")
+                                   or order.get("filled_size")
+                                   or order.get("filledAmount") or 0)
+                if api_status in ("FILLED", "MATCHED") or api_filled >= float(shares or 0) * 0.999:
+                    new_status = "FILLED"
+                    fill_price = (order.get("avgPrice") or order.get("avg_price")
+                                  or order.get("price"))
+                    filled_size = api_filled or shares
+                elif api_status in ("CANCELLED", "CANCELED", "EXPIRED", "REJECTED"):
+                    new_status = "CANCELLED"
+                else:
+                    # Still open. Cancel if past the candle period.
+                    age_ms = now_ms - (int(fired_at) * 1000 if fired_at and fired_at < 1e12 else int(fired_at or 0))
+                    candle_ms = tf_to_ms.get(str(tf_label).upper(), 15 * 60_000)
+                    if age_ms > candle_ms:
+                        try:
+                            client.cancel_order(str(order_id))
+                            new_status = "CANCELLED"
+                            print("[LMTS-LIVE] poll: cancelled stale order {} ({} {}m old, candle={}m)".format(
+                                str(order_id)[:12], tf_label, age_ms // 60_000, candle_ms // 60_000))
+                        except Exception as e:
+                            print("[LMTS-LIVE] poll: cancel failed for {}: {}".format(
+                                str(order_id)[:12], str(e)[:120]))
+
+            if new_status:
+                try:
+                    conn = get_db()
+                    if new_status == "FILLED":
+                        conn.run("""
+                            UPDATE v2_live_trades
+                               SET fill_status = :s,
+                                   fill_price_cents = COALESCE(:fp, fill_price_cents),
+                                   filled_size = COALESCE(:fs, filled_size)
+                             WHERE id = :id
+                        """, s=new_status, fp=fill_price, fs=filled_size, id=row_id)
+                        print("[LMTS-LIVE] poll: FILLED order {} ({} {} @ {}c)".format(
+                            str(order_id)[:12], tf_label, direction, fill_price or limit_cents))
+                    else:
+                        conn.run(
+                            "UPDATE v2_live_trades SET fill_status = :s WHERE id = :id",
+                            s=new_status, id=row_id)
+                    conn.close()
+                    changed += 1
+                except Exception as e:
+                    print("[LMTS-LIVE] poll DB update failed for row {}: {}".format(
+                        row_id, str(e)[:160]))
+    return changed
 
 
 def _v2_resolve_live_trades():
@@ -6440,8 +6750,15 @@ def _v2_monitor_thread():
 
 def _v2_resolve_loop():
     """Background thread to resolve paper + live trades, then attempt on-chain
-    redemption of pending live wins. All three pieces run on the same 60s
-    cadence; each is wrapped so one failing path can't stall the others."""
+    redemption of pending live wins. All four pieces run on the same 60s
+    cadence; each is wrapped so one failing path can't stall the others.
+
+    Order matters:
+      1. Paper resolve (PolyPaper + LmtsPaper)
+      2. Live fill poll  ← promotes PENDING (resting GTC) → FILLED/CANCELLED
+      3. Live resolve    ← reads FILLED rows, computes outcome at market expiry
+      4. Live redeem     ← picks redeem_status=PENDING wins, sends on-chain tx
+    """
     print("[V2] Resolve loop started")
     while True:
         try:
@@ -6450,6 +6767,12 @@ def _v2_resolve_loop():
                 print("[V2] Resolved {} trades".format(resolved))
         except Exception as e:
             print("[V2] Resolve loop error: {}".format(e))
+        try:
+            polled = _lmts_poll_pending_orders()
+            if polled:
+                print("[LMTS-LIVE] Polled {} pending orders".format(polled))
+        except Exception as e:
+            print("[LMTS-LIVE] poll loop error: {}".format(e))
         try:
             live_resolved = _v2_resolve_live_trades()
             if live_resolved:
@@ -9077,7 +9400,19 @@ def _sports_scan_and_alert():
                 scores_line="🎯 Score reads: {}\n".format(scores_str) if scores_str else "",
                 reasons=" | ".join(reasons[:4]), score=pick_score,
             )
+            # ── Once-per-pick dedup gate ──
+            # The sports scanner now runs once a day at 08:00 Lagos. Without
+            # dedup, the model's prediction for "Mexico vs Serbia → Mexico"
+            # would recur every morning until Mexico-vs-Serbia is played,
+            # so the user would receive the same Telegram alert N days in
+            # a row. The dedup log makes each (home, away, pick) fire
+            # exactly once across the entire lifetime of the deployment.
+            if _sports_alert_seen(home, away, pick_outcome):
+                print("[SPORTS] DEDUP: skip {} vs {} → {} (already alerted)".format(
+                    home, away, pick_outcome))
+                continue
             send_telegram(msg)
+            _sports_alert_record(home, away, pick_outcome, market_label, url, pick_score)
             try:
                 _plat = 'limitless' if 'limitless' in url else 'polymarket'
                 _sports_market_cache.setdefault(_plat, [])
@@ -9133,15 +9468,25 @@ def _sports_scan_and_alert():
 
 
 def _sports_scanner_thread():
-    """Background thread that runs sports scanning periodically."""
-    print("[SPORTS] Scanner thread started")
+    """Background thread for the sports-picks scanner. Fires ONCE PER DAY
+    at 08:00 Lagos time (07:00 UTC). On boot any already-passed slot for
+    today is marked complete without firing — we wait for the next slot.
+    Picks are deduped against sports_alerts_log so the same prediction
+    never alerts twice across days."""
+    print("[SPORTS] Scanner thread started — schedule: 08:00 Lagos / 07:00 UTC daily")
+    time.sleep(45)  # let the DB/migrations finish on cold boot
+    try:
+        _init_scheduler_no_catchup((7,), "sports_last_slot", "SPORTS")
+    except Exception as e:
+        print("[SPORTS] scheduler init error: {}".format(e))
     while True:
         try:
-            _sports_scan_and_alert()
+            _scheduler_run_due_slot((7,), "sports_last_slot",
+                                    _sports_scan_and_alert, "SPORTS")
         except Exception as e:
-            print("[SPORTS] Scanner error: {}".format(e))
+            print("[SPORTS] Scheduler tick error: {}".format(e))
             import traceback; traceback.print_exc()
-        time.sleep(SPORTS_SCAN_INTERVAL)
+        time.sleep(60)  # tick every minute, fires when the 07:00 UTC slot is due
 
 
 # Sports dashboard page
@@ -12570,6 +12915,30 @@ body::after{ content:""; position:fixed; inset:0; z-index:0; pointer-events:none
 .badge.void { background:var(--surface2); color:var(--muted); }
 .tier .sel.won .pick { color:var(--good); }
 .tier .sel.lost .pick { color:var(--red); text-decoration:line-through; opacity:0.75; }
+/* Pending-reason note — explains WHY a slip is still pending, so the user
+   never has to guess. Subtle gray pill + smaller text. */
+.pending-reason {
+  font: 12px/1.45 system-ui;
+  color: var(--muted);
+  background: var(--surface2);
+  border: 1px solid rgba(0,0,0,0.04);
+  border-radius: 10px;
+  padding: 8px 11px;
+  margin: 10px 0 0;
+}
+.pending-reason .why-pill {
+  display: inline-block;
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  background: var(--surface);
+  color: var(--text);
+  padding: 2px 7px;
+  border-radius: 999px;
+  margin-right: 7px;
+  border: 1px solid rgba(0,0,0,0.06);
+}
 
 @media (max-width:600px){
   .page-head h1 { font-size:1.75rem; }
@@ -12987,6 +13356,30 @@ def render_results_day(date_iso, date_human, sets):
         status = (a.get("result") or "pending").lower()
         badge = '<span class="badge {}">{}</span>'.format(
             status, {"won": "WON", "lost": "LOST", "void": "VOID"}.get(status, "PENDING"))
+        # NEW: surface the settle thread's explanation for why this slip is
+        # still PENDING, so the user doesn't have to guess.  Only shown for
+        # pending slips; settled slips don't need this.
+        pending_note = ""
+        if status == "pending" and a.get("pending_reason"):
+            reason_txt = (a.get("pending_reason") or "")[:400]
+            # last-attempt freshness so the user knows the reason isn't stale
+            sl = a.get("settle_last_attempt")
+            age_txt = ""
+            try:
+                if sl:
+                    age_s = max(0, int(time.time()) - int(sl))
+                    if age_s < 60:
+                        age_txt = " · checked {}s ago".format(age_s)
+                    elif age_s < 3600:
+                        age_txt = " · checked {}m ago".format(age_s // 60)
+                    else:
+                        age_txt = " · checked {}h ago".format(age_s // 3600)
+            except Exception:
+                age_txt = ""
+            pending_note = (
+                '<div class="pending-reason">'
+                '<span class="why-pill">Why pending?</span> {}{}'
+                '</div>'.format(reason_txt, age_txt))
         parts = []
         for s in a.get("selections", []):
             lr = (s.get("result") or "").lower()
@@ -13009,8 +13402,9 @@ def render_results_day(date_iso, date_human, sets):
                     '<div class="code">{}</div></div></div>'.format(a["sportybet_code"]))
         return ('<div class="glass tier"><div class="tier-head"><div class="tier-title">'
                 '<h2>{}</h2>{}</div><div class="tier-odds">{:.2f}'
-                '<span class="lbl">TOTAL ODDS</span></div></div>{}{}</div>'.format(
-                    a.get("label", ""), badge, a.get("total_odds", 0), "".join(parts), code))
+                '<span class="lbl">TOTAL ODDS</span></div></div>{}{}{}</div>'.format(
+                    a.get("label", ""), badge, a.get("total_odds", 0),
+                    pending_note, "".join(parts), code))
 
     set_blocks = []
     for i, grp in enumerate(sets or []):
@@ -13371,6 +13765,11 @@ def fb_init_db(get_db):
             ("selections_json", "TEXT"), ("sportybet_code", "TEXT"),
             ("status", "TEXT DEFAULT 'pending'"), ("result", "TEXT"),
             ("run_id", "TEXT"),
+            # pending_reason: structured human-readable explanation for WHY a slip is
+            # still pending after a settle attempt. Updated on every settle tick.
+            # Cleared when the slip is finally graded (won/lost/void).
+            ("pending_reason", "TEXT"),
+            ("settle_last_attempt", "BIGINT"),
             ("created_at", "TIMESTAMPTZ DEFAULT NOW()"),
         ]
         for col, typ in _acc_cols:
@@ -14015,17 +14414,68 @@ def _fb_build_score_index(dates):
 
 
 def _fb_norm_team(s):
+    """Aggressive normalization to maximize fuzzy-match recall while leaving
+    distinguishing words intact.  Strips:
+      - common club tokens at either end (FC, CF, SC, AC, AFC, AS, CD, UD, EC,
+        FK, SK, BK, CK, KS, VfB, VfL, SV, KV, SF, RB, OFK, NK, MFK, RC, SD …)
+      - founding-year tokens (any 4-digit number 18XX–20XX)
+      - parenthesized state/country codes ("(GO)", "(SP)", "(BR)" …)
+      - filler words (and, de, of, the, do, da, la, le, el, l')
+      - trailing reserve markers (B / II / 2 / Res / Reserves)
+      - punctuation and accents (Latin, Slavic, Turkish)
+    DOES NOT strip age-group / gender markers (U17/U21/W/Women) — those are
+    *meaningful* distinctions: "Croatia" vs "Croatia U21" must not collide."""
+    import re
     s = (s or "").lower().strip()
-    s = s.replace("&", " and ").replace("-", " ").replace("/", " ").replace("'", "")
-    for junk in (" fc", " cf", " sc", " ac", " afc", " cd", " ud", " club",
-                 " calcio", " 1929", " 1913", " 04", " 05", " 09", ".",
-                 " and ", " de ", " of "):
-        s = s.replace(junk, " ")
-    s = (s.replace("á", "a").replace("é", "e").replace("í", "i")
-           .replace("ó", "o").replace("ú", "u").replace("ñ", "n")
-           .replace("ç", "c").replace("ü", "u").replace("ö", "o")
-           .replace("ä", "a").replace("ø", "o").replace("å", "a"))
-    return " ".join(s.split())
+    # parenthesized regional codes — "(GO)", "(SP)", "( br )", etc.
+    s = re.sub(r"\(\s*[a-z]{2,3}\s*\)", " ", s)
+    # founding years inside the name.
+    s = re.sub(r"\b(18\d\d|19\d\d|20\d\d)\b", " ", s)
+    # Punctuation → space
+    s = (s.replace("&", " and ")
+           .replace("-", " ").replace("/", " ").replace(",", " ")
+           .replace(":", " ").replace(".", " ").replace("'", "")
+           .replace("\u2019", "").replace("`", ""))
+    # Latin + Slavic + Turkish accent fold (do this BEFORE token filter so the
+    # filter words match in their ASCII form).
+    accent_map = {
+        "á": "a", "à": "a", "â": "a", "ä": "a", "ã": "a", "å": "a",
+        "é": "e", "è": "e", "ê": "e", "ë": "e",
+        "í": "i", "ì": "i", "î": "i", "ï": "i", "ı": "i",
+        "ó": "o", "ò": "o", "ô": "o", "ö": "o", "õ": "o", "ø": "o",
+        "ú": "u", "ù": "u", "û": "u", "ü": "u",
+        "ý": "y", "ÿ": "y",
+        "ñ": "n", "ń": "n",
+        "ç": "c", "ć": "c", "č": "c",
+        "š": "s", "ş": "s",
+        "ž": "z", "ż": "z", "ź": "z",
+        "đ": "d", "ð": "d",
+        "ğ": "g", "ł": "l",
+    }
+    for k, v in accent_map.items():
+        if k in s:
+            s = s.replace(k, v)
+    # Token filter — drop standalone noise tokens at any position. This is more
+    # robust than substring stripping because it handles BOTH prefixes
+    # ("VfL Wolfsburg") AND suffixes ("Real Madrid CF") in one shot, and won't
+    # accidentally cut into a real team-name substring.
+    noise_tokens = {
+        # Latin-script club abbreviations
+        "fc", "cf", "sc", "ac", "afc", "as", "cd", "ud", "ec", "rc", "sd",
+        # Nordic/Central European
+        "fk", "sk", "bk", "ck", "gks", "ks", "nk", "mfk", "ofk", "hk", "ik",
+        # German prefixes
+        "vfb", "vfl", "sv", "kv", "sf", "rb", "tsv", "fsv",
+        # Filler / decorative
+        "club", "calcio", "sport", "athletic", "atletico",
+        "and", "de", "do", "da", "of", "the",
+        "la", "le", "el", "l",
+    }
+    tokens = [t for t in s.split() if t and t not in noise_tokens]
+    s = " ".join(tokens)
+    # strip trailing reserve markers (B-team) but only at the absolute end
+    s = re.sub(r"\s+(b|ii|res|reserves|b\s*team)\s*$", "", s)
+    return s.strip()
 
 
 _FB_CANON = {}
@@ -14058,17 +14508,49 @@ def _fb_canon(name):
     return _FB_CANON.get(n, n)
 
 
+_FB_AGE_GENDER_TOKENS = {
+    # Youth categories (under-NN). Same age = compatible; different = NOT.
+    "u15", "u16", "u17", "u18", "u19", "u20", "u21", "u23",
+    # Gender markers — F/W is women's football; absence = men's/senior.
+    "w", "women", "wom", "femenil", "femenino", "feminine", "ladies",
+    # Other category markers
+    "youth", "junior", "jr",
+}
+
+
+def _fb_age_gender_set(normalized_name):
+    """Return the set of age/gender tokens present in a normalized team name.
+    Empty set = senior men's team (the default).  Two team names are
+    'age/gender compatible' if they have the same set."""
+    return {t for t in normalized_name.split() if t in _FB_AGE_GENDER_TOKENS}
+
+
 def _fb_teams_match(a, b):
     """Fuzzy team-name match tolerant of suffixes, accents, reserve sides,
-    and common abbreviations (PSG, Man Utd, Spurs, ...)."""
+    and common abbreviations (PSG, Man Utd, Spurs, ...).  Gated by an
+    age/gender compatibility check: 'Brazil' never matches 'Brazil U17' or
+    'Brazil Women' even though the substring is present."""
     ca, cb = _fb_canon(a), _fb_canon(b)
     if ca and cb and ca == cb:
         return True
     a, b = _fb_norm_team(a), _fb_norm_team(b)
     if not a or not b:
         return False
-    if a == b or a in b or b in a:
+    # Age/gender disqualifier: if one name has a youth/women marker and the
+    # other doesn't (or has a different one), they are different teams.
+    ag_a, ag_b = _fb_age_gender_set(a), _fb_age_gender_set(b)
+    if ag_a != ag_b:
+        return False
+    # Exact match.
+    if a == b:
         return True
+    # Substring match — only safe NOW that age/gender markers are equal on
+    # both sides.  Without that gate, 'brazil' would be a substring of
+    # 'brazil u17' and the matcher would return True for a totally different
+    # game.
+    if a in b or b in a:
+        return True
+    # Token overlap (≥4-char word) — last-resort fuzzy match.
     wa, wb = set(a.split()), set(b.split())
     return any(len(w) >= 4 and w in wb for w in wa)
 
@@ -14316,8 +14798,11 @@ def _fb_settle_accumulators(get_db):
         if new_result:
             try:
                 conn = get_db()
-                conn.run("UPDATE sportybet_accumulators SET result=:r, selections_json=:sj WHERE id=:i",
-                         r=new_result, sj=json.dumps(sels), i=acc_id)
+                # Clear pending_reason on settlement — slip is now graded.
+                conn.run("UPDATE sportybet_accumulators SET result=:r, selections_json=:sj, "
+                         "pending_reason=NULL, settle_last_attempt=:ts WHERE id=:i",
+                         r=new_result, sj=json.dumps(sels), i=acc_id,
+                         ts=int(time.time()))
                 conn.close()
                 settled_count += 1
                 tally[new_result] = tally.get(new_result, 0) + 1
@@ -14328,11 +14813,26 @@ def _fb_settle_accumulators(get_db):
         else:
             bits = []
             if upcoming:
-                bits.append("not played yet: " + ", ".join(upcoming[:3]))
+                bits.append("Not played yet: " + ", ".join(upcoming[:3]))
             if absent:
-                bits.append("NOT IN FEED: " + ", ".join(absent[:3]))
+                bits.append("Not in score feed: " + ", ".join(absent[:3]))
             if ungradeable:
-                bits.append("{} leg(s) finished but ungradeable (need stats)".format(ungradeable))
+                bits.append("{} leg(s) finished but missing stats (corner/card/timeline data unavailable for the source ESPN feed)".format(ungradeable))
+            reason_str = " · ".join(bits) if bits else None
+            # Persist the reason so the codes page can show "why pending" to the
+            # user without recomputing.  Also stamp settle_last_attempt so we
+            # know how fresh the reason is.
+            try:
+                conn = get_db()
+                conn.run("UPDATE sportybet_accumulators "
+                         "SET pending_reason = :r, settle_last_attempt = :ts "
+                         "WHERE id = :i",
+                         r=reason_str, ts=int(time.time()), i=acc_id)
+                conn.close()
+            except Exception as e:
+                # Persistence failure is non-fatal — log only.
+                print("[FB] settle: pending_reason write failed for slip {}: {}".format(
+                    acc_id, str(e)[:120]))
             if bits:
                 print("[FB] settle: slip {} pending — {}".format(acc_id, " | ".join(bits)))
 
@@ -14743,45 +15243,43 @@ def run_football_engine(get_db, tg_token, tg_chat, send_telegram,
 
 
 def fb_scanner_thread(get_db, tg_token, tg_chat, send_telegram, interval_hours=12):
-    """Keep the engine on a schedule, but DON'T re-scrape on every deploy. On boot
-    we restore the last run from the DB and only scan if that run is missing or
-    older than the interval. The schedule is anchored to the real last-scan time
-    (last_run_ts), so a redeploy no longer resets the clock, and a manual rescan
-    re-anchors it automatically."""
-    interval = interval_hours * 3600
+    """Football accumulator scanner. Fires TWICE A DAY at fixed wall-clock
+    times: 08:00 and 16:00 Lagos (07:00 and 15:00 UTC). The interval_hours
+    arg is kept for backward-compat with the existing callsite but is now
+    ignored — the scheduler is slot-driven.
+
+    On boot we still load the last successful run from the DB so the UI
+    isn't blank, but we DO NOT re-scrape on boot. If today's 07:00 UTC
+    slot has already passed when the bot comes up, it is marked complete
+    without firing and we wait for 15:00 UTC. Same applies if both slots
+    have already passed — we wait until tomorrow's 07:00.
+
+    Manual /app/fb-rescan still works the same and re-anchors the cache."""
     def loop():
-        time.sleep(30)  # let app boot first
-        # Restore the last scan so the pages aren't blank after a redeploy.
-        restored = False
+        time.sleep(30)  # let the app boot
+        # Restore last successful run so the pages aren't blank after a redeploy.
         try:
-            restored = fb_load_latest(get_db)
+            fb_load_latest(get_db)
         except Exception as e:
             print("[FB] boot restore error: {}".format(e))
-        # Scan on boot ONLY if there's no usable run, or the restored one is stale.
-        age = time.time() - (_FB_CACHE.get("last_run_ts") or 0)
-        if not restored or age >= interval:
-            print("[FB] boot scan ({})".format(
-                "no saved run" if not restored else "last run {:.1f}h old".format(age / 3600)))
-            try:
-                run_football_engine(get_db, tg_token, tg_chat, send_telegram)
-            except Exception as e:
-                print("[FB] initial run error: {}".format(e))
-        else:
-            print("[FB] boot: restored run {:.1f}h old — skipping re-scrape, "
-                  "next scan in {:.1f}h".format(age / 3600, (interval - age) / 3600))
-        # Schedule anchored to last_run_ts: wake every few minutes and run only
-        # when due, so deploys and manual rescans re-anchor instead of resetting.
+        # Mark today's already-passed slots as complete (no catch-up).
+        try:
+            _init_scheduler_no_catchup((7, 15), "fb_last_slot", "FB")
+        except Exception as e:
+            print("[FB] scheduler init error: {}".format(e))
+        # Tick every minute and fire the engine when a slot is due.
+        def _run():
+            run_football_engine(get_db, tg_token, tg_chat, send_telegram)
         while True:
-            time.sleep(300)  # 5-min tick
-            if _FB_CACHE.get("running"):
-                continue
-            if time.time() - (_FB_CACHE.get("last_run_ts") or 0) >= interval:
-                try:
-                    run_football_engine(get_db, tg_token, tg_chat, send_telegram)
-                except Exception as e:
-                    print("[FB] scheduled run error: {}".format(e))
+            time.sleep(60)
+            try:
+                if _FB_CACHE.get("running"):
+                    continue
+                _scheduler_run_due_slot((7, 15), "fb_last_slot", _run, "FB")
+            except Exception as e:
+                print("[FB] scheduler tick error: {}".format(e))
     threading.Thread(target=loop, daemon=True).start()
-    print("[FB] scanner thread started (every {}h, anchored, no re-scrape on deploy)".format(interval_hours))
+    print("[FB] scanner thread started — schedule: 08:00 + 16:00 Lagos (07:00 + 15:00 UTC) daily")
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -15427,8 +15925,65 @@ def fb_picks_page():
 
 @app.route("/app/codes")
 def fb_codes_page():
-    return render_codes_page(_FB_CACHE.get("accumulators", []),
-                             _FB_CACHE.get("date") or _fb_today_human())
+    """Render the codes page with FRESH data from the database — the in-memory
+    _FB_CACHE only refreshes at scan time, but the settle thread updates
+    accumulator results on its own hourly cadence.  Without this DB reload,
+    a slip that's been graded WON in the database would still render as
+    'pending' until the next 12h scan rebuilt the cache."""
+    accumulators = []
+    date_str = None
+    try:
+        conn = get_db()
+        # Pull only the latest run_id (matches fb_load_latest semantics) but
+        # include result + pending_reason + settle_last_attempt — the columns
+        # the previous SELECT was missing.  The previous bug: the loader
+        # didn't SELECT `result`, so a.get("result") was always None and
+        # every slip rendered as PENDING regardless of the settled state.
+        rows = conn.run(
+            "SELECT tier, label, target_odds, total_odds, num_selections, "
+            "selections_json, sportybet_code, match_date, created_at, "
+            "result, pending_reason, settle_last_attempt "
+            "FROM sportybet_accumulators "
+            "WHERE run_id = (SELECT run_id FROM sportybet_accumulators "
+            "                ORDER BY created_at DESC LIMIT 1) "
+            "ORDER BY total_odds ASC")
+        conn.close()
+        for r in (rows or []):
+            (tier, label, tgt, tot, ns, sj, code,
+             mdate, created, result, pending_reason, settle_ts) = r
+            try:
+                sels = json.loads(sj or "[]")
+            except Exception:
+                sels = []
+            if not sels:
+                continue
+            accumulators.append({
+                "tier": tier, "label": label,
+                "emoji": TIER_CONFIG.get(tier, {}).get("emoji", "🟢"),
+                "target_odds": tgt, "total_odds": tot,
+                "num_selections": ns or len(sels),
+                "selections": sels, "code": code or None,
+                "sportybet_code": code or None,
+                # NEW: surface result + pending_reason to the renderer.
+                "result": (result or "pending"),
+                "pending_reason": pending_reason or None,
+                "settle_last_attempt": settle_ts,
+                "match_date": mdate,
+            })
+            if date_str is None and mdate is not None:
+                try:
+                    date_str = mdate.strftime("%A, %B %d, %Y")
+                except Exception:
+                    date_str = str(mdate)
+    except Exception as e:
+        print("[FB] codes page DB read failed, falling back to cache: {}".format(e))
+        accumulators = _FB_CACHE.get("accumulators", [])
+        date_str = _FB_CACHE.get("date") or _fb_today_human()
+    if not accumulators:
+        # No fresh DB rows yet (e.g. very first deploy) — fall back to cache.
+        accumulators = _FB_CACHE.get("accumulators", [])
+        date_str = date_str or _FB_CACHE.get("date") or _fb_today_human()
+    return render_codes_page(accumulators, date_str or _fb_today_human())
 
 
 @app.route("/app/fb-rescan")
@@ -15456,6 +16011,46 @@ def fb_rescan_now():
     return ("<h3 style='font:600 18px system-ui'>Rescan started ✅</h3>"
             "<p style='font:15px system-ui'>Fresh picks + codes are building now and the "
             "12-hour clock has been reset. Refresh Codes in ~1–2 minutes.</p>" + back), 200
+
+
+@app.route("/app/settle-now")
+def fb_settle_now():
+    """Manual 'Settle pending slips now' trigger.  The background settle thread
+    runs hourly; this route lets the user force an immediate pass after a
+    normalizer or score-feed improvement, instead of waiting up to 60 minutes.
+
+    Runs synchronously (~3-15s typically) so the user sees the result tally
+    on the response page. Safe to call repeatedly — settled slips are
+    skipped via the 'result IS NULL' filter inside _fb_settle_accumulators."""
+    back = ("<p style='font:15px system-ui;margin-top:14px'>"
+            "<a href='/app/codes'>← Back to Codes</a></p>")
+    started = time.time()
+    try:
+        _fb_settle_accumulators(get_db)
+    except Exception as e:
+        return ("<h3 style='font:600 18px system-ui'>Settle pass failed ❌</h3>"
+                "<pre style='font:13px ui-monospace,monospace;color:#b91c1c;"
+                "background:#fef2f2;padding:14px;border-radius:10px;white-space:pre-wrap'>"
+                "{}</pre>".format(str(e)[:600]) + back), 200
+    # Quick summary: pending vs graded counts after the run.
+    try:
+        conn = get_db()
+        rows = list(conn.run(
+            "SELECT result, COUNT(*) FROM sportybet_accumulators "
+            "WHERE created_at > NOW() - INTERVAL '14 days' GROUP BY result"))
+        conn.close()
+        tallies = {(r[0] or "pending"): r[1] for r in rows}
+    except Exception:
+        tallies = {}
+    elapsed = time.time() - started
+    tally_html = " · ".join(
+        '<b>{}</b> {}'.format(v, k) for k, v in sorted(tallies.items()))
+    return ("<h3 style='font:600 18px system-ui'>Settle pass complete ✅</h3>"
+            "<p style='font:15px system-ui'>Ran in {:.1f}s. Last 14 days: "
+            "{}.</p>"
+            "<p style='font:13px system-ui;color:#666'>Pending slips display "
+            "their reason on the Codes page (look for the 'Why pending?' note).</p>".format(
+                elapsed, tally_html or "no slips") + back), 200
 
 
 @app.route("/app/builder")
