@@ -5150,8 +5150,23 @@ def _lmts_place_live(paper_trade_id, market_data, asset, tf_label, direction,
                                 condition_id=condition_id)
         return "ERROR"
 
-    # shares = USDC budget / (price in dollars). e.g. $2 @ 70c -> ~2.857 shares.
-    shares = round(capped_stake / max(limit_price_cents / 100.0, 0.01), 4)
+    # shares = USDC budget / (price in dollars). e.g. $1 @ 76.9c -> ~1.3004 shares.
+    #
+    # CRITICAL TICK QUANTIZATION (Limitless rule discovered Jun 2026):
+    #   The exchange requires (price × contracts) to be a whole number of
+    #   micro-USDC, where contracts = shares × 10⁶.  Limitless prices can be
+    #   3-decimal (e.g. 0.769) — that means contracts must be a multiple of
+    #   1000 (so the product clears the 1000 denominator).  Equivalently:
+    #   shares must be a multiple of 0.001.
+    #
+    #   The old code rounded to 4 decimals (e.g. 1.3004) — that fails on
+    #   3-decimal prices with HTTP 400 "Order amounts tick violation:
+    #   price(0.769) * contracts(1300400) = 1000007.6 is not a whole (int)".
+    #
+    #   We FLOOR (not round) so we never overshoot the stake budget.
+    import math as _math
+    raw_shares = capped_stake / max(limit_price_cents / 100.0, 0.01)
+    shares = _math.floor(raw_shares * 1000) / 1000.0
 
     # ORDER_TYPE_FOK is a module-level constant (defined ~line 176 alongside
     # the rest of the inlined SDK constants). No try/except shim needed.
@@ -5186,28 +5201,55 @@ def _lmts_place_live(paper_trade_id, market_data, asset, tf_label, direction,
     # and we record the raw JSON for any field we don't pull out.
     resp_d = resp if isinstance(resp, dict) else {}
     order_id = (resp_d.get("orderId") or resp_d.get("order_id")
-                or resp_d.get("id") or "")
+                or resp_d.get("id") or resp_d.get("uuid")
+                or (resp_d.get("order") or {}).get("id")
+                or (resp_d.get("order") or {}).get("orderId") or "")
     matches = (resp_d.get("makerMatches") or resp_d.get("maker_matches")
-               or resp_d.get("matches") or [])
-    filled_size = sum(float(m.get("size", m.get("amount", 0)) or 0)
+               or resp_d.get("matches") or resp_d.get("fills")
+               or resp_d.get("executions") or [])
+    filled_size = sum(float(m.get("size", m.get("amount", m.get("quantity", 0))) or 0)
                       for m in matches) if isinstance(matches, list) else 0.0
+    # Some shapes report fill quantity at the top level instead of in a list.
+    if filled_size <= 0:
+        top_filled = (resp_d.get("filledSize") or resp_d.get("filled_size")
+                      or resp_d.get("filledAmount") or resp_d.get("filledQuantity")
+                      or resp_d.get("executedQuantity"))
+        try:
+            if top_filled is not None:
+                filled_size = float(top_filled)
+        except Exception:
+            pass
+    # Same for fill price.
     fill_price = None
     if matches and isinstance(matches, list):
         prices = [float(m.get("price", 0) or 0) for m in matches if m.get("price")]
         if prices:
             fill_price = sum(prices) / len(prices)
-    status = (resp_d.get("status") or "").upper()
+    if fill_price is None:
+        top_price = (resp_d.get("avgPrice") or resp_d.get("avg_price")
+                     or resp_d.get("fillPrice") or resp_d.get("fill_price")
+                     or resp_d.get("executedPrice"))
+        try:
+            if top_price is not None:
+                fill_price = float(top_price)
+        except Exception:
+            pass
+    status = (resp_d.get("status") or
+              (resp_d.get("order") or {}).get("status") or "").upper()
+    # Boolean fill flags some APIs use instead of a status string.
+    bool_filled = bool(resp_d.get("filled") or resp_d.get("isFilled")
+                       or resp_d.get("matched") or resp_d.get("executed"))
     # GTC three-way classification:
-    #   FILLED   = makerMatches present OR API returned an immediate-fill status
+    #   FILLED   = any of: filled_size > 0, fill flag, or known FILLED status
     #   PENDING  = order resting on book ("OPEN"/"ACTIVE"/"RESTING"/"PARTIALLY_FILLED")
-    #              — the poll loop will promote it later if it fills
-    #   CANCELLED = anything else (rejected, expired, etc.). Old FOK code
-    #               defaulted everything non-filled to CANCELLED; that was
-    #               correct for FOK but wrong for GTC, which submits as OPEN.
-    if filled_size > 0 or status in ("FILLED", "MATCHED"):
+    #   CANCELLED = anything else (rejected, expired, etc.)
+    if (filled_size > 0 or bool_filled
+            or status in ("FILLED", "MATCHED", "EXECUTED", "DONE",
+                          "COMPLETE", "COMPLETED", "SUCCESS")):
         fill_status = "FILLED"
     elif status in ("OPEN", "PENDING", "ACTIVE", "RESTING",
-                    "NEW", "PLACED", "ACCEPTED", "PARTIALLY_FILLED"):
+                    "NEW", "PLACED", "ACCEPTED", "PARTIALLY_FILLED",
+                    "WORKING", "LIVE"):
         fill_status = "PENDING"
     elif not status and order_id:
         # Empty status + order_id returned ⇒ the API accepted the order.
@@ -5215,6 +5257,15 @@ def _lmts_place_live(paper_trade_id, market_data, asset, tf_label, direction,
         fill_status = "PENDING"
     else:
         fill_status = "CANCELLED"
+        # Log the full response on CANCELLED so the NEXT time this happens
+        # we can see why — was it really cancelled, or did the response just
+        # use a field name our parser doesn't know about?
+        try:
+            print("[LMTS-LIVE] CANCELLED with raw response: {}".format(
+                json.dumps(resp_d)[:600]))
+        except Exception:
+            print("[LMTS-LIVE] CANCELLED with raw response (non-JSON): {}".format(
+                str(resp)[:600]))
 
     _lmts_record_live_trade(paper_trade_id, asset, tf_label, direction,
                             market_slug, token_id, limit_price_cents,
@@ -5222,7 +5273,7 @@ def _lmts_place_live(paper_trade_id, market_data, asset, tf_label, direction,
                             order_id=str(order_id) if order_id else None,
                             fill_price=fill_price, filled_size=filled_size,
                             raw_response=resp_d, condition_id=condition_id)
-    print("[LMTS-LIVE] {} {} {} {} @ {:.0f}c x {:.4f} shares -> {}".format(
+    print("[LMTS-LIVE] {} {} {} {} @ {:.1f}c x {:.3f} shares -> {}".format(
         fill_status, asset, tf_label, direction, limit_price_cents, shares, order_id or "(no id)"))
     return fill_status
 
