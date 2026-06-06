@@ -5207,16 +5207,79 @@ def _lmts_place_live(paper_trade_id, market_data, asset, tf_label, direction,
     # Parse common response shapes defensively — exact response is API-shaped
     # and we record the raw JSON for any field we don't pull out.
     resp_d = resp if isinstance(resp, dict) else {}
+
+    # ─── Limitless's actual response shape (confirmed via diagnostic dump, Jun 2026) ───
+    # Wrapped object: { "order": {...}, "execution": {...} }
+    #
+    #   order.id              → the UUID order id we save
+    #   order.orderType       → "GTC" / "FOK" / etc.
+    #   order.price           → fill price (or limit if not filled)
+    #   execution.matched     → bool
+    #   execution.settlementStatus → "UNMATCHED" | "MATCHED" | "PARTIAL" | "CANCELLED"
+    #   execution.totalsRaw.contractsNet → contracts filled (micro-shares, 1e6 = 1 share)
+    #   execution.totalsRaw.usdNet       → USDC paid (micro-USDC)
+    #
+    # CRITICAL: UNMATCHED on a GTC order does NOT mean the order failed.
+    # It means the order is RESTING on the book, waiting for a maker. The
+    # poll loop will promote it to FILLED when matched, or CANCELLED when
+    # the candle expires. UNMATCHED on FOK = killed (correct CANCELLED).
+    if isinstance(resp_d.get("order"), dict) and "execution" in resp_d:
+        order_obj = resp_d.get("order") or {}
+        exec_obj  = resp_d.get("execution") or {}
+        order_id  = str(order_obj.get("id") or "")
+        order_type_resp = str(order_obj.get("orderType") or "GTC").upper()
+        matched   = bool(exec_obj.get("matched"))
+        settlement = str(exec_obj.get("settlementStatus") or "").upper()
+
+        totals = exec_obj.get("totalsRaw") or {}
+        try:
+            contracts_net = float(totals.get("contractsNet", 0) or 0)  # micro-shares
+            usd_net       = float(totals.get("usdNet", 0) or 0)         # micro-USDC
+        except Exception:
+            contracts_net = usd_net = 0.0
+        filled_size = contracts_net / 1_000_000.0  # → shares (e.g. 1300000 → 1.3)
+        # Avg fill price in cents: (usd_net / contracts_net) gives dollars; ×100 = cents
+        fill_price = None
+        if contracts_net > 0 and usd_net > 0:
+            fill_price = (usd_net / contracts_net) * 100.0
+
+        if matched or settlement in ("MATCHED", "FILLED", "PARTIAL", "PARTIALLY_FILLED"):
+            # PARTIAL counts as filled — we keep the partial position; the
+            # resolver settles whatever we hold at market resolution.
+            fill_status = "FILLED"
+        elif settlement == "UNMATCHED" and order_type_resp in ("GTC", "GTD"):
+            # Order is resting on the book — poll loop will check it.
+            fill_status = "PENDING"
+        elif settlement in ("CANCELLED", "CANCELED", "EXPIRED", "REJECTED"):
+            fill_status = "CANCELLED"
+        else:
+            # FOK + UNMATCHED, or any unrecognized settlement state.
+            fill_status = "CANCELLED"
+            try:
+                print("[LMTS-LIVE] CANCELLED (wrapped resp, settlement={}, orderType={}): {}".format(
+                    settlement, order_type_resp, json.dumps(resp_d)[:400]))
+            except Exception:
+                pass
+
+        _lmts_record_live_trade(paper_trade_id, asset, tf_label, direction,
+                                market_slug, token_id, limit_price_cents,
+                                capped_stake, shares, fill_status,
+                                order_id=order_id or None,
+                                fill_price=fill_price, filled_size=filled_size,
+                                raw_response=resp_d, condition_id=condition_id)
+        print("[LMTS-LIVE] {} {} {} {} @ {:.1f}c x {:.3f} shares -> {} (settlement={})".format(
+            fill_status, asset, tf_label, direction, limit_price_cents,
+            shares, order_id[:18] if order_id else "(no id)", settlement))
+        return fill_status
+
+    # ─── Legacy / flat response-shape fallback (kept for safety) ───
     order_id = (resp_d.get("orderId") or resp_d.get("order_id")
-                or resp_d.get("id") or resp_d.get("uuid")
-                or (resp_d.get("order") or {}).get("id")
-                or (resp_d.get("order") or {}).get("orderId") or "")
+                or resp_d.get("id") or resp_d.get("uuid") or "")
     matches = (resp_d.get("makerMatches") or resp_d.get("maker_matches")
                or resp_d.get("matches") or resp_d.get("fills")
                or resp_d.get("executions") or [])
     filled_size = sum(float(m.get("size", m.get("amount", m.get("quantity", 0))) or 0)
                       for m in matches) if isinstance(matches, list) else 0.0
-    # Some shapes report fill quantity at the top level instead of in a list.
     if filled_size <= 0:
         top_filled = (resp_d.get("filledSize") or resp_d.get("filled_size")
                       or resp_d.get("filledAmount") or resp_d.get("filledQuantity")
@@ -5226,7 +5289,6 @@ def _lmts_place_live(paper_trade_id, market_data, asset, tf_label, direction,
                 filled_size = float(top_filled)
         except Exception:
             pass
-    # Same for fill price.
     fill_price = None
     if matches and isinstance(matches, list):
         prices = [float(m.get("price", 0) or 0) for m in matches if m.get("price")]
@@ -5241,15 +5303,9 @@ def _lmts_place_live(paper_trade_id, market_data, asset, tf_label, direction,
                 fill_price = float(top_price)
         except Exception:
             pass
-    status = (resp_d.get("status") or
-              (resp_d.get("order") or {}).get("status") or "").upper()
-    # Boolean fill flags some APIs use instead of a status string.
+    status = (resp_d.get("status") or "").upper()
     bool_filled = bool(resp_d.get("filled") or resp_d.get("isFilled")
                        or resp_d.get("matched") or resp_d.get("executed"))
-    # GTC three-way classification:
-    #   FILLED   = any of: filled_size > 0, fill flag, or known FILLED status
-    #   PENDING  = order resting on book ("OPEN"/"ACTIVE"/"RESTING"/"PARTIALLY_FILLED")
-    #   CANCELLED = anything else (rejected, expired, etc.)
     if (filled_size > 0 or bool_filled
             or status in ("FILLED", "MATCHED", "EXECUTED", "DONE",
                           "COMPLETE", "COMPLETED", "SUCCESS")):
@@ -5259,14 +5315,9 @@ def _lmts_place_live(paper_trade_id, market_data, asset, tf_label, direction,
                     "WORKING", "LIVE"):
         fill_status = "PENDING"
     elif not status and order_id:
-        # Empty status + order_id returned ⇒ the API accepted the order.
-        # Default to PENDING (we'll discover the true state via the poll loop).
         fill_status = "PENDING"
     else:
         fill_status = "CANCELLED"
-        # Log the full response on CANCELLED so the NEXT time this happens
-        # we can see why — was it really cancelled, or did the response just
-        # use a field name our parser doesn't know about?
         try:
             print("[LMTS-LIVE] CANCELLED with raw response: {}".format(
                 json.dumps(resp_d)[:600]))
