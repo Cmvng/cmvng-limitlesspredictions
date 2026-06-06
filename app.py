@@ -1278,6 +1278,16 @@ def get_user_orders(
     return response.json()
 
 
+# Alias for the SDK's Client.get_user_orders method (~line 2802) which calls
+# `_get_user_orders` (with leading underscore) as the module-private helper.
+# The original SDK source pair probably had `_get_user_orders` as the private
+# helper and the Client method as a public re-export; the inlining process
+# flattened both names to `get_user_orders`. Adding the alias makes both
+# names point to the same function so the Client method works AND any
+# external caller of the public name keeps working.
+_get_user_orders = get_user_orders
+
+
 def cancel_all_orders(
     market_slug: str,
     session_cookie: str,
