@@ -6903,6 +6903,70 @@ def _v2_monitor_thread():
             time.sleep(60)
 
 
+def _lmts_reconcile_redeemable():
+    """Query Limitless's portfolio directly and auto-redeem any winning
+    positions we don't already have queued. This is the fallback for ghost
+    wins — orders that filled on Limitless but were misclassified locally,
+    so they never reached `redeem_status='PENDING'`. Returns count redeemed.
+
+    Heavier than the per-row redeem (it queries the full portfolio), so the
+    loop calls this on a longer cadence than the regular redeem path.
+    """
+    if not LIMITLESS_PRIV_KEY:
+        return 0
+    try:
+        client = _lmts_client()
+        if not client or not getattr(client, "is_authenticated", False):
+            return 0
+        portfolio = client.get_portfolio_positions()
+        redeemable = get_redeemable_positions(portfolio) or []
+    except Exception as e:
+        print("[RECONCILE] portfolio fetch failed: {}".format(str(e)[:200]))
+        return 0
+
+    if not redeemable:
+        return 0
+
+    done = 0
+    for pos in redeemable:
+        cid = pos.condition_id
+        title = pos.market_title or "?"
+        winning = pos.winning_token
+        balance = float(pos.balance)
+        res = _lmts_redeem_winnings(cid)
+        if res.get("ok"):
+            tx_hash = res.get("tx_hash") or ""
+            done += 1
+            # Update matching DB row if we have one
+            try:
+                conn = get_db()
+                conn.run("""
+                    UPDATE v2_live_trades SET
+                        redeem_status       = 'DONE',
+                        redeem_tx_hash      = :tx,
+                        redeem_last_attempt = NOW(),
+                        outcome             = COALESCE(outcome, 'WIN'),
+                        actual_result       = COALESCE(actual_result, :w)
+                    WHERE condition_id = :c
+                """, tx=tx_hash,
+                    w=("UP" if winning == "YES" else "DOWN"),
+                    c=cid)
+                conn.close()
+            except Exception as e:
+                print("[RECONCILE] DB update failed: {}".format(e))
+            print("[RECONCILE] auto-redeemed {} ({} ${:.4f}) -> tx {}".format(
+                title, winning, balance, (tx_hash[:14] + "…") if tx_hash else ""))
+            try:
+                send_telegram("💰 Auto-reconciled redemption: {} ${:.4f} → tx {}".format(
+                    title, balance, tx_hash[:14] + "…" if tx_hash else "?"))
+            except Exception:
+                pass
+        else:
+            print("[RECONCILE] redeem failed for cid {}: {}".format(
+                cid[:18], (res.get("error") or "")[:160]))
+    return done
+
+
 def _v2_resolve_loop():
     """Background thread to resolve paper + live trades, then attempt on-chain
     redemption of pending live wins. All four pieces run on the same 60s
@@ -6913,14 +6977,19 @@ def _v2_resolve_loop():
       2. Live fill poll  ← promotes PENDING (resting GTC) → FILLED/CANCELLED
       3. Live resolve    ← reads FILLED rows, computes outcome at market expiry
       4. Live redeem     ← picks redeem_status=PENDING wins, sends on-chain tx
+      5. Reconcile-redeem ← every 5 min, queries Limitless's portfolio
+                            directly and redeems anything claimable that we
+                            missed locally (ghost wins).
     """
     print("[V2] Resolve loop started")
     last_heartbeat = 0.0
+    last_reconcile = 0.0
     while True:
         # Run all 4 steps and collect counts.  Track activity so a quiet loop
         # still emits a heartbeat every 5 minutes — that way you can SEE the
         # loop is alive and looking at zero PENDING rows, vs. "loop is dead".
-        resolved = polled = live_resolved = redeemed = 0
+        resolved = polled = live_resolved = redeemed = reconciled = 0
+        pending_count = 0
         errs = []
         try:
             resolved = _v2_resolve_trades() or 0
@@ -6964,18 +7033,34 @@ def _v2_resolve_loop():
             errs.append("redeem:{}".format(e))
             print("[LMTS-LIVE] redeem loop error: {}".format(e))
 
+        # Step 5: reconcile-redeem every 5 minutes. This is the safety net
+        # for ghost wins — positions that Limitless says we won but that we
+        # never marked PENDING locally because the original order's response
+        # was misclassified. By querying the portfolio directly, we redeem
+        # them regardless of what our DB thinks.
+        nowts = time.time()
+        if nowts - last_reconcile > 300:
+            try:
+                reconciled = _lmts_reconcile_redeemable() or 0
+                if reconciled:
+                    print("[RECONCILE] auto-redeemed {} ghost position(s)".format(reconciled))
+            except Exception as e:
+                errs.append("reconcile:{}".format(e))
+                print("[RECONCILE] loop error: {}".format(e))
+            last_reconcile = nowts
+
         # Heartbeat: print a summary line if ANY work happened this tick,
         # OR if 5 min have passed since the last heartbeat. This is what
         # makes the loop's status visible — without this you only see logs
         # when something succeeds, leaving "is it running?" ambiguous.
-        nowts = time.time()
-        any_work = (resolved + polled + live_resolved + redeemed) > 0
+        any_work = (resolved + polled + live_resolved + redeemed + reconciled) > 0
         if any_work or pending_count > 0 or nowts - last_heartbeat > 300:
             print("[V2-LOOP] heartbeat: paper-resolved={} live-polled={} "
-                  "live-resolved={} pending-redeem={} redeemed-this-tick={}{}".format(
+                  "live-resolved={} pending-redeem={} redeemed-this-tick={} "
+                  "reconciled-this-tick={}{}".format(
                 resolved, polled, live_resolved,
                 pending_count if pending_count >= 0 else "?",
-                redeemed,
+                redeemed, reconciled,
                 " errs=" + "|".join(errs) if errs else ""))
             last_heartbeat = nowts
         time.sleep(60)
@@ -7937,6 +8022,153 @@ def live_redemptions_page():
              "<a href='/app/live-limitless'>← live-limitless dashboard</a> · "
              "<a href='/app/codes'>codes</a></p></body></html>")
     return html
+
+
+@app.route("/app/reconcile-redeem")
+def reconcile_redeem():
+    """Authoritative reconciliation: query Limitless directly for every
+    claimable winning position you hold, redeem each one on-chain, and
+    update our DB to match.
+
+    This is the recovery path for ghost wins — positions that Limitless says
+    you won but our DB doesn't show as `redeem_status='PENDING'`, because the
+    underlying order was placed back when our parser bugs were misclassifying
+    fills as CANCELLED. Those orders did fill on Limitless's book, the
+    markets resolved in your favor, and the positions are sitting in your
+    Limitless wallet unredeemed — invisible to our auto-redeem loop because
+    our DB has the wrong status.
+
+    Workflow:
+      1. Call client.get_portfolio_positions() — Limitless's source of truth
+      2. get_redeemable_positions(...) — filter to (status=RESOLVED AND we hold
+         winning tokens AND balance > 0)
+      3. For each, EOAPositionRedeemer.redeem_position(condition_id)
+      4. If the condition_id matches a v2_live_trades row, update that row
+         to redeem_status='DONE' with the tx hash; otherwise log it as a
+         ghost-redemption (no matching local row)
+
+    The user's USDC balance goes up regardless of whether we match the row
+    locally. This route is safe to hit multiple times — once a position is
+    redeemed on-chain, Limitless removes it from claimable; subsequent calls
+    are no-ops."""
+    back = ("<p style='font:14px system-ui;margin-top:18px'>"
+            "<a href='/app/live-redemptions'>← back to diagnostics</a></p>")
+    if not LIMITLESS_PRIV_KEY:
+        return "<h2>LIMITLESS_PRIVATE_KEY not set — can't sign redemptions.</h2>" + back, 400
+
+    try:
+        client = _lmts_client()
+        if not client or not getattr(client, "is_authenticated", False):
+            return "<h2>Limitless client not authenticated.</h2>" + back, 500
+    except Exception as e:
+        return "<h2>Couldn't create Limitless client</h2><pre>{}</pre>".format(e) + back, 500
+
+    # 1. Pull portfolio
+    try:
+        portfolio = client.get_portfolio_positions()
+    except Exception as e:
+        return "<h2>get_portfolio_positions() failed</h2><pre>{}</pre>".format(e) + back, 500
+
+    # 2. Extract claimable wins
+    try:
+        redeemable = get_redeemable_positions(portfolio)
+    except Exception as e:
+        return "<h2>get_redeemable_positions() failed</h2><pre>{}</pre>".format(e) + back, 500
+
+    if not redeemable:
+        return ("<h2 style='color:#15803d'>Nothing claimable on Limitless ✓</h2>"
+                "<p>Your portfolio has 0 resolved positions where you hold winning "
+                "tokens. Either everything's already been redeemed or you haven't "
+                "won anything yet.</p>" + back), 200
+
+    # 3. Redeem each, collect results
+    rows = []
+    successes = 0
+    for pos in redeemable:
+        cid = pos.condition_id
+        title = pos.market_title
+        winning = pos.winning_token
+        balance = float(pos.balance)  # USDC
+        # Try the on-chain redemption
+        res = _lmts_redeem_winnings(cid)
+        if res.get("ok"):
+            tx_hash = res.get("tx_hash") or ""
+            successes += 1
+            # Update matching v2_live_trades row(s) if any
+            local_id = None
+            try:
+                conn = get_db()
+                local_rows = list(conn.run(
+                    "SELECT id FROM v2_live_trades WHERE condition_id = :c LIMIT 1",
+                    c=cid))
+                if local_rows:
+                    local_id = local_rows[0][0]
+                    conn.run("""
+                        UPDATE v2_live_trades SET
+                            redeem_status       = 'DONE',
+                            redeem_tx_hash      = :tx,
+                            redeem_last_attempt = NOW(),
+                            outcome             = COALESCE(outcome, 'WIN'),
+                            actual_result       = COALESCE(actual_result, :w)
+                        WHERE id = :i
+                    """, tx=tx_hash, w=("UP" if winning == "YES" else "DOWN"), i=local_id)
+                conn.close()
+            except Exception as e:
+                print("[RECONCILE] DB update failed for cid {}: {}".format(cid[:18], e))
+            rows.append({
+                "title": title, "winning": winning, "balance": balance,
+                "tx_hash": tx_hash, "cid": cid, "local_id": local_id,
+                "ok": True, "error": None,
+            })
+            print("[RECONCILE] redeemed {} ({} {} USDC) -> tx {}".format(
+                title, winning, balance, tx_hash[:14] + "…"))
+        else:
+            rows.append({
+                "title": title, "winning": winning, "balance": balance,
+                "tx_hash": None, "cid": cid, "local_id": None,
+                "ok": False, "error": res.get("error") or "unknown",
+            })
+            print("[RECONCILE] FAILED to redeem {}: {}".format(title, res.get("error")))
+
+    # 4. Render results
+    total_usdc = sum(r["balance"] for r in rows if r["ok"])
+    out = []
+    out.append("<h1 style='font:600 22px system-ui'>Reconciliation Results</h1>")
+    out.append("<p>Found <b>{}</b> claimable position(s) on Limitless. Redeemed "
+               "<b style='color:#15803d'>{}</b>, failed <b style='color:#b91c1c'>{}</b>. "
+               "Net USDC redeemed: <b>${:.4f}</b></p>".format(
+               len(rows), successes, len(rows) - successes, total_usdc))
+    out.append("<table style='border-collapse:collapse;width:100%;font:13px system-ui;margin-top:12px'>"
+               "<thead><tr style='background:#f0f0f0;text-align:left'>"
+               "<th>market</th><th>winning</th><th>balance</th>"
+               "<th>local row</th><th>result</th><th>tx / error</th>"
+               "</tr></thead><tbody>")
+    for r in rows:
+        if r["ok"]:
+            tx = r["tx_hash"]
+            tx_html = '<a href="https://basescan.org/tx/{0}" target="_blank">{1}…</a>'.format(
+                      tx, tx[:14]) if tx else "—"
+            result_html = "<span style='color:#15803d'>✓ redeemed</span>"
+        else:
+            tx_html = "<span style='color:#b91c1c'>{}</span>".format((r["error"] or "")[:200])
+            result_html = "<span style='color:#b91c1c'>✗ failed</span>"
+        out.append("<tr>"
+                   "<td style='padding:6px 8px;border-bottom:1px solid #eee'>{title}</td>"
+                   "<td style='padding:6px 8px;border-bottom:1px solid #eee'>{winning}</td>"
+                   "<td style='padding:6px 8px;border-bottom:1px solid #eee'>${balance:.4f}</td>"
+                   "<td style='padding:6px 8px;border-bottom:1px solid #eee'>{local}</td>"
+                   "<td style='padding:6px 8px;border-bottom:1px solid #eee'>{result}</td>"
+                   "<td style='padding:6px 8px;border-bottom:1px solid #eee;font:11px ui-monospace'>{tx}</td>"
+                   "</tr>".format(
+                   title=r["title"], winning=r["winning"], balance=r["balance"],
+                   local=("#" + str(r["local_id"])) if r["local_id"] else "ghost (no DB row)",
+                   result=result_html, tx=tx_html))
+    out.append("</tbody></table>")
+    out.append("<p style='font:12px system-ui;color:#666;margin-top:16px'>"
+               "Ghost rows = wins where our DB has no matching v2_live_trades record. "
+               "These were placed back when the parser bug was misclassifying fills as CANCELLED. "
+               "The USDC still goes to your wallet, we just can't link them to a local row.</p>")
+    return "".join(out) + back, 200
 
 
 @app.route("/app/resolve-now")
