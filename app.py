@@ -6915,7 +6915,7 @@ def _lmts_reconcile_redeemable():
     if not LIMITLESS_PRIV_KEY:
         return 0
     try:
-        client = _lmts_client()
+        client = _lmts_get_client()
         if not client or not getattr(client, "is_authenticated", False):
             return 0
         portfolio = client.get_portfolio_positions()
@@ -8057,7 +8057,7 @@ def reconcile_redeem():
         return "<h2>LIMITLESS_PRIVATE_KEY not set — can't sign redemptions.</h2>" + back, 400
 
     try:
-        client = _lmts_client()
+        client = _lmts_get_client()
         if not client or not getattr(client, "is_authenticated", False):
             return "<h2>Limitless client not authenticated.</h2>" + back, 500
     except Exception as e:
