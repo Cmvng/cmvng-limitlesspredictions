@@ -4806,6 +4806,33 @@ def _settings_set(key, value):
         return False
 
 
+def _lmts_get_max_trade_usdc():
+    """Per-trade USDC cap for Limitless live orders.
+
+    Read order:
+      1. v2_settings['limitless_max_trade_usdc']  ← live-editable via
+         /app/set-risk?max_usdc=N (persists across restarts, takes effect
+         on the next trade, no redeploy needed)
+      2. LIMITLESS_MAX_TRADE_USDC env var          ← fallback boot default
+      3. 1.0                                       ← hard fallback if both missing
+
+    The DB-backed value lets the user dial risk up/down on the fly. Floor at
+    $0.10 prevents accidental zero/negative values from killing the bot
+    silently; Limitless's own minimum (around $1 in practice) will reject
+    anything genuinely too small with a clear API error.
+    """
+    raw = _settings_get("limitless_max_trade_usdc", None)
+    if raw is not None:
+        try:
+            val = float(raw)
+            if val >= 0.10:
+                return val
+        except (TypeError, ValueError):
+            pass
+    # fallback to env var (which itself defaults to 1.0)
+    return float(LIMITLESS_MAX_TRADE_USDC)
+
+
 def _lmts_live_enabled():
     """True if Limitless live trading is currently switched ON. DB-backed and
     cached for ~3s so the per-signal hot path doesn't hit DB every check.
@@ -5116,7 +5143,7 @@ def _lmts_place_live(paper_trade_id, market_data, asset, tf_label, direction,
                                 condition_id=condition_id)
         return "ERROR"
 
-    capped_stake = min(float(stake_usdc), LIMITLESS_MAX_TRADE_USDC)
+    capped_stake = min(float(stake_usdc), _lmts_get_max_trade_usdc())
     if capped_stake <= 0 or limit_price_cents <= 0:
         _lmts_record_live_trade(paper_trade_id, asset, tf_label, direction,
                                 market_slug, token_id, limit_price_cents,
@@ -8022,6 +8049,101 @@ def live_redemptions_page():
              "<a href='/app/live-limitless'>← live-limitless dashboard</a> · "
              "<a href='/app/codes'>codes</a></p></body></html>")
     return html
+
+
+@app.route("/app/set-risk")
+def set_risk_route():
+    """Change the per-trade USDC cap for Limitless live trades on the fly.
+
+    Usage:
+      /app/set-risk                  → just show the current cap
+      /app/set-risk?max_usdc=2       → set the cap to $2.00 per trade
+      /app/set-risk?max_usdc=3.5     → set the cap to $3.50 per trade
+      /app/set-risk?max_usdc=reset   → clear the override, revert to env var
+
+    The new value takes effect on the very next live order — no redeploy
+    needed. Persists across restarts (stored in v2_settings)."""
+    arg = (request.args.get("max_usdc") or "").strip()
+    current = _lmts_get_max_trade_usdc()
+    env_default = float(LIMITLESS_MAX_TRADE_USDC)
+
+    msg = ""
+    if arg:
+        if arg.lower() in ("reset", "default", "clear"):
+            try:
+                conn = get_db()
+                conn.run("DELETE FROM v2_settings WHERE key = :k",
+                         k="limitless_max_trade_usdc")
+                conn.close()
+                msg = ('<p style="color:#15803d;font-weight:600">✓ Override '
+                       'cleared. Now using env-var default: ${:.2f}/trade.</p>'
+                       .format(env_default))
+            except Exception as e:
+                msg = '<p style="color:#b91c1c">Reset failed: {}</p>'.format(e)
+        else:
+            try:
+                new_val = float(arg)
+                if new_val < 0.10:
+                    msg = ('<p style="color:#b91c1c">Refused: ${} is below the '
+                           '$0.10 floor.</p>'.format(new_val))
+                elif new_val > 100.0:
+                    msg = ('<p style="color:#b91c1c">Refused: ${} is above the '
+                           '$100 sanity ceiling. If you really want that big, '
+                           'edit the route\'s upper bound first.</p>'.format(new_val))
+                else:
+                    ok = _settings_set("limitless_max_trade_usdc", new_val)
+                    if ok:
+                        current = new_val
+                        msg = ('<p style="color:#15803d;font-weight:600">✓ '
+                               'Per-trade cap set to <b>${:.2f}</b>. Takes '
+                               'effect on the next live order.</p>'
+                               .format(new_val))
+                    else:
+                        msg = '<p style="color:#b91c1c">DB write failed — check logs.</p>'
+            except (TypeError, ValueError):
+                msg = ('<p style="color:#b91c1c">Invalid number: '
+                       '<code>{}</code>. Use e.g. <code>?max_usdc=2</code> '
+                       'or <code>?max_usdc=2.5</code>.</p>'.format(arg))
+
+    src = ("v2_settings override" if _settings_get("limitless_max_trade_usdc")
+           is not None else "env-var fallback")
+    return ("<!doctype html><html><head><meta charset='utf-8'>"
+            "<title>Risk per trade · Cmvng Bot</title>"
+            "<style>body{font:15px system-ui;max-width:680px;margin:30px auto;"
+            "padding:0 18px}a{color:#2f6bd6;text-decoration:none}"
+            "a:hover{text-decoration:underline}"
+            "code{background:#f4f4f4;padding:2px 6px;border-radius:4px;"
+            "font-size:13px}</style></head><body>"
+            "<h1 style='font:600 22px system-ui'>Limitless · risk per trade</h1>"
+            "{msg}"
+            "<table style='font:14px system-ui;border-collapse:collapse;"
+            "margin-top:12px;background:#fafafa'>"
+            "<tr><td style='padding:10px 14px;border-bottom:1px solid #eee'>"
+            "Current cap</td><td style='padding:10px 14px;border-bottom:1px solid #eee;"
+            "font-weight:700;font-size:20px'>${current:.2f} per trade</td></tr>"
+            "<tr><td style='padding:10px 14px;border-bottom:1px solid #eee'>"
+            "Source</td><td style='padding:10px 14px;border-bottom:1px solid #eee'>"
+            "{src}</td></tr>"
+            "<tr><td style='padding:10px 14px'>"
+            "Env-var default</td><td style='padding:10px 14px'>"
+            "${env_default:.2f}</td></tr>"
+            "</table>"
+            "<h3 style='font:600 16px system-ui;margin-top:24px'>Change it</h3>"
+            "<p>Just append <code>?max_usdc=N</code> to this URL. Examples:</p>"
+            "<ul style='font:14px system-ui;line-height:1.7'>"
+            "<li><a href='/app/set-risk?max_usdc=2'>?max_usdc=2</a> → $2.00 per trade</li>"
+            "<li><a href='/app/set-risk?max_usdc=3'>?max_usdc=3</a> → $3.00 per trade</li>"
+            "<li><a href='/app/set-risk?max_usdc=5'>?max_usdc=5</a> → $5.00 per trade</li>"
+            "<li><a href='/app/set-risk?max_usdc=reset'>?max_usdc=reset</a> → "
+            "clear override, use env-var default</li>"
+            "</ul>"
+            "<p style='font:13px system-ui;color:#666;margin-top:18px'>"
+            "Takes effect on the next live order. Persists across restarts. "
+            "Floor: $0.10. Ceiling: $100.</p>"
+            "<p style='margin-top:24px'><a href='/app/live-limitless'>"
+            "← back to live dashboard</a></p>"
+            "</body></html>").format(
+            msg=msg, current=current, src=src, env_default=env_default), 200
 
 
 @app.route("/app/reconcile-redeem")
