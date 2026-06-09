@@ -8075,75 +8075,83 @@ def set_risk_route():
                 conn.run("DELETE FROM v2_settings WHERE key = :k",
                          k="limitless_max_trade_usdc")
                 conn.close()
+                current = env_default
                 msg = ('<p style="color:#15803d;font-weight:600">✓ Override '
-                       'cleared. Now using env-var default: ${:.2f}/trade.</p>'
-                       .format(env_default))
+                       'cleared. Now using env-var default: $'
+                       + ("%.2f" % env_default) + '/trade.</p>')
             except Exception as e:
-                msg = '<p style="color:#b91c1c">Reset failed: {}</p>'.format(e)
+                msg = '<p style="color:#b91c1c">Reset failed: ' + str(e)[:300] + '</p>'
         else:
             try:
                 new_val = float(arg)
                 if new_val < 0.10:
-                    msg = ('<p style="color:#b91c1c">Refused: ${} is below the '
-                           '$0.10 floor.</p>'.format(new_val))
+                    msg = ('<p style="color:#b91c1c">Refused: $'
+                           + ("%.2f" % new_val)
+                           + ' is below the $0.10 floor.</p>')
                 elif new_val > 100.0:
-                    msg = ('<p style="color:#b91c1c">Refused: ${} is above the '
-                           '$100 sanity ceiling. If you really want that big, '
-                           'edit the route\'s upper bound first.</p>'.format(new_val))
+                    msg = ('<p style="color:#b91c1c">Refused: $'
+                           + ("%.2f" % new_val) + ' is above the $100 sanity '
+                           'ceiling. If you really want that big, edit the '
+                           'route\'s upper bound first.</p>')
                 else:
                     ok = _settings_set("limitless_max_trade_usdc", new_val)
                     if ok:
                         current = new_val
                         msg = ('<p style="color:#15803d;font-weight:600">✓ '
-                               'Per-trade cap set to <b>${:.2f}</b>. Takes '
-                               'effect on the next live order.</p>'
-                               .format(new_val))
+                               'Per-trade cap set to <b>$'
+                               + ("%.2f" % new_val)
+                               + '</b>. Takes effect on the next live order.</p>')
                     else:
                         msg = '<p style="color:#b91c1c">DB write failed — check logs.</p>'
             except (TypeError, ValueError):
-                msg = ('<p style="color:#b91c1c">Invalid number: '
-                       '<code>{}</code>. Use e.g. <code>?max_usdc=2</code> '
-                       'or <code>?max_usdc=2.5</code>.</p>'.format(arg))
+                msg = ('<p style="color:#b91c1c">Invalid number: <code>'
+                       + str(arg)[:80] + '</code>. Use e.g. '
+                       '<code>?max_usdc=2</code> or <code>?max_usdc=2.5</code>.</p>')
 
     src = ("v2_settings override" if _settings_get("limitless_max_trade_usdc")
            is not None else "env-var fallback")
-    return ("<!doctype html><html><head><meta charset='utf-8'>"
-            "<title>Risk per trade · Cmvng Bot</title>"
-            "<style>body{font:15px system-ui;max-width:680px;margin:30px auto;"
-            "padding:0 18px}a{color:#2f6bd6;text-decoration:none}"
-            "a:hover{text-decoration:underline}"
-            "code{background:#f4f4f4;padding:2px 6px;border-radius:4px;"
-            "font-size:13px}</style></head><body>"
-            "<h1 style='font:600 22px system-ui'>Limitless · risk per trade</h1>"
-            "{msg}"
-            "<table style='font:14px system-ui;border-collapse:collapse;"
-            "margin-top:12px;background:#fafafa'>"
-            "<tr><td style='padding:10px 14px;border-bottom:1px solid #eee'>"
-            "Current cap</td><td style='padding:10px 14px;border-bottom:1px solid #eee;"
-            "font-weight:700;font-size:20px'>${current:.2f} per trade</td></tr>"
-            "<tr><td style='padding:10px 14px;border-bottom:1px solid #eee'>"
-            "Source</td><td style='padding:10px 14px;border-bottom:1px solid #eee'>"
-            "{src}</td></tr>"
-            "<tr><td style='padding:10px 14px'>"
-            "Env-var default</td><td style='padding:10px 14px'>"
-            "${env_default:.2f}</td></tr>"
-            "</table>"
-            "<h3 style='font:600 16px system-ui;margin-top:24px'>Change it</h3>"
-            "<p>Just append <code>?max_usdc=N</code> to this URL. Examples:</p>"
-            "<ul style='font:14px system-ui;line-height:1.7'>"
-            "<li><a href='/app/set-risk?max_usdc=2'>?max_usdc=2</a> → $2.00 per trade</li>"
-            "<li><a href='/app/set-risk?max_usdc=3'>?max_usdc=3</a> → $3.00 per trade</li>"
-            "<li><a href='/app/set-risk?max_usdc=5'>?max_usdc=5</a> → $5.00 per trade</li>"
-            "<li><a href='/app/set-risk?max_usdc=reset'>?max_usdc=reset</a> → "
-            "clear override, use env-var default</li>"
-            "</ul>"
-            "<p style='font:13px system-ui;color:#666;margin-top:18px'>"
-            "Takes effect on the next live order. Persists across restarts. "
-            "Floor: $0.10. Ceiling: $100.</p>"
-            "<p style='margin-top:24px'><a href='/app/live-limitless'>"
-            "← back to live dashboard</a></p>"
-            "</body></html>").format(
-            msg=msg, current=current, src=src, env_default=env_default), 200
+
+    # Build HTML by concatenation — CSS contains `{...}` blocks that would
+    # collide with .format() placeholders, so we sidestep .format entirely.
+    html = (
+        "<!doctype html><html><head><meta charset='utf-8'>"
+        "<title>Risk per trade · Cmvng Bot</title>"
+        "<style>"
+        "body{font:15px system-ui;max-width:680px;margin:30px auto;padding:0 18px}"
+        "a{color:#2f6bd6;text-decoration:none}"
+        "a:hover{text-decoration:underline}"
+        "code{background:#f4f4f4;padding:2px 6px;border-radius:4px;font-size:13px}"
+        "table{font:14px system-ui;border-collapse:collapse;margin-top:12px;background:#fafafa}"
+        "td{padding:10px 14px;border-bottom:1px solid #eee}"
+        "</style></head><body>"
+        "<h1 style='font:600 22px system-ui'>Limitless · risk per trade</h1>"
+        + msg +
+        "<table>"
+        "<tr><td>Current cap</td>"
+        "<td style='font-weight:700;font-size:20px'>$" + ("%.2f" % current) +
+        " per trade</td></tr>"
+        "<tr><td>Source</td><td>" + src + "</td></tr>"
+        "<tr><td style='border-bottom:none'>Env-var default</td>"
+        "<td style='border-bottom:none'>$" + ("%.2f" % env_default) +
+        "</td></tr>"
+        "</table>"
+        "<h3 style='font:600 16px system-ui;margin-top:24px'>Change it</h3>"
+        "<p>Just append <code>?max_usdc=N</code> to this URL. Examples:</p>"
+        "<ul style='font:14px system-ui;line-height:1.7'>"
+        "<li><a href='/app/set-risk?max_usdc=2'>?max_usdc=2</a> → $2.00 per trade</li>"
+        "<li><a href='/app/set-risk?max_usdc=3'>?max_usdc=3</a> → $3.00 per trade</li>"
+        "<li><a href='/app/set-risk?max_usdc=5'>?max_usdc=5</a> → $5.00 per trade</li>"
+        "<li><a href='/app/set-risk?max_usdc=reset'>?max_usdc=reset</a> → "
+        "clear override, use env-var default</li>"
+        "</ul>"
+        "<p style='font:13px system-ui;color:#666;margin-top:18px'>"
+        "Takes effect on the next live order. Persists across restarts. "
+        "Floor: $0.10. Ceiling: $100.</p>"
+        "<p style='margin-top:24px'>"
+        "<a href='/app/live-limitless'>← back to live dashboard</a></p>"
+        "</body></html>"
+    )
+    return html, 200
 
 
 @app.route("/app/reconcile-redeem")
