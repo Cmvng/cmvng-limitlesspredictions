@@ -12626,23 +12626,22 @@ def _warmup(api_url):
 def _scrape_get(url, timeout=15):
     """One GET that beats Cloudflare via curl_cffi Chrome impersonation + a warmed
     session (homepage visit → clearance cookie → API call), routing through
-    SCRAPE_PROXY when set. Falls back to plain requests if curl_cffi is absent."""
+    SCRAPE_PROXY when set. Falls back to plain requests if curl_cffi is absent.
+
+    NOTE on cloudscraper: cloudscraper v3.0.0's js2py interpreter can hang for
+    minutes attempting to solve modern Cloudflare challenges, and crucially it
+    does NOT respect the timeout parameter once it starts executing the JS VM.
+    We previously auto-routed sofascore/fbref/understat through cloudscraper
+    here — but those three are PERMANENTLY blocked from Railway's datacenter IP
+    (they reject by IP reputation before the JS challenge even runs), so the
+    bypass can never succeed and the script just hangs the engine. Removed.
+    Scrapers that legitimately benefit from cloudscraper (fp.net) call it
+    directly from their own code path."""
     headers = dict(_HEADERS)
     ref = _scrape_referer(url)
     if ref:
         headers["Referer"] = ref
     proxies = {"http": _SCRAPE_PROXY, "https": _SCRAPE_PROXY} if _SCRAPE_PROXY else None
-    # Cloudflare-challenged hosts: try cloudscraper first (solves the JS challenge)
-    challenged = any(h in url for h in ("sofascore", "fbref", "understat"))
-    if challenged and _cloudscraper is not None:
-        cs = _cs_session()
-        if cs is not None:
-            try:
-                r = cs.get(url, headers=headers, timeout=timeout)
-                if r is not None and r.status_code == 200:
-                    return r
-            except Exception:
-                pass
     if _cf is not None:
         s = _cf_session()
         if s is not None:
@@ -16913,7 +16912,25 @@ def run_football_engine(get_db, tg_token, tg_chat, send_telegram,
         print("[FB] ▶ STAGE: methodology enrich starting ({} fixtures)".format(
             len(fixtures) if fixtures else 0))
         try:
-            _fb_apply_methodology(fixtures)
+            # Hard 90s timeout — methodology enrich is OPTIONAL data
+            # (xG/PPDA/possession used as tiebreakers, not the core signal).
+            # If any source hangs (CF challenge solver spinning, slow API,
+            # network stall) the engine must NOT block waiting for it. Run
+            # in a daemon thread and abandon if it doesn't return in time.
+            import threading as _thr
+            _enrich_done = {"v": False}
+            def _enrich_worker():
+                try:
+                    _fb_apply_methodology(fixtures)
+                finally:
+                    _enrich_done["v"] = True
+            _t = _thr.Thread(target=_enrich_worker, daemon=True)
+            _t.start()
+            _t.join(timeout=90)
+            if not _enrich_done["v"]:
+                print("[FB] methodology enrich TIMED OUT after 90s — "
+                      "abandoning enrich and continuing with prediction "
+                      "data only (picks come from scrapers, not enrich)")
         except Exception as e:
             print("[FB] methodology enrich error: {}".format(e))
         print("[FB] ▶ STAGE: methodology enrich done")
