@@ -12021,43 +12021,63 @@ TIER_CONFIG = {
         "label": "100 ODDS — BOLD CALLS", "emoji": "🎯",
     },
     "1000_odds": {
-        # GRAND AUDIT — max-odds slip targeting 5000+. Uses the SAME
-        # bold-call market universe and SAME smart-punter ranking as
-        # 100 ODDS, just stacks more legs to reach the bigger total.
+        # GRAND AUDIT — bold-but-smart max-odds slip targeting 1000+ total.
+        # SAME bold-call market universe as 100 ODDS, but two critical
+        # differences from the 100-tier:
         #
-        # The build_all_accumulators pipeline pre-populates this tier's
-        # match_count with every GAME used in 100 ODDS, so Grand Audit
-        # never overlaps with the bold slip — true no-game-repeat across
-        # the session.
+        #   1. odds_lo=1.65 (was 1.28) — excludes the soft 1.1-1.5 picks
+        #      (Over 1.5, Double Chance, DNB on weak favorites) that make
+        #      the 100-tier safe but can't multiply to 1000+. The Grand
+        #      Audit only considers picks that ACTUALLY contribute to the
+        #      odds total — handicaps, win-a-halves, Over 2.5/3.5,
+        #      straight 1X2 wins, BTTS.
         #
-        # rank="conf" ranks picks by hit-rate first; on a thin slate the
-        # tier will lean on smart-safe markets (DNBs, X2, over 1.5,
-        # under 3.5) which makes more legs fit while still committing to
-        # what the data says.
+        #   2. rank="odds" (was "conf") — among legs that already passed
+        #      the confidence floor, picks the HIGHEST-odds qualifying leg
+        #      on each game first. This is the smart-bold logic: when
+        #      Brazil's predicted to beat Morocco 2-0, the 100-tier takes
+        #      "Brazil DNB" at 1.30; the Grand Audit takes "Brazil to Win"
+        #      at 1.55 or "Brazil -1.0 handicap" at 1.80 — same data,
+        #      bolder market choice. Both picks are equally informed by
+        #      the prediction; only the market priced differs.
+        #
+        # 11 legs averaging 1.85 odds = ~1015 total. With the new floor
+        # plus rank=odds, that's the expected output on a normal slate
+        # (each game contributes its boldest qualifying pick).
+        #
+        # build_all_accumulators still pre-populates this tier's used-game
+        # set with every game in 100 ODDS, so the two tiers never share a
+        # game — true no-game-repeat across the session.
         #
         # Internal key remains "1000_odds" for backwards compatibility
-        # with historical sportybet_accumulators rows; the user-facing
-        # label is "GRAND AUDIT".
-        "target": 5000.0, "min_conf": 55, "min_sel": 5, "max_sel": 20,
-        "odds_lo": 1.28, "odds_hi": 6.00,
-        "rank": "conf",                       # smart-punter ordering
+        # with historical sportybet_accumulators rows; user-facing label
+        # is "GRAND AUDIT".
+        "target": 5000.0, "min_conf": 58, "min_sel": 5, "max_sel": 20,
+        "odds_lo": 1.65, "odds_hi": 6.00,
+        "rank": "odds",                       # bold-call ordering: biggest qualifying odds first
         "allow": [
-            # Same expanded bold-call universe as 100 ODDS
             "home_win", "away_win", "draw",
             "double_chance_1X", "double_chance_X2",
             "dnb_home", "dnb_away",
-            "over_1", "over_1.5", "over_2", "over_2.5", "over_3.5",
-            "under_1.5", "under_2.5", "under_3.5", "under_4.5",
+            "over_2", "over_2.5", "over_3.5",
+            "under_2.5", "under_3.5",
             "handicap_home_-1.5", "handicap_away_-1.5",
+            "btts_yes", "btts_no",
         ],
         "allow_prefixes": ["winhalf_"],
         "prefer": [
-            "home_win", "away_win", "draw",
+            # Boldest smart markets first — these are the picks that
+            # actually move the odds needle on lopsided predictions.
+            "handicap_home_-1.5", "handicap_away_-1.5",
+            "winhalf_home", "winhalf_away",
+            "over_3.5",
+            "home_win", "away_win",
+            "btts_yes", "btts_no",
+            "over_2.5",
+            # Safer fallbacks — only used when nothing bolder qualifies.
             "double_chance_1X", "double_chance_X2",
             "dnb_home", "dnb_away",
-            "over_1.5", "under_3.5",
-            "over_2.5", "over_3.5",
-            "handicap_home_-1.5", "handicap_away_-1.5",
+            "under_3.5", "under_2.5",
         ],
         "label": "GRAND AUDIT — MAX ODDS", "emoji": "🚀",
     },
