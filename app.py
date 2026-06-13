@@ -9245,6 +9245,187 @@ def v2_prices():
 # ═══════════════════════════════════════════════════════════
 
 import requests as _sports_req
+
+
+def _sports_cache_save(source_name, predictions):
+    """Persist a successful scrape so the next run can fall back to it if
+    that source fails live. Stored as JSON in v2_settings keyed by source
+    name. Only saves NON-empty results — never overwrites a good cache
+    with [] from a partial-failure run."""
+    if not predictions:
+        return
+    try:
+        key = "sports_pred_cache_{}".format(source_name)
+        payload = json.dumps({
+            "saved_at": int(time.time()),
+            "count": len(predictions),
+            "predictions": predictions
+        })
+        conn = get_db()
+        conn.run(
+            "INSERT INTO v2_settings (key, value, updated_at) VALUES (:k, :v, NOW()) "
+            "ON CONFLICT (key) DO UPDATE SET value = :v, updated_at = NOW()",
+            k=key, v=payload)
+        conn.close()
+        print("[CACHE-SAVE] {}: {} predictions stored".format(
+            source_name, len(predictions)))
+    except Exception as e:
+        print("[CACHE-SAVE] {} error: {}".format(source_name, str(e)[:200]))
+
+
+def _sports_cache_load(source_name, max_age_hours=72):
+    """Load the last-successful scrape for this source. Returns [] if
+    nothing cached or cache is older than max_age_hours.
+
+    72h is intentionally generous — WC fixtures are scheduled days in
+    advance and prediction sites publish those predictions ahead of time,
+    so a 3-day-old cache is still good data for any upcoming game. The
+    downstream fixture-matcher will naturally drop predictions for games
+    that have already been played, so stale entries don't pollute picks."""
+    try:
+        conn = get_db()
+        rows = list(conn.run(
+            "SELECT value FROM v2_settings WHERE key = :k",
+            k="sports_pred_cache_{}".format(source_name)))
+        conn.close()
+        if not rows:
+            print("[CACHE-LOAD] {}: no cache available".format(source_name))
+            return []
+        data = json.loads(rows[0][0])
+        saved_at = data.get("saved_at", 0)
+        age_h = (time.time() - saved_at) / 3600
+        if age_h > max_age_hours:
+            print("[CACHE-LOAD] {}: cache too old ({:.1f}h > {}h)".format(
+                source_name, age_h, max_age_hours))
+            return []
+        preds = data.get("predictions", [])
+        print("[CACHE-LOAD] {}: USING cached {} predictions (age {:.1f}h)".format(
+            source_name, len(preds), age_h))
+        return preds
+    except Exception as e:
+        print("[CACHE-LOAD] {} error: {}".format(source_name, str(e)[:200]))
+        return []
+
+
+def _sports_robust_fetch(url, headers=None, timeout=15, max_retries=5,
+                         min_body_chars=1000, label=""):
+    """Resilient HTTP GET with three escalating bypass methods and
+    progressive backoff. Designed to give a flaky source MANY chances
+    before falling back to cache.
+
+    Method escalation per attempt:
+        1. Plain requests (cheapest)
+        2. cloudscraper (Cloudflare JS challenge solver)
+        3. curl_cffi with TLS impersonation (fingerprint bypass)
+
+    Backoff between attempts: 5s, 15s, 30s, 60s, 90s. So a fully
+    unresponsive source gets retried over ~3-4 minutes before this
+    function gives up.
+
+    Returns:
+        Response object on success
+        None if all methods + retries exhausted (caller should fall back
+        to cached predictions)
+    """
+    headers = dict(headers or {})
+    headers.setdefault(
+        "User-Agent",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+    headers.setdefault("Accept",
+                       "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+    headers.setdefault("Accept-Language", "en-US,en;q=0.9")
+
+    backoffs = [5, 15, 30, 60, 90]
+    last_err = "no attempt made"
+    methods_used = []
+
+    for attempt in range(max_retries):
+        if attempt > 0:
+            wait_s = backoffs[min(attempt - 1, len(backoffs) - 1)]
+            print("[SCRAPE-WAIT] {} backing off {}s before attempt {}/{}".format(
+                label or url[:50], wait_s, attempt + 1, max_retries))
+            time.sleep(wait_s)
+
+        # ── Method 1: plain requests ──
+        try:
+            r = _sports_req.get(url, headers=headers, timeout=timeout)
+            methods_used.append("plain")
+            if r.status_code == 200 and len(r.text) >= min_body_chars:
+                if attempt > 0:
+                    print("[SCRAPE-OK] {} via plain (attempt {})".format(
+                        label or url[:50], attempt + 1))
+                return r
+            elif r.status_code in (403, 429, 503):
+                last_err = "plain HTTP {}".format(r.status_code)
+            else:
+                last_err = "plain HTTP {} body={}".format(
+                    r.status_code, len(r.text))
+        except Exception as e:
+            last_err = "plain: {}".format(str(e)[:200])
+
+        # ── Method 2: cloudscraper ──
+        try:
+            sess = _cs_session() if '_cs_session' in globals() else None
+            if sess is None and _cloudscraper is not None:
+                sess = _cloudscraper.create_scraper(
+                    browser={"browser": "chrome", "platform": "windows",
+                             "mobile": False})
+            if sess is not None:
+                r = sess.get(url, headers=headers, timeout=timeout * 2)
+                methods_used.append("cs")
+                if r.status_code == 200 and len(r.text) >= min_body_chars:
+                    print("[SCRAPE-OK] {} via cloudscraper (attempt {})".format(
+                        label or url[:50], attempt + 1))
+                    return r
+                else:
+                    last_err = "cs HTTP {} body={}".format(
+                        r.status_code, len(r.text))
+        except Exception as e:
+            last_err = "cs: {}".format(str(e)[:200])
+
+        # ── Method 3: curl_cffi with TLS impersonation ──
+        try:
+            if _cf is not None:
+                r = _cf.get(url, headers=headers, timeout=timeout * 2,
+                            impersonate=_CF_IMPERSONATE)
+                methods_used.append("cf")
+                if r.status_code == 200 and len(r.text) >= min_body_chars:
+                    print("[SCRAPE-OK] {} via curl_cffi (attempt {})".format(
+                        label or url[:50], attempt + 1))
+                    return r
+                else:
+                    last_err = "cf HTTP {} body={}".format(
+                        r.status_code, len(r.text))
+        except Exception as e:
+            last_err = "cf: {}".format(str(e)[:200])
+
+    print("[SCRAPE-FAIL] {} after {} attempts via {}: {}".format(
+        label or url[:50], max_retries,
+        "+".join(sorted(set(methods_used))) or "(no methods)", last_err))
+    return None
+
+
+def _sports_scrape_with_cache_fallback(source_name, scrape_fn):
+    """Run a source-specific scraper. If it returns 0 predictions OR
+    raises, fall back to cached predictions from the last successful run.
+    Saves successful results to cache for future fallback.
+
+    Guarantees that a source NEVER returns empty as long as it was
+    working at least once in the last 72 hours."""
+    try:
+        live = scrape_fn()
+        if live:
+            _sports_cache_save(source_name, live)
+            return live
+        else:
+            print("[CACHE-FALLBACK] {} live scrape returned 0 predictions, "
+                  "loading from cache".format(source_name))
+            return _sports_cache_load(source_name)
+    except Exception as e:
+        print("[CACHE-FALLBACK] {} live scrape threw: {} — loading from cache"
+              .format(source_name, str(e)[:200]))
+        return _sports_cache_load(source_name)
 from bs4 import BeautifulSoup
 import re as _sports_re
 
@@ -9320,9 +9501,11 @@ def _sports_scrape_footballpredictions_com():
 
     for tip_type, url in tip_pages:
         try:
-            r = _sports_req.get(url, headers=_sports_headers, timeout=15)
-            if r.status_code != 200:
-                print("[SPORTS] FP.com {} — HTTP {}".format(tip_type, r.status_code))
+            r = _sports_robust_fetch(url, headers=_sports_headers, timeout=15,
+                                      max_retries=3,
+                                      label="fp.com:{}".format(tip_type))
+            if r is None:
+                print("[SPORTS] FP.com {} — robust fetch exhausted".format(tip_type))
                 continue
             soup = BeautifulSoup(r.text, "html.parser")
 
@@ -9421,13 +9604,20 @@ def _sports_scrape_footballpredictions_com():
 
 
 def _sports_scrape_footballpredictions_net():
-    """Scrape footballpredictions.net for correct score predictions."""
+    """Scrape footballpredictions.net for correct score predictions.
+
+    Uses the robust fetcher (plain → cloudscraper → curl_cffi) so a
+    Cloudflare challenge or transient block doesn't silently return 0
+    predictions like it did before. If ALL methods exhaust, returns an
+    empty list and the [SCRAPE-FAIL] log line names this source so you
+    can see which one died."""
     predictions = []
     url = "https://footballpredictions.net/correct-score-predictions-betting-tips"
     try:
-        r = _sports_req.get(url, headers=_sports_headers, timeout=15)
-        if r.status_code != 200:
-            print("[SPORTS] FP.net — HTTP {}".format(r.status_code))
+        r = _sports_robust_fetch(url, headers=_sports_headers, timeout=15,
+                                  max_retries=3, label="fp.net")
+        if r is None:
+            print("[SPORTS] FP.net — robust fetch exhausted, 0 predictions")
             return predictions
         soup = BeautifulSoup(r.text, "html.parser")
 
@@ -9497,9 +9687,11 @@ def _sports_scrape_forebet():
 
     for page_name, url in urls_to_scrape:
         try:
-            r = _sports_req.get(url, headers=_sports_headers, timeout=15)
-            if r.status_code != 200:
-                print("[SPORTS] Forebet {} — HTTP {}".format(page_name, r.status_code))
+            r = _sports_robust_fetch(url, headers=_sports_headers, timeout=15,
+                                      max_retries=3,
+                                      label="forebet:{}".format(page_name))
+            if r is None:
+                print("[SPORTS] Forebet {} — robust fetch exhausted".format(page_name))
                 continue
             soup = BeautifulSoup(r.text, "html.parser")
 
@@ -10486,11 +10678,20 @@ def _sports_scan_and_alert():
     """Main sports scanning function. Scrapes all sites, finds consensus, matches markets, sends alerts."""
     print("[SPORTS] Starting scan...")
 
-    # 1. Scrape all prediction sites
+    # 1. Scrape all prediction sites — every source wrapped in cache
+    # fallback so a live scrape failure (Cloudflare block, timeout, HTML
+    # change) does NOT result in zero predictions for that source. If the
+    # live scrape works, we save the result to cache. If it fails, we load
+    # the last successful scrape (up to 72h old). The engine then ALWAYS
+    # gets data from all three sources, so consensus calculations always
+    # have 3 votes instead of collapsing to 2.
     all_predictions = []
-    all_predictions.extend(_sports_scrape_footballpredictions_com())
-    all_predictions.extend(_sports_scrape_footballpredictions_net())
-    all_predictions.extend(_sports_scrape_forebet())
+    all_predictions.extend(_sports_scrape_with_cache_fallback(
+        "fp.com", _sports_scrape_footballpredictions_com))
+    all_predictions.extend(_sports_scrape_with_cache_fallback(
+        "fp.net", _sports_scrape_footballpredictions_net))
+    all_predictions.extend(_sports_scrape_with_cache_fallback(
+        "forebet", _sports_scrape_forebet))
     all_predictions.extend(_sports_scrape_predictz())
     print("[SPORTS] Total predictions scraped: {}".format(len(all_predictions)))
 
@@ -12088,9 +12289,57 @@ def build_all_accumulators(all_picks, avoid_games=None):
     if bold_acc:
         for s in bold_acc["selections"]:
             grand_match_count[s["match"]] = 1
-    result["1000_odds"] = build_accumulator(
+    grand_acc = build_accumulator(
         all_picks, "1000_odds", set(), grand_match_count, {},
         rotation_seed, max_reuse=1, avoid_games=avoid_games)
+
+    # Fallback for thin slates: if the strict no-game-repeat rule made it
+    # impossible to reach Grand Audit's min_sel (e.g., on a 14-game slate
+    # where 100 ODDS used 13 of them), relax to family-level dedup. Grand
+    # Audit can then share GAMES with 100 ODDS — just never with the same
+    # bet TYPE. Strict rule preserved on wide slates (30+ games) where the
+    # first build succeeds; graceful degradation on thin ones so the user
+    # always gets a Grand Audit slip.
+    if not grand_acc and bold_acc:
+        grand_match_families = {}
+        for s in bold_acc["selections"]:
+            grand_match_families.setdefault(s["match"], set()).add(
+                _mkt_family(s["market_type"]))
+        grand_acc = build_accumulator(
+            all_picks, "1000_odds", set(), {}, grand_match_families,
+            rotation_seed, max_reuse=1, avoid_games=avoid_games)
+        if grand_acc:
+            print("[FB] Grand Audit: thin slate fallback engaged — "
+                  "strict no-game-repeat against 100 ODDS could not build, "
+                  "relaxed to family-different (same games OK, different bet "
+                  "types). {} legs / {:.0f} odds.".format(
+                  grand_acc["num_selections"], grand_acc["total_odds"]))
+        else:
+            print("[FB] Grand Audit: even fallback couldn't build — slate "
+                  "too thin or no high-confidence bold-call picks "
+                  "available.")
+    result["1000_odds"] = grand_acc
+
+    # ── Per-tier slip diagnostic dump. Lets you audit "why did the bot pick
+    # X" directly from the deploy logs — every leg shows its match, the
+    # market type, confidence score, and odds. If a leg looks wrong, you can
+    # check the source data (run /app/debug-scrape) to see what the
+    # prediction engine fed into the picker. ──
+    for tier_key in ("2_odds", "3_odds", "5_odds", "10_odds",
+                     "100_odds", "1000_odds"):
+        acc = result.get(tier_key)
+        if not acc:
+            print("[FB] {} -> NOT BUILT".format(tier_key))
+            continue
+        print("[FB] {} -> {} legs, total {:.2f} odds".format(
+            tier_key, acc["num_selections"], acc["total_odds"]))
+        for s in acc["selections"]:
+            print("[FB]   {} | {} | conf={} odds={:.2f}".format(
+                s.get("match", "?")[:48],
+                s.get("market_type", "?"),
+                s.get("confidence", "?"),
+                float(s.get("odds", 0))))
+
     return result
 
 
@@ -12215,17 +12464,51 @@ _WARMED = set()
 
 
 def _cs_session():
-    """Cloudscraper session (solves Cloudflare JS challenge in pure Python),
-    routed through the proxy if set."""
+    """Cloudscraper session with the enhanced v3.0.0 fork's full bypass
+    config. Stealth mode + js2py interpreter + 5s delay are what actually
+    solve modern Cloudflare protections (v2, v3 JavaScript VM, Turnstile).
+    The default cloudscraper config (just `browser`) only handles legacy
+    v1 challenges, which is why fp.net was returning 0 predictions.
+
+    Falls back gracefully to a basic scraper if the enhanced kwargs aren't
+    supported by the installed version (e.g., if requirements.txt hasn't
+    been redeployed yet and Railway is still running the old 1.2.71)."""
     global _CS_SESSION
     if _CS_SESSION is None and _cloudscraper is not None:
+        # Try the enhanced (v3.0.0) constructor first
         try:
             _CS_SESSION = _cloudscraper.create_scraper(
-                browser={"browser": "chrome", "platform": "windows", "mobile": False})
-            if _SCRAPE_PROXY:
-                _CS_SESSION.proxies = {"http": _SCRAPE_PROXY, "https": _SCRAPE_PROXY}
-        except Exception:
+                browser={"browser": "chrome", "platform": "windows",
+                         "mobile": False},
+                interpreter="js2py",        # Best for v3 challenges
+                delay=5,                     # Allow time for complex challenges
+                enable_stealth=True,         # Human-like behavior
+                stealth_options={
+                    "min_delay": 1.5,
+                    "max_delay": 4.0,
+                    "human_like_delays": True,
+                    "randomize_headers": True,
+                    "browser_quirks": True,
+                },
+                debug=False,                 # Set True to debug challenge solving
+            )
+            print("[CS] cloudscraper v3.0.0 enhanced config loaded "
+                  "(stealth + js2py + v3 challenge support)")
+        except TypeError:
+            # Old 1.2.71 doesn't accept enable_stealth — fall back to basic
+            try:
+                _CS_SESSION = _cloudscraper.create_scraper(
+                    browser={"browser": "chrome", "platform": "windows",
+                             "mobile": False})
+                print("[CS] cloudscraper basic config (old 1.2.71 detected — "
+                      "upgrade requirements.txt for v3 challenge support)")
+            except Exception:
+                _CS_SESSION = None
+        except Exception as e:
+            print("[CS] cloudscraper init failed: {}".format(str(e)[:200]))
             _CS_SESSION = None
+        if _CS_SESSION is not None and _SCRAPE_PROXY:
+            _CS_SESSION.proxies = {"http": _SCRAPE_PROXY, "https": _SCRAPE_PROXY}
     return _CS_SESSION
 
 
@@ -17835,6 +18118,82 @@ def fb_manual_run():
         args=(get_db, TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, send_telegram),
         daemon=True).start()
     return jsonify({"ok": True, "msg": "Football engine started — check logs and /app/codes in a minute"})
+
+
+@app.route("/app/cache-status")
+def fb_cache_status():
+    """Show per-source prediction cache state: when each was last
+    successfully scraped, age in hours, and prediction count. If a
+    source is currently failing live, you can see at a glance how
+    old its cached predictions are and whether they're still fresh
+    enough to use (cache TTL = 72h)."""
+    rows_out = []
+    try:
+        conn = get_db()
+        for src in ("fp.com", "fp.net", "forebet"):
+            try:
+                rows = list(conn.run(
+                    "SELECT value FROM v2_settings WHERE key = :k",
+                    k="sports_pred_cache_{}".format(src)))
+                if rows:
+                    data = json.loads(rows[0][0])
+                    saved_at = data.get("saved_at", 0)
+                    age_h = (time.time() - saved_at) / 3600
+                    fresh = age_h < 72
+                    rows_out.append({
+                        "source": src,
+                        "count": data.get("count", 0),
+                        "age_hours": round(age_h, 1),
+                        "fresh": fresh,
+                        "saved_at": time.strftime(
+                            "%Y-%m-%d %H:%M:%S",
+                            time.localtime(saved_at)) if saved_at else "—",
+                    })
+                else:
+                    rows_out.append({"source": src, "count": 0,
+                                     "age_hours": None, "fresh": False,
+                                     "saved_at": "(never)"})
+            except Exception as e:
+                rows_out.append({"source": src, "error": str(e)[:200]})
+        conn.close()
+    except Exception as e:
+        return "Cache status error: {}".format(e), 500
+
+    html_rows = []
+    for r in rows_out:
+        if "error" in r:
+            html_rows.append(
+                "<tr><td>{}</td><td colspan=4 style='color:#dc2626'>error: {}</td></tr>".format(
+                    r["source"], r["error"]))
+        else:
+            fresh_badge = ("<span style='color:#10b981;font-weight:600'>FRESH</span>"
+                           if r["fresh"]
+                           else "<span style='color:#dc2626;font-weight:600'>STALE</span>")
+            age_str = ("{}h".format(r["age_hours"])
+                       if r["age_hours"] is not None else "—")
+            html_rows.append(
+                "<tr><td><b>{}</b></td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>"
+                .format(r["source"], r["count"], r["saved_at"], age_str, fresh_badge))
+
+    html = """<!doctype html><html><head><title>Prediction Cache Status</title>
+    <style>body{font:14px system-ui;max-width:800px;margin:24px auto;padding:0 20px;color:#111}
+    table{width:100%;border-collapse:collapse;margin-top:16px}
+    th,td{padding:8px 12px;text-align:left;border-bottom:1px solid #e5e7eb}
+    th{background:#f9fafb;font-weight:600}
+    .note{background:#fef3c7;padding:12px;border-radius:8px;margin:16px 0;font-size:13px}
+    </style></head><body>
+    <h2>Prediction Source Cache</h2>
+    <div class="note">If a live scrape fails (Cloudflare block, timeout, HTML change),
+    the engine loads from this cache instead — as long as the entry is less than
+    72 hours old. This is how all 3 sources keep contributing to consensus even
+    when one is temporarily unreachable.</div>
+    <table><thead><tr><th>Source</th><th>Cached Predictions</th>
+    <th>Last Successful Scrape</th><th>Age</th><th>Status</th></tr></thead>
+    <tbody>__ROWS__</tbody></table>
+    <p style="margin-top:16px"><a href="/app/fb-rescan">→ Force rescan now</a>
+    | <a href="/app/debug-scrape">→ See what scrapers receive</a></p>
+    </body></html>""".replace("__ROWS__", "".join(html_rows))
+    return html
 
 
 @app.route("/app/debug-scrape")
