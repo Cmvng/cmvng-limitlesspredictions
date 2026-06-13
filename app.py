@@ -12539,38 +12539,34 @@ _WARMED = set()
 
 
 def _cs_session():
-    """Cloudscraper session with the enhanced v3.0.0 fork's full bypass
-    config. Stealth mode + js2py interpreter + 5s delay are what actually
-    solve modern Cloudflare protections (v2, v3 JavaScript VM, Turnstile).
-    The default cloudscraper config (just `browser`) only handles legacy
-    v1 challenges, which is why fp.net was returning 0 predictions.
-
-    Falls back gracefully to a basic scraper if the enhanced kwargs aren't
-    supported by the installed version (e.g., if requirements.txt hasn't
-    been redeployed yet and Railway is still running the old 1.2.71)."""
+    """Cloudscraper session with the enhanced v3.0.0 fork's bypass config.
+    Tuned for SPEED — the previous config used stealth_options with 1.5-4s
+    human-like delays on every request, which silently added 2-3 minutes to
+    a 25-fixture engine run (Sofascore + FBref + Understat + others each
+    paying the delay). We keep stealth mode and js2py for challenge solving
+    but disable the human-like timing, since bypassing CF is the goal — not
+    actually pretending to be a slow human reading the page."""
     global _CS_SESSION
     if _CS_SESSION is None and _cloudscraper is not None:
-        # Try the enhanced (v3.0.0) constructor first
         try:
             _CS_SESSION = _cloudscraper.create_scraper(
                 browser={"browser": "chrome", "platform": "windows",
                          "mobile": False},
-                interpreter="js2py",        # Best for v3 challenges
-                delay=5,                     # Allow time for complex challenges
-                enable_stealth=True,         # Human-like behavior
+                interpreter="js2py",
+                delay=2,                     # was 5, fine for most challenges
+                enable_stealth=True,         # keep — for fingerprint stealth
                 stealth_options={
-                    "min_delay": 1.5,
-                    "max_delay": 4.0,
-                    "human_like_delays": True,
+                    "min_delay": 0.0,        # WAS 1.5 — no per-request wait
+                    "max_delay": 0.0,        # WAS 4.0
+                    "human_like_delays": False,   # WAS True — KEY FIX
                     "randomize_headers": True,
                     "browser_quirks": True,
                 },
-                debug=False,                 # Set True to debug challenge solving
+                debug=False,
             )
             print("[CS] cloudscraper v3.0.0 enhanced config loaded "
-                  "(stealth + js2py + v3 challenge support)")
+                  "(stealth + js2py + v3 challenge support, fast mode)")
         except TypeError:
-            # Old 1.2.71 doesn't accept enable_stealth — fall back to basic
             try:
                 _CS_SESSION = _cloudscraper.create_scraper(
                     browser={"browser": "chrome", "platform": "windows",
@@ -16914,10 +16910,13 @@ def run_football_engine(get_db, tg_token, tg_chat, send_telegram,
 
         # 1c. Apply the methodology data (xG/PPDA/possession) to the LIVE fixtures
         #     — connects Understat + FBref to the picks that actually get bet.
+        print("[FB] ▶ STAGE: methodology enrich starting ({} fixtures)".format(
+            len(fixtures) if fixtures else 0))
         try:
             _fb_apply_methodology(fixtures)
         except Exception as e:
             print("[FB] methodology enrich error: {}".format(e))
+        print("[FB] ▶ STAGE: methodology enrich done")
 
         if not fixtures:
             print("[FB] No upcoming bettable fixtures right now — nothing to post")
@@ -16926,10 +16925,12 @@ def run_football_engine(get_db, tg_token, tg_chat, send_telegram,
 
         # 1b. Attach the proven club model (corners/cards) BEFORE scoring, so
         #     board-explore can inject qualifying corner/card legs into the codes.
+        print("[FB] ▶ STAGE: model attach starting")
         try:
             _model_attach(fixtures)
         except Exception as e:
             print("[MODEL] attach run error: {}".format(e))
+        print("[FB] ▶ STAGE: model attach done")
 
         # 2. Analyze
         all_picks = []
@@ -16938,6 +16939,7 @@ def run_football_engine(get_db, tg_token, tg_chat, send_telegram,
                 all_picks.extend(analyze_fixture(fx))
             except Exception as e:
                 print("[FB] analyze error for {}: {}".format(fx.get("home_team"), e))
+        print("[FB] ▶ STAGE: scoring done")
         print("[FB] Scored {} picks across {} fixtures".format(len(all_picks), len(fixtures)))
 
         if not all_picks:
@@ -16964,6 +16966,7 @@ def run_football_engine(get_db, tg_token, tg_chat, send_telegram,
 
         # 3. Build accumulators (from bettable picks). Avoid the previous
         #    session's games so the 12h session 2 doesn't repeat session 1.
+        print("[FB] ▶ STAGE: build_all_accumulators starting")
         try:
             avoid_prev = _fb_recent_session_games(get_db)
             if avoid_prev:
