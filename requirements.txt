@@ -8,11 +8,19 @@ beautifulsoup4>=4.12
 # Imported inside the Chainlink RTDS thread only — if missing, the app
 # still boots and trades; only the real-time price stream is disabled.
 websocket-client>=1.7
-# Cloudflare bypass for Sofascore/FBref (real Chrome TLS fingerprint).
-# Graceful fallback to plain requests if missing — app still boots either way.
+# Cloudflare bypass — TLS-level fingerprinting + JS challenge solving.
+# Both are needed because Cloudflare runs MULTIPLE detection layers:
+#   1. TLS/JA3 fingerprint check (defeated by curl_cffi's real-Chrome handshake)
+#   2. JavaScript challenge (defeated by cloudscraper's interpreter)
+#   3. Turnstile / v3 VM challenges (only the enhanced cloudscraper handles these)
+# Bumped curl_cffi to a version with current Chrome impersonation profiles.
 curl_cffi>=0.7.0
-# Cloudflare JS-challenge solver (pure Python, no browser) for FBref/Sofascore.
-cloudscraper>=1.2.71
+# Enhanced cloudscraper from VeNoMouS GitHub fork — supports Cloudflare v2,
+# v3 (JavaScript VM), and Turnstile challenges that the old PyPI version
+# (stuck at 1.2.71) cannot solve. fp.net specifically requires this fork
+# to scrape reliably. If the GitHub install fails for any reason, the bot
+# falls back to plain requests/curl_cffi.
+cloudscraper @ git+https://github.com/VeNoMouS/cloudscraper.git@3.0.0
 # Polymarket CLOB client — Polymarket reads/writes.
 # Pinned to a known-good version that matches the import paths the code uses
 # (py_clob_client.client.ClobClient, py_clob_client.clob_types.ApiCreds).
