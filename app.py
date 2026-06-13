@@ -12162,7 +12162,10 @@ TIER_CONFIG = {
             # Match winner / draw (direction lock)
             "home_win", "away_win", "draw",
             # Double chance (committed direction + safety net)
-            "double_chance_1X", "double_chance_X2",
+            "double_chance_1X", "double_chance_X2", "double_chance_12",
+            "dc1up_1x", "dc1up_x2", "dc1up_12",
+            # 1UP (early-payout win — strictly safer than straight win)
+            "oneup_home", "oneup_away",
             # Draw No Bet — back a side, get stake back on draw
             "dnb_home", "dnb_away",
             # Over X goals (commits to goals coming)
@@ -12171,11 +12174,15 @@ TIER_CONFIG = {
             "under_1.5", "under_2.5", "under_3.5", "under_4.5",
             # Handicap (commits to a margin — use when prediction is heavy)
             "handicap_home_-1.5", "handicap_away_-1.5",
+            # BTTS
+            "btts_yes", "btts_no",
         ],
-        # Win-a-half market_types are dynamically constructed
-        # (winhalf_home_1sthalf_yes, etc.) so they can't be enumerated —
-        # let them through by prefix.
-        "allow_prefixes": ["winhalf_"],
+        # Win-a-half and team-total markets have dynamically-constructed
+        # market_types (winhalf_home_1sthalf_yes, team_home_over_1.5) so
+        # they're allowed by prefix.
+        "allow_prefixes": ["winhalf_", "team_home_over_", "team_away_over_",
+                           "team_home_under_", "team_away_under_",
+                           "fh_over_", "fh_under_"],
         "prefer": [
             # Direction-locks and high-hit-rate markets first
             "home_win", "away_win", "draw",
@@ -12221,18 +12228,31 @@ TIER_CONFIG = {
         # with historical sportybet_accumulators rows; user-facing label
         # is "GRAND AUDIT".
         "target": 5000.0, "min_conf": 50, "min_sel": 5, "max_sel": 20,
-        "odds_lo": 1.50, "odds_hi": 6.00,
+        "odds_lo": 1.40, "odds_hi": 6.00,
         "rank": "odds",                       # bold-call ordering: biggest qualifying odds first
         "allow": [
+            # Match-winner family: directional picks
             "home_win", "away_win", "draw",
-            "double_chance_1X", "double_chance_X2",
             "dnb_home", "dnb_away",
+            # Double-chance family
+            "double_chance_1X", "double_chance_X2", "double_chance_12",
+            "dc1up_1x", "dc1up_x2", "dc1up_12",
+            # 1UP family (lead at any point — strictly safer than straight win)
+            "oneup_home", "oneup_away",
+            # Goals
             "over_2", "over_2.5", "over_3.5",
             "under_2.5", "under_3.5",
+            # Handicap family — bold blowout picks
             "handicap_home_-1.5", "handicap_away_-1.5",
+            # BTTS family
             "btts_yes", "btts_no",
         ],
-        "allow_prefixes": ["winhalf_"],
+        # Win-a-half and team-total families have dynamic market_types
+        # (winhalf_home_1sthalf_yes, team_home_over_1.5, etc.) so they're
+        # allowed by prefix.
+        "allow_prefixes": ["winhalf_", "team_home_over_", "team_away_over_",
+                           "team_home_under_", "team_away_under_",
+                           "fh_over_", "fh_under_"],
         "prefer": [
             # Boldest smart markets first — these are the picks that
             # actually move the odds needle on lopsided predictions.
@@ -12240,6 +12260,7 @@ TIER_CONFIG = {
             "winhalf_home", "winhalf_away",
             "over_3.5",
             "home_win", "away_win",
+            "oneup_home", "oneup_away",
             "btts_yes", "btts_no",
             "over_2.5",
             # Safer fallbacks — only used when nothing bolder qualifies.
@@ -12274,6 +12295,8 @@ def _mkt_family(mt):
         return "match_goals"
     if mt.startswith("winmargin") or mt.startswith("leadby"):
         return "winning_margin"
+    if mt.startswith("handicap"):
+        return "handicap"
     if mt.startswith("winhalf"):
         return "win_a_half"
     if mt.startswith("tonil"):
@@ -12351,7 +12374,14 @@ def build_accumulator(all_picks, tier_key, used_selections=None, match_count=Non
     # kind of bet) and spread hard, to reach the full range of SportyBet markets.
     # The 2/3/100 constrained tiers keep their ORIGINAL behaviour: cap by exact
     # market type with a +1 slack, so they stay disciplined.
-    explore_tier = not has_allow_rule
+    #
+    # Grand Audit gets explore-mode diversity EVEN THOUGH it has an allow list.
+    # Without this override, the picker counts each market_type separately —
+    # which let the previous run stack 10 btts_yes picks (each from a distinct
+    # game, so individually under any per-market cap) and call it diverse.
+    # With family-level diversity, btts as a whole has a cap and the picker is
+    # forced to rotate through handicap / match_winner / win_a_half / etc.
+    explore_tier = (not has_allow_rule) or (tier_key == "1000_odds")
 
     def _div_key(p):
         return _mkt_family(p["market_type"]) if explore_tier else p["market_type"]
@@ -12362,6 +12392,13 @@ def build_accumulator(all_picks, tier_key, used_selections=None, match_count=Non
     max_per_type = max(1, _m.ceil(cfg["max_sel"] / max(1, distinct_types)) + slack)
     if distinct_types >= cfg["max_sel"]:
         max_per_type = 1  # plenty of variety -> force every leg a different type
+
+    # Grand Audit specifically: hard ceiling of 3 picks per family. Even with
+    # family-level diversity, the dynamic cap can still allow 4-5 per family
+    # when distinct_types is low. 3 is a sensible hard floor — every family
+    # gets a seat, no family runs the show.
+    if tier_key == "1000_odds":
+        max_per_type = min(max_per_type, 3)
 
     rank_mode = cfg.get("rank", "conf")   # "odds" = moonshot builds toward big odds
     # When True, target is treated as an aspiration, not a ceiling. Used by
