@@ -12375,25 +12375,45 @@ def build_all_accumulators(all_picks, avoid_games=None):
                   "available.")
     result["1000_odds"] = grand_acc
 
-    # ── Per-tier slip diagnostic dump. Lets you audit "why did the bot pick
-    # X" directly from the deploy logs — every leg shows its match, the
-    # market type, confidence score, and odds. If a leg looks wrong, you can
-    # check the source data (run /app/debug-scrape) to see what the
-    # prediction engine fed into the picker. ──
-    for tier_key in ("2_odds", "3_odds", "5_odds", "10_odds",
-                     "100_odds", "1000_odds"):
-        acc = result.get(tier_key)
-        if not acc:
-            print("[FB] {} -> NOT BUILT".format(tier_key))
-            continue
-        print("[FB] {} -> {} legs, total {:.2f} odds".format(
-            tier_key, acc["num_selections"], acc["total_odds"]))
-        for s in acc["selections"]:
-            print("[FB]   {} | {} | conf={} odds={:.2f}".format(
-                s.get("match", "?")[:48],
-                s.get("market_type", "?"),
-                s.get("confidence", "?"),
-                float(s.get("odds", 0))))
+    # ── Per-tier slip diagnostic dump. CRITICAL: wrapped in try/except so a
+    # None value, missing key, or any unexpected data shape can NEVER prevent
+    # this function from returning. Diagnostic logging is non-essential — the
+    # engine must complete and write codes regardless. Previous version could
+    # crash on float(None) or "{:.2f}".format(None) and silently kill the
+    # whole engine run, leaving the user wondering why no codes appeared. ──
+    try:
+        for tier_key in ("2_odds", "3_odds", "5_odds", "10_odds",
+                         "100_odds", "1000_odds"):
+            try:
+                acc = result.get(tier_key)
+                if not acc:
+                    print("[FB] {} -> NOT BUILT".format(tier_key))
+                    continue
+                n_sel = acc.get("num_selections") or len(acc.get("selections", []) or [])
+                tot = acc.get("total_odds")
+                tot_str = "{:.2f}".format(tot) if isinstance(tot, (int, float)) else "?"
+                print("[FB] {} -> {} legs, total {} odds".format(
+                    tier_key, n_sel, tot_str))
+                for s in (acc.get("selections") or []):
+                    try:
+                        match = (s.get("match") or "?")[:48]
+                        mt = s.get("market_type") or "?"
+                        conf = s.get("confidence", "?")
+                        odds_raw = s.get("odds", 0)
+                        try:
+                            odds_str = "{:.2f}".format(float(odds_raw))
+                        except (TypeError, ValueError):
+                            odds_str = "?"
+                        print("[FB]   {} | {} | conf={} odds={}".format(
+                            match, mt, conf, odds_str))
+                    except Exception:
+                        continue
+            except Exception as e:
+                print("[FB] {} -> diagnostic print error: {}".format(
+                    tier_key, str(e)[:120]))
+    except Exception as e:
+        print("[FB] diagnostic dump failed (engine still returning): {}".format(
+            str(e)[:200]))
 
     return result
 
