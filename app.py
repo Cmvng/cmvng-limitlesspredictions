@@ -11697,7 +11697,13 @@ def _apply_prediction_alignment(picks, fx):
         if track is None or a is None:
             continue  # ambiguous market — leave alone
         if a is True:
-            new_conf = min(92.0, p.get("confidence", 0) * 1.08)
+            # Boost — but never REDUCE an already-high pick. The old code
+            # used min(92, conf * 1.08), which silently slashed dc1up_12
+            # picks that were already at 98 down to 92, killing the 2_odds
+            # tier. Use max(original, boost) capped at 98 so high-conf
+            # aligned picks stay high.
+            orig = p.get("confidence", 0)
+            new_conf = max(orig, min(98.0, orig * 1.08))
             p["confidence"] = round(new_conf, 1)
             p["odds"] = prob_to_odds(new_conf)
         else:  # a is False — contradicts the prediction
@@ -12087,7 +12093,7 @@ def _sb_board_explore(fx, home, away, exp_home, exp_away, exp_total):
 # Tier configuration: per-selection odds band + packing rules
 TIER_CONFIG = {
     "2_odds": {
-        "target": 2.0, "min_conf": 90, "min_sel": 4, "max_sel": 8,
+        "target": 2.0, "min_conf": 85, "min_sel": 4, "max_sel": 8,
         "odds_lo": 1.04, "odds_hi": 1.32,
         # BANKER: only the lowest-variance markets. No BTTS, no corners, no
         # outright win — those are coin-flips on a 2-odds slip.
@@ -12214,8 +12220,8 @@ TIER_CONFIG = {
         # Internal key remains "1000_odds" for backwards compatibility
         # with historical sportybet_accumulators rows; user-facing label
         # is "GRAND AUDIT".
-        "target": 5000.0, "min_conf": 58, "min_sel": 5, "max_sel": 20,
-        "odds_lo": 1.65, "odds_hi": 6.00,
+        "target": 5000.0, "min_conf": 50, "min_sel": 5, "max_sel": 20,
+        "odds_lo": 1.50, "odds_hi": 6.00,
         "rank": "odds",                       # bold-call ordering: biggest qualifying odds first
         "allow": [
             "home_win", "away_win", "draw",
