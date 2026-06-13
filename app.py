@@ -11518,12 +11518,20 @@ def analyze_fixture(fx):
         "Safe double chance + goals")
 
     # ── HANDICAP ──
+    # Bold direction pick — backs a side to win by 2+. The haircut reflects
+    # the bolder bet (you lose on 1-0 / 2-1 wins), but isn't aggressive: the
+    # alignment filter elsewhere already kills handicap picks when the
+    # prediction is only a close win (margin == 1, penalty × 0.40). On true
+    # predicted blowouts (margin ≥ 2) the handicap is the smart pick, and
+    # 0.90 keeps its confidence in the playable range for 100_odds (min 60)
+    # and Grand Audit (min 50). Previous 0.65 silently floored every
+    # handicap below 50 and they never made any tier.
     if home_win_raw > 0.55:
-        hcp = home_win_conf * 0.65
+        hcp = home_win_conf * 0.90
         add("handicap_home_-1.5", "{} -1.5".format(home), hcp,
             "{} strongly favored to win by 2+".format(home))
     if away_win_raw > 0.55:
-        hcp = away_win_conf * 0.65
+        hcp = away_win_conf * 0.90
         add("handicap_away_-1.5", "{} -1.5".format(away), hcp,
             "{} strongly favored to win by 2+".format(away))
 
@@ -12106,7 +12114,7 @@ TIER_CONFIG = {
         "label": "2 ODDS — BANKER", "emoji": "🟢",
     },
     "3_odds": {
-        "target": 3.0, "min_conf": 83, "min_sel": 4, "max_sel": 10,
+        "target": 3.0, "min_conf": 78, "min_sel": 3, "max_sel": 10,
         "odds_lo": 1.12, "odds_hi": 1.48,
         # SAFE: double chance + goals lines + outright wins ONLY when the match
         # projects clear (tight games shade wins below the 70 floor). Still no
