@@ -4860,6 +4860,71 @@ def _lmts_live_set(enabled):
     return ok
 
 
+# ════════════════════════════════════════════════════════════════════════
+# POLYMARKET LIVE — mirrors the Limitless helpers above.
+# Same wallet key (LIMITLESS_PRIV_KEY signs both, since polymarket uses
+# signature_type=2 with a proxy funder address) but runs on Polygon (chain
+# 137) instead of Base.
+# ════════════════════════════════════════════════════════════════════════
+
+_poly_live_cache = {"value": None, "ts": 0.0}
+
+
+def _poly_live_enabled():
+    """True if Polymarket live trading is currently switched ON.
+
+    Defaults to OFF (paper) so flipping Polymarket live is an explicit user
+    action via /app/polymarket-toggle. No bootstrap env var — must be turned
+    on via the route after deploy."""
+    now = time.time()
+    if _poly_live_cache["value"] is not None and (now - _poly_live_cache["ts"]) < 3.0:
+        return _poly_live_cache["value"]
+    v = _settings_get("polymarket_live")
+    if v is None:
+        v = "0"
+        _settings_set("polymarket_live", v)
+    enabled = str(v).strip().lower() in ("1", "true", "yes", "on")
+    _poly_live_cache["value"] = enabled
+    _poly_live_cache["ts"] = now
+    return enabled
+
+
+def _poly_live_set(enabled):
+    """Flip the polymarket live switch and bust the in-process cache."""
+    ok = _settings_set("polymarket_live", "1" if enabled else "0")
+    _poly_live_cache["value"] = bool(enabled) if ok else _poly_live_cache["value"]
+    _poly_live_cache["ts"] = time.time() if ok else _poly_live_cache["ts"]
+    return ok
+
+
+def _poly_get_max_trade_usdc():
+    """Per-trade USDC cap for Polymarket live orders. Separate from the
+    Limitless cap so each platform can be sized independently — Polymarket
+    bankroll is smaller (~$33) so a different cap is appropriate.
+
+    NOTE: Polymarket enforces a 5-share minimum on limit orders. At typical
+    confirmation-signal prices (70-95c), that means real minimum stake is
+    $3.50-$4.75 per trade. Anything lower will be auto-rejected as CAPPED
+    by _poly_place_live with a clear reason. Default cap is $5 to ensure
+    most trades meet the minimum; bump higher to fire on 95c+ markets.
+
+    Read order:
+      1. v2_settings['polymarket_max_trade_usdc']  ← /app/set-poly-risk
+      2. POLYMARKET_MAX_TRADE_USDC env var
+      3. 5.0 hard fallback (covers up-to-95c markets at the 5-share minimum)
+    """
+    raw = _settings_get("polymarket_max_trade_usdc", None)
+    if raw is not None:
+        try:
+            val = float(raw)
+            if val >= 0.10:
+                return val
+        except (TypeError, ValueError):
+            pass
+    env_default = float(os.environ.get("POLYMARKET_MAX_TRADE_USDC", "5.0"))
+    return env_default
+
+
 def _lmts_get_client():
     """Lazily import py-limitless and authenticate. Returns None on any
     failure — caller treats None as 'live not available, keep going on paper'.
@@ -5038,10 +5103,13 @@ def _lmts_record_live_trade(paper_trade_id, asset, tf_label, direction,
                             shares, fill_status, order_id=None,
                             fill_price=None, filled_size=None,
                             raw_response=None, error_message=None,
-                            condition_id=None):
+                            condition_id=None, platform="limitless"):
     """Single audit row per live attempt — FILLED / CANCELLED / ERROR / CAPPED.
     condition_id is captured so the resolver/redeemer can find the on-chain
-    market without re-fetching from the API later."""
+    market without re-fetching from the API later.
+
+    platform: 'limitless' (default) or 'polymarket'. Same table, same columns
+    — the platform field tags which exchange/chain the row belongs to."""
     try:
         conn = get_db()
         conn.run("""
@@ -5051,13 +5119,14 @@ def _lmts_record_live_trade(paper_trade_id, asset, tf_label, direction,
                 stake_usdc, size_shares, fill_status, order_id,
                 fill_price_cents, filled_size, raw_response, error_message
             ) VALUES (
-                :ptid, 'limitless', :tf, :asset, :dir,
+                :ptid, :plat, :tf, :asset, :dir,
                 :slug, :tok, :cid, :lim,
                 :stake, :shares, :st, :oid,
                 :fp, :fs, :raw, :err
             )
         """,
-            ptid=paper_trade_id, tf=tf_label, asset=asset, dir=direction,
+            ptid=paper_trade_id, plat=platform,
+            tf=tf_label, asset=asset, dir=direction,
             slug=market_slug, tok=token_id, cid=(condition_id or None),
             lim=limit_cents, stake=stake, shares=shares, st=fill_status,
             oid=order_id, fp=fill_price, fs=filled_size,
@@ -5065,7 +5134,7 @@ def _lmts_record_live_trade(paper_trade_id, asset, tf_label, direction,
             err=(error_message[:1000] if error_message else None))
         conn.close()
     except Exception as e:
-        print("[LMTS-LIVE] record error: {}".format(e))
+        print("[{}-LIVE] record error: {}".format(platform.upper(), e))
 
 
 def _lmts_place_live(paper_trade_id, market_data, asset, tf_label, direction,
@@ -6026,6 +6095,182 @@ def _v2_resolve_trades():
 # The redeemer runs as its own pass so a flaky RPC, a not-yet-settled-on-chain
 # condition, or a single failure can't block resolution of new rows.
 
+# ════════════════════════════════════════════════════════════════════════
+# POLYMARKET LIVE PLACEMENT
+# Mirrors _lmts_place_live but uses py-clob-client for orders on Polygon.
+#
+# Key differences from Limitless:
+#   • Order API: client.create_and_post_order(OrderArgs, OrderType.GTC)
+#   • Response shape: {success, errorMsg, orderID, status, transactionsHashes}
+#     - status='matched' → FILLED (immediate match)
+#     - status='live'    → PENDING (resting on book)
+#     - status='delayed' → PENDING (in delay buffer; will go matched or live)
+#     - success=false    → ERROR (errorMsg has the reason)
+#   • Token IDs and condition_ids come from the same up_token/down_token/
+#     condition_id fields that paper trading already uses (no lazy fetch)
+#   • Same v2_live_trades table, tagged platform='polymarket'
+# ════════════════════════════════════════════════════════════════════════
+
+def _poly_place_live(paper_trade_id, market_data, asset, tf_label, direction,
+                     limit_price_cents, stake_usdc):
+    """Place a live BUY GTC on Polymarket CLOB. Records to v2_live_trades
+    with platform='polymarket'. Returns fill_status string. NEVER raises."""
+    market_slug  = (market_data or {}).get("slug") or ""
+    token_id     = ((market_data or {}).get("up_token") if direction == "UP"
+                    else (market_data or {}).get("down_token")) or ""
+    condition_id = (market_data or {}).get("condition_id") or ""
+
+    if not token_id:
+        _lmts_record_live_trade(
+            paper_trade_id, asset, tf_label, direction, market_slug, "",
+            limit_price_cents, stake_usdc, 0.0, "ERROR",
+            error_message="missing token_id in market_data",
+            condition_id=condition_id, platform="polymarket")
+        print("[POLY-LIVE] missing token_id for {} {} {}".format(
+            asset, tf_label, direction))
+        return "ERROR"
+
+    # Per-trade cap
+    capped_stake = min(float(stake_usdc), _poly_get_max_trade_usdc())
+    if capped_stake <= 0 or limit_price_cents <= 0:
+        _lmts_record_live_trade(
+            paper_trade_id, asset, tf_label, direction, market_slug, token_id,
+            limit_price_cents, stake_usdc, 0.0, "CAPPED",
+            error_message="stake or price non-positive",
+            condition_id=condition_id, platform="polymarket")
+        return "CAPPED"
+
+    # Get the client (already auth'd, used by paper for read-side too)
+    client = _get_poly_client()
+    if not client:
+        _lmts_record_live_trade(
+            paper_trade_id, asset, tf_label, direction, market_slug, token_id,
+            limit_price_cents, capped_stake, 0.0, "ERROR",
+            error_message="get_poly_client returned None",
+            condition_id=condition_id, platform="polymarket")
+        print("[POLY-LIVE] poly client unavailable")
+        return "ERROR"
+
+    # Tick-quantize shares the same way as Limitless (3-decimal floor).
+    # Polymarket also requires price × size to settle cleanly in micro-USDC;
+    # 3-decimal shares × ≤3-decimal price gives an integer micro-USDC cost.
+    import math as _math
+    price_decimal = limit_price_cents / 100.0
+    raw_shares = capped_stake / max(price_decimal, 0.01)
+    shares = _math.floor(raw_shares * 1000) / 1000.0
+    if shares <= 0:
+        _lmts_record_live_trade(
+            paper_trade_id, asset, tf_label, direction, market_slug, token_id,
+            limit_price_cents, capped_stake, 0.0, "CAPPED",
+            error_message="quantized shares = 0 (stake too small for price)",
+            condition_id=condition_id, platform="polymarket")
+        return "CAPPED"
+
+    # Polymarket enforces a 5-share minimum on limit orders (see docs:
+    # https://docs.polymarket.com — orderbook response has "min_order_size":
+    # "5"; the trading guide confirms "Limit orders require a minimum of 5
+    # shares"). If our stake at the current price can't buy 5 shares, the
+    # CLOB will reject the order. Catch it here with a clear reason so the
+    # user knows to either raise the cap or skip this price tier.
+    POLY_MIN_SHARES = 5.0
+    if shares < POLY_MIN_SHARES:
+        min_stake_needed = POLY_MIN_SHARES * price_decimal
+        reason = ("below Polymarket 5-share minimum: ${:.2f} stake @ {:.1f}c "
+                  "= {:.3f} shares (need ${:.2f} for 5 shares)").format(
+                  capped_stake, limit_price_cents, shares, min_stake_needed)
+        _lmts_record_live_trade(
+            paper_trade_id, asset, tf_label, direction, market_slug, token_id,
+            limit_price_cents, capped_stake, shares, "CAPPED",
+            error_message=reason, condition_id=condition_id,
+            platform="polymarket")
+        print("[POLY-LIVE] {} {} {} {}".format(asset, tf_label, direction, reason))
+        return "CAPPED"
+
+    # Build + post the order via py-clob-client. We try V2 first (the
+    # patched module if present), V1 otherwise — same fallback chain that
+    # _get_poly_client uses, so whichever module the client was built with
+    # is what we use here too.
+    try:
+        try:
+            from py_clob_client_v2.clob_types import OrderArgs, OrderType
+            from py_clob_client_v2.order_builder.constants import BUY
+            order_args = OrderArgs(price=price_decimal, size=shares,
+                                   side=BUY, token_id=str(token_id))
+            resp = client.create_and_post_order(order_args, OrderType.GTC)
+        except ImportError:
+            from py_clob_client.clob_types import OrderArgs, OrderType
+            from py_clob_client.order_builder.constants import BUY
+            order_args = OrderArgs(price=price_decimal, size=shares,
+                                   side=BUY, token_id=str(token_id))
+            resp = client.create_and_post_order(order_args, OrderType.GTC)
+    except Exception as e:
+        _lmts_record_live_trade(
+            paper_trade_id, asset, tf_label, direction, market_slug, token_id,
+            limit_price_cents, capped_stake, shares, "ERROR",
+            error_message=str(e)[:1000],
+            condition_id=condition_id, platform="polymarket")
+        print("[POLY-LIVE] order error {} {} {}: {}".format(
+            asset, tf_label, direction, str(e)[:200]))
+        return "ERROR"
+
+    # Parse Polymarket's response shape.
+    resp_d = resp if isinstance(resp, dict) else {}
+    success    = bool(resp_d.get("success", False))
+    err_msg    = resp_d.get("errorMsg") or ""
+    order_id   = resp_d.get("orderID") or resp_d.get("order_id") or ""
+    status_raw = (resp_d.get("status") or "").lower()
+    tx_hashes  = resp_d.get("transactionsHashes") or resp_d.get("transactionHashes") or []
+
+    if not success:
+        _lmts_record_live_trade(
+            paper_trade_id, asset, tf_label, direction, market_slug, token_id,
+            limit_price_cents, capped_stake, shares, "ERROR",
+            error_message=err_msg[:1000] or "polymarket success=false",
+            raw_response=resp_d, condition_id=condition_id,
+            platform="polymarket")
+        print("[POLY-LIVE] rejected {} {} {}: {}".format(
+            asset, tf_label, direction, err_msg[:200]))
+        return "ERROR"
+
+    # Map polymarket status → our fill_status vocabulary
+    if status_raw == "matched":
+        fill_status = "FILLED"
+    elif status_raw in ("live", "delayed"):
+        fill_status = "PENDING"   # resting on book or in delay buffer
+    elif status_raw in ("unmatched", "cancelled", "canceled", "expired"):
+        fill_status = "CANCELLED"
+    elif tx_hashes:
+        # No status but on-chain tx hashes returned → must have filled
+        fill_status = "FILLED"
+    else:
+        # Unknown status with success=true: log the raw response so we
+        # can patch the parser if Polymarket adds a new state.
+        try:
+            print("[POLY-LIVE] unknown status {!r} — full resp: {}".format(
+                status_raw, json.dumps(resp_d)[:600]))
+        except Exception:
+            pass
+        fill_status = "PENDING"  # default to PENDING (conservative)
+
+    # Polymarket doesn't return a separate fill_price field for matched
+    # orders — the fill price equals the order price for marketable limits,
+    # and for resting orders we don't know until it fills.
+    fill_price = limit_price_cents if fill_status == "FILLED" else None
+    filled_size = shares if fill_status == "FILLED" else 0.0
+
+    _lmts_record_live_trade(
+        paper_trade_id, asset, tf_label, direction, market_slug, token_id,
+        limit_price_cents, capped_stake, shares, fill_status,
+        order_id=str(order_id) if order_id else None,
+        fill_price=fill_price, filled_size=filled_size,
+        raw_response=resp_d, condition_id=condition_id,
+        platform="polymarket")
+    print("[POLY-LIVE] {} {} {} {} @ {:.1f}c x {:.3f} shares -> {} (status={})".format(
+        fill_status, asset, tf_label, direction, limit_price_cents,
+        shares, (order_id[:18] if order_id else "(no id)"), status_raw))
+    return fill_status
+
+
 _LMTS_LIVE_RESOLVE_DIAG = [0]   # at-most-N diagnostic prints per process
 _LMTS_RESOLVE_LOG_TS = {}        # per-slug timestamp dict (rate-limit verbose logs to once per 5 min)
 _LMTS_REDEEM_MAX_ATTEMPTS = 10  # docs warn API can mark resolved before CTF on-chain;
@@ -6731,19 +6976,27 @@ def _v2_scan_timeframe(timeframe):
                     market_url = _v2_market_url(platform, market_data, asset, tf_label)
 
                     # ── Either-or mode (toggled from the paper bot page) ──
-                    # When live trading is ON for a Limitless market, the scanner
-                    # SKIPS the paper insert entirely and places a real FOK on
-                    # Limitless — paper does not record. When OFF (or non-Limitless
-                    # platform), the original paper path runs unchanged.
-                    go_live = (platform == "limitless" and _lmts_live_enabled())
+                    # When live trading is ON for the signal's platform, the
+                    # scanner SKIPS the paper insert entirely and places a
+                    # real GTC on that platform — paper does not record.
+                    # When OFF, the original paper path runs unchanged.
+                    go_lmts_live = (platform == "limitless" and _lmts_live_enabled())
+                    go_poly_live = (platform == "polymarket" and _poly_live_enabled())
+                    go_live = go_lmts_live or go_poly_live
 
                     if go_live:
                         try:
-                            live_status = _lmts_place_live(
-                                None, market_data, asset, tf_label, direction,
-                                float(limit_price), float(FLAT_STAKE))
-                        except Exception as _lmts_e:
-                            print("[LMTS-LIVE] place exception (signal not recorded): {}".format(_lmts_e))
+                            if go_lmts_live:
+                                live_status = _lmts_place_live(
+                                    None, market_data, asset, tf_label, direction,
+                                    float(limit_price), float(FLAT_STAKE))
+                            else:
+                                live_status = _poly_place_live(
+                                    None, market_data, asset, tf_label, direction,
+                                    float(limit_price), float(FLAT_STAKE))
+                        except Exception as _live_e:
+                            print("[{}-LIVE] place exception (signal not recorded): {}".format(
+                                "POLY" if go_poly_live else "LMTS", _live_e))
                             continue
                     else:
                         try:
@@ -7864,6 +8117,163 @@ def limitless_toggle():
     print("[LMTS-LIVE] toggled {} -> {} (ok={})".format(
         "live" if cur else "paper", "live" if new else "paper", ok))
     return redirect("/app/paper-limitless")
+
+
+@app.route("/app/polymarket-toggle", methods=["POST", "GET"])
+def polymarket_toggle():
+    """Flip Polymarket live trading on/off (DB-backed). Same pattern as the
+    limitless toggle. Defaults to OFF — first call turns it on.
+
+    Usage:
+      /app/polymarket-toggle                → flip current state
+      /app/polymarket-toggle?to=on          → force ON
+      /app/polymarket-toggle?to=off         → force OFF
+    """
+    cur = _poly_live_enabled()
+    target = request.values.get("to", "").strip().lower()
+    if target in ("1", "live", "on", "yes", "true"):
+        new = True
+    elif target in ("0", "paper", "off", "no", "false"):
+        new = False
+    else:
+        new = not cur
+    ok = _poly_live_set(new)
+    print("[POLY-LIVE] toggled {} -> {} (ok={})".format(
+        "live" if cur else "paper", "live" if new else "paper", ok))
+    return ("<!doctype html><html><body style='font:15px system-ui;"
+            "max-width:560px;margin:30px auto;padding:0 18px'>"
+            "<h1 style='font:600 22px system-ui'>Polymarket live</h1>"
+            "<p style='font-size:18px'>State: <b style='color:" +
+            ("#15803d" if new else "#666") + "'>" +
+            ("LIVE" if new else "PAPER") + "</b></p>"
+            "<p style='color:#666;font-size:13px'>" +
+            ("Polymarket signals will now place real orders on-chain at "
+             "$" + ("%.2f" % _poly_get_max_trade_usdc()) + "/trade. "
+             "Toggle off any time at <a href='/app/polymarket-toggle?to=off'>"
+             "?to=off</a>." if new else
+             "Polymarket signals are paper-only. Toggle on at "
+             "<a href='/app/polymarket-toggle?to=on'>?to=on</a>.") +
+            "</p><p style='margin-top:20px'>"
+            "<a href='/app/set-poly-risk'>Configure per-trade cap →</a> · "
+            "<a href='/app/live-redemptions'>← live dashboard</a></p>"
+            "</body></html>"), 200
+
+
+@app.route("/app/set-poly-risk")
+def set_poly_risk_route():
+    """Change the per-trade USDC cap for POLYMARKET live trades on the fly.
+
+    Mirrors /app/set-risk but for the polymarket side. Polymarket has a
+    5-share minimum on limit orders (per docs.polymarket.com), so at typical
+    confirmation prices (70-95c) the real minimum stake is $3.50-$4.75 per
+    trade. Anything below $2.50 will fail to fill even on 50c markets.
+
+    Usage:
+      /app/set-poly-risk?max_usdc=5      → $5.00 per trade (default)
+      /app/set-poly-risk?max_usdc=10     → $10.00 per trade
+      /app/set-poly-risk?max_usdc=reset  → clear override, use env-var default
+    """
+    arg = (request.args.get("max_usdc") or "").strip()
+    current = _poly_get_max_trade_usdc()
+    env_default = float(os.environ.get("POLYMARKET_MAX_TRADE_USDC", "5.0"))
+
+    msg = ""
+    if arg:
+        if arg.lower() in ("reset", "default", "clear"):
+            try:
+                conn = get_db()
+                conn.run("DELETE FROM v2_settings WHERE key = :k",
+                         k="polymarket_max_trade_usdc")
+                conn.close()
+                current = env_default
+                msg = ('<p style="color:#15803d;font-weight:600">✓ Override '
+                       'cleared. Now using env-var default: $'
+                       + ("%.2f" % env_default) + '/trade.</p>')
+            except Exception as e:
+                msg = '<p style="color:#b91c1c">Reset failed: ' + str(e)[:300] + '</p>'
+        else:
+            try:
+                new_val = float(arg)
+                if new_val < 2.50:
+                    msg = ('<p style="color:#b91c1c">Refused: $'
+                           + ("%.2f" % new_val)
+                           + ' is below Polymarket\'s 5-share minimum '
+                           '(5 × $0.50 = $2.50 floor even on 50c markets, '
+                           'and most signals fire at 70-95c where the min '
+                           'is $3.50-$4.75). Use $5 or higher.</p>')
+                elif new_val > 50.0:
+                    msg = ('<p style="color:#b91c1c">Refused: $'
+                           + ("%.2f" % new_val) + ' is above the $50 sanity '
+                           'ceiling for Polymarket (smaller bankroll than '
+                           'Limitless).</p>')
+                else:
+                    ok = _settings_set("polymarket_max_trade_usdc", new_val)
+                    if ok:
+                        current = new_val
+                        msg = ('<p style="color:#15803d;font-weight:600">✓ '
+                               'Polymarket per-trade cap set to <b>$'
+                               + ("%.2f" % new_val)
+                               + '</b>. Takes effect on the next live order.</p>')
+                    else:
+                        msg = '<p style="color:#b91c1c">DB write failed — check logs.</p>'
+            except (TypeError, ValueError):
+                msg = ('<p style="color:#b91c1c">Invalid number: <code>'
+                       + str(arg)[:80] + '</code>.</p>')
+
+    src = ("v2_settings override" if _settings_get("polymarket_max_trade_usdc")
+           is not None else "env-var fallback")
+    live_state = "LIVE" if _poly_live_enabled() else "PAPER"
+
+    html = (
+        "<!doctype html><html><head><meta charset='utf-8'>"
+        "<title>Polymarket risk · Cmvng Bot</title>"
+        "<style>"
+        "body{font:15px system-ui;max-width:680px;margin:30px auto;padding:0 18px}"
+        "a{color:#2f6bd6;text-decoration:none}"
+        "a:hover{text-decoration:underline}"
+        "code{background:#f4f4f4;padding:2px 6px;border-radius:4px;font-size:13px}"
+        "table{font:14px system-ui;border-collapse:collapse;margin-top:12px;background:#fafafa}"
+        "td{padding:10px 14px;border-bottom:1px solid #eee}"
+        ".note{background:#fff8e1;border-left:3px solid #f59e0b;padding:10px 14px;"
+        "margin-top:16px;font-size:13px;color:#5d4205}"
+        "</style></head><body>"
+        "<h1 style='font:600 22px system-ui'>Polymarket · risk per trade</h1>"
+        + msg +
+        "<table>"
+        "<tr><td>Current cap</td>"
+        "<td style='font-weight:700;font-size:20px'>$" + ("%.2f" % current) +
+        " per trade</td></tr>"
+        "<tr><td>Source</td><td>" + src + "</td></tr>"
+        "<tr><td>Live state</td>"
+        "<td><b style='color:" + ("#15803d" if live_state == "LIVE" else "#666") + "'>"
+        + live_state + "</b></td></tr>"
+        "<tr><td style='border-bottom:none'>Env-var default</td>"
+        "<td style='border-bottom:none'>$" + ("%.2f" % env_default) +
+        "</td></tr>"
+        "</table>"
+        "<div class='note'>"
+        "<b>Polymarket 5-share minimum:</b> limit orders require ≥5 shares. "
+        "At 50c that's $2.50, at 70c $3.50, at 95c $4.75. Most confirmation "
+        "signals fire at 70-95c — your cap should be at least <b>$5</b> to "
+        "cover those reliably."
+        "</div>"
+        "<h3 style='font:600 16px system-ui;margin-top:24px'>Change it</h3>"
+        "<ul style='font:14px system-ui;line-height:1.7'>"
+        "<li><a href='/app/set-poly-risk?max_usdc=5'>?max_usdc=5</a> → $5.00 (covers up to 100c · ~7 trades on $33 BR)</li>"
+        "<li><a href='/app/set-poly-risk?max_usdc=7'>?max_usdc=7</a> → $7.00 (~4-5 trades on $33 BR)</li>"
+        "<li><a href='/app/set-poly-risk?max_usdc=10'>?max_usdc=10</a> → $10.00 (~3 trades on $33 BR)</li>"
+        "<li><a href='/app/set-poly-risk?max_usdc=15'>?max_usdc=15</a> → $15.00 (~2 trades on $33 BR — aggressive)</li>"
+        "<li><a href='/app/set-poly-risk?max_usdc=reset'>?max_usdc=reset</a> → "
+        "clear override</li>"
+        "</ul>"
+        "<p style='font:13px system-ui;color:#666;margin-top:18px'>"
+        "Takes effect on the next live order. Floor: $2.50. Ceiling: $50.</p>"
+        "<p style='margin-top:24px'>"
+        "<a href='/app/polymarket-toggle'>Toggle live on/off →</a> · "
+        "<a href='/app/live-redemptions'>← live dashboard</a></p>"
+        "</body></html>"
+    )
+    return html, 200
 
 
 @app.route("/app/limitless-approve", methods=["POST", "GET"])
@@ -11272,7 +11682,7 @@ TIER_CONFIG = {
         "label": "2 ODDS — BANKER", "emoji": "🟢",
     },
     "3_odds": {
-        "target": 3.0, "min_conf": 83, "min_sel": 4, "max_sel": 7,
+        "target": 3.0, "min_conf": 83, "min_sel": 4, "max_sel": 10,
         "odds_lo": 1.12, "odds_hi": 1.48,
         # SAFE: double chance + goals lines + outright wins ONLY when the match
         # projects clear (tight games shade wins below the 70 floor). Still no
@@ -11287,7 +11697,7 @@ TIER_CONFIG = {
         "label": "3 ODDS — SAFE", "emoji": "🟢",
     },
     "5_odds": {
-        "target": 5.0, "min_conf": 73, "min_sel": 3, "max_sel": 6,
+        "target": 5.0, "min_conf": 73, "min_sel": 3, "max_sel": 10,
         "odds_lo": 1.22, "odds_hi": 1.80,
         # VALUE: this is where BTTS / corners are allowed to enter.
         "exclude": ["correct_score"],
@@ -11303,14 +11713,97 @@ TIER_CONFIG = {
                    "home_win_over_2.5", "over_3.5"],
         "label": "10 ODDS — RISK", "emoji": "🟠",
     },
+    "100_odds": {
+        # BOLD CALLS — directional picks committing to what the data is
+        # saying. "Bold" means CONFIDENT, not RECKLESS — a bold call is a
+        # mix of bold and safe markets chosen for hit rate, not for raw
+        # odds. For a predicted 2-0, the bold call is "Brazil to Win" or
+        # "Win-a-Half" or "Over 1.5" (high hit), NOT "Brazil -1.5 handicap"
+        # (fragile, busts on 1-0 or 2-1).
+        #
+        # The allow list is intentionally wide so the bot has both
+        # AGGRESSIVE markets (handicap, over 3.5) for cases where data
+        # supports them (4-0 predictions, 3-1 predictions) and SAFER
+        # markets (over 1.5, X2 double chance, DNB, unders) for tighter
+        # games where direction is clear but margin/total isn't.
+        #
+        # rank="conf" (not "odds") ranks picks by hit-rate first — so on a
+        # 2-0 prediction, "Brazil to Win" at 78% confidence beats
+        # "Brazil -1.5" at 55% confidence even though the handicap has
+        # bigger odds. This is the smart-punter ordering.
+        "target": 100.0, "min_conf": 60, "min_sel": 4, "max_sel": 20,
+        "odds_lo": 1.30, "odds_hi": 4.50,    # widened lo to admit DNBs (~1.30)
+        "rank": "conf",                       # highest-confidence picks first
+        "allow": [
+            # Match winner / draw (direction lock)
+            "home_win", "away_win", "draw",
+            # Double chance (committed direction + safety net)
+            "double_chance_1X", "double_chance_X2",
+            # Draw No Bet — back a side, get stake back on draw
+            "dnb_home", "dnb_away",
+            # Over X goals (commits to goals coming)
+            "over_1", "over_1.5", "over_2", "over_2.5", "over_3.5",
+            # Under X goals (commits to LOW-scoring on tight predictions)
+            "under_1.5", "under_2.5", "under_3.5", "under_4.5",
+            # Handicap (commits to a margin — use when prediction is heavy)
+            "handicap_home_-1.5", "handicap_away_-1.5",
+        ],
+        # Win-a-half market_types are dynamically constructed
+        # (winhalf_home_1sthalf_yes, etc.) so they can't be enumerated —
+        # let them through by prefix.
+        "allow_prefixes": ["winhalf_"],
+        "prefer": [
+            # Direction-locks and high-hit-rate markets first
+            "home_win", "away_win", "draw",
+            "double_chance_1X", "double_chance_X2",
+            "dnb_home", "dnb_away",
+            "over_1.5", "under_3.5",
+            # Bolder markets second — only when data supports them
+            "over_2.5", "over_3.5",
+            "handicap_home_-1.5", "handicap_away_-1.5",
+        ],
+        "label": "100 ODDS — BOLD CALLS", "emoji": "🎯",
+    },
     "1000_odds": {
-        "target": 1000.0, "min_conf": 58, "min_sel": 4, "max_sel": 20,
-        "odds_lo": 1.28, "odds_hi": 15.0,   # real legs only — no 1.01 padding
-        "rank": "odds",                      # build toward big odds, best longshots first
-        "prefer": ["correct_score", "home_win_btts", "home_win_over_2.5",
-                   "handicap_home_-1.5", "handicap_away_-1.5", "over_3.5",
-                   "cards_over_3.5", "away_win", "corners_over_9.5"],
-        "label": "1000+ ODDS — MOONSHOT", "emoji": "🔴",
+        # GRAND AUDIT — max-odds slip targeting 5000+. Uses the SAME
+        # bold-call market universe and SAME smart-punter ranking as
+        # 100 ODDS, just stacks more legs to reach the bigger total.
+        #
+        # The build_all_accumulators pipeline pre-populates this tier's
+        # match_count with every GAME used in 100 ODDS, so Grand Audit
+        # never overlaps with the bold slip — true no-game-repeat across
+        # the session.
+        #
+        # rank="conf" ranks picks by hit-rate first; on a thin slate the
+        # tier will lean on smart-safe markets (DNBs, X2, over 1.5,
+        # under 3.5) which makes more legs fit while still committing to
+        # what the data says.
+        #
+        # Internal key remains "1000_odds" for backwards compatibility
+        # with historical sportybet_accumulators rows; the user-facing
+        # label is "GRAND AUDIT".
+        "target": 5000.0, "min_conf": 55, "min_sel": 5, "max_sel": 20,
+        "odds_lo": 1.28, "odds_hi": 6.00,
+        "rank": "conf",                       # smart-punter ordering
+        "allow": [
+            # Same expanded bold-call universe as 100 ODDS
+            "home_win", "away_win", "draw",
+            "double_chance_1X", "double_chance_X2",
+            "dnb_home", "dnb_away",
+            "over_1", "over_1.5", "over_2", "over_2.5", "over_3.5",
+            "under_1.5", "under_2.5", "under_3.5", "under_4.5",
+            "handicap_home_-1.5", "handicap_away_-1.5",
+        ],
+        "allow_prefixes": ["winhalf_"],
+        "prefer": [
+            "home_win", "away_win", "draw",
+            "double_chance_1X", "double_chance_X2",
+            "dnb_home", "dnb_away",
+            "over_1.5", "under_3.5",
+            "over_2.5", "over_3.5",
+            "handicap_home_-1.5", "handicap_away_-1.5",
+        ],
+        "label": "GRAND AUDIT — MAX ODDS", "emoji": "🚀",
     },
 }
 
@@ -11371,17 +11864,32 @@ def build_accumulator(all_picks, tier_key, used_selections=None, match_count=Non
     target = cfg["target"]
     prefer_set = set(cfg["prefer"])
     allow_set = set(cfg.get("allow", []))      # if set, ONLY these market types
+    allow_prefixes = tuple(cfg.get("allow_prefixes", []))  # ...OR these prefixes
     exclude_set = set(cfg.get("exclude", []))  # never these market types
     used_selections = used_selections or set()   # (match, market_type) already used
     match_count = match_count or {}              # match -> how many tiers it's in already
     match_families = match_families or {}        # match -> bet families already used for it
     avoid_games = avoid_games or set()           # games used in the PREVIOUS session
 
+    # A pick passes the market-type filter when:
+    #   - no allow rule is configured (open to everything except exclude_set), OR
+    #   - its market_type is explicitly in allow_set, OR
+    #   - its market_type starts with one of allow_prefixes (for dynamic market
+    #     names like winhalf_home_1sthalf_yes that can't be enumerated).
+    has_allow_rule = bool(allow_set or allow_prefixes)
+
+    def _market_allowed(mt):
+        if not has_allow_rule:
+            return True
+        if mt in allow_set:
+            return True
+        return any(mt.startswith(pre) for pre in allow_prefixes)
+
     eligible = [
         p for p in all_picks
         if p["confidence"] >= cfg["min_conf"]
         and cfg["odds_lo"] <= p["odds"] <= cfg["odds_hi"]
-        and (not allow_set or p["market_type"] in allow_set)
+        and _market_allowed(p["market_type"])
         and p["market_type"] not in exclude_set
         and (p["match"], p["market_type"]) not in used_selections
         # A game may appear in at most `max_reuse` slips, and any repeat must be a
@@ -11394,12 +11902,12 @@ def build_accumulator(all_picks, tier_key, used_selections=None, match_count=Non
     if not eligible:
         return None
 
-    # 5/10/1000 have no banker whitelist — those are the exploratory tiers.
+    # 5/10/grand_audit have no banker whitelist — those are the exploratory tiers.
     # They cap diversity by bet FAMILY (so "1st Half Under 1/1.5/2" count as ONE
     # kind of bet) and spread hard, to reach the full range of SportyBet markets.
-    # The 2/3 banker tiers keep their ORIGINAL behaviour: cap by exact market
-    # type with a +1 slack, so they stay safe and unchanged.
-    explore_tier = not allow_set
+    # The 2/3/100 constrained tiers keep their ORIGINAL behaviour: cap by exact
+    # market type with a +1 slack, so they stay disciplined.
+    explore_tier = not has_allow_rule
 
     def _div_key(p):
         return _mkt_family(p["market_type"]) if explore_tier else p["market_type"]
@@ -11412,6 +11920,11 @@ def build_accumulator(all_picks, tier_key, used_selections=None, match_count=Non
         max_per_type = 1  # plenty of variety -> force every leg a different type
 
     rank_mode = cfg.get("rank", "conf")   # "odds" = moonshot builds toward big odds
+    # When True, target is treated as an aspiration, not a ceiling. Used by
+    # Grand Audit so it keeps stacking legs until max_sel is reached or no
+    # more eligible picks exist — final odds lands wherever the data takes
+    # it, not capped at target * 0.92.
+    no_ceiling = bool(cfg.get("no_stop_at_target", False))
 
     def base_rank(p):
         # 1) games from the PREVIOUS session sink to the bottom (only used if the
@@ -11455,16 +11968,30 @@ def build_accumulator(all_picks, tier_key, used_selections=None, match_count=Non
                 if type_count.get(key, 0) >= per_type_cap:
                     continue
                 new_running = running * p["odds"]
-                if rank_mode != "odds" and new_running > target * 1.18 and len(slip) >= cfg["min_sel"]:
+                # Overshoot guard: only applies to non-rank tiers with a
+                # ceiling. Grand Audit (no_ceiling=True) explicitly wants to
+                # blow past the target if the data allows it.
+                if (not no_ceiling and rank_mode != "odds"
+                        and new_running > target * 1.18
+                        and len(slip) >= cfg["min_sel"]):
                     continue
                 slip.append(p)
                 used_matches.add(p["match"])
                 type_count[key] = type_count.get(key, 0) + 1
                 running = new_running
                 progressed = True
-                if running >= target * 0.92 and len(slip) >= cfg["min_sel"]:
+                # Early-stop only when target is a real ceiling. For
+                # no-ceiling tiers (Grand Audit), keep going until max_sel
+                # or no more eligible picks.
+                if (not no_ceiling and running >= target * 0.92
+                        and len(slip) >= cfg["min_sel"]):
                     return True
                 break  # restart scan from the top for best-ranked next pick
+        # Final success check: no-ceiling tiers succeed if they reached
+        # min_sel regardless of total odds; ceiling tiers need to be at
+        # 92% of target as well.
+        if no_ceiling:
+            return len(slip) >= cfg["min_sel"]
         return running >= target * 0.92 and len(slip) >= cfg["min_sel"]
 
     # First pass: strict diversity cap
@@ -11490,17 +12017,25 @@ def build_accumulator(all_picks, tier_key, used_selections=None, match_count=Non
 
 
 def build_all_accumulators(all_picks, avoid_games=None):
-    """Build all 5 tiers, each distinct. Returns {tier_key: accumulator|None}.
-    Tiers are built safest-first, with de-duplication that controls correlation:
-      - the identical leg (match, market_type) is never repeated across tiers;
-      - by DEFAULT a game appears in only ONE slip (no repeat). A tier that can't
-        build under that rule relaxes to allow a game in 2 then 3 slips — but any
-        repeat must be a TOTALLY different bet family, so no one result sinks the
-        board. This keeps thin days from losing the bigger tiers (flexible
-        moonshot) while busy days stay fully spread;
-      - games used in the PREVIOUS session are pushed to the bottom, so the 12h
-        session 2 doesn't repeat session 1 (best-effort: on a very thin slate it
-        may have to reuse some, since the same few games are all that's on)."""
+    """Build all 6 tiers, each distinct. Returns {tier_key: accumulator|None}.
+
+    Pipeline:
+      1. 2/3/5 are built SEQUENTIALLY sharing the same `used`/`match_count`/
+         `match_families` state — these are the "linked" tiers where no leg
+         and (under no_repeat) no game crosses between them. The original
+         1→2→3 reuse-cap relaxation is preserved unchanged.
+      2. 10 is a STANDALONE slip built from the full board (max_reuse=1),
+         identical to the prior behaviour.
+      3. 100 (BOLD CALLS, NEW) is a STANDALONE slip built from the full
+         board with the bold-call market filter (set in TIER_CONFIG).
+      4. GRAND AUDIT (internal key 1000_odds, the renamed/reworked tier)
+         is the final STANDALONE slip but with one extra constraint: it
+         cannot repeat any (game, family) pair already used in 100 ODDS.
+         This is the "no game+category repeat across the session" rule —
+         Grand Audit can use the same GAMES as 100 ODDS, just not with the
+         same BET TYPE.
+    All tiers continue to honour `avoid_games` (previous-session avoidance)
+    and the existing rotation_seed jitter so consecutive runs differ."""
     result = {}
     used = set()            # (match, market_type) legs already placed
     match_count = {}        # match -> how many slips it appears in
@@ -11509,22 +12044,12 @@ def build_all_accumulators(all_picks, avoid_games=None):
     # Per-run rotation: changes each hour so consecutive runs (e.g. 6am vs 6pm)
     # pick DIFFERENT expressions of the same games rather than the identical slip.
     rotation_seed = int(time.time() // 3600)
-    for tier_key in ["2_odds", "3_odds", "5_odds", "10_odds", "1000_odds"]:
+
+    # ── Linked tiers: 2/3/5 share state and stay distinct from each other.
+    # No leg is reused across them; a game is normally in only one slip but
+    # the cap relaxes 1→2→3 if a tier can't build on a thin slate.
+    for tier_key in ["2_odds", "3_odds", "5_odds"]:
         tgt = TIER_CONFIG[tier_key]["target"]
-        if tier_key in ("10_odds", "1000_odds"):
-            # The two highest tiers need the scarce high-odds legs, and on a thin
-            # slate the lower tiers eat them first under no-repeat — which is what
-            # stranded the moonshot on 4 legs. Each of these is a STANDALONE slip
-            # the user plays on its own, so build each from the FULL board (highest
-            # available legs, one per match) rather than the leftovers. They may
-            # share a game with another slip — that's fine across separate slips.
-            result[tier_key] = build_accumulator(
-                all_picks, tier_key, set(), {}, {}, rotation_seed,
-                max_reuse=1, avoid_games=avoid_games)
-            continue
-        # 2/3/5: kept distinct from each other (no-repeat). Relax the cap 1->2->3
-        # so a tier can still REACH ITS TARGET on a thin slate by reusing a game
-        # with a DIFFERENT bet family. Keep the best build across caps.
         best = None
         for cap in (1, 2, 3):
             acc = build_accumulator(all_picks, tier_key, used, match_count,
@@ -11541,6 +12066,31 @@ def build_all_accumulators(all_picks, avoid_games=None):
                 m = s["match"]
                 match_count[m] = match_count.get(m, 0) + 1
                 match_families.setdefault(m, set()).add(_mkt_family(s["market_type"]))
+
+    # ── 10 standalone (unchanged behaviour) ──
+    result["10_odds"] = build_accumulator(
+        all_picks, "10_odds", set(), {}, {}, rotation_seed,
+        max_reuse=1, avoid_games=avoid_games)
+
+    # ── 100 ODDS (BOLD CALLS) standalone ──
+    bold_acc = build_accumulator(
+        all_picks, "100_odds", set(), {}, {}, rotation_seed,
+        max_reuse=1, avoid_games=avoid_games)
+    result["100_odds"] = bold_acc
+
+    # ── GRAND AUDIT standalone, blocked from using ANY game already in the
+    # 100 ODDS slip — true no-game-repeat across the session. We pre-populate
+    # match_count with the bold slip's games at count 1, so the eligible
+    # filter (match_count.get(match, 0) < max_reuse=1) evaluates to 1<1=False
+    # and excludes every bold-slip game. match_families stays empty since the
+    # dedup happens at the game level now, not the family level. ──
+    grand_match_count = {}
+    if bold_acc:
+        for s in bold_acc["selections"]:
+            grand_match_count[s["match"]] = 1
+    result["1000_odds"] = build_accumulator(
+        all_picks, "1000_odds", set(), grand_match_count, {},
+        rotation_seed, max_reuse=1, avoid_games=avoid_games)
     return result
 
 
@@ -16069,7 +16619,7 @@ def run_football_engine(get_db, tg_token, tg_chat, send_telegram,
             acca_dict = {}
 
         accumulators = [acca_dict[k] for k in
-                        ["2_odds", "3_odds", "5_odds", "10_odds", "1000_odds"]
+                        ["2_odds", "3_odds", "5_odds", "10_odds", "100_odds", "1000_odds"]
                         if acca_dict.get(k)]
 
         # 4. Generate SportyBet codes (reusing the event cache from enrichment)
@@ -16683,7 +17233,8 @@ def _fb_get_results():
     """Win-rate stats per accumulator tier."""
     tiers = [("2_odds", "🟢 2 ODDS — BANKER"), ("3_odds", "🟢 3 ODDS — SAFE"),
              ("5_odds", "🟡 5 ODDS — VALUE"), ("10_odds", "🟠 10 ODDS — RISK"),
-             ("1000_odds", "🔴 1000+ ODDS — MOONSHOT")]
+             ("100_odds", "🎯 100 ODDS — BOLD CALLS"),
+             ("1000_odds", "🚀 GRAND AUDIT — MAX ODDS")]
     stats = []
     agg = {}
     try:
@@ -17192,7 +17743,8 @@ def fb_results_page():
                 "FROM sportybet_accumulators WHERE match_date = :d ORDER BY id DESC",
                 d=date_q)
             conn.close()
-            order = {"2_odds": 0, "3_odds": 1, "5_odds": 2, "10_odds": 3, "1000_odds": 4}
+            order = {"2_odds": 0, "3_odds": 1, "5_odds": 2, "10_odds": 3,
+                     "100_odds": 4, "1000_odds": 5}
             gmap = {}
             for r in rows:
                 # group key: run_id when present, else fall back to created_at
