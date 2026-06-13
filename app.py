@@ -11567,19 +11567,27 @@ def _apply_prediction_alignment(picks, fx):
 
     Reads the rounded predicted score from fx['_pred_score'] (e.g. "2-0")
     set by _fb_fixtures_from_predictions. For each pick, derives whether
-    its market outcome would WIN given that score, and adjusts confidence:
-      - CONTRADICTS the prediction  →  confidence × 0.15  (effectively removed)
-      - ALIGNS with the prediction  →  confidence × 1.08  (small boost, capped 92)
-      - AMBIGUOUS (first-half lines, unknown markets, etc) →  unchanged
+    its market outcome would WIN given that score, and adjusts confidence.
 
-    Penalty severity scales with the predicted margin:
-      - clear blowout (|margin| >= 2)  →  strong penalty (×0.15) — high confidence to contradict
-      - close win    (|margin| == 1)   →  moderate penalty (×0.40) — could go either way
-      - predicted draw (margin == 0)   →  no penalty at all — anything can happen in a 1-1
+    Two penalty tracks because winner-alignment and total-alignment have
+    different uncertainty:
 
-    Boost is fixed × 1.08 so we don't over-promote weak picks; the
-    important effect is the penalty bringing contradicting picks below
-    the tier min_conf floors. """
+      WINNER track (home_win, dc_X2, dnb_home, handicap, oneup, winhalf):
+        - blowout predicted (|margin| >= 2)  →  ×0.15  (strong)
+        - close win        (|margin| == 1)   →  ×0.40  (moderate)
+        - predicted draw   (margin == 0)     →  ×1.00  (no penalty — winner
+                                                       is genuinely uncertain)
+
+      TOTAL track (over_*, under_*, btts_*, team_*_over_*, team_*_under_*):
+        - always ×0.15 when contradicting   (totals are concrete: 1-1 means
+                                             2 goals, you can't 'over 3.5'
+                                             that, even if sources disagree
+                                             slightly on the winner)
+
+    Aligned picks (either track) get a small ×1.08 boost capped at 92.
+    Ambiguous picks (first-half lines, corners, cards, multigoal, unknown
+    markets) are left untouched.
+    """
     pred = fx.get("_pred_score") or ""
     try:
         h_pred_s, a_pred_s = pred.split("-")
@@ -11592,109 +11600,112 @@ def _apply_prediction_alignment(picks, fx):
     total = h_pred + a_pred
     abs_m = abs(margin)
 
-    # Penalty severity by predicted margin
+    # Winner-track penalty severity (margin-scaled)
     if abs_m >= 2:
-        penalty = 0.15        # blowout predicted — heavy penalty for contradiction
+        winner_penalty = 0.15
     elif abs_m == 1:
-        penalty = 0.40        # close game — moderate penalty (1-0 could easily land 1-1)
+        winner_penalty = 0.40
     else:
-        return picks          # predicted draw — anything possible, no filter
+        winner_penalty = 1.00     # predicted draw: don't filter winner picks
+
+    # Total-track penalty (always strong — totals are unambiguous)
+    total_penalty = 0.15
 
     home_wins_pred = margin >= 1
     away_wins_pred = margin <= -1
 
-    def aligns(mt):
-        """Return True if mt aligns with predicted score, False if contradicts,
-        None if ambiguous/can't tell."""
+    def classify(mt):
+        """Return (track, aligns) where:
+          track   = 'winner' | 'total' | None (ambiguous, leave alone)
+          aligns  = True if mt would win given predicted score
+                    False if mt would lose
+                    None if can't determine"""
         if not mt:
-            return None
-        # ── Match-winner family ──
+            return None, None
+        # ── Match-winner family (WINNER track) ──
         if mt == "home_win":
-            return home_wins_pred
+            return "winner", home_wins_pred
         if mt == "away_win":
-            return away_wins_pred
+            return "winner", away_wins_pred
         if mt == "draw":
-            return margin == 0
-        # ── Double chance (full match) ──
+            return "winner", margin == 0
         if mt == "double_chance_1X" or mt == "dc1up_1x":
-            return home_wins_pred or margin == 0
+            return "winner", home_wins_pred or margin == 0
         if mt == "double_chance_X2" or mt == "dc1up_x2":
-            return away_wins_pred or margin == 0
+            return "winner", away_wins_pred or margin == 0
         if mt == "double_chance_12" or mt == "dc1up_12":
-            return margin != 0
-        # ── Draw No Bet ──
+            return "winner", margin != 0
         if mt == "dnb_home":
-            return home_wins_pred
+            return "winner", home_wins_pred
         if mt == "dnb_away":
-            return away_wins_pred
-        # ── 1UP / Win-a-Half (treat as needing a win) ──
+            return "winner", away_wins_pred
         if mt == "oneup_home" or mt.startswith("winhalf_home"):
-            return home_wins_pred
+            return "winner", home_wins_pred
         if mt == "oneup_away" or mt.startswith("winhalf_away"):
-            return away_wins_pred
-        # ── Handicaps ──
+            return "winner", away_wins_pred
         if mt == "handicap_home_-1.5":
-            return margin >= 2
+            return "winner", margin >= 2
         if mt == "handicap_away_-1.5":
-            return margin <= -2
-        # ── Total goals (Over/Under) ──
+            return "winner", margin <= -2
+        # ── Total goals (TOTAL track) ──
         if mt.startswith("over_"):
             try:
                 line = float(mt.split("_", 1)[1])
-                return total > line
+                return "total", total > line
             except (ValueError, IndexError):
-                return None
+                return None, None
         if mt.startswith("under_"):
             try:
                 line = float(mt.split("_", 1)[1])
-                return total < line
+                return "total", total < line
             except (ValueError, IndexError):
-                return None
-        # ── Team totals ──
+                return None, None
         if mt.startswith("team_home_over_"):
             try:
                 line = float(mt.replace("team_home_over_", ""))
-                return h_pred > line
+                return "total", h_pred > line
             except ValueError:
-                return None
+                return None, None
         if mt.startswith("team_home_under_"):
             try:
                 line = float(mt.replace("team_home_under_", ""))
-                return h_pred < line
+                return "total", h_pred < line
             except ValueError:
-                return None
+                return None, None
         if mt.startswith("team_away_over_"):
             try:
                 line = float(mt.replace("team_away_over_", ""))
-                return a_pred > line
+                return "total", a_pred > line
             except ValueError:
-                return None
+                return None, None
         if mt.startswith("team_away_under_"):
             try:
                 line = float(mt.replace("team_away_under_", ""))
-                return a_pred < line
+                return "total", a_pred < line
             except ValueError:
-                return None
-        # ── BTTS ──
+                return None, None
         if mt == "btts_yes":
-            return h_pred > 0 and a_pred > 0
+            return "total", h_pred > 0 and a_pred > 0
         if mt == "btts_no":
-            return h_pred == 0 or a_pred == 0
+            return "total", h_pred == 0 or a_pred == 0
         # ── First-half, corners, cards, multigoal, etc. — too ambiguous
         # to verify from a full-time score; leave unchanged.
-        return None
+        return None, None
 
     for p in picks:
-        a = aligns(p.get("market_type"))
+        track, a = classify(p.get("market_type"))
+        if track is None or a is None:
+            continue  # ambiguous market — leave alone
         if a is True:
             new_conf = min(92.0, p.get("confidence", 0) * 1.08)
             p["confidence"] = round(new_conf, 1)
             p["odds"] = prob_to_odds(new_conf)
-        elif a is False:
-            new_conf = p.get("confidence", 0) * penalty
-            p["confidence"] = round(new_conf, 1)
-            p["odds"] = prob_to_odds(new_conf)
-        # a is None → leave unchanged
+        else:  # a is False — contradicts the prediction
+            penalty = winner_penalty if track == "winner" else total_penalty
+            if penalty < 1.0:
+                new_conf = p.get("confidence", 0) * penalty
+                p["confidence"] = round(new_conf, 1)
+                p["odds"] = prob_to_odds(new_conf)
 
     return picks
 
