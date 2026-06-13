@@ -11545,6 +11545,157 @@ def analyze_fixture(fx):
     except Exception as e:
         print("[FB] board explore error: {}".format(e))
 
+    # ── PREDICTION ALIGNMENT (smart-punter rule) ──
+    # The bot's whole job is to BACK the prediction using the right market.
+    # A pick whose outcome cannot occur if the prediction is correct is, by
+    # definition, betting AGAINST our own data — that should never make it
+    # onto a slip. This pass slashes the confidence of any pick that
+    # contradicts the predicted scoreline (e.g. "Morocco or Draw" when the
+    # consensus says Brazil 2-0) so it falls below the tier confidence floors
+    # and can't be picked. Aligned picks get a small boost.
+    try:
+        picks = _apply_prediction_alignment(picks, fx)
+    except Exception as e:
+        print("[FB] alignment error for {}: {}".format(match_label, e))
+
+    return picks
+
+
+def _apply_prediction_alignment(picks, fx):
+    """Penalize picks that contradict the predicted scoreline; boost picks
+    that align with it.
+
+    Reads the rounded predicted score from fx['_pred_score'] (e.g. "2-0")
+    set by _fb_fixtures_from_predictions. For each pick, derives whether
+    its market outcome would WIN given that score, and adjusts confidence:
+      - CONTRADICTS the prediction  →  confidence × 0.15  (effectively removed)
+      - ALIGNS with the prediction  →  confidence × 1.08  (small boost, capped 92)
+      - AMBIGUOUS (first-half lines, unknown markets, etc) →  unchanged
+
+    Penalty severity scales with the predicted margin:
+      - clear blowout (|margin| >= 2)  →  strong penalty (×0.15) — high confidence to contradict
+      - close win    (|margin| == 1)   →  moderate penalty (×0.40) — could go either way
+      - predicted draw (margin == 0)   →  no penalty at all — anything can happen in a 1-1
+
+    Boost is fixed × 1.08 so we don't over-promote weak picks; the
+    important effect is the penalty bringing contradicting picks below
+    the tier min_conf floors. """
+    pred = fx.get("_pred_score") or ""
+    try:
+        h_pred_s, a_pred_s = pred.split("-")
+        h_pred = int(h_pred_s)
+        a_pred = int(a_pred_s)
+    except (ValueError, AttributeError):
+        return picks  # no usable predicted score — leave picks unchanged
+
+    margin = h_pred - a_pred
+    total = h_pred + a_pred
+    abs_m = abs(margin)
+
+    # Penalty severity by predicted margin
+    if abs_m >= 2:
+        penalty = 0.15        # blowout predicted — heavy penalty for contradiction
+    elif abs_m == 1:
+        penalty = 0.40        # close game — moderate penalty (1-0 could easily land 1-1)
+    else:
+        return picks          # predicted draw — anything possible, no filter
+
+    home_wins_pred = margin >= 1
+    away_wins_pred = margin <= -1
+
+    def aligns(mt):
+        """Return True if mt aligns with predicted score, False if contradicts,
+        None if ambiguous/can't tell."""
+        if not mt:
+            return None
+        # ── Match-winner family ──
+        if mt == "home_win":
+            return home_wins_pred
+        if mt == "away_win":
+            return away_wins_pred
+        if mt == "draw":
+            return margin == 0
+        # ── Double chance (full match) ──
+        if mt == "double_chance_1X" or mt == "dc1up_1x":
+            return home_wins_pred or margin == 0
+        if mt == "double_chance_X2" or mt == "dc1up_x2":
+            return away_wins_pred or margin == 0
+        if mt == "double_chance_12" or mt == "dc1up_12":
+            return margin != 0
+        # ── Draw No Bet ──
+        if mt == "dnb_home":
+            return home_wins_pred
+        if mt == "dnb_away":
+            return away_wins_pred
+        # ── 1UP / Win-a-Half (treat as needing a win) ──
+        if mt == "oneup_home" or mt.startswith("winhalf_home"):
+            return home_wins_pred
+        if mt == "oneup_away" or mt.startswith("winhalf_away"):
+            return away_wins_pred
+        # ── Handicaps ──
+        if mt == "handicap_home_-1.5":
+            return margin >= 2
+        if mt == "handicap_away_-1.5":
+            return margin <= -2
+        # ── Total goals (Over/Under) ──
+        if mt.startswith("over_"):
+            try:
+                line = float(mt.split("_", 1)[1])
+                return total > line
+            except (ValueError, IndexError):
+                return None
+        if mt.startswith("under_"):
+            try:
+                line = float(mt.split("_", 1)[1])
+                return total < line
+            except (ValueError, IndexError):
+                return None
+        # ── Team totals ──
+        if mt.startswith("team_home_over_"):
+            try:
+                line = float(mt.replace("team_home_over_", ""))
+                return h_pred > line
+            except ValueError:
+                return None
+        if mt.startswith("team_home_under_"):
+            try:
+                line = float(mt.replace("team_home_under_", ""))
+                return h_pred < line
+            except ValueError:
+                return None
+        if mt.startswith("team_away_over_"):
+            try:
+                line = float(mt.replace("team_away_over_", ""))
+                return a_pred > line
+            except ValueError:
+                return None
+        if mt.startswith("team_away_under_"):
+            try:
+                line = float(mt.replace("team_away_under_", ""))
+                return a_pred < line
+            except ValueError:
+                return None
+        # ── BTTS ──
+        if mt == "btts_yes":
+            return h_pred > 0 and a_pred > 0
+        if mt == "btts_no":
+            return h_pred == 0 or a_pred == 0
+        # ── First-half, corners, cards, multigoal, etc. — too ambiguous
+        # to verify from a full-time score; leave unchanged.
+        return None
+
+    for p in picks:
+        a = aligns(p.get("market_type"))
+        if a is True:
+            new_conf = min(92.0, p.get("confidence", 0) * 1.08)
+            p["confidence"] = round(new_conf, 1)
+            p["odds"] = prob_to_odds(new_conf)
+        elif a is False:
+            new_conf = p.get("confidence", 0) * penalty
+            p["confidence"] = round(new_conf, 1)
+            p["odds"] = prob_to_odds(new_conf)
+        # a is None → leave unchanged
+
     return picks
 
 
@@ -12354,45 +12505,44 @@ def build_all_accumulators(all_picks, avoid_games=None):
         max_reuse=1, avoid_games=avoid_games)
     result["100_odds"] = bold_acc
 
-    # ── GRAND AUDIT standalone, blocked from using ANY game already in the
-    # 100 ODDS slip — true no-game-repeat across the session. We pre-populate
-    # match_count with the bold slip's games at count 1, so the eligible
-    # filter (match_count.get(match, 0) < max_reuse=1) evaluates to 1<1=False
-    # and excludes every bold-slip game. match_families stays empty since the
-    # dedup happens at the game level now, not the family level. ──
-    grand_match_count = {}
+    # ── GRAND AUDIT standalone, dedup'd against 100 ODDS at the FAMILY
+    # level: same games allowed, but with a different bet family. So if
+    # 100 ODDS picked "Brazil DNB" on Brazil vs Morocco, Grand Audit can
+    # still take "Brazil to Win" or "Over 2.5" on the same game — just
+    # not another DNB or double-chance pick. This makes Grand Audit
+    # actually buildable on tight slates (the strict game-level rule
+    # killed it when 100 ODDS used 13 of 25 games). Family dedup gives
+    # genuine variety within the session AND lets the bolder Grand
+    # Audit picks land on the strongest games, which is the whole
+    # point of having both tiers. ──
+    grand_match_families = {}
     if bold_acc:
-        for s in bold_acc["selections"]:
-            grand_match_count[s["match"]] = 1
-    grand_acc = build_accumulator(
-        all_picks, "1000_odds", set(), grand_match_count, {},
-        rotation_seed, max_reuse=1, avoid_games=avoid_games)
-
-    # Fallback for thin slates: if the strict no-game-repeat rule made it
-    # impossible to reach Grand Audit's min_sel (e.g., on a 14-game slate
-    # where 100 ODDS used 13 of them), relax to family-level dedup. Grand
-    # Audit can then share GAMES with 100 ODDS — just never with the same
-    # bet TYPE. Strict rule preserved on wide slates (30+ games) where the
-    # first build succeeds; graceful degradation on thin ones so the user
-    # always gets a Grand Audit slip.
-    if not grand_acc and bold_acc:
-        grand_match_families = {}
         for s in bold_acc["selections"]:
             grand_match_families.setdefault(s["match"], set()).add(
                 _mkt_family(s["market_type"]))
+    grand_acc = build_accumulator(
+        all_picks, "1000_odds", set(), {}, grand_match_families,
+        rotation_seed, max_reuse=1, avoid_games=avoid_games)
+
+    # Last-resort fallback: if even family dedup couldn't build, drop
+    # all cross-tier constraints and just let Grand Audit pick its
+    # boldest picks. The user has been clear they'd rather get SOME
+    # Grand Audit slip (with one or two leg overlaps vs 100 ODDS) than
+    # no slip at all.
+    if not grand_acc:
         grand_acc = build_accumulator(
-            all_picks, "1000_odds", set(), {}, grand_match_families,
+            all_picks, "1000_odds", set(), {}, {},
             rotation_seed, max_reuse=1, avoid_games=avoid_games)
         if grand_acc:
-            print("[FB] Grand Audit: thin slate fallback engaged — "
-                  "strict no-game-repeat against 100 ODDS could not build, "
-                  "relaxed to family-different (same games OK, different bet "
-                  "types). {} legs / {:.0f} odds.".format(
+            print("[FB] Grand Audit: full-fallback engaged — cross-tier "
+                  "constraints relaxed, {} legs / {:.0f} odds.".format(
                   grand_acc["num_selections"], grand_acc["total_odds"]))
         else:
-            print("[FB] Grand Audit: even fallback couldn't build — slate "
-                  "too thin or no high-confidence bold-call picks "
-                  "available.")
+            print("[FB] Grand Audit: still couldn't build even with no "
+                  "constraints — no picks meet odds_lo {} and min_conf {} "
+                  "on this slate.".format(
+                  TIER_CONFIG["1000_odds"]["odds_lo"],
+                  TIER_CONFIG["1000_odds"]["min_conf"]))
     result["1000_odds"] = grand_acc
 
     # ── Per-tier slip diagnostic dump. CRITICAL: wrapped in try/except so a
