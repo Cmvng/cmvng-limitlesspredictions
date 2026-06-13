@@ -9606,11 +9606,27 @@ def _sports_scrape_footballpredictions_com():
 def _sports_scrape_footballpredictions_net():
     """Scrape footballpredictions.net for correct score predictions.
 
-    Uses the robust fetcher (plain → cloudscraper → curl_cffi) so a
-    Cloudflare challenge or transient block doesn't silently return 0
-    predictions like it did before. If ALL methods exhaust, returns an
-    empty list and the [SCRAPE-FAIL] log line names this source so you
-    can see which one died."""
+    Updated June 2026: the page format changed. Match-prediction URLs use
+    `-v-` (single letter) not `-vs-`, the suffix is `-predictions-betting-
+    tips` not `-prediction`, and the team order in the URL is sometimes
+    alphabetical (not home-away). So we extract team names from the page
+    DOM where they appear in correct order, and find the score from the
+    `👉 X-Y` pattern that fp.net uses in each match card.
+
+    Each match card has this structure on the page:
+        <some-container>
+          <a href="/teamA-streams">Team A</a>     ← home (first in DOM)
+          <a href="/teamB-streams">Team B</a>     ← away
+          <span>2026-06-13 22:00:00</span>
+          <span>👉</span>
+          <span>2-0</span>                         ← the score
+          <a href="/teamA-v-teamB-predictions-betting-tips">Preview »</a>
+        </some-container>
+
+    So we anchor on the preview link (unique per match), walk up the DOM
+    to find the container with both team-streams links, and read the
+    score from the container's text using the 👉 marker.
+    """
     predictions = []
     url = "https://footballpredictions.net/correct-score-predictions-betting-tips"
     try:
@@ -9621,51 +9637,90 @@ def _sports_scrape_footballpredictions_net():
             return predictions
         soup = BeautifulSoup(r.text, "html.parser")
 
-        # FP.net uses table rows with match data
-        # Look for links to individual match pages — they contain team names
-        links = soup.find_all("a", href=True)
-        for link in links:
-            href = link.get("href", "")
-            text = link.get_text(" ", strip=True)
-            # Match pages have format: /team-a-vs-team-b-prediction/
-            if "-vs-" in href and "prediction" in href:
-                # Extract teams from the href
-                parts = href.split("/")
-                for part in parts:
-                    if "-vs-" in part:
-                        teams = part.replace("-prediction", "").replace("-tips", "")
-                        team_parts = teams.split("-vs-")
-                        if len(team_parts) == 2:
-                            home = team_parts[0].replace("-", " ").strip().title()
-                            away = team_parts[1].replace("-", " ").strip().title()
-                            if len(home) > 2 and len(away) > 2:
-                                # Look for score in nearby text
-                                parent = link.parent
-                                parent_text = parent.get_text(" ", strip=True) if parent else text
-                                score_match = _sports_re.search(r'(\d)\s*[-–:]\s*(\d)', parent_text)
-                                score = "{}-{}".format(score_match.group(1), score_match.group(2)) if score_match else None
-                                predictions.append({
-                                    "source": "footballpredictions.net",
-                                    "type": "correct-score",
-                                    "home": home, "away": away,
-                                    "score": score,
-                                    "text": parent_text[:200] if parent_text else text[:200],
-                                })
+        # Find all match-prediction links — both new (-v-) and old (-vs-)
+        # formats, both suffix styles. This is the anchor for each match
+        # card; one preview link per match.
+        match_link_pattern = _sports_re.compile(
+            r'(-v-|-vs-).*-predictions?-betting-tips')
+        match_links = soup.find_all("a", href=match_link_pattern)
 
-        # Deduplicate
+        seen_hrefs = set()
+        for ml in match_links:
+            href = ml.get("href", "")
+            if href in seen_hrefs:
+                continue
+            seen_hrefs.add(href)
+
+            # Walk up the DOM up to 8 levels looking for a container that
+            # has 2+ team-streams links. The first two in DOM order are
+            # home and away (in that order).
+            container = ml.parent
+            home_name = None
+            away_name = None
+            container_text = ""
+            for _ in range(8):
+                if container is None or getattr(container, "name", None) == "body":
+                    break
+                stream_links = container.find_all(
+                    "a", href=lambda h: h and h.endswith("-streams"))
+                if len(stream_links) >= 2:
+                    home_name = stream_links[0].get_text(strip=True)
+                    away_name = stream_links[1].get_text(strip=True)
+                    container_text = container.get_text(" ", strip=True)
+                    break
+                container = container.parent
+
+            if not home_name or not away_name:
+                continue
+            if home_name == away_name:
+                continue
+            if len(home_name) < 2 or len(away_name) < 2:
+                continue
+
+            # Extract score. Strong signal: 👉 emoji right before the
+            # score. Fallback: any standalone single-digit X-Y in the
+            # container that isn't part of a date (2026-06-13).
+            score = None
+            m = _sports_re.search(
+                r'👉\s*(\d+)\s*[-–]\s*(\d+)', container_text)
+            if not m:
+                # Fallback — isolated small-number score, with lookbehind/
+                # ahead so we don't capture "26-06" from "2026-06-13"
+                m = _sports_re.search(
+                    r'(?<!\d)([0-9])\s*[-–]\s*([0-9])(?!\d)', container_text)
+            if m:
+                h_goals = m.group(1)
+                a_goals = m.group(2)
+                # Sanity check — football scores almost never exceed 15
+                try:
+                    if int(h_goals) < 15 and int(a_goals) < 15:
+                        score = "{}-{}".format(h_goals, a_goals)
+                except (TypeError, ValueError):
+                    pass
+
+            predictions.append({
+                "source": "footballpredictions.net",
+                "type": "correct-score",
+                "home": home_name, "away": away_name,
+                "score": score,
+                "text": container_text[:200],
+            })
+
+        # Deduplicate by normalized team pair
         seen = set()
         unique = []
         for p in predictions:
-            key = (_sports_normalize_team(p["home"]), _sports_normalize_team(p["away"]))
+            key = (_sports_normalize_team(p["home"]),
+                   _sports_normalize_team(p["away"]))
             if key not in seen:
                 seen.add(key)
                 unique.append(p)
         predictions = unique
 
         print("[SPORTS] FP.net: {} predictions".format(len(predictions)))
-        # Debug: show first 3
         for p in predictions[:3]:
-            print("[SPORTS] FP.net sample: {} vs {} → {}".format(p["home"], p["away"], p.get("score", "?")))
+            print("[SPORTS] FP.net sample: {} vs {} → {}".format(
+                p["home"], p["away"], p.get("score", "?")))
     except Exception as e:
         print("[SPORTS] FP.net error: {}".format(e))
     return predictions
